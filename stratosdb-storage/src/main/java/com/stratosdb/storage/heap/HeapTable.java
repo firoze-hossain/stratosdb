@@ -1,0 +1,160 @@
+package com.stratosdb.storage.heap;
+
+import com.stratosdb.storage.buffer.BufferPool;
+import com.stratosdb.storage.page.SlottedPage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Heap table implementation
+ */
+public class HeapTable {
+    private static final Logger LOG = LoggerFactory.getLogger(HeapTable.class);
+    
+    private final String name;
+    private final BufferPool bufferPool;
+    private long lastPageId;
+    
+    public HeapTable(String name, BufferPool bufferPool) {
+        this.name = name;
+        this.bufferPool = bufferPool;
+        this.lastPageId = 0;
+    }
+    
+    /**
+     * Insert a tuple
+     */
+    public InsertResult insert(byte[] tupleData) {
+        // Try existing pages first
+        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+            
+            // Check if we have space for this tuple
+            if (page.hasSpace(tupleData)) {
+                int slot = page.insertTuple(tupleData);
+                if (slot != -1) {
+                    bufferPool.markDirty(name, pageId);
+                    bufferPool.unpinPage(name, pageId);
+                    LOG.debug("Inserted at {}/{}", pageId, slot);
+                    return new InsertResult(pageId, slot);
+                }
+            }
+            bufferPool.unpinPage(name, pageId);
+        }
+        
+        // Need new page
+        long newPageId = lastPageId + 1;
+        SlottedPage newPage = new SlottedPage(newPageId);
+        int slot = newPage.insertTuple(tupleData);
+        
+        // Write to disk
+        bufferPool.markDirty(name, newPageId);
+        bufferPool.unpinPage(name, newPageId);
+        
+        lastPageId = newPageId;
+        LOG.debug("Created new page {} for insertion", newPageId);
+        
+        return new InsertResult(newPageId, slot);
+    }
+    
+    /**
+     * Scan all tuples
+     */
+    public List<byte[]> scan() {
+        List<byte[]> results = new ArrayList<>();
+        
+        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+            
+            List<Integer> slots = page.getValidSlots();
+            for (int slot : slots) {
+                byte[] tuple = page.readTuple(slot);
+                if (tuple != null) {
+                    results.add(tuple);
+                }
+            }
+            
+            bufferPool.unpinPage(name, pageId);
+        }
+        
+        LOG.debug("Scanned {} tuples from table {}", results.size(), name);
+        return results;
+    }
+    
+    /**
+     * Scan with limit
+     */
+    public List<byte[]> scan(int limit) {
+        List<byte[]> results = new ArrayList<>();
+        int count = 0;
+        
+        for (long pageId = 0; pageId <= lastPageId && count < limit; pageId++) {
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+            
+            List<Integer> slots = page.getValidSlots();
+            for (int slot : slots) {
+                if (count >= limit) break;
+                byte[] tuple = page.readTuple(slot);
+                if (tuple != null) {
+                    results.add(tuple);
+                    count++;
+                }
+            }
+            
+            bufferPool.unpinPage(name, pageId);
+        }
+        
+        return results;
+    }
+    
+    /**
+     * Delete by page and slot
+     */
+    public boolean delete(long pageId, int slot) {
+        SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+        page.deleteTuple(slot);
+        bufferPool.markDirty(name, pageId);
+        bufferPool.unpinPage(name, pageId);
+        LOG.debug("Deleted {}/{}", pageId, slot);
+        return true;
+    }
+    
+    /**
+     * Update by page and slot
+     */
+    public boolean update(long pageId, int slot, byte[] newData) {
+        SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+        boolean result = page.updateTuple(slot, newData);
+        if (result) {
+            bufferPool.markDirty(name, pageId);
+        }
+        bufferPool.unpinPage(name, pageId);
+        return result;
+    }
+    
+    /**
+     * Get tuple by page and slot
+     */
+    public byte[] readTuple(long pageId, int slot) {
+        SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+        byte[] data = page.readTuple(slot);
+        bufferPool.unpinPage(name, pageId);
+        return data;
+    }
+    
+    public String getName() { return name; }
+    public long getLastPageId() { return lastPageId; }
+    
+    public static class InsertResult {
+        public final long pageId;
+        public final int slot;
+        
+        public InsertResult(long pageId, int slot) {
+            this.pageId = pageId;
+            this.slot = slot;
+        }
+    }
+}
