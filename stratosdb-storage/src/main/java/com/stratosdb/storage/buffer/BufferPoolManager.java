@@ -3,6 +3,7 @@ package com.stratosdb.storage.buffer;
 import com.stratosdb.common.exceptions.StorageException;
 import com.stratosdb.storage.disk.DiskManager;
 import com.stratosdb.storage.page.Page;
+import com.stratosdb.storage.page.SlottedPage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,21 +11,18 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-/**
- * Thread-safe buffer pool with LRU eviction policy
- */
 public class BufferPoolManager implements BufferPool {
     private static final Logger LOG = LoggerFactory.getLogger(BufferPoolManager.class);
-    
+
     private final int maxPages;
     private final DiskManager diskManager;
     private final Map<String, Map<Long, Page>> pageCache;
     private final Map<String, Map<Long, Integer>> pinCounts;
     private final ReentrantReadWriteLock globalLock;
-    
+
     private long hits = 0;
     private long misses = 0;
-    
+
     public BufferPoolManager(int maxPages, DiskManager diskManager) {
         this.maxPages = maxPages;
         this.diskManager = diskManager;
@@ -32,7 +30,7 @@ public class BufferPoolManager implements BufferPool {
         this.pinCounts = new ConcurrentHashMap<>();
         this.globalLock = new ReentrantReadWriteLock();
     }
-    
+
     @Override
     public Page getPage(String tableName, long pageId) {
         // Check if in cache
@@ -44,7 +42,7 @@ public class BufferPoolManager implements BufferPool {
             LOG.debug("Cache hit: {}/{}", tableName, pageId);
             return page;
         }
-        
+
         // Cache miss - load from disk
         globalLock.writeLock().lock();
         try {
@@ -56,27 +54,42 @@ public class BufferPoolManager implements BufferPool {
                 hits++;
                 return page;
             }
-            
+
             // Evict if needed
             evictIfNeeded();
-            
-            // Load from disk
+
+            // Load from disk - create SlottedPage instead of Page
             Page page = diskManager.readPage(tableName, pageId);
-            
+
+            // If the page is new (empty), make it a SlottedPage
+            // Otherwise, use what was loaded
+            if (page.getBytes() != null && page.getPageId() >= 0) {
+                // Check if it's already a SlottedPage by checking if data exists
+                // Since we can't cast directly, we'll create a SlottedPage from the bytes
+                SlottedPage slottedPage = new SlottedPage(pageId);
+                // Copy data from loaded page
+                slottedPage.getBuffer().put(page.getBytes());
+                slottedPage.getBuffer().flip();
+                page = slottedPage;
+            } else {
+                // Create a new SlottedPage
+                page = new SlottedPage(pageId);
+            }
+
             // Add to cache
             tablePages = pageCache.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
             tablePages.put(pageId, page);
-            
+
             pinPage(tableName, pageId);
             misses++;
-            
+
             LOG.debug("Cache miss: {}/{}", tableName, pageId);
             return page;
         } finally {
             globalLock.writeLock().unlock();
         }
     }
-    
+
     @Override
     public void markDirty(String tableName, long pageId) {
         Map<Long, Page> tablePages = pageCache.get(tableName);
@@ -84,7 +97,7 @@ public class BufferPoolManager implements BufferPool {
             tablePages.get(pageId).setDirty(true);
         }
     }
-    
+
     @Override
     public void unpinPage(String tableName, long pageId) {
         Map<Long, Integer> pins = pinCounts.get(tableName);
@@ -92,7 +105,7 @@ public class BufferPoolManager implements BufferPool {
             pins.computeIfPresent(pageId, (k, v) -> v > 0 ? v - 1 : 0);
         }
     }
-    
+
     @Override
     public void flushAll() {
         globalLock.writeLock().lock();
@@ -109,7 +122,7 @@ public class BufferPoolManager implements BufferPool {
             globalLock.writeLock().unlock();
         }
     }
-    
+
     @Override
     public void flushPage(String tableName, long pageId) {
         Map<Long, Page> tablePages = pageCache.get(tableName);
@@ -120,7 +133,7 @@ public class BufferPoolManager implements BufferPool {
             }
         }
     }
-    
+
     @Override
     public void evictPage(String tableName, long pageId) {
         globalLock.writeLock().lock();
@@ -141,27 +154,27 @@ public class BufferPoolManager implements BufferPool {
             globalLock.writeLock().unlock();
         }
     }
-    
+
     private void pinPage(String tableName, long pageId) {
         Map<Long, Integer> pins = pinCounts.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
         pins.compute(pageId, (k, v) -> (v == null) ? 1 : v + 1);
     }
-    
+
     private void evictIfNeeded() {
         int totalPages = pageCache.values().stream()
                 .mapToInt(Map::size)
                 .sum();
-        
+
         if (totalPages < maxPages) {
             return;
         }
-        
-        // Find unpinned page to evict (simple approach - first found)
+
+        // Find unpinned page to evict
         for (Map.Entry<String, Map<Long, Page>> entry : pageCache.entrySet()) {
             String tableName = entry.getKey();
             Map<Long, Page> pages = entry.getValue();
             Map<Long, Integer> pins = pinCounts.getOrDefault(tableName, new ConcurrentHashMap<>());
-            
+
             for (Map.Entry<Long, Page> pageEntry : pages.entrySet()) {
                 Long pageId = pageEntry.getKey();
                 if (pins.getOrDefault(pageId, 0) == 0) {
@@ -177,22 +190,21 @@ public class BufferPoolManager implements BufferPool {
             }
         }
     }
-    
+
     @Override
     public double getCacheHitRatio() {
         long total = hits + misses;
         return total > 0 ? (double) hits / total : 0.0;
     }
-    
+
     @Override
     public int getCacheSize() {
         return pageCache.values().stream().mapToInt(Map::size).sum();
     }
-    
+
     @Override
     public void close() {
         flushAll();
         diskManager.close();
     }
 }
-
