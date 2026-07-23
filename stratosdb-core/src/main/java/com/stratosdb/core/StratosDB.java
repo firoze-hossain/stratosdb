@@ -32,7 +32,7 @@ public class StratosDB {
         this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager);
 
         // Recover from WAL
-        this.walManager.recover();
+        this.walManager.recover(diskManager);
 
         LOG.info("StratosDB initialized at {}", config.getDataDirectory());
     }

@@ -21,7 +21,13 @@ public class HeapTable {
     public HeapTable(String name, BufferPool bufferPool) {
         this.name = name;
         this.bufferPool = bufferPool;
-        this.lastPageId = 0;
+        // Discover how many pages this table actually has on disk. Previously this
+        // was hardcoded to 0, meaning every HeapTable object - including one freshly
+        // constructed after a restart - only ever looked at page 0, no matter how
+        // many pages the table really had. scan()/insert() silently ignored every
+        // page beyond the first for any table that survived a restart.
+        long existingPages = bufferPool.getTablePageCount(name);
+        this.lastPageId = existingPages > 0 ? existingPages - 1 : 0;
     }
     
     /**
@@ -45,12 +51,16 @@ public class HeapTable {
             bufferPool.unpinPage(name, pageId);
         }
         
-        // Need new page
+        // Need new page. This MUST go through the buffer pool (getPage), the same
+        // as every existing page above - otherwise the page only exists in this
+        // local variable, is never registered in the pool's cache, and is silently
+        // dropped on the floor: flushAll()/eviction can only persist pages they know
+        // about. (Previously this called `new SlottedPage(newPageId)` directly,
+        // which is exactly why data on any page past the first was lost.)
         long newPageId = lastPageId + 1;
-        SlottedPage newPage = new SlottedPage(newPageId);
+        SlottedPage newPage = (SlottedPage) bufferPool.getPage(name, newPageId);
         int slot = newPage.insertTuple(tupleData);
         
-        // Write to disk
         bufferPool.markDirty(name, newPageId);
         bufferPool.unpinPage(name, newPageId);
         

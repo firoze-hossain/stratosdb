@@ -11,5 +11,6 @@ public interface BufferPool {
     void evictPage(String tableName, long pageId);
     double getCacheHitRatio();
     int getCacheSize();
+    long getTablePageCount(String tableName);
     void close();
 }

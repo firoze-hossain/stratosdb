@@ -198,6 +198,11 @@ public class BufferPoolManager implements BufferPool {
     }
 
     @Override
+    public long getTablePageCount(String tableName) {
+        return diskManager.getTablePageCount(tableName);
+    }
+
+    @Override
     public int getCacheSize() {
         return pageCache.values().stream().mapToInt(Map::size).sum();
     }
