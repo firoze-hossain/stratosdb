@@ -12,14 +12,14 @@
 
     <name>StratosDB</name>
     <description>PostgreSQL-inspired Database Engine in Java - Reach for the Clouds</description>
-    <url>https://github.com/yourname/stratosdb</url>
+    <url>https://github.com/firoze-hossain/stratosdb</url>
 
     <properties>
-        <maven.compiler.source>25</maven.compiler.source>
-        <maven.compiler.target>25</maven.compiler.target>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <!-- Updated versions for Java 25 compatibility -->
         <slf4j.version>2.0.13</slf4j.version>
         <junit.version>5.10.2</junit.version>
         <antlr.version>4.13.2</antlr.version>
@@ -115,8 +115,7 @@
                     <artifactId>maven-compiler-plugin</artifactId>
                     <version>3.13.0</version>
                     <configuration>
-                        <source>25</source>
-                        <target>25</target>
+                        <release>21</release>
                         <compilerArgs>
                             <arg>-Xlint:all</arg>
                             <arg>-Xlint:-options</arg>
@@ -140,8 +139,6 @@
                     <version>3.2.5</version>
                     <configuration>
                         <argLine>
-                            <!-- Enable for better testing with Java 25 -->
-                            -XX:+EnableDynamicAgentLoading
                             -Djdk.attach.allowAttachSelf=true
                         </argLine>
                     </configuration>
@@ -174,36 +171,4 @@
         </pluginManagement>
     </build>
 
-    <!-- Optional: Add profiles for different Java versions -->
-    <profiles>
-        <profile>
-            <id>java25-preview</id>
-            <activation>
-                <activeByDefault>false</activeByDefault>
-            </activation>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-compiler-plugin</artifactId>
-                        <configuration>
-                            <compilerArgs>
-                                <arg>--enable-preview</arg>
-                            </compilerArgs>
-                        </configuration>
-                    </plugin>
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-surefire-plugin</artifactId>
-                        <configuration>
-                            <argLine>
-                                --enable-preview
-                                -XX:+EnableDynamicAgentLoading
-                            </argLine>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-    </profiles>
 </project>
