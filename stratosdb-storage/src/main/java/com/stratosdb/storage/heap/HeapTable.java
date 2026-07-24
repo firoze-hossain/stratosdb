@@ -1,7 +1,13 @@
 package com.stratosdb.storage.heap;
 
+import com.stratosdb.common.exceptions.DeadlockException;
+import com.stratosdb.common.exceptions.TransactionException;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.page.SlottedPage;
+import com.stratosdb.transaction.TransactionManager;
+import com.stratosdb.transaction.locking.LockManager;
+import com.stratosdb.transaction.mvcc.MVCCVisibility;
+import com.stratosdb.transaction.mvcc.Snapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -157,7 +163,90 @@ public class HeapTable {
     
     public String getName() { return name; }
     public long getLastPageId() { return lastPageId; }
-    
+
+    // --- MVCC-aware API ---
+    // These sit on top of the raw methods above rather than replacing them:
+    // every stored row is the raw payload with a 16-byte (xmin, xmax) header
+    // prepended (see MVCCVisibility). The raw insert/scan/delete/update above
+    // are untouched so existing callers (e.g. the Week 1 crash-recovery test)
+    // keep working exactly as before against tables that don't use MVCC.
+
+    /** A scanned row together with its physical position, needed so callers can target UPDATE/DELETE at it. */
+    public record PositionedRow(long pageId, int slot, byte[] stored) {}
+
+    /** Like scan(), but keeps (pageId, slot) around instead of returning bare payload bytes. */
+    public List<PositionedRow> scanPositioned() {
+        List<PositionedRow> results = new ArrayList<>();
+        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+            for (int slot : page.getValidSlots()) {
+                byte[] stored = page.readTuple(slot);
+                if (stored != null) {
+                    results.add(new PositionedRow(pageId, slot, stored));
+                }
+            }
+            bufferPool.unpinPage(name, pageId);
+        }
+        return results;
+    }
+
+    /** Inserts payload as a new row version created by xid (xmax left unset - i.e. currently live). */
+    public InsertResult insertMvcc(byte[] payload, long xid) {
+        byte[] stored = MVCCVisibility.wrap(payload, xid, MVCCVisibility.NO_XMAX);
+        return insert(stored);
+    }
+
+    /** Returns the payload bytes of every row version visible to this snapshot. */
+    public List<byte[]> scanMvcc(Snapshot snapshot, TransactionManager txnManager) {
+        List<byte[]> visible = new ArrayList<>();
+        for (PositionedRow row : scanPositioned()) {
+            if (MVCCVisibility.isVisible(row.stored(), snapshot, txnManager)) {
+                visible.add(MVCCVisibility.readPayload(row.stored()));
+            }
+        }
+        return visible;
+    }
+
+    /**
+     * Deletes (tombstones) the row at (pageId, slot) on behalf of xid, after
+     * taking an exclusive lock on it. Returns false if the row is not visible
+     * to this transaction's snapshot (already deleted by someone else, or
+     * never existed) rather than throwing - a delete of something you can't
+     * see is a no-op, not a conflict.
+     */
+    public boolean deleteMvcc(long pageId, int slot, long xid, Snapshot snapshot,
+                               TransactionManager txnManager, LockManager lockManager) throws DeadlockException {
+        lockManager.acquireExclusive(new LockManager.RowId(name, pageId, slot), xid);
+        byte[] stored = readTuple(pageId, slot);
+        if (stored == null || !MVCCVisibility.isVisible(stored, snapshot, txnManager)) {
+            return false;
+        }
+        byte[] tombstoned = MVCCVisibility.withXmax(stored, xid);
+        return update(pageId, slot, tombstoned);
+    }
+
+    /**
+     * Updates the row at (pageId, slot) on behalf of xid: tombstones the old
+     * version in place and inserts newPayload as a brand-new version (which
+     * may land on a different page/slot - MVCC row identity here is "this
+     * table's data", not a fixed physical location tracked across versions).
+     * Throws TransactionException if the row is not visible to this
+     * transaction's snapshot - unlike delete, a write conflict on UPDATE is
+     * treated as an error the caller should see, not a silent no-op.
+     */
+    public InsertResult updateMvcc(long pageId, int slot, byte[] newPayload, long xid, Snapshot snapshot,
+                                    TransactionManager txnManager, LockManager lockManager) throws DeadlockException {
+        lockManager.acquireExclusive(new LockManager.RowId(name, pageId, slot), xid);
+        byte[] stored = readTuple(pageId, slot);
+        if (stored == null || !MVCCVisibility.isVisible(stored, snapshot, txnManager)) {
+            throw new TransactionException("Write conflict: row " + pageId + "/" + slot
+                + " is not visible to transaction " + xid);
+        }
+        byte[] tombstoned = MVCCVisibility.withXmax(stored, xid);
+        update(pageId, slot, tombstoned);
+        return insertMvcc(newPayload, xid);
+    }
+
     public static class InsertResult {
         public final long pageId;
         public final int slot;

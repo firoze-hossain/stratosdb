@@ -40,6 +40,8 @@ public class SqlParser {
             return buildInsert(ctx.insert());
         } else if (ctx.select() != null) {
             return buildSelect(ctx.select());
+        } else if (ctx.update() != null) {
+            return buildUpdate(ctx.update());
         } else if (ctx.delete() != null) {
             return buildDelete(ctx.delete());
         } else if (ctx.dropTable() != null) {
@@ -48,6 +50,25 @@ public class SqlParser {
             return new ShowTablesStatement();
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
+    }
+
+    /**
+     * The grammar has always had a proper `update` rule (UPDATE ... SET ...
+     * WHERE ...), but this method never existed and buildStatement() never
+     * checked for it - so any UPDATE statement fell through every branch
+     * above and hit the IllegalArgumentException at the bottom, regardless
+     * of what the executor could or couldn't do with it.
+     */
+    private UpdateStatement buildUpdate(StratosSQLParser.UpdateContext ctx) {
+        String tableName = ctx.tableName().getText();
+        List<Assignment> assignments = new ArrayList<>();
+        for (StratosSQLParser.AssignmentContext assignCtx : ctx.assignment()) {
+            String column = assignCtx.columnName().getText();
+            String value = assignCtx.literal().getText();
+            assignments.add(new Assignment(column, value));
+        }
+        String whereClause = ctx.expression() != null ? ctx.expression().getText() : null;
+        return new UpdateStatement(tableName, assignments, whereClause);
     }
 
     private CreateTableStatement buildCreateTable(StratosSQLParser.CreateTableContext ctx) {
