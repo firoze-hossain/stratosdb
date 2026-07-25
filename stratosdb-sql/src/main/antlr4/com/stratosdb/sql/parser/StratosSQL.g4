@@ -14,7 +14,8 @@ explain: EXPLAIN select;
 
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
-select: SELECT selectList FROM tableName (WHERE expression)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
+select: SELECT selectList FROM tableName joinClause* (WHERE expression)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
+joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
 update: UPDATE tableName SET assignment (COMMA assignment)* (WHERE expression)? SEMICOLON?;
 delete: DELETE FROM tableName (WHERE expression)? SEMICOLON?;
 
@@ -63,7 +64,7 @@ defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP;
 
 // Identifiers
 tableName: IDENTIFIER;
-columnName: IDENTIFIER;
+columnName: IDENTIFIER (DOT IDENTIFIER)?;
 alias: IDENTIFIER | STRING_LITERAL;
 limitValue: INTEGER_LITERAL;
 
@@ -97,6 +98,8 @@ SHOW: S H O W;
 TABLES: T A B L E S;
 INDEX: I N D E X;
 ON: O N;
+JOIN: J O I N;
+INNER: I N N E R;
 EXPLAIN: E X P L A I N;
 
 // Data type keywords
@@ -128,6 +131,7 @@ CURRENT_TIMESTAMP: C U R R E N T '_' T I M E S T A M P;
 
 // Operators and symbols
 LPAREN: '(';
+DOT: '.';
 RPAREN: ')';
 COMMA: ',';
 SEMICOLON: ';';

@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **25 / 25** |
-| Current stage | Week 3 (SQL engine + indexing) — in progress |
+| Tests passing | **30 / 30** |
+| Current stage | Week 3 (SQL engine + indexing) — **complete** |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -53,8 +53,17 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 - ✅ Found and fixed two more real bugs while building this, both in `ExecutorEngine`'s WHERE-clause handling:
   - Operator detection checked `"="` before `">="`/`"<="`, so `age>=30` was split on the wrong character (`age>` / `30`) — order matters when operators overlap as substrings
   - `matchesWhere` detected an operator but always evaluated equality regardless of it, so `age>25` silently behaved exactly like `age=25`. Every operator (`=`,`!=`,`>`,`>=`,`<`,`<=`) is now actually evaluated, and a dedicated test checks both the index-scan and seq-scan paths return identical, correct results for all of them
-- 🔲 JOIN support (nested loop at minimum) — **not started**
-- 🔲 Benchmark: point lookup with index vs. full scan on 100k+ rows — **not started**
+- ✅ **JOIN support (nested loop)** — new grammar (`JOIN`/`INNER`/`ON`, qualified `table.column` references everywhere a column name appears), a real nested-loop executor (`ExecutorEngine.executeJoinedSelect`), and `EXPLAIN` support (`Nested Loop Join: Seq Scan on X -> Seq Scan on Y ON ...`). Joined columns are qualified as `table.column` internally to avoid ambiguity, with a documented fallback so unambiguous bare names (`SELECT name, amount FROM users JOIN orders ...`) still work. Known limitation stated plainly: no index acceleration for joins yet (every join is a full nested loop, not an index-nested-loop or hash join) and no join reordering. 5 new tests: basic match, exclusion of non-matching rows (real inner-join semantics), `WHERE` on a joined column, bare-name resolution, and `EXPLAIN` shape.
+- ✅ **Benchmark: indexed point lookup vs. full scan on 100k+ rows** — `stratosdb-benchmark`'s `QueryBenchmark` (previously the module was completely empty). Runs through the real `StratosDB.execute()` interface, not an idealized storage-only number, so it honestly includes today's per-query ANTLR-parse and transaction-commit overhead. Real measured result on the build machine, 100,000 rows / 300 queries per scenario:
+
+  | Scenario | avg (ms) | p50 | p95 | p99 | ops/sec |
+  |---|---|---|---|---|---|
+  | Index Scan | 0.827 | 0.634 | 1.971 | 6.128 | 1,209.4 |
+  | Seq Scan | 80.603 | 85.030 | 102.008 | 126.502 | 12.4 |
+
+  **97.5x faster** with the index. One machine, one run — not a substitute for reproducing against another database on identical hardware, and the report says so.
+
+**Week 3 is done.** Remaining Week 3 scope-cuts, named honestly rather than silently dropped: cost-based (vs. rule-based) query optimization, index-accelerated joins, and statistics collection are real further work, not attempted here.
 
 ## Week 4 — Network, JDBC, CLI, security 🔲 NOT STARTED
 
@@ -75,19 +84,21 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
 | `stratosdb-storage` | 10 | 1,686 | Real — disk/buffer/WAL/heap, now with a page-type-agnostic buffer pool |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 14 | 610 | Real — ANTLR grammar + hand-written AST builder + executor |
-| `stratosdb-index` | 1 | 304 | Real — B+Tree, tested at scale. Not yet wired into query execution |
+| `stratosdb-sql` | 17 | 993 | Real — ANTLR grammar (now with JOIN/qualified columns) + hand-written AST builder + executor |
+| `stratosdb-index` | 1 | 304 | Real — B+Tree, tested at scale, wired into query execution via the planner |
 | `stratosdb-network` | 0 | 0 | Empty |
 | `stratosdb-jdbc` | 0 | 0 | Empty |
 | `stratosdb-cli` | 1 | 133 | Partial — in-process shell only, no network protocol to connect to yet |
-| `stratosdb-testing` | 0 (test-only) | — | 12 integration tests, all passing |
-| `stratosdb-benchmark` | 0 | 0 | Empty |
+| `stratosdb-testing` | 0 (test-only) | — | 17 integration tests, all passing |
+| `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 ## What to do next (in order)
 
-1. **JOIN support** (nested loop at minimum) — the remaining SQL-engine gap in Week 3.
-2. **Benchmark**: indexed point lookup vs. full scan on 100k+ rows, to close out Week 3 with real numbers instead of just correctness.
-3. **Then Week 4**: wire protocol, JDBC driver, auth, TLS.
+Week 3 is complete. Week 4 is next:
+1. **Wire protocol** (`stratosdb-network` is empty) — a real socket server, length-prefixed frames at minimum.
+2. **JDBC driver** (`stratosdb-jdbc` is empty) — even a minimal `Driver`/`Connection`/`Statement`/`ResultSet` makes the engine usable from any Java tool.
+3. **CLI over the network** — point the existing shell at the new protocol instead of linking in-process.
+4. **Auth + TLS** — salted/hashed credentials, socket-level TLS.
 
 ## Cross-platform note
 

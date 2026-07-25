@@ -23,12 +23,12 @@ Real WAL redo, real crash-recovery testing (kill a forked JVM mid-batch, restart
 ### Week 2 — Transactions that actually isolate ✅
 MVCC with snapshot isolation (xmin/xmax, Postgres-style visibility rules), a lock manager with deadlock detection, `UPDATE`/`DELETE` actually implemented (they were no-op stubs). Done — see PROGRESS.md.
 
-### Week 3 — SQL engine and indexing 🟡 in progress
+### Week 3 — SQL engine and indexing ✅ complete
 - B+Tree index: **done** — disk-backed, real node splitting, tested at 250k-key scale.
 - `CREATE INDEX` + index-scan-vs-seq-scan planner choice in the executor: **done** — see PROGRESS.md.
-- `EXPLAIN`-style output: **done**.
-- JOIN support (nested loop minimum): **not done**.
-- Benchmark (indexed point lookup vs. full scan, 100k+ rows): **not done**.
+- `EXPLAIN`-style output: **done** — including a description of the join shape for joined queries.
+- JOIN support (nested loop minimum): **done** — see PROGRESS.md for the test coverage and known limitations (no index-accelerated joins yet).
+- Benchmark (indexed point lookup vs. full scan, 100k+ rows): **done** — 97.5x speedup measured for real, see PROGRESS.md.
 
 ### Week 4 — Reachable, secure, provable 🔲 not started
 - Wire protocol + socket server (`stratosdb-network` is currently empty).

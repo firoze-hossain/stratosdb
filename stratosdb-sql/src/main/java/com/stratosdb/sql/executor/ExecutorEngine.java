@@ -214,6 +214,10 @@ public class ExecutorEngine {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
+        if (stmt.joins() != null && !stmt.joins().isEmpty()) {
+            return executeJoinedSelect(stmt, txn);
+        }
+
         ScanPlan plan = planScan(stmt.tableName(), stmt.whereClause());
         List<Tuple> tuples = new ArrayList<>();
 
@@ -258,12 +262,122 @@ public class ExecutorEngine {
         return QueryResult.success(tuples);
     }
 
+    /**
+     * Nested-loop join - the "at minimum" version from the Week 3 plan.
+     * Each joined table is fully scanned per iteration; there is no index
+     * acceleration for joins yet (a hash join or an index-nested-loop join
+     * would need one), and no join reordering - tables are joined in the
+     * order they're written in the query. Correctness first; join planning
+     * is a real further optimization, not attempted here.
+     *
+     * Every column in the combined result is qualified as
+     * "tableName.columnName" to avoid ambiguity when two joined tables
+     * share a column name (both having "id" is the common case). Bare
+     * column references in WHERE/SELECT still work when unambiguous, via
+     * findColumnValue's suffix-match fallback.
+     */
+    private QueryResult executeJoinedSelect(SelectStatement stmt, Transaction txn) {
+        List<Tuple> current = new ArrayList<>();
+        for (byte[] raw : tables.get(stmt.tableName()).scanMvcc(txn.getSnapshot(), transactionManager)) {
+            current.add(qualify(Tuple.deserialize(raw), stmt.tableName()));
+        }
+
+        for (JoinClause join : stmt.joins()) {
+            HeapTable joinedTable = tables.get(join.tableName());
+            if (joinedTable == null) {
+                return QueryResult.error("Table not found: " + join.tableName());
+            }
+
+            List<Tuple> joinedRows = new ArrayList<>();
+            for (byte[] raw : joinedTable.scanMvcc(txn.getSnapshot(), transactionManager)) {
+                joinedRows.add(qualify(Tuple.deserialize(raw), join.tableName()));
+            }
+
+            List<Tuple> next = new ArrayList<>();
+            for (Tuple left : current) {
+                Object leftVal = findColumnValue(left, join.leftColumn());
+                for (Tuple right : joinedRows) {
+                    if (valuesEqual(leftVal, findColumnValue(right, join.rightColumn()))) {
+                        next.add(merge(left, right));
+                    }
+                }
+            }
+            current = next;
+        }
+
+        List<Tuple> tuples = new ArrayList<>();
+        for (Tuple row : current) {
+            if (!matchesWhere(row, stmt.whereClause())) {
+                continue;
+            }
+            tuples.add(project(row, stmt.columns()));
+        }
+
+        if (stmt.limit() != null) {
+            try {
+                int limit = Integer.parseInt(stmt.limit());
+                if (tuples.size() > limit) {
+                    tuples = tuples.subList(0, limit);
+                }
+            } catch (NumberFormatException e) {
+                // Ignore invalid limit
+            }
+        }
+
+        return QueryResult.success(tuples);
+    }
+
+    private Tuple qualify(Tuple tuple, String tableName) {
+        Tuple qualified = new Tuple();
+        List<String> columnNames = tuple.getColumnNames();
+        for (int i = 0; i < columnNames.size(); i++) {
+            qualified.addValue(tableName + "." + columnNames.get(i), tuple.getValue(i));
+        }
+        return qualified;
+    }
+
+    private Tuple merge(Tuple left, Tuple right) {
+        Tuple merged = new Tuple();
+        List<String> leftNames = left.getColumnNames();
+        for (int i = 0; i < leftNames.size(); i++) {
+            merged.addValue(leftNames.get(i), left.getValue(i));
+        }
+        List<String> rightNames = right.getColumnNames();
+        for (int i = 0; i < rightNames.size(); i++) {
+            merged.addValue(rightNames.get(i), right.getValue(i));
+        }
+        return merged;
+    }
+
+    private boolean valuesEqual(Object a, Object b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        try {
+            return Double.parseDouble(a.toString()) == Double.parseDouble(b.toString());
+        } catch (NumberFormatException e) {
+            return a.toString().equals(b.toString());
+        }
+    }
     /** Reports which strategy planScan would pick, without running the query. */
     private QueryResult executeExplain(ExplainStatement stmt) {
         SelectStatement select = stmt.select();
         if (!tables.containsKey(select.tableName())) {
             return QueryResult.error("Table not found: " + select.tableName());
         }
+
+        if (select.joins() != null && !select.joins().isEmpty()) {
+            StringBuilder sb = new StringBuilder("Nested Loop Join: Seq Scan on ").append(select.tableName());
+            for (JoinClause join : select.joins()) {
+                if (!tables.containsKey(join.tableName())) {
+                    return QueryResult.error("Table not found: " + join.tableName());
+                }
+                sb.append(" -> Seq Scan on ").append(join.tableName())
+                  .append(" ON ").append(join.leftColumn()).append("=").append(join.rightColumn());
+            }
+            return QueryResult.success(sb.toString());
+        }
+
         ScanPlan plan = planScan(select.tableName(), select.whereClause());
         String description = plan.useIndex()
             ? String.format("Index Scan using %s on %s (column=%s, range=[%s, %s])",
@@ -430,22 +544,16 @@ public class ExecutorEngine {
     /**
      * Column projection, factored out of executeSelect so it can stay
      * unchanged while the surrounding method switched to MVCC scanning.
+     * Delegates to findColumnValue so joined (qualified-column) tuples are
+     * projected correctly too, using the same resolution rules WHERE uses.
      */
     private Tuple project(Tuple tuple, List<String> requestedColumns) {
         if (requestedColumns.isEmpty() || requestedColumns.get(0).equals("*")) {
             return tuple;
         }
         Tuple projected = new Tuple();
-        List<String> columnNames = tuple.getColumnNames();
         for (String colName : requestedColumns) {
-            Object value = null;
-            for (int i = 0; i < columnNames.size(); i++) {
-                if (columnNames.get(i).equalsIgnoreCase(colName)) {
-                    value = tuple.getValue(i);
-                    break;
-                }
-            }
-            projected.addValue(colName, value);
+            projected.addValue(colName, findColumnValue(tuple, colName));
         }
         return projected;
     }
@@ -542,6 +650,22 @@ public class ExecutorEngine {
         for (int i = 0; i < columnNames.size(); i++) {
             if (columnNames.get(i).equalsIgnoreCase(columnName)) {
                 return tuple.getValue(i);
+            }
+        }
+        // Convenience fallback for joined tuples, whose columns are all
+        // qualified as "table.column": a bare "amount" resolves to
+        // "orders.amount" if some qualified column ends with ".amount".
+        // This is a simplification, stated plainly: if two joined tables
+        // both have a column with that bare name, whichever appears first
+        // in the merged tuple wins silently rather than raising a real
+        // SQL-style "ambiguous column reference" error. Use the qualified
+        // form (table.column) to be unambiguous.
+        if (!columnName.contains(".")) {
+            String suffix = "." + columnName.toLowerCase();
+            for (int i = 0; i < columnNames.size(); i++) {
+                if (columnNames.get(i).toLowerCase().endsWith(suffix)) {
+                    return tuple.getValue(i);
+                }
             }
         }
         return null;

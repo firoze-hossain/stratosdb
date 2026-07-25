@@ -128,10 +128,23 @@ public class SqlParser {
             }
         }
 
+        List<JoinClause> joins = new ArrayList<>();
+        for (StratosSQLParser.JoinClauseContext joinCtx : ctx.joinClause()) {
+            joins.add(buildJoinClause(joinCtx));
+        }
+
         String whereClause = ctx.expression() != null ? ctx.expression().getText() : null;
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, whereClause, null, limit);
+        return new SelectStatement(tableName, columns, whereClause, null, limit, joins);
+    }
+
+    private JoinClause buildJoinClause(StratosSQLParser.JoinClauseContext ctx) {
+        String tableName = ctx.tableName().getText();
+        List<StratosSQLParser.ColumnNameContext> columns = ctx.columnName();
+        String leftColumn = columns.get(0).getText();
+        String rightColumn = columns.get(1).getText();
+        return new JoinClause(tableName, leftColumn, rightColumn);
     }
 
     private DeleteStatement buildDelete(StratosSQLParser.DeleteContext ctx) {

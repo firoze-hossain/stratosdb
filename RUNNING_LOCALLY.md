@@ -23,7 +23,7 @@ mvn clean install -DskipTests
 mvn test
 ```
 
-**Expect 25 passing tests** across 5 test classes:
+**Expect 30 passing tests** across 5 test classes:
 
 | Test class | Tests | What it actually checks |
 |---|---|---|
@@ -31,7 +31,7 @@ mvn test
 | `MvccIsolationTest` | 3 | Snapshot isolation: uncommitted writes are invisible to others, old snapshots don't see later commits |
 | `LockManagerDeadlockTest` | 2 | Two real threads in a genuine circular wait; verifies exactly one is aborted with a deadlock error |
 | `BTreeIndexTest` | 6 | Point search, range scan, duplicates, persistence across reopen, and 250,000 shuffled keys forcing real multi-level node splits |
-| `StratosDBTest` | 12 | Full SQL round-trips: CRUD, `CREATE INDEX`, index-vs-seq-scan planning via `EXPLAIN`, and comparison-operator correctness on both scan paths |
+| `StratosDBTest` | 17 | Full SQL round-trips: CRUD, `CREATE INDEX`, index-vs-seq-scan planning via `EXPLAIN`, comparison-operator correctness on both scan paths, and JOIN (basic match, inner-join exclusion, WHERE on a joined column, bare-name resolution, EXPLAIN shape) |
 
 Two things not to be alarmed by:
 - `BTreeIndexTest`'s large test inserts 250,000 keys — it may take several seconds.
@@ -73,6 +73,13 @@ SELECT * FROM users WHERE age = 31;   -- expect Alice
 DELETE FROM users WHERE id = 2;
 SELECT * FROM users;                  -- expect Alice(31) and Carol(40)
 
+CREATE TABLE orders (id INT, user_id INT, amount INT);
+INSERT INTO orders VALUES (100, 1, 50);
+INSERT INTO orders VALUES (101, 1, 75);
+SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id;
+EXPLAIN SELECT * FROM users JOIN orders ON users.id = orders.user_id;
+-- expect: Nested Loop Join: Seq Scan on users -> Seq Scan on orders ON users.id=orders.user_id
+
 \status
 \dt
 \exit
@@ -84,7 +91,15 @@ Then **relaunch the shell pointed at the same data directory** and run `SELECT *
 
 The clearest proof "the SQL machine works" for this specific round of work: run the same query shape against an indexed and a non-indexed column and confirm `EXPLAIN` reports different strategies (shown above — `idx_age` on `age` vs. no index on `id`). If both report the same strategy, or `EXPLAIN` errors out, something regressed.
 
-## 5. If you want to see the crash test with your own eyes
+## 5. Run the benchmark for yourself
+
+```bash
+java -jar stratosdb-benchmark/target/stratosdb-benchmark-1.0.0-SNAPSHOT.jar [rowCount] [queryCount]
+```
+
+Defaults to 100,000 rows and 300 queries per scenario if you don't pass arguments. On the machine this was built on, that took about 2-3 minutes total (inserting 100k rows one `INSERT` statement at a time is the slow part — each one pays a full SQL parse and transaction commit, which the benchmark's own report calls out honestly rather than hiding). It prints the planner's actual `EXPLAIN` choice for both the indexed and unindexed column before running anything, so the numbers that follow are provably measuring what they claim to. Expect something in the neighborhood of a 50-100x speedup for the indexed path at 100k rows; the exact ratio will vary by machine.
+
+## 6. If you want to see the crash test with your own eyes
 
 `CrashRecoveryTest` does this automatically, but you can reproduce the shape of it manually: start the CLI, insert some rows, and `kill -9 <pid>` the Java process from another terminal instead of using `\exit`. Relaunch pointed at the same directory — everything you committed (each statement auto-commits, per Week 2) should still be there; anything from an interrupted multi-row operation should not partially appear.
 

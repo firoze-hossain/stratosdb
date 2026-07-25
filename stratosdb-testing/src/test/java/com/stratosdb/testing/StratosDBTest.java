@@ -223,4 +223,90 @@ public class StratosDBTest {
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());
         assertEquals(expected, result.getRows().size(), () -> sql + " returned wrong row count");
     }
+
+    @Test
+    void testInnerJoin_basicMatch() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice')");
+        database.execute("INSERT INTO users VALUES (2, 'Bob')");
+        database.execute("INSERT INTO orders VALUES (100, 1, 50)");
+        database.execute("INSERT INTO orders VALUES (101, 1, 75)");
+        database.execute("INSERT INTO orders VALUES (102, 2, 20)");
+
+        QueryResult result = database.execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id");
+        assertTrue(result.isSuccess(), () -> "JOIN failed: " + result.getError());
+        assertEquals(3, result.getRows().size(), "Alice has 2 orders, Bob has 1 - 3 joined rows total");
+
+        int aliceTotal = 0, bobTotal = 0;
+        for (var row : result.getRows()) {
+            String name = (String) row.getValue("users.name");
+            int amount = (Integer) row.getValue("orders.amount");
+            if ("Alice".equals(name)) aliceTotal += amount;
+            if ("Bob".equals(name)) bobTotal += amount;
+        }
+        assertEquals(125, aliceTotal);
+        assertEquals(20, bobTotal);
+    }
+
+    @Test
+    void testInnerJoin_excludesNonMatchingRows() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice')");
+        database.execute("INSERT INTO users VALUES (2, 'Bob')"); // Bob has no orders
+        database.execute("INSERT INTO orders VALUES (100, 1, 50)");
+        database.execute("INSERT INTO orders VALUES (200, 999, 999)"); // orphan order, no matching user
+
+        QueryResult result = database.execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size(), "inner join must exclude Bob (no orders) and the orphan order");
+        assertEquals("Alice", result.getRows().get(0).getValue("users.name"));
+    }
+
+    @Test
+    void testInnerJoin_withWhereOnJoinedColumn() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice')");
+        database.execute("INSERT INTO orders VALUES (100, 1, 50)");
+        database.execute("INSERT INTO orders VALUES (101, 1, 150)");
+
+        QueryResult result = database.execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 100");
+        assertTrue(result.isSuccess(), () -> "JOIN+WHERE failed: " + result.getError());
+        assertEquals(1, result.getRows().size());
+        assertEquals(150, result.getRows().get(0).getValue("orders.amount"));
+    }
+
+    @Test
+    void testInnerJoin_bareColumnNameResolvesWhenUnambiguous() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice')");
+        database.execute("INSERT INTO orders VALUES (100, 1, 50)");
+
+        // "name" and "amount" are each unambiguous (only one table has them),
+        // even though "id" exists in both tables and isn't requested here.
+        QueryResult result = database.execute(
+            "SELECT name, amount FROM users JOIN orders ON users.id = orders.user_id");
+        assertTrue(result.isSuccess(), () -> "bare column JOIN failed: " + result.getError());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Alice", result.getRows().get(0).getValue("name"));
+        assertEquals(50, result.getRows().get(0).getValue("amount"));
+    }
+
+    @Test
+    void testExplainDescribesJoinShape() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+
+        QueryResult result = database.execute(
+            "EXPLAIN SELECT * FROM users JOIN orders ON users.id = orders.user_id");
+        assertTrue(result.isSuccess());
+        assertEquals("Nested Loop Join: Seq Scan on users -> Seq Scan on orders ON users.id=orders.user_id",
+            result.getMessage());
+    }
 }
