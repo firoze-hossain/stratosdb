@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **37 / 37** |
-| Current stage | Week 4 (Network, JDBC, CLI, security) — wire protocol + JDBC driver done, CLI/auth/TLS remain |
+| Tests passing | **51 / 51** |
+| Current stage | Foundation (Weeks 1-4) — **complete** |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -65,15 +65,18 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 
 **Week 3 is done.** Remaining Week 3 scope-cuts, named honestly rather than silently dropped: cost-based (vs. rule-based) query optimization, index-accelerated joins, and statistics collection are real further work, not attempted here.
 
-## Week 4 — Network, JDBC, CLI, security 🟡 IN PROGRESS
+## Week 4 — Network, JDBC, CLI, security ✅ COMPLETE
 
-- ✅ **Wire protocol** (`stratosdb-network` was empty) — `WireProtocol`: a small custom binary protocol (not PostgreSQL-wire-compatible, stated plainly), self-framing via `DataInputStream`/`DataOutputStream` primitives. `StratosServer` accepts connections and runs one virtual thread per connection (Java 21 - the reason this project pinned to that LTS back in Week 1), all sharing one `StratosDB` instance so every connection sees the same data. `StratosServerMain` is a runnable entry point (`java -jar stratosdb-network-*.jar [dataDir] [port]`). 3 tests: real socket round-trip, server-side errors surviving the round-trip as a failed result rather than a hang, and two separate connections sharing committed data.
+- ✅ **Wire protocol** (`stratosdb-network` was empty) — `WireProtocol`: a small custom binary protocol (not PostgreSQL-wire-compatible, stated plainly), self-framing via `DataInputStream`/`DataOutputStream` primitives. `StratosServer` accepts connections and runs one virtual thread per connection (Java 21 - the reason this project pinned to that LTS back in Week 1), all sharing one `StratosDB` instance so every connection sees the same data. `StratosServerMain` is a runnable entry point (`java -jar stratosdb-network-*.jar [dataDir] [port]`).
   - Along the way, fixed `StratosDB.startServer()`, which previously logged "server started on port X" while starting nothing at all - now honestly documented as a state flag, with the real listener living in `stratosdb-network` (which depends on `stratosdb-core`, not the reverse, so `core` itself architecturally cannot start a network listener without a circular module dependency - this is why the real server isn't inside `StratosDB` itself).
-- ✅ **JDBC driver** (`stratosdb-jdbc` was empty) — `StratosDriver`/`StratosConnection`/`StratosStatement`/`StratosResultSet`/`StratosResultSetMetaData`, real behavior over a real socket to a real server, verified through `java.sql.DriverManager` exactly as a real application would use it (not by referencing the driver class directly). `Connection`/`Statement`/`ResultSet` have 63/61/203 methods respectively on their JDBC interfaces; rather than hand-writing that much boilerplate, they're implemented as dynamic proxies backed by a real handler class - full real behavior for CRUD, metadata, and error propagation, and a clear `SQLFeatureNotSupportedException` (not a silent no-op) for anything genuinely unimplemented, like multi-statement transactions. 4 tests: full CRUD round-trip via `DriverManager`, server errors becoming real `SQLException`s, unsupported features throwing clearly rather than silently doing nothing, and URL-acceptance rules.
+- ✅ **JDBC driver** (`stratosdb-jdbc` was empty) — `StratosDriver`/`StratosConnection`/`StratosStatement`/`StratosResultSet`/`StratosResultSetMetaData`, real behavior over a real socket to a real server, verified through `java.sql.DriverManager` exactly as a real application would use it. `Connection`/`Statement`/`ResultSet` have 63/61/203 methods respectively on their JDBC interfaces; rather than hand-writing that much boilerplate, they're implemented as dynamic proxies backed by a real handler class - full real behavior for CRUD, metadata, and error propagation, and a clear `SQLFeatureNotSupportedException` (not a silent no-op) for anything genuinely unimplemented, like multi-statement transactions.
   - Found a real bug while testing rather than assuming it away: `DriverManager.getConnection(...)` only found the driver when *some* test happened to reference the class first, because the standard JDBC 4 `META-INF/services/java.sql.Driver` auto-registration file didn't exist - added it, confirmed the fix by running the affected test 3 times in a row (it's a registration-order bug, easy for a single lucky run to hide).
-- 🟡 CLI shell exists (`StratosShell`, 133 lines) but talks to `StratosDB` **in-process** — it doesn't go over the network protocol yet, even though that protocol now exists
-- 🔲 Auth (salted + hashed credentials)
-- 🔲 TLS
+- ✅ **Auth** — `UserStore`: real PBKDF2-HMAC-SHA256 password hashing (100,000 iterations, independent random salt per user, constant-time verification), not a toy single-round hash. Wired into the wire protocol as a mandatory `AUTH`/`AUTH_RESULT` handshake on every connection - a server with no `UserStore` configured just accepts it unconditionally, so unauthenticated use works exactly as before auth existed. Username/password flow through JDBC's standard `Properties` (`DriverManager.getConnection(url, user, password)`).
+- ✅ **TLS** — `TlsSupport`: real server-side `SSLContext` built from an actual Java keystore (verified against a certificate generated with the JDK's own `keytool`, not a fake). Client-side is honestly incomplete and says so in its own javadoc: trust-all only, no certificate verification wired up yet - that encrypts against passive eavesdropping but does **not** defend against an active man-in-the-middle, a distinction stated plainly rather than oversold as "TLS support" implying more than it delivers.
+- ✅ **CLI over the network** — `StratosShell` rewritten to connect via the JDBC driver instead of linking `StratosDB` in-process; verified with a real end-to-end run (separate server process, separate CLI process, real TCP). One honest, named tradeoff: standard JDBC's `Statement.execute()` only exposes a boolean and a row count, not an arbitrary message string, so the old engine messages ("Table created: X") are gone in favor of a generic row count or "OK" - the same way `psql` shows generic response tags, not custom engine text. `SHOW TABLES` was fixed to return real rows instead of a message specifically so it keeps working meaningfully through this path.
+  - Found and fixed a real robustness bug while testing shutdown paths: `StratosDB.shutdown()` was not idempotent. `WALManager.close()` called `checkpoint()` (which writes to the WAL channel) before checking whether that channel was already closed, and `shutdown()` also called `checkpoint()` a second, redundant time directly. Calling `shutdown()` twice threw `ClosedChannelException`. Fixed at the source (a guard in `checkpoint()` itself, plus removing the redundant direct call), with a regression test.
+
+Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest` (now 7 total: auth-required-rejects-wrong-credentials, accepts-correct-credentials, rejects-a-connection-that-skips-auth, open-access-when-unconfigured) + 3 (`TlsIntegrationTest`, using a real generated certificate) + 1 (`StratosDBTest`'s shutdown-idempotency regression) = **51 tests total**, up from 37.
 
 ---
 
@@ -83,21 +86,21 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 |---|---|---|---|
 | `stratosdb-common` | 11 | 182 | Real — exceptions, constants, utils |
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
-| `stratosdb-storage` | 10 | 1,686 | Real — disk/buffer/WAL/heap, now with a page-type-agnostic buffer pool |
+| `stratosdb-storage` | 10 | 1,686 | Real — disk/buffer/WAL/heap, now with a page-type-agnostic buffer pool and an idempotent shutdown path |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
 | `stratosdb-sql` | 17 | 993 | Real — ANTLR grammar (now with JOIN/qualified columns) + hand-written AST builder + executor |
 | `stratosdb-index` | 1 | 304 | Real — B+Tree, tested at scale, wired into query execution via the planner |
-| `stratosdb-network` | 3 | 351 | Real — wire protocol + virtual-thread-per-connection server, tested over real sockets |
-| `stratosdb-jdbc` | 6 | 686 | Real — Driver/Connection/Statement/ResultSet, verified through `DriverManager` |
-| `stratosdb-cli` | 1 | 133 | Partial — in-process shell only, doesn't use the network protocol yet |
-| `stratosdb-testing` | 0 (test-only) | — | 17 integration tests, all passing |
+| `stratosdb-network` | 5 | 621 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server, all tested over real sockets |
+| `stratosdb-jdbc` | 6 | 741 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support, verified through `DriverManager` |
+| `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
+| `stratosdb-testing` | 0 (test-only) | — | 18 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
-## What to do next (in order)
+**Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
 
-1. **CLI over the network** — point `StratosShell` at `StratosConnection`/the wire protocol instead of linking `StratosDB` in-process. Mostly plumbing at this point; the hard parts (protocol, server) are done.
-2. **Auth** — salted + hashed credentials, checked at connection time.
-3. **TLS** — wrap the server socket with `SSLContext`.
+## What to do next
+
+The Foundation phase (Weeks 1-4) is finished. Per `PROJECT_PLAN.md`'s Part 2, the long-term vision is unscheduled by design - see that document for the reorganized feature catalog (JOINs beyond nested-loop, subqueries, aggregations, cost-based optimization, more index types, replication, extensibility, monitoring, scaling). Worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 

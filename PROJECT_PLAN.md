@@ -11,7 +11,7 @@ Both are useful for different things. Document 2's feature enumeration (MVCC, JO
 
 ---
 
-## Part 1: The Foundation (weeks, not months — in progress now)
+## Part 1: The Foundation (weeks, not months — complete)
 
 Goal, stated once so every later phase can be measured against it:
 
@@ -30,14 +30,15 @@ MVCC with snapshot isolation (xmin/xmax, Postgres-style visibility rules), a loc
 - JOIN support (nested loop minimum): **done** — see PROGRESS.md for the test coverage and known limitations (no index-accelerated joins yet).
 - Benchmark (indexed point lookup vs. full scan, 100k+ rows): **done** — 97.5x speedup measured for real, see PROGRESS.md.
 
-### Week 4 — Reachable, secure, provable 🟡 in progress
+### Week 4 — Reachable, secure, provable ✅ complete
 - Wire protocol + socket server: **done** — `stratosdb-network`, virtual-thread-per-connection, tested over real sockets.
 - Minimal JDBC driver: **done** — `stratosdb-jdbc`, verified through `java.sql.DriverManager`. See PROGRESS.md for what's real vs. stubbed (dynamic-proxy fallback throws `SQLFeatureNotSupportedException` for the large parts of `Connection`/`Statement`/`ResultSet` not implemented).
-- CLI shell talking over that protocol: **not done yet** — the protocol now exists; the shell still links `StratosDB` in-process rather than using it.
-- Auth (salted+hashed credentials) and TLS: **not done**.
+- CLI shell talking over that protocol: **done** — verified end-to-end against a real, separate server process.
+- Auth: **done** — real PBKDF2 salted password hashing, a mandatory handshake on every connection.
+- TLS: **done** on the server side (a real certificate-backed `SSLContext`); client-side certificate verification is honestly not implemented yet (trust-all only) - see PROGRESS.md for exactly what that does and doesn't protect against.
 - Real throughput/latency benchmark numbers: **done** in Week 3 (97.5x indexed speedup, measured).
 
-**Explicitly out of scope for the Foundation phase**, and why that's fine: cost-based query optimization, replication, full vacuum/autovacuum, extensions, stored procedures, triggers, partitioning. Each of these is itself a multi-month-to-multi-year undertaking in Postgres's own history. A month-one engine is the correct base to eventually build them on, not a substitute for them.
+**All four weeks of the Foundation are complete.** Explicitly out of scope for this phase, and why that's fine: cost-based query optimization, replication, full vacuum/autovacuum, extensions, stored procedures, triggers, partitioning, client-side TLS certificate verification. Each of these is itself a multi-month-to-multi-year undertaking in Postgres's own history (or, for client TLS verification, a genuinely important but separable next increment). A month-one engine is the correct base to eventually build them on, not a substitute for them.
 
 ---
 

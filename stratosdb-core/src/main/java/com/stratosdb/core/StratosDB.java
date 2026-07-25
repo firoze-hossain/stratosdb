@@ -64,13 +64,12 @@ public class StratosDB {
     public void shutdown() {
         LOG.info("Shutting down StratosDB...");
         running = false;
-        walManager.checkpoint();
         bufferPool.close(); // flushes every heap-table page and closes DiskManager's file handles
-        walManager.close(); // WALManager owns a separate file handle for wal.log - bufferPool.close()
-                             // never touched it, so it stayed open for the life of the process.
-                             // Invisible on Linux (an open file can still be deleted/reused); on
-                             // Windows the handle stays locked, which is exactly the class of bug
-                             // this project's test suite hit before this file was ever wired in.
+        walManager.close(); // checkpoints internally, then closes its own separate wal.log file
+                             // handle - bufferPool.close() never touched that handle, so it used
+                             // to stay open for the life of the process (invisible on Linux, a
+                             // locked file on Windows - the bug this project's test suite hit
+                             // before this method was fixed to call walManager.close() at all).
         LOG.info("StratosDB shutdown complete");
     }
 

@@ -533,12 +533,26 @@ public class ExecutorEngine {
         return QueryResult.success("Table dropped: " + stmt.tableName());
     }
 
+    /**
+     * Returns one row per table, with a single "table_name" column - not a
+     * message string. This used to return QueryResult.success("Tables: a, b")
+     * or QueryResult.success("No tables found"), which worked fine for the
+     * in-process CLI (which printed QueryResult.toString() directly) but
+     * would have been silently useless over standard JDBC: Statement.execute()
+     * only exposes a boolean ("was there a ResultSet") and an int row count,
+     * not an arbitrary message string, so the actual table names would never
+     * have reached a real JDBC caller. A proper rows-based result is both
+     * more correct (this is fundamentally a query, not a command) and the
+     * only way it can flow through a ResultSet.
+     */
     private QueryResult executeShowTables() {
-        List<String> tableNames = new ArrayList<>(tables.keySet());
-        if (tableNames.isEmpty()) {
-            return QueryResult.success("No tables found");
+        List<Tuple> rows = new ArrayList<>();
+        for (String tableName : tables.keySet()) {
+            Tuple row = new Tuple();
+            row.addValue("table_name", tableName);
+            rows.add(row);
         }
-        return QueryResult.success("Tables: " + String.join(", ", tableNames));
+        return QueryResult.success(rows);
     }
 
     /**

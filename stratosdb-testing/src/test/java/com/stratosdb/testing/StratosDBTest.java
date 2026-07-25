@@ -218,6 +218,18 @@ public class StratosDBTest {
         assertRowCount("SELECT * FROM users WHERE id<3", 2);     // Alice(1), Bob(2) - via seq scan
     }
 
+    @Test
+    void testShutdownIsIdempotent() {
+        // Regression test: WALManager.close() used to call checkpoint() (which
+        // writes to the WAL channel) BEFORE checking whether that channel was
+        // already closed, so calling shutdown() twice threw ClosedChannelException
+        // on the second call. A caller shutting down twice (e.g. once explicitly,
+        // once via a framework's own cleanup) must not throw.
+        database.execute("CREATE TABLE t (id INT)");
+        database.shutdown();
+        assertDoesNotThrow(database::shutdown, "calling shutdown() a second time must not throw");
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

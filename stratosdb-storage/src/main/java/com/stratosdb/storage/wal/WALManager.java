@@ -146,6 +146,10 @@ public class WALManager {
      * Log a checkpoint
      */
     public void checkpoint() {
+        if (walChannel == null || !walChannel.isOpen()) {
+            LOG.debug("Skipping checkpoint - WAL is already closed");
+            return;
+        }
         try {
             // putInt (4 bytes) + putLong (8 bytes) = 12 bytes.
             // This was previously allocate(8), which overflows on the putLong()
@@ -377,12 +381,13 @@ public class WALManager {
     }
     
     public void close() {
+        if (walChannel == null || !walChannel.isOpen()) {
+            return; // already closed - makes close() safe to call more than once
+        }
         try {
-            checkpoint();
-            if (walChannel != null && walChannel.isOpen()) {
-                walChannel.force(true);
-                walChannel.close();
-            }
+            checkpoint(); // writes to walChannel, so this MUST run before the isOpen() check above would be false
+            walChannel.force(true);
+            walChannel.close();
         } catch (Exception e) {
             LOG.error("Failed to close WAL", e);
         }

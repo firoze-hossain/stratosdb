@@ -23,7 +23,7 @@ mvn clean install -DskipTests
 mvn test
 ```
 
-**Expect 37 passing tests** across 7 test classes:
+**Expect 51 passing tests** across 9 test classes:
 
 | Test class | Tests | What it actually checks |
 |---|---|---|
@@ -31,9 +31,11 @@ mvn test
 | `MvccIsolationTest` | 3 | Snapshot isolation: uncommitted writes are invisible to others, old snapshots don't see later commits |
 | `LockManagerDeadlockTest` | 2 | Two real threads in a genuine circular wait; verifies exactly one is aborted with a deadlock error |
 | `BTreeIndexTest` | 6 | Point search, range scan, duplicates, persistence across reopen, and 250,000 shuffled keys forcing real multi-level node splits |
-| `StratosServerTest` | 3 | Real socket round-trips: query/result, server-side errors surviving the round-trip as a failed result, two connections sharing committed data |
+| `UserStoreTest` | 6 | Real PBKDF2 password hashing: correct/wrong password, unknown user, removed user, shared-password independence |
+| `StratosServerTest` | 7 | Real socket round-trips, server errors, shared data across connections, and the AUTH handshake (open access with no `UserStore`, correct/wrong credentials, a connection that skips AUTH entirely) |
 | `StratosDriverTest` | 4 | The JDBC driver through `java.sql.DriverManager` exactly as a real application would use it: full CRUD, server errors becoming real `SQLException`s, unsupported features throwing clearly, URL-acceptance rules |
-| `StratosDBTest` | 17 | Full SQL round-trips: CRUD, `CREATE INDEX`, index-vs-seq-scan planning via `EXPLAIN`, comparison-operator correctness on both scan paths, and JOIN (basic match, inner-join exclusion, WHERE on a joined column, bare-name resolution, EXPLAIN shape) |
+| `TlsIntegrationTest` | 3 | Real TLS with a certificate generated via the JDK's own `keytool`: a JDBC client over real encryption, a plain socket correctly failing against a TLS-only server, and auth+TLS working together |
+| `StratosDBTest` | 18 | Full SQL round-trips: CRUD, `CREATE INDEX`, index-vs-seq-scan planning via `EXPLAIN`, comparison-operator correctness on both scan paths, JOIN, and a shutdown-idempotency regression test |
 
 Two things not to be alarmed by:
 - `BTreeIndexTest`'s large test inserts 250,000 keys — it may take several seconds.
@@ -41,13 +43,23 @@ Two things not to be alarmed by:
 
 **If anything fails, that's the signal to send back** — paste the failing test name and the assertion message.
 
-## 3. Launch the interactive CLI
+## 3. Launch the network server, then connect the CLI to it
+
+The CLI is a **network client** now, not an embedded engine — it connects to a running StratosDB server over the wire protocol, the same as any other client would. Two processes, two terminals:
 
 ```bash
-java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar [optional-data-directory]
+# Terminal 1: the server
+java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar [dataDirectory] [port]
 ```
 
-Defaults to `./stratosdb_data` if you don't pass a directory. This is an **in-process** shell (it links directly against the engine — there's no network layer yet, see `PROGRESS.md` Week 4), but it exercises the real SQL engine end to end.
+Defaults to `./stratosdb_data` and port 5432.
+
+```bash
+# Terminal 2: the CLI
+java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar [host] [port] [username] [password] [--ssl]
+```
+
+Defaults to `localhost` and `5432`, no credentials, no TLS. All args are optional and positional except `--ssl`, which can appear anywhere.
 
 The shell reads one line at a time, so **type each statement on a single line** (no multi-line SQL yet). Try this session to prove out CRUD, MVCC, and the new planner all at once:
 
@@ -87,32 +99,51 @@ EXPLAIN SELECT * FROM users JOIN orders ON users.id = orders.user_id;
 \exit
 ```
 
-Then **relaunch the shell pointed at the same data directory** and run `SELECT * FROM users;` again — the table, its rows, and the index should all still be there. That's Week 1 and Week 2's durability and transaction work, visible from the outside rather than just in a test file.
+Then **stop the server (Ctrl+C) and restart it pointed at the same data directory**, then reconnect the CLI — the table, its rows, and the index should all still be there. That's Week 1 and Week 2's durability and transaction work, visible from the outside rather than just in a test file.
 
-## 4. Sanity-check the planner is actually choosing differently
+## 4. Try authentication and TLS
 
-The clearest proof "the SQL machine works" for this specific round of work: run the same query shape against an indexed and a non-indexed column and confirm `EXPLAIN` reports different strategies (shown above — `idx_age` on `age` vs. no index on `id`). If both report the same strategy, or `EXPLAIN` errors out, something regressed.
-
-## 5. Run the network server and connect with a real JDBC client
-
-```bash
-java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar [dataDirectory] [port]
-```
-
-Defaults to `./stratosdb_data` and port 5432. Leave it running in one terminal, then from any Java code with `stratosdb-jdbc-1.0.0-SNAPSHOT.jar` on the classpath:
+Both are opt-in — the server defaults to open access over plain TCP, exactly as it always has, so nothing above requires either. To turn them on, you write a small amount of Java (there's no `CREATE USER` SQL yet, and no config-file support — credentials are configured in code at startup):
 
 ```java
-Connection conn = DriverManager.getConnection("jdbc:stratos://localhost:5432/");
-Statement stmt = conn.createStatement();
-stmt.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
-stmt.executeUpdate("INSERT INTO users VALUES (1, 'Alice', 30)");
-ResultSet rs = stmt.executeQuery("SELECT * FROM users WHERE age >= 25");
-while (rs.next()) {
-    System.out.println(rs.getString("name") + " is " + rs.getInt("age"));
-}
+UserStore users = new UserStore();
+users.addUser("alice", "correct-horse-battery-staple"); // real PBKDF2 hashing under the hood
+
+SSLContext serverContext = TlsSupport.loadServerContext("/path/to/keystore.p12", "keystore-password".toCharArray());
+
+StratosServer server = new StratosServer(port, db, users, serverContext);
+server.start();
 ```
 
-No `Class.forName(...)` needed — the driver self-registers via the standard JDBC 4 service-loading mechanism the moment it's on the classpath. This is a genuinely minimal driver, stated plainly rather than oversold: `Connection`/`Statement`/`ResultSet` are JDBC's three largest interfaces (63/61/203 methods respectively), and only the commonly-used subset is implemented for real - CRUD, metadata, error propagation. Anything else throws `SQLFeatureNotSupportedException` with a clear message rather than silently doing nothing; if a tool you're pointing at StratosDB hits one, that exception message will say exactly which method it needs.
+Generate a test keystore with the JDK's own `keytool` if you don't have a real certificate handy:
+
+```bash
+keytool -genkeypair -alias stratosdb -keyalg RSA -keysize 2048 -validity 365 \
+  -keystore keystore.p12 -storetype PKCS12 -storepass changeit -keypass changeit \
+  -dname "CN=localhost, OU=StratosDB, O=StratosDB, L=Test, ST=Test, C=US"
+```
+
+Then connect the CLI with credentials and TLS:
+
+```bash
+java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar localhost 5432 alice correct-horse-battery-staple --ssl
+```
+
+Or via raw JDBC:
+
+```java
+Properties props = new Properties();
+props.setProperty("user", "alice");
+props.setProperty("password", "correct-horse-battery-staple");
+props.setProperty("ssl", "true");
+Connection conn = DriverManager.getConnection("jdbc:stratos://localhost:5432/", props);
+```
+
+**Read this before relying on TLS for anything real**: the client currently trusts *any* certificate the server presents - there is no certificate verification wired up yet. That's still real encryption (a passive eavesdropper reading the raw bytes off the wire gets nothing useful), but it does **not** protect against an active attacker who intercepts the connection and presents their own certificate - the client has no way to tell a genuine StratosDB server from an impostor. `TlsSupport`'s javadoc says this explicitly. Treat this as "encryption," not "authentication of the server," until real certificate/truststore verification is added.
+
+## 5. Sanity-check the planner is actually choosing differently
+
+The clearest proof "the SQL machine works" for this specific round of work: run the same query shape against an indexed and a non-indexed column and confirm `EXPLAIN` reports different strategies (shown above — `idx_age` on `age` vs. no index on `id`). If both report the same strategy, or `EXPLAIN` errors out, something regressed.
 
 ## 6. Run the benchmark for yourself
 
@@ -128,7 +159,10 @@ Defaults to 100,000 rows and 300 queries per scenario if you don't pass argument
 
 ## Troubleshooting
 
+- **DDL/DML shows "0 row(s) affected" or "1 row(s) affected" instead of a descriptive message like "Table created: users"**: expected, not a bug. Standard JDBC's `Statement.execute()`/`executeUpdate()` only expose a boolean and a row count, not an arbitrary message string - the CLI used to show StratosDB's own internal messages because it linked the engine in-process and printed its result objects directly. Now that it's a real JDBC client (see PROGRESS.md Week 4), it sees exactly what any other JDBC-based tool would see. `SHOW TABLES` was specifically fixed to return real rows instead of a message so it keeps working meaningfully; that fix doesn't extend to other commands' descriptive text, which isn't something JDBC has a slot for.
+- **`mvn test` fails with a shutdown-related `ClosedChannelException`**: this was a real idempotency bug, found and fixed - `StratosDB.shutdown()` could throw if called twice, because `WALManager.close()` called `checkpoint()` (which writes to the WAL channel) before checking whether that channel was already closed, and `shutdown()` also called `checkpoint()` a second, redundant time directly. Fixed at the source with a regression test (`StratosDBTest.testShutdownIsIdempotent`). If you pulled before this fix landed, `git pull` and retry.
 - **`mvn test` fails with `IOException: Failed to delete temp directory` / "The process cannot access the file because it is being used by another process" (Windows)**: this was two rounds of a real bug, both found and fixed via actual Windows `mvn test` runs - thank you for those, since my own build environment is Linux and never surfaced either. Round one: several tests never explicitly closed their `DiskManager`/`WALManager`/`BufferPoolManager` instances - fixed by tracking and closing every such resource in `@AfterEach`. Round two, one level deeper: `StratosDB.shutdown()` itself never closed the WAL's own file handle (it closed the heap-table files via `bufferPool.close()`, but never called `walManager.close()`), so `wal.log` stayed open for the life of the process no matter how cleanly a caller shut things down - this affected the real shutdown path, not just tests. Both are fixed now. If you pulled before either fix landed, `git pull` and retry.
 - **`mvn test` fails on `BTreeIndexTest`'s big test with a timeout**: likely means the buffer pool eviction path is slower on your machine than expected. The test already sizes its pool to avoid pathological thrashing (a bug I hit and fixed while building this — see `PROGRESS.md`), but if it's still too slow, that's worth reporting with your JDK version and OS.
 - **ANTLR-related compile errors**: means the grammar (`StratosSQL.g4`) and the hand-written `SqlParser.java` have drifted out of sync again — this has happened twice already in this project's history (a missing `UPDATE` dispatch, a `VARCHAR` length requirement that broke the project's own tests). Check `SqlParser.buildStatement()` against the grammar's `sqlStatement` alternatives first.
 - **`stratosdb-cli` jar not found**: confirm `mvn clean install` (not just `package` on a single module) ran from the repo root, since `stratosdb-cli` depends on every other module having been built and installed to your local `.m2` repository first.
+- **CLI can't connect / "Could not connect to StratosDB"**: the CLI no longer starts its own embedded engine - make sure `StratosServerMain` is actually running first, pointed at the host/port the CLI is trying to reach.

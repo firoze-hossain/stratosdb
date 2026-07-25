@@ -1,5 +1,9 @@
 package com.stratosdb.jdbc;
 
+import com.stratosdb.network.tls.TlsSupport;
+
+import javax.net.ssl.SSLContext;
+import java.security.GeneralSecurityException;
 import java.sql.*;
 import java.util.Properties;
 import java.util.logging.Logger;
@@ -48,7 +52,28 @@ public class StratosDriver implements Driver {
         } catch (NumberFormatException e) {
             throw new SQLException("Invalid port in StratosDB JDBC URL: " + url, e);
         }
-        return StratosConnection.connect(host, port);
+
+        // Standard JDBC convention: DriverManager.getConnection(url, username, password)
+        // populates these two properties for the driver to read.
+        String username = info != null ? info.getProperty("user") : null;
+        String password = info != null ? info.getProperty("password") : null;
+
+        // Non-standard but common convention for "extra" driver options: ssl=true
+        // enables TLS. There is no client-side certificate verification yet (see
+        // TlsSupport's javadoc) - this encrypts the connection, it does not
+        // authenticate the server, so it does not defend against an active
+        // man-in-the-middle. Stated here rather than left to be discovered.
+        boolean ssl = info != null && "true".equalsIgnoreCase(info.getProperty("ssl"));
+        SSLContext sslContext = null;
+        if (ssl) {
+            try {
+                sslContext = TlsSupport.insecureTrustAllClientContext();
+            } catch (GeneralSecurityException e) {
+                throw new SQLException("Failed to set up TLS for StratosDB connection", e);
+            }
+        }
+
+        return StratosConnection.connect(host, port, username, password, sslContext);
     }
 
     @Override

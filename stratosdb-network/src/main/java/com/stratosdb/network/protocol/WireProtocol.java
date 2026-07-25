@@ -20,6 +20,16 @@ import java.util.List;
  *
  * Message shapes:
  *
+ * AUTH (client -> server, always sent first, even with no server-side auth configured):
+ *   byte    MSG_AUTH
+ *   UTF     username (empty string if none)
+ *   UTF     password (empty string if none)
+ *
+ * AUTH_RESULT (server -> client, always sent in response to AUTH):
+ *   byte    MSG_AUTH_RESULT
+ *   boolean success
+ *   UTF     message (human-readable reason, e.g. "Invalid username or password")
+ *
  * QUERY (client -> server):
  *   byte    MSG_QUERY
  *   UTF     sql text
@@ -59,12 +69,51 @@ public final class WireProtocol {
 
     public static final int MSG_QUERY = 1;
     public static final int MSG_RESULT = 2;
+    public static final int MSG_AUTH = 3;
+    public static final int MSG_AUTH_RESULT = 4;
 
     private WireProtocol() {}
 
     public static int readMessageType(DataInputStream in) throws IOException {
         return in.readUnsignedByte();
     }
+
+    // --- AUTH ---
+    // Every connection sends exactly one AUTH message immediately after
+    // connecting, before any QUERY - even against a server with no
+    // authentication configured at all, which just accepts it
+    // unconditionally. A single, always-present handshake step is simpler
+    // and less error-prone than negotiating whether one is needed.
+
+    public static void writeAuth(DataOutputStream out, String username, String password) throws IOException {
+        out.writeByte(MSG_AUTH);
+        out.writeUTF(username == null ? "" : username);
+        out.writeUTF(password == null ? "" : password);
+        out.flush();
+    }
+
+    /** Returns {username, password}. Call after readMessageType() has confirmed MSG_AUTH. */
+    public static String[] readAuthBody(DataInputStream in) throws IOException {
+        String username = in.readUTF();
+        String password = in.readUTF();
+        return new String[]{username, password};
+    }
+
+    public static void writeAuthResult(DataOutputStream out, boolean success, String message) throws IOException {
+        out.writeByte(MSG_AUTH_RESULT);
+        out.writeBoolean(success);
+        out.writeUTF(message == null ? "" : message);
+        out.flush();
+    }
+
+    /** Call after readMessageType() has confirmed MSG_AUTH_RESULT. */
+    public static AuthResult readAuthResultBody(DataInputStream in) throws IOException {
+        boolean success = in.readBoolean();
+        String message = in.readUTF();
+        return new AuthResult(success, message);
+    }
+
+    public record AuthResult(boolean success, String message) {}
 
     // --- QUERY ---
 
