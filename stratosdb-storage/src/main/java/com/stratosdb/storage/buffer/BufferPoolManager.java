@@ -31,12 +31,37 @@ public class BufferPoolManager implements BufferPool {
         this.globalLock = new ReentrantReadWriteLock();
     }
 
+    private static final com.stratosdb.storage.page.PageFactory<SlottedPage> SLOTTED_PAGE_FACTORY =
+        new com.stratosdb.storage.page.PageFactory<>() {
+            @Override
+            public SlottedPage createEmpty(long pageId) {
+                return new SlottedPage(pageId);
+            }
+
+            @Override
+            public SlottedPage wrap(long pageId, byte[] existingBytes) {
+                SlottedPage page = new SlottedPage(pageId);
+                page.getBuffer().put(existingBytes);
+                page.getBuffer().flip();
+                return page;
+            }
+        };
+
     @Override
     public Page getPage(String tableName, long pageId) {
+        // Unchanged behavior from before this class supported other page types:
+        // every page is wrapped as a SlottedPage, whether it's brand new or
+        // freshly read from disk.
+        return getPage(tableName, pageId, SLOTTED_PAGE_FACTORY);
+    }
+
+    @Override
+    public <T extends Page> T getPage(String tableName, long pageId, com.stratosdb.storage.page.PageFactory<T> factory) {
         // Check if in cache
         Map<Long, Page> tablePages = pageCache.get(tableName);
         if (tablePages != null && tablePages.containsKey(pageId)) {
-            Page page = tablePages.get(pageId);
+            @SuppressWarnings("unchecked")
+            T page = (T) tablePages.get(pageId);
             pinPage(tableName, pageId);
             hits++;
             LOG.debug("Cache hit: {}/{}", tableName, pageId);
@@ -49,7 +74,8 @@ public class BufferPoolManager implements BufferPool {
             // Double-check after acquiring write lock
             tablePages = pageCache.get(tableName);
             if (tablePages != null && tablePages.containsKey(pageId)) {
-                Page page = tablePages.get(pageId);
+                @SuppressWarnings("unchecked")
+                T page = (T) tablePages.get(pageId);
                 pinPage(tableName, pageId);
                 hits++;
                 return page;
@@ -58,23 +84,10 @@ public class BufferPoolManager implements BufferPool {
             // Evict if needed
             evictIfNeeded();
 
-            // Load from disk - create SlottedPage instead of Page
-            Page page = diskManager.readPage(tableName, pageId);
-
-            // If the page is new (empty), make it a SlottedPage
-            // Otherwise, use what was loaded
-            if (page.getBytes() != null && page.getPageId() >= 0) {
-                // Check if it's already a SlottedPage by checking if data exists
-                // Since we can't cast directly, we'll create a SlottedPage from the bytes
-                SlottedPage slottedPage = new SlottedPage(pageId);
-                // Copy data from loaded page
-                slottedPage.getBuffer().put(page.getBytes());
-                slottedPage.getBuffer().flip();
-                page = slottedPage;
-            } else {
-                // Create a new SlottedPage
-                page = new SlottedPage(pageId);
-            }
+            // Load raw bytes from disk and let the factory interpret them as
+            // whatever page type this caller needs (SlottedPage, BTreePage, ...).
+            Page raw = diskManager.readPage(tableName, pageId);
+            T page = factory.wrap(pageId, raw.getBytes());
 
             // Add to cache
             tablePages = pageCache.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());

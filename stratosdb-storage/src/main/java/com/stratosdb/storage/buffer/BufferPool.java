@@ -1,9 +1,11 @@
 package com.stratosdb.storage.buffer;
 
 import com.stratosdb.storage.page.Page;
+import com.stratosdb.storage.page.PageFactory;
 
 public interface BufferPool {
     Page getPage(String tableName, long pageId);
+    <T extends Page> T getPage(String tableName, long pageId, PageFactory<T> factory);
     void markDirty(String tableName, long pageId);
     void unpinPage(String tableName, long pageId);
     void flushAll();
