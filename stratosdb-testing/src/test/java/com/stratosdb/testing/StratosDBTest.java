@@ -109,4 +109,118 @@ public class StratosDBTest {
         assertEquals(1, selectAll.getRows().size());
         assertEquals("Bob", selectAll.getRows().get(0).getValue("name"));
     }
+
+    @Test
+    void testCreateIndex_backfillsExistingRows() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        database.execute("INSERT INTO users VALUES (2, 'Bob', 25)");
+        database.execute("INSERT INTO users VALUES (3, 'Carol', 40)");
+
+        QueryResult result = database.execute("CREATE INDEX idx_age ON users (age)");
+        assertTrue(result.isSuccess(), () -> "CREATE INDEX failed: " + result.getError());
+        assertTrue(result.getMessage().contains("indexed 3 row(s)"),
+            "expected all 3 pre-existing rows to be backfilled: " + result.getMessage());
+    }
+
+    @Test
+    void testPlannerChoosesIndexScanWhenAnIndexExists_seqScanOtherwise() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        database.execute("CREATE INDEX idx_age ON users (age)");
+
+        QueryResult withIndex = database.execute("EXPLAIN SELECT * FROM users WHERE age=30");
+        assertTrue(withIndex.isSuccess());
+        assertTrue(withIndex.getMessage().startsWith("Index Scan using idx_age"),
+            "expected an index scan: " + withIndex.getMessage());
+
+        QueryResult withoutIndex = database.execute("EXPLAIN SELECT * FROM users WHERE id=1");
+        assertTrue(withoutIndex.isSuccess());
+        assertEquals("Seq Scan on users", withoutIndex.getMessage());
+    }
+
+    @Test
+    void testIndexScanReturnsCorrectRow() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        database.execute("INSERT INTO users VALUES (2, 'Bob', 25)");
+        database.execute("INSERT INTO users VALUES (3, 'Carol', 40)");
+        database.execute("CREATE INDEX idx_age ON users (age)");
+
+        QueryResult result = database.execute("SELECT * FROM users WHERE age=25");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Bob", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testIndexMaintainedOnInsertAfterIndexCreation() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        database.execute("CREATE INDEX idx_age ON users (age)");
+
+        // Inserted AFTER the index exists - must be maintained on insert, not just backfilled.
+        database.execute("INSERT INTO users VALUES (2, 'Dave', 50)");
+
+        QueryResult result = database.execute("SELECT * FROM users WHERE age=50");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Dave", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testIndexReflectsUpdatedValue_oldValueNoLongerMatches() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        database.execute("CREATE INDEX idx_age ON users (age)");
+
+        QueryResult updateResult = database.execute("UPDATE users SET age=31 WHERE id=1");
+        assertTrue(updateResult.isSuccess());
+
+        QueryResult oldValue = database.execute("SELECT * FROM users WHERE age=30");
+        assertEquals(0, oldValue.getRows().size(), "old value must no longer be found via the index");
+
+        QueryResult newValue = database.execute("SELECT * FROM users WHERE age=31");
+        assertEquals(1, newValue.getRows().size());
+        assertEquals("Alice", newValue.getRows().get(0).getValue("name"));
+    }
+
+    /**
+     * The real regression test for two bugs found while building the
+     * planner: (1) operator detection used to pick "=" for a clause like
+     * "age>=30" because "=" is a substring of ">=", corrupting the column
+     * name; (2) matchesWhere detected an operator but always evaluated
+     * equality regardless of it, so "age>25" silently behaved like
+     * "age=25". This checks every comparison operator against BOTH an
+     * indexed and a non-indexed column, so both the index-scan path and the
+     * seq-scan path are proven to compute the same, correct answer.
+     */
+    @Test
+    void testComparisonOperators_correctOnBothIndexedAndSeqScanPaths() {
+        database.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+        database.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        database.execute("INSERT INTO users VALUES (2, 'Bob', 25)");
+        database.execute("INSERT INTO users VALUES (3, 'Carol', 40)");
+        database.execute("INSERT INTO users VALUES (4, 'Dave', 25)");
+        // age is indexed; id is not - exercises both the index-scan and seq-scan paths.
+        database.execute("CREATE INDEX idx_age ON users (age)");
+
+        assertRowCount("SELECT * FROM users WHERE age>=30", 2);  // Alice(30), Carol(40) - via index
+        assertRowCount("SELECT * FROM users WHERE id>=3", 2);    // Carol(3), Dave(4) - via seq scan
+
+        assertRowCount("SELECT * FROM users WHERE age<=25", 2);  // Bob, Dave - via index
+        assertRowCount("SELECT * FROM users WHERE id<=2", 2);    // Alice(1), Bob(2) - via seq scan
+
+        assertRowCount("SELECT * FROM users WHERE age>25", 2);   // Alice(30), Carol(40) - via index
+        assertRowCount("SELECT * FROM users WHERE id>2", 2);     // Carol(3), Dave(4) - via seq scan
+
+        assertRowCount("SELECT * FROM users WHERE age<30", 2);   // Bob, Dave - via index
+        assertRowCount("SELECT * FROM users WHERE id<3", 2);     // Alice(1), Bob(2) - via seq scan
+    }
+
+    private void assertRowCount(String sql, int expected) {
+        QueryResult result = database.execute(sql);
+        assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());
+        assertEquals(expected, result.getRows().size(), () -> sql + " returned wrong row count");
+    }
 }

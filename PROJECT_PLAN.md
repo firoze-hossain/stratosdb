@@ -25,9 +25,9 @@ MVCC with snapshot isolation (xmin/xmax, Postgres-style visibility rules), a loc
 
 ### Week 3 — SQL engine and indexing 🟡 in progress
 - B+Tree index: **done** — disk-backed, real node splitting, tested at 250k-key scale.
-- Wiring the index into query execution (`CREATE INDEX`, index-scan-vs-seq-scan choice in the executor): **not done yet**.
+- `CREATE INDEX` + index-scan-vs-seq-scan planner choice in the executor: **done** — see PROGRESS.md.
+- `EXPLAIN`-style output: **done**.
 - JOIN support (nested loop minimum): **not done**.
-- `EXPLAIN`-style output: **not done**.
 - Benchmark (indexed point lookup vs. full scan, 100k+ rows): **not done**.
 
 ### Week 4 — Reachable, secure, provable 🔲 not started

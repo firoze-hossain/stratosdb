@@ -36,6 +36,8 @@ public class SqlParser {
     private Statement buildStatement(StratosSQLParser.SqlStatementContext ctx) {
         if (ctx.createTable() != null) {
             return buildCreateTable(ctx.createTable());
+        } else if (ctx.createIndex() != null) {
+            return buildCreateIndex(ctx.createIndex());
         } else if (ctx.insert() != null) {
             return buildInsert(ctx.insert());
         } else if (ctx.select() != null) {
@@ -48,8 +50,17 @@ public class SqlParser {
             return buildDropTable(ctx.dropTable());
         } else if (ctx.showTables() != null) {
             return new ShowTablesStatement();
+        } else if (ctx.explain() != null) {
+            return new ExplainStatement(buildSelect(ctx.explain().select()));
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
+    }
+
+    private CreateIndexStatement buildCreateIndex(StratosSQLParser.CreateIndexContext ctx) {
+        String indexName = ctx.indexName().getText();
+        String tableName = ctx.tableName().getText();
+        String columnName = ctx.columnName().getText();
+        return new CreateIndexStatement(indexName, tableName, columnName);
     }
 
     /**

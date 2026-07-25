@@ -9,7 +9,7 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **19 / 19** |
+| Tests passing | **25 / 25** |
 | Current stage | Week 3 (SQL engine + indexing) — in progress |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
@@ -46,10 +46,14 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
   - Verified with 250,000 shuffled keys forcing genuine multi-level splits, plus a dedicated eviction/reload test under a deliberately tight buffer pool — **6/6 passing**
   - Found and fixed a real bug along the way: the root leaf's "next leaf" pointer was never initialized and inherited garbage bytes from the generic page header, corrupting the leaf linked list after enough splits
   - Also fixed a real architectural gap to build this at all: the buffer pool was hardcoded to always wrap pages as `SlottedPage`, making it impossible to serve a different page layout. Added a `PageFactory<T>` so the pool is now page-type-agnostic, with zero change to existing heap-table behavior (regression-tested against Week 1 + Week 2 suites)
-- 🔲 Rule-based planner (seq scan vs. index scan choice) — **not started**
-- 🔲 Wire the B+Tree into `ExecutorEngine`/`CREATE INDEX` so SQL queries can actually use it — **not started**
+- ✅ **`CREATE INDEX`** — new grammar rule, new `CreateIndexStatement` AST node, real execution: builds a `BTreeIndex` and backfills it from every currently-visible row. Integer-valued columns only (B+Tree keys are `long` — no string key encoding yet, stated plainly in the code, not hidden)
+- ✅ **Rule-based planner (seq scan vs. index scan)** — `ExecutorEngine.planScan()`: a single numeric predicate on an indexed column uses the B+Tree (equality via point lookup, `>`/`>=`/`<`/`<=` via range scan); anything else falls back to a full MVCC scan. Not cost-based (no statistics collection exists yet) — the honest "does an applicable index exist" version the plan called for
+- ✅ **`EXPLAIN`** — reports which strategy `planScan` would pick, without running the query
+- ✅ Index maintenance on `INSERT` and `UPDATE` (new row versions get new index entries; stale entries from old versions are left in place and filtered out at read time by MVCC visibility, same as an unindexed `DELETE` would be — `BTreeIndex` has no delete operation yet, noted as a known gap)
+- ✅ Found and fixed two more real bugs while building this, both in `ExecutorEngine`'s WHERE-clause handling:
+  - Operator detection checked `"="` before `">="`/`"<="`, so `age>=30` was split on the wrong character (`age>` / `30`) — order matters when operators overlap as substrings
+  - `matchesWhere` detected an operator but always evaluated equality regardless of it, so `age>25` silently behaved exactly like `age=25`. Every operator (`=`,`!=`,`>`,`>=`,`<`,`<=`) is now actually evaluated, and a dedicated test checks both the index-scan and seq-scan paths return identical, correct results for all of them
 - 🔲 JOIN support (nested loop at minimum) — **not started**
-- 🔲 `EXPLAIN`-style output — **not started**
 - 🔲 Benchmark: point lookup with index vs. full scan on 100k+ rows — **not started**
 
 ## Week 4 — Network, JDBC, CLI, security 🔲 NOT STARTED
@@ -76,15 +80,14 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 | `stratosdb-network` | 0 | 0 | Empty |
 | `stratosdb-jdbc` | 0 | 0 | Empty |
 | `stratosdb-cli` | 1 | 133 | Partial — in-process shell only, no network protocol to connect to yet |
-| `stratosdb-testing` | 0 (test-only) | — | 6 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 12 integration tests, all passing |
 | `stratosdb-benchmark` | 0 | 0 | Empty |
 
 ## What to do next (in order)
 
-1. **Wire the B+Tree into query execution.** Right now it's a correct, tested, standalone component that nothing calls. Add `CREATE INDEX`, have `HeapTable`/`ExecutorEngine` maintain an index on insert, and add a rule-based check in the executor: use the index for `WHERE indexed_col = ?`, fall back to a full scan otherwise.
-2. **`EXPLAIN`-style output** — cheap to add once there's an actual choice between scan strategies to report on.
-3. **JOIN support** (nested loop) — the next SQL-engine gap.
-4. **Then Week 4**: wire protocol, JDBC driver, auth, TLS.
+1. **JOIN support** (nested loop at minimum) — the remaining SQL-engine gap in Week 3.
+2. **Benchmark**: indexed point lookup vs. full scan on 100k+ rows, to close out Week 3 with real numbers instead of just correctness.
+3. **Then Week 4**: wire protocol, JDBC driver, auth, TLS.
 
 ## How this doc is kept honest
 

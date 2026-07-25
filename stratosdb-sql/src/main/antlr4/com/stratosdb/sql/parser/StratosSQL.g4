@@ -3,12 +3,14 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | insert | select | update | delete | dropTable | showTables;
+sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
+createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
 showTables: SHOW TABLES SEMICOLON?;
+explain: EXPLAIN select;
 
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
@@ -21,6 +23,7 @@ columnDef: columnName dataType (NOT NULL)? (DEFAULT defaultValue)?;
 assignment: columnName ASSIGN literal;
 orderList: orderItem (COMMA orderItem)*;
 orderItem: columnName (ASC | DESC)?;
+indexName: IDENTIFIER;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
@@ -92,6 +95,9 @@ NULL: N U L L;
 DEFAULT: D E F A U L T;
 SHOW: S H O W;
 TABLES: T A B L E S;
+INDEX: I N D E X;
+ON: O N;
+EXPLAIN: E X P L A I N;
 
 // Data type keywords
 INT: I N T;
