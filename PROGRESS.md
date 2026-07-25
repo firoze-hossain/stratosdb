@@ -89,6 +89,10 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 2. **Benchmark**: indexed point lookup vs. full scan on 100k+ rows, to close out Week 3 with real numbers instead of just correctness.
 3. **Then Week 4**: wire protocol, JDBC driver, auth, TLS.
 
+## Cross-platform note
+
+All verification above was done on Linux. A real `mvn test` run on Windows caught a genuine bug my Linux sandbox couldn't: `CrashRecoveryTest`, `MvccIsolationTest`, and `BTreeIndexTest` never explicitly closed their `DiskManager`/`WALManager`/`BufferPoolManager` instances. Linux allows deleting a file that's still open; Windows doesn't, so JUnit's `@TempDir` cleanup failed with "the process cannot access the file." Every actual test assertion had passed - this was purely a test-cleanup gap, not a logic bug - and it's now fixed by tracking and closing every such resource in `@AfterEach`. Worth remembering: **this project's automated verification has been Linux-only so far**, and Windows-specific issues like this one won't surface again until someone runs it there.
+
 ## How this doc is kept honest
 
 Every checkmark above was produced by: cloning the actual repo fresh, generating the real ANTLR parser (not assuming it works), compiling every module together, and running the full test suite — then reading the pass/fail counts, not writing them from memory. When something failed (and things have failed multiple times this project — a partially-applied commit, a buffer-size bug, a garbage pointer bug), it's recorded above as a fix, not smoothed over. If you update this file yourself, keep that standard: a checkmark means "I ran it and it passed," not "I'm pretty sure this works."

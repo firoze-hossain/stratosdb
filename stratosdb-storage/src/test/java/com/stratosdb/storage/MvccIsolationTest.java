@@ -5,10 +5,12 @@ import com.stratosdb.storage.disk.DiskManager;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.transaction.Transaction;
 import com.stratosdb.transaction.TransactionManager;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -22,10 +24,33 @@ class MvccIsolationTest {
     @TempDir
     Path tempDir;
 
+    private final List<BufferPoolManager> openPools = new ArrayList<>();
+
+    /**
+     * Every DiskManager this creates holds a real open file handle until
+     * closed. Windows refuses to delete a file that's still open (Linux
+     * doesn't have that restriction, which is why this went unnoticed until
+     * a real Windows run), so @TempDir's post-test cleanup fails unless
+     * every pool created here is closed first. Closing happens in
+     * @AfterEach, strictly after each test's own assertions have run.
+     */
     private HeapTable newTable(String name) {
         DiskManager dm = new DiskManager(tempDir.toString());
         BufferPoolManager bp = new BufferPoolManager(64, dm);
+        openPools.add(bp);
         return new HeapTable(name, bp);
+    }
+
+    @AfterEach
+    void tearDown() {
+        for (BufferPoolManager pool : openPools) {
+            try {
+                pool.close();
+            } catch (Exception e) {
+                // Best-effort cleanup; shouldn't mask the test's own result.
+            }
+        }
+        openPools.clear();
     }
 
     @Test

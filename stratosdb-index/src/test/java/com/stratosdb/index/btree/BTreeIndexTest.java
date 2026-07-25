@@ -3,6 +3,7 @@ package com.stratosdb.index.btree;
 import com.stratosdb.storage.buffer.BufferPoolManager;
 import com.stratosdb.storage.disk.DiskManager;
 import com.stratosdb.storage.page.BTreePage;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -22,10 +23,32 @@ class BTreeIndexTest {
     @TempDir
     Path tempDir;
 
+    private final List<BufferPoolManager> openPools = new ArrayList<>();
+
+    /**
+     * Tracked so @AfterEach can close it. Windows locks open file handles
+     * and refuses to delete them, so @TempDir's post-test cleanup fails if
+     * any pool created during a test is left open - harmless on Linux
+     * (where this suite was first built and run), which is exactly why it
+     * went unnoticed until a real Windows run surfaced it.
+     */
     private BTreeIndex newIndex(String name, int poolSize) {
         DiskManager dm = new DiskManager(tempDir.toString());
         BufferPoolManager bp = new BufferPoolManager(poolSize, dm);
+        openPools.add(bp);
         return new BTreeIndex(name, bp);
+    }
+
+    @AfterEach
+    void tearDown() {
+        for (BufferPoolManager pool : openPools) {
+            try {
+                pool.close();
+            } catch (Exception e) {
+                // Best-effort cleanup; shouldn't mask the test's own result.
+            }
+        }
+        openPools.clear();
     }
 
     @Test
@@ -160,11 +183,12 @@ class BTreeIndexTest {
         for (long k = 0; k < 2000; k++) {
             index1.insert(k, new BTreePage.RID(k, 0));
         }
-        bp1.close(); // flushes everything and closes the disk manager
+        bp1.close(); // flushes everything and closes the disk manager - already closed, not tracked again
 
         // Fresh managers, same directory - this is "restart."
         DiskManager dm2 = new DiskManager(tempDir.toString());
         BufferPoolManager bp2 = new BufferPoolManager(64, dm2);
+        openPools.add(bp2); // this one needs @AfterEach to close it
         BTreeIndex index2 = new BTreeIndex(name, bp2);
 
         for (long k = 0; k < 2000; k += 137) {

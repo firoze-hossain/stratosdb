@@ -38,15 +38,51 @@ class CrashRecoveryTest {
     Path tempDir;
 
     private String dataDir;
+    private final List<Runnable> closeActions = new java.util.ArrayList<>();
 
     @BeforeEach
     void setUp() {
         dataDir = tempDir.toString();
     }
 
+    /**
+     * Every DiskManager/BufferPoolManager AND every WALManager a test
+     * creates holds a real open file handle - DiskManager keeps a
+     * FileChannel per table file open in a cache (crash_test.dat),
+     * WALManager keeps its own separate one open for wal/wal.log - both
+     * only released by their own close(). On Linux, an open file can still
+     * be deleted (the directory entry goes away immediately, space is
+     * reclaimed once the last handle closes), so @TempDir's post-test
+     * cleanup never noticed anything was still open. Windows refuses to
+     * delete a file that's still open by any process, so the exact same
+     * test - correct in every assertion - fails during teardown with "The
+     * process cannot access the file because it is being used by another
+     * process." Tracking and closing both kinds of resource here fixes it.
+     * Closing happens strictly after each test's own assertions have
+     * already run, so it changes nothing about what's actually being
+     * tested - including the tests that deliberately simulate "no graceful
+     * shutdown" during the test body itself.
+     */
+    private BufferPoolManager track(BufferPoolManager pool) {
+        closeActions.add(pool::close);
+        return pool;
+    }
+
+    private WALManager track(WALManager wal) {
+        closeActions.add(wal::close);
+        return wal;
+    }
+
     @AfterEach
     void tearDown() {
-        // @TempDir cleans up the directory tree automatically.
+        for (Runnable close : closeActions) {
+            try {
+                close.run();
+            } catch (Exception e) {
+                // Best-effort cleanup; a close failure here shouldn't mask the test's own result.
+            }
+        }
+        closeActions.clear();
     }
 
     /**
@@ -67,8 +103,8 @@ class CrashRecoveryTest {
 
         {
             DiskManager diskManager = new DiskManager(dataDir);
-            BufferPoolManager bufferPool = new BufferPoolManager(64, diskManager);
-            WALManager walManager = new WALManager(dataDir);
+            BufferPoolManager bufferPool = track(new BufferPoolManager(64, diskManager));
+            WALManager walManager = track(new WALManager(dataDir));
             HeapTable table = new HeapTable("crash_test", bufferPool);
 
             for (int i = 0; i < totalRows; i++) {
@@ -84,12 +120,14 @@ class CrashRecoveryTest {
             }
             // Deliberately no bufferPool.flushAll(), no walManager.checkpoint()/close():
             // this is what "the process ended" looks like without a graceful shutdown path.
+            // (The pool is still tracked for teardown, once this test's own assertions are
+            // done - see track()'s javadoc.)
         }
 
         // Fresh managers, same directory - this is what "restart" means.
         DiskManager diskManager2 = new DiskManager(dataDir);
-        BufferPoolManager bufferPool2 = new BufferPoolManager(64, diskManager2);
-        WALManager walManager2 = new WALManager(dataDir);
+        BufferPoolManager bufferPool2 = track(new BufferPoolManager(64, diskManager2));
+        WALManager walManager2 = track(new WALManager(dataDir));
         walManager2.recover(diskManager2);
         HeapTable table2 = new HeapTable("crash_test", bufferPool2);
 
@@ -156,8 +194,8 @@ class CrashRecoveryTest {
 
         // Fresh managers over the crashed data directory - this is "restart after crash".
         DiskManager diskManager = new DiskManager(dataDir);
-        BufferPoolManager bufferPool = new BufferPoolManager(64, diskManager);
-        WALManager walManager = new WALManager(dataDir);
+        BufferPoolManager bufferPool = track(new BufferPoolManager(64, diskManager));
+        WALManager walManager = track(new WALManager(dataDir));
         walManager.recover(diskManager);
         HeapTable table = new HeapTable("crash_test", bufferPool);
 
