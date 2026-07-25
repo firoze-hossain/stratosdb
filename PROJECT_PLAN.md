@@ -30,12 +30,12 @@ MVCC with snapshot isolation (xmin/xmax, Postgres-style visibility rules), a loc
 - JOIN support (nested loop minimum): **done** — see PROGRESS.md for the test coverage and known limitations (no index-accelerated joins yet).
 - Benchmark (indexed point lookup vs. full scan, 100k+ rows): **done** — 97.5x speedup measured for real, see PROGRESS.md.
 
-### Week 4 — Reachable, secure, provable 🔲 not started
-- Wire protocol + socket server (`stratosdb-network` is currently empty).
-- Minimal JDBC driver (`stratosdb-jdbc` is currently empty).
-- CLI shell talking over that protocol (a basic in-process shell exists; it doesn't use the network layer because that layer doesn't exist yet).
-- Auth (salted+hashed credentials) and TLS.
-- Real throughput/latency benchmark numbers, honestly reported.
+### Week 4 — Reachable, secure, provable 🟡 in progress
+- Wire protocol + socket server: **done** — `stratosdb-network`, virtual-thread-per-connection, tested over real sockets.
+- Minimal JDBC driver: **done** — `stratosdb-jdbc`, verified through `java.sql.DriverManager`. See PROGRESS.md for what's real vs. stubbed (dynamic-proxy fallback throws `SQLFeatureNotSupportedException` for the large parts of `Connection`/`Statement`/`ResultSet` not implemented).
+- CLI shell talking over that protocol: **not done yet** — the protocol now exists; the shell still links `StratosDB` in-process rather than using it.
+- Auth (salted+hashed credentials) and TLS: **not done**.
+- Real throughput/latency benchmark numbers: **done** in Week 3 (97.5x indexed speedup, measured).
 
 **Explicitly out of scope for the Foundation phase**, and why that's fine: cost-based query optimization, replication, full vacuum/autovacuum, extensions, stored procedures, triggers, partitioning. Each of these is itself a multi-month-to-multi-year undertaking in Postgres's own history. A month-one engine is the correct base to eventually build them on, not a substitute for them.
 

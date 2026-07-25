@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **30 / 30** |
-| Current stage | Week 3 (SQL engine + indexing) — **complete** |
+| Tests passing | **37 / 37** |
+| Current stage | Week 4 (Network, JDBC, CLI, security) — wire protocol + JDBC driver done, CLI/auth/TLS remain |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -65,14 +65,15 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 
 **Week 3 is done.** Remaining Week 3 scope-cuts, named honestly rather than silently dropped: cost-based (vs. rule-based) query optimization, index-accelerated joins, and statistics collection are real further work, not attempted here.
 
-## Week 4 — Network, JDBC, CLI, security 🔲 NOT STARTED
+## Week 4 — Network, JDBC, CLI, security 🟡 IN PROGRESS
 
-- 🔲 Wire protocol (`stratosdb-network` is empty)
-- 🔲 JDBC driver (`stratosdb-jdbc` is empty)
-- 🟡 CLI shell exists (`StratosShell`, 133 lines) but talks to `StratosDB` **in-process** — it doesn't go over a network protocol yet, because that protocol doesn't exist yet
+- ✅ **Wire protocol** (`stratosdb-network` was empty) — `WireProtocol`: a small custom binary protocol (not PostgreSQL-wire-compatible, stated plainly), self-framing via `DataInputStream`/`DataOutputStream` primitives. `StratosServer` accepts connections and runs one virtual thread per connection (Java 21 - the reason this project pinned to that LTS back in Week 1), all sharing one `StratosDB` instance so every connection sees the same data. `StratosServerMain` is a runnable entry point (`java -jar stratosdb-network-*.jar [dataDir] [port]`). 3 tests: real socket round-trip, server-side errors surviving the round-trip as a failed result rather than a hang, and two separate connections sharing committed data.
+  - Along the way, fixed `StratosDB.startServer()`, which previously logged "server started on port X" while starting nothing at all - now honestly documented as a state flag, with the real listener living in `stratosdb-network` (which depends on `stratosdb-core`, not the reverse, so `core` itself architecturally cannot start a network listener without a circular module dependency - this is why the real server isn't inside `StratosDB` itself).
+- ✅ **JDBC driver** (`stratosdb-jdbc` was empty) — `StratosDriver`/`StratosConnection`/`StratosStatement`/`StratosResultSet`/`StratosResultSetMetaData`, real behavior over a real socket to a real server, verified through `java.sql.DriverManager` exactly as a real application would use it (not by referencing the driver class directly). `Connection`/`Statement`/`ResultSet` have 63/61/203 methods respectively on their JDBC interfaces; rather than hand-writing that much boilerplate, they're implemented as dynamic proxies backed by a real handler class - full real behavior for CRUD, metadata, and error propagation, and a clear `SQLFeatureNotSupportedException` (not a silent no-op) for anything genuinely unimplemented, like multi-statement transactions. 4 tests: full CRUD round-trip via `DriverManager`, server errors becoming real `SQLException`s, unsupported features throwing clearly rather than silently doing nothing, and URL-acceptance rules.
+  - Found a real bug while testing rather than assuming it away: `DriverManager.getConnection(...)` only found the driver when *some* test happened to reference the class first, because the standard JDBC 4 `META-INF/services/java.sql.Driver` auto-registration file didn't exist - added it, confirmed the fix by running the affected test 3 times in a row (it's a registration-order bug, easy for a single lucky run to hide).
+- 🟡 CLI shell exists (`StratosShell`, 133 lines) but talks to `StratosDB` **in-process** — it doesn't go over the network protocol yet, even though that protocol now exists
 - 🔲 Auth (salted + hashed credentials)
 - 🔲 TLS
-- 🔲 Real throughput/latency benchmark numbers
 
 ---
 
@@ -86,19 +87,17 @@ This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything w
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
 | `stratosdb-sql` | 17 | 993 | Real — ANTLR grammar (now with JOIN/qualified columns) + hand-written AST builder + executor |
 | `stratosdb-index` | 1 | 304 | Real — B+Tree, tested at scale, wired into query execution via the planner |
-| `stratosdb-network` | 0 | 0 | Empty |
-| `stratosdb-jdbc` | 0 | 0 | Empty |
-| `stratosdb-cli` | 1 | 133 | Partial — in-process shell only, no network protocol to connect to yet |
+| `stratosdb-network` | 3 | 351 | Real — wire protocol + virtual-thread-per-connection server, tested over real sockets |
+| `stratosdb-jdbc` | 6 | 686 | Real — Driver/Connection/Statement/ResultSet, verified through `DriverManager` |
+| `stratosdb-cli` | 1 | 133 | Partial — in-process shell only, doesn't use the network protocol yet |
 | `stratosdb-testing` | 0 (test-only) | — | 17 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 ## What to do next (in order)
 
-Week 3 is complete. Week 4 is next:
-1. **Wire protocol** (`stratosdb-network` is empty) — a real socket server, length-prefixed frames at minimum.
-2. **JDBC driver** (`stratosdb-jdbc` is empty) — even a minimal `Driver`/`Connection`/`Statement`/`ResultSet` makes the engine usable from any Java tool.
-3. **CLI over the network** — point the existing shell at the new protocol instead of linking in-process.
-4. **Auth + TLS** — salted/hashed credentials, socket-level TLS.
+1. **CLI over the network** — point `StratosShell` at `StratosConnection`/the wire protocol instead of linking `StratosDB` in-process. Mostly plumbing at this point; the hard parts (protocol, server) are done.
+2. **Auth** — salted + hashed credentials, checked at connection time.
+3. **TLS** — wrap the server socket with `SSLContext`.
 
 ## Cross-platform note
 

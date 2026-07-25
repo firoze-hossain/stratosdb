@@ -23,7 +23,7 @@ mvn clean install -DskipTests
 mvn test
 ```
 
-**Expect 30 passing tests** across 5 test classes:
+**Expect 37 passing tests** across 7 test classes:
 
 | Test class | Tests | What it actually checks |
 |---|---|---|
@@ -31,6 +31,8 @@ mvn test
 | `MvccIsolationTest` | 3 | Snapshot isolation: uncommitted writes are invisible to others, old snapshots don't see later commits |
 | `LockManagerDeadlockTest` | 2 | Two real threads in a genuine circular wait; verifies exactly one is aborted with a deadlock error |
 | `BTreeIndexTest` | 6 | Point search, range scan, duplicates, persistence across reopen, and 250,000 shuffled keys forcing real multi-level node splits |
+| `StratosServerTest` | 3 | Real socket round-trips: query/result, server-side errors surviving the round-trip as a failed result, two connections sharing committed data |
+| `StratosDriverTest` | 4 | The JDBC driver through `java.sql.DriverManager` exactly as a real application would use it: full CRUD, server errors becoming real `SQLException`s, unsupported features throwing clearly, URL-acceptance rules |
 | `StratosDBTest` | 17 | Full SQL round-trips: CRUD, `CREATE INDEX`, index-vs-seq-scan planning via `EXPLAIN`, comparison-operator correctness on both scan paths, and JOIN (basic match, inner-join exclusion, WHERE on a joined column, bare-name resolution, EXPLAIN shape) |
 
 Two things not to be alarmed by:
@@ -91,7 +93,28 @@ Then **relaunch the shell pointed at the same data directory** and run `SELECT *
 
 The clearest proof "the SQL machine works" for this specific round of work: run the same query shape against an indexed and a non-indexed column and confirm `EXPLAIN` reports different strategies (shown above — `idx_age` on `age` vs. no index on `id`). If both report the same strategy, or `EXPLAIN` errors out, something regressed.
 
-## 5. Run the benchmark for yourself
+## 5. Run the network server and connect with a real JDBC client
+
+```bash
+java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar [dataDirectory] [port]
+```
+
+Defaults to `./stratosdb_data` and port 5432. Leave it running in one terminal, then from any Java code with `stratosdb-jdbc-1.0.0-SNAPSHOT.jar` on the classpath:
+
+```java
+Connection conn = DriverManager.getConnection("jdbc:stratos://localhost:5432/");
+Statement stmt = conn.createStatement();
+stmt.execute("CREATE TABLE users (id INT, name VARCHAR, age INT)");
+stmt.executeUpdate("INSERT INTO users VALUES (1, 'Alice', 30)");
+ResultSet rs = stmt.executeQuery("SELECT * FROM users WHERE age >= 25");
+while (rs.next()) {
+    System.out.println(rs.getString("name") + " is " + rs.getInt("age"));
+}
+```
+
+No `Class.forName(...)` needed — the driver self-registers via the standard JDBC 4 service-loading mechanism the moment it's on the classpath. This is a genuinely minimal driver, stated plainly rather than oversold: `Connection`/`Statement`/`ResultSet` are JDBC's three largest interfaces (63/61/203 methods respectively), and only the commonly-used subset is implemented for real - CRUD, metadata, error propagation. Anything else throws `SQLFeatureNotSupportedException` with a clear message rather than silently doing nothing; if a tool you're pointing at StratosDB hits one, that exception message will say exactly which method it needs.
+
+## 6. Run the benchmark for yourself
 
 ```bash
 java -jar stratosdb-benchmark/target/stratosdb-benchmark-1.0.0-SNAPSHOT.jar [rowCount] [queryCount]
@@ -99,7 +122,7 @@ java -jar stratosdb-benchmark/target/stratosdb-benchmark-1.0.0-SNAPSHOT.jar [row
 
 Defaults to 100,000 rows and 300 queries per scenario if you don't pass arguments. On the machine this was built on, that took about 2-3 minutes total (inserting 100k rows one `INSERT` statement at a time is the slow part — each one pays a full SQL parse and transaction commit, which the benchmark's own report calls out honestly rather than hiding). It prints the planner's actual `EXPLAIN` choice for both the indexed and unindexed column before running anything, so the numbers that follow are provably measuring what they claim to. Expect something in the neighborhood of a 50-100x speedup for the indexed path at 100k rows; the exact ratio will vary by machine.
 
-## 6. If you want to see the crash test with your own eyes
+## 7. If you want to see the crash test with your own eyes
 
 `CrashRecoveryTest` does this automatically, but you can reproduce the shape of it manually: start the CLI, insert some rows, and `kill -9 <pid>` the Java process from another terminal instead of using `\exit`. Relaunch pointed at the same directory — everything you committed (each statement auto-commits, per Week 2) should still be there; anything from an interrupted multi-row operation should not partially appear.
 

@@ -42,9 +42,23 @@ public class StratosDB {
         return executor.execute(sql);
     }
 
+    /**
+     * Marks this instance as "running" - a state flag for callers that want
+     * to track it, nothing more. This does NOT open a network listener:
+     * stratosdb-core has no networking dependency by design, so embedding
+     * StratosDB as a plain library loads no socket code at all. To actually
+     * accept network connections, wrap this instance in a
+     * com.stratosdb.network.server.StratosServer from the stratosdb-network
+     * module (which depends on core, not the other way around, so core
+     * itself cannot start that server without a circular module
+     * dependency): {@code new StratosServer(config.getPort(), this).start();}
+     * The previous version of this method logged "server started on port
+     * X" without starting anything - fixed to say what actually happens.
+     */
     public void startServer() {
         running = true;
-        LOG.info("StratosDB server started on port: {}", config.getPort());
+        LOG.info("StratosDB marked as running (port {} configured - use stratosdb-network's "
+            + "StratosServer to actually accept connections on it)", config.getPort());
     }
 
     public void shutdown() {
