@@ -111,19 +111,25 @@ public class SqlParser {
     private SelectStatement buildSelect(StratosSQLParser.SelectContext ctx) {
         String tableName = ctx.tableName().getText();
         List<String> columns = new ArrayList<>();
+        List<AggregateCall> aggregates = new ArrayList<>();
 
-        // Check if it's SELECT *
         if (ctx.selectList().STAR() != null) {
             columns.add("*");
         } else {
-            // Get all children and extract column names
-            // Alternative approach: get the raw text and parse
-            String selectText = ctx.selectList().getText();
-            if (selectText != null && !selectText.isEmpty()) {
-                // Remove parentheses and split by comma
-                String[] parts = selectText.split(",");
-                for (String part : parts) {
-                    columns.add(part.trim());
+            for (StratosSQLParser.SelectItemContext itemCtx : ctx.selectList().selectItem()) {
+                String alias = itemCtx.alias() != null ? itemCtx.alias().getText() : null;
+                if (itemCtx.aggregateFunction() != null) {
+                    aggregates.add(buildAggregateCall(itemCtx.aggregateFunction(), alias));
+                } else if (itemCtx.columnName() != null) {
+                    // No alias support for plain columns yet (a separate, smaller gap than
+                    // aggregate aliasing) - the requested column text is used as-is, same as before.
+                    columns.add(itemCtx.columnName().getText());
+                } else {
+                    // The `expression (AS alias)?` selectItem alternative - not really meaningful
+                    // for this engine's simple SELECT list (an expression like "age > 30" isn't a
+                    // projectable column), kept only because the grammar allows it. Fall back to
+                    // raw text rather than silently dropping it.
+                    columns.add(itemCtx.getText());
                 }
             }
         }
@@ -133,10 +139,30 @@ public class SqlParser {
             joins.add(buildJoinClause(joinCtx));
         }
 
+        List<String> groupBy = new ArrayList<>();
+        if (ctx.groupByList() != null) {
+            for (StratosSQLParser.ColumnNameContext colCtx : ctx.groupByList().columnName()) {
+                groupBy.add(colCtx.getText());
+            }
+        }
+
+        String havingClause = ctx.havingClause() != null ? ctx.havingClause().getText() : null;
         String whereClause = ctx.expression() != null ? ctx.expression().getText() : null;
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, whereClause, null, limit, joins);
+        return new SelectStatement(tableName, columns, whereClause, null, limit, joins, aggregates, groupBy, havingClause);
+    }
+
+    private AggregateCall buildAggregateCall(StratosSQLParser.AggregateFunctionContext ctx, String alias) {
+        String function;
+        if (ctx.COUNT() != null) function = "COUNT";
+        else if (ctx.SUM() != null) function = "SUM";
+        else if (ctx.AVG() != null) function = "AVG";
+        else if (ctx.MIN() != null) function = "MIN";
+        else function = "MAX";
+
+        String argument = ctx.STAR() != null ? "*" : ctx.columnName().getText();
+        return new AggregateCall(function, argument, alias);
     }
 
     private JoinClause buildJoinClause(StratosSQLParser.JoinClauseContext ctx) {

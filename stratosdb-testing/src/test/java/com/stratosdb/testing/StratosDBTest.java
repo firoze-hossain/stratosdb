@@ -230,6 +230,109 @@ public class StratosDBTest {
         assertDoesNotThrow(database::shutdown, "calling shutdown() a second time must not throw");
     }
 
+    @Test
+    void testCountStarWithNoGroupBy() {
+        database.execute("CREATE TABLE sales (id INT, region VARCHAR, amount INT)");
+        database.execute("INSERT INTO sales VALUES (1, 'east', 100)");
+        database.execute("INSERT INTO sales VALUES (2, 'east', 150)");
+        database.execute("INSERT INTO sales VALUES (3, 'west', 200)");
+
+        QueryResult result = database.execute("SELECT COUNT(*) FROM sales");
+        assertTrue(result.isSuccess(), () -> "COUNT(*) failed: " + result.getError());
+        assertEquals(1, result.getRows().size(), "no GROUP BY means one implicit group");
+        assertEquals(3, result.getRows().get(0).getValue("COUNT(*)"));
+    }
+
+    @Test
+    void testGroupByWithAllFiveAggregateFunctions() {
+        database.execute("CREATE TABLE sales (id INT, region VARCHAR, amount INT)");
+        database.execute("INSERT INTO sales VALUES (1, 'east', 100)");
+        database.execute("INSERT INTO sales VALUES (2, 'east', 150)");
+        database.execute("INSERT INTO sales VALUES (3, 'west', 200)");
+        database.execute("INSERT INTO sales VALUES (4, 'west', 50)");
+        database.execute("INSERT INTO sales VALUES (5, 'west', 300)");
+
+        QueryResult result = database.execute(
+            "SELECT region, COUNT(*) AS cnt, SUM(amount) AS total, AVG(amount) AS avg_amt, "
+            + "MIN(amount) AS lo, MAX(amount) AS hi FROM sales GROUP BY region");
+        assertTrue(result.isSuccess(), () -> "GROUP BY failed: " + result.getError());
+        assertEquals(2, result.getRows().size(), "two distinct regions");
+
+        for (var row : result.getRows()) {
+            String region = (String) row.getValue("region");
+            if ("east".equals(region)) {
+                assertEquals(2, row.getValue("cnt"));
+                assertEquals(250L, row.getValue("total"));
+                assertEquals(125.0, (Double) row.getValue("avg_amt"), 0.001);
+                assertEquals(100, row.getValue("lo"));
+                assertEquals(150, row.getValue("hi"));
+            } else if ("west".equals(region)) {
+                assertEquals(3, row.getValue("cnt"));
+                assertEquals(550L, row.getValue("total"));
+                assertEquals(50, row.getValue("lo"));
+                assertEquals(300, row.getValue("hi"));
+            } else {
+                fail("unexpected region: " + region);
+            }
+        }
+    }
+
+    @Test
+    void testHavingFiltersGroups() {
+        database.execute("CREATE TABLE sales (id INT, region VARCHAR, amount INT)");
+        database.execute("INSERT INTO sales VALUES (1, 'east', 100)");
+        database.execute("INSERT INTO sales VALUES (2, 'west', 200)");
+        database.execute("INSERT INTO sales VALUES (3, 'west', 50)");
+        database.execute("INSERT INTO sales VALUES (4, 'west', 300)");
+
+        QueryResult result = database.execute(
+            "SELECT region, COUNT(*) AS cnt FROM sales GROUP BY region HAVING COUNT(*) > 2");
+        assertTrue(result.isSuccess(), () -> "HAVING failed: " + result.getError());
+        assertEquals(1, result.getRows().size(), "only 'west' has more than 2 rows");
+        assertEquals("west", result.getRows().get(0).getValue("region"));
+        assertEquals(3, result.getRows().get(0).getValue("cnt"));
+    }
+
+    @Test
+    void testWhereAppliesBeforeGrouping() {
+        database.execute("CREATE TABLE sales (id INT, region VARCHAR, amount INT)");
+        database.execute("INSERT INTO sales VALUES (1, 'east', 100)");
+        database.execute("INSERT INTO sales VALUES (2, 'east', 150)");
+        database.execute("INSERT INTO sales VALUES (3, 'west', 200)");
+        database.execute("INSERT INTO sales VALUES (4, 'west', 50)"); // excluded by WHERE
+
+        QueryResult result = database.execute(
+            "SELECT region, SUM(amount) AS total FROM sales WHERE amount > 75 GROUP BY region");
+        assertTrue(result.isSuccess(), () -> "WHERE+GROUP BY failed: " + result.getError());
+        assertEquals(2, result.getRows().size());
+
+        for (var row : result.getRows()) {
+            if ("west".equals(row.getValue("region"))) {
+                assertEquals(200L, row.getValue("total"), "the 50-amount west row must be excluded by WHERE before grouping");
+            }
+        }
+    }
+
+    @Test
+    void testExplainDescribesAggregateQuery() {
+        database.execute("CREATE TABLE sales (id INT, region VARCHAR, amount INT)");
+
+        QueryResult result = database.execute("EXPLAIN SELECT region, COUNT(*) FROM sales GROUP BY region");
+        assertTrue(result.isSuccess());
+        assertTrue(result.getMessage().startsWith("Aggregate GROUP BY region"),
+            () -> "unexpected EXPLAIN output: " + result.getMessage());
+    }
+
+    @Test
+    void testCountOnEmptyResultIsZeroNotError() {
+        database.execute("CREATE TABLE sales (id INT, region VARCHAR, amount INT)");
+
+        QueryResult result = database.execute("SELECT COUNT(*) FROM sales WHERE region='nonexistent'");
+        assertTrue(result.isSuccess(), () -> "COUNT on empty result failed: " + result.getError());
+        assertEquals(1, result.getRows().size());
+        assertEquals(0, result.getRows().get(0).getValue("COUNT(*)"));
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

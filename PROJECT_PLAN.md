@@ -69,7 +69,7 @@ Given that, the real goal for Part 2 is: close the feature gaps that matter most
 | Indexing | B+Tree only, **no delete operation yet**, no index-accelerated joins | B-Tree, Hash, GiST, GIN, BRIN, SP-GiST | Large |
 | Query optimizer | Rule-based ("does an index exist for this predicate? use it") | Cost-based, statistics-driven | Large |
 | JOINs | Nested loop only | Nested loop, hash join, merge join, join reordering | Large |
-| Aggregation | **None** — no `GROUP BY`/`HAVING`/window functions at all | Full | Large |
+| Aggregation | `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` done; no window functions, no CTEs | Full | Moderate |
 | Subqueries | **None** | Full (scalar, correlated, `EXISTS`, CTEs, recursive) | Large |
 | Wire protocol | Custom, not pg-wire compatible | The format every pg client/tool already speaks | Large (ecosystem, not just code) |
 | Replication | None | Streaming, logical, synchronous options | Large |
@@ -108,7 +108,7 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 |---|---|---|---|
 | Statistics collection (`ANALYZE`-equivalent) | 🔴 | none | Row counts and per-column distinct-value estimates, at minimum. Nothing else here can be genuinely cost-based without this — it's a prerequisite, not parallel work. |
 | Cost-based optimizer | 🔴 | Statistics | Replaces the current rule-based planner with real cost comparison. Realistic scope: even a simple model (page-read estimates for seq scan vs. index scan vs. each join strategy) is a substantial rewrite — probably warrants its own `Planner` class, distinct from execution, which doesn't exist as a separate concept yet. |
-| `GROUP BY` / `HAVING` / aggregates (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) | 🔴 | none | Completely absent today — not partial, not present at all. Arguably a bigger real-world usability gap than joins. |
+| `GROUP BY` / `HAVING` / aggregates (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) | ✅ done | none | Was completely absent, now real - see PROGRESS.md. Known gap: doesn't combine with JOIN yet (a query using both silently skips grouping rather than erroring - a named follow-up). |
 | Hash join | 🔴 | none (independent of the optimizer landing first) | Nested-loop join degrades badly past small tables. Can slot in as "the strategy the planner falls back to" once cost comparison exists, but doesn't need to wait for it to be built. |
 | Subqueries (scalar, `EXISTS`, `IN`) | 🟡 | none, but aggregates will likely land first in practice | Needs the grammar extended again (same pattern as JOIN support in Part 1) plus real plan-time handling, not string substitution. |
 | Merge join | 🟡 | Cost-based optimizer | Valuable for pre-sorted inputs specifically; low priority until the optimizer can meaningfully choose between strategies. |
@@ -156,7 +156,7 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 
 ### If forced to pick just one thing next
 
-**Phase B — query engine depth (statistics, cost-based optimization, joins beyond nested-loop, and aggregation)** is where the gap versus PostgreSQL is both largest and most *visible* to anyone actually using the engine. A database with correct MVCC and no `GROUP BY` doesn't feel like PostgreSQL; a database with real aggregation, real joins, and a planner making sensible choices does — even with plenty of Phase A/C/D/E gaps still open. If a single next unit of work is wanted: `GROUP BY`/aggregates or hash join, both 🔴 and both independent of the cost-based optimizer landing first, are the honest answer.
+**Phase B — query engine depth (statistics, cost-based optimization, joins beyond nested-loop, and aggregation)** is where the gap versus PostgreSQL is both largest and most *visible* to anyone actually using the engine. `GROUP BY`/aggregates — the first item picked from this phase — is done (see PROGRESS.md). A database with correct MVCC and no `GROUP BY` didn't feel like PostgreSQL; one with real aggregation, real joins, and a planner making sensible choices does — even with plenty of Phase A/C/D/E gaps still open. Next up in this phase: **hash join** (nested-loop degrades badly past small tables, and doesn't need the cost-based optimizer to land first) or **statistics collection** (the prerequisite for that optimizer). Either is the honest answer for what comes next.
 
 ---
 

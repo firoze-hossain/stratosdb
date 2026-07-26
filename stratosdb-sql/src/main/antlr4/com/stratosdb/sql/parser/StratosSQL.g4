@@ -14,8 +14,16 @@ explain: EXPLAIN select;
 
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
-select: SELECT selectList FROM tableName joinClause* (WHERE expression)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
+select: SELECT selectList FROM tableName joinClause* (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
 joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
+groupByList: columnName (COMMA columnName)*;
+havingClause: aggregateFunction ASSIGN literal
+            | aggregateFunction GT literal
+            | aggregateFunction LT literal
+            | aggregateFunction GE literal
+            | aggregateFunction LE literal
+            | aggregateFunction NE literal;
+aggregateFunction: (COUNT | SUM | AVG | MIN | MAX) LPAREN (STAR | columnName) RPAREN;
 update: UPDATE tableName SET assignment (COMMA assignment)* (WHERE expression)? SEMICOLON?;
 delete: DELETE FROM tableName (WHERE expression)? SEMICOLON?;
 
@@ -28,7 +36,7 @@ indexName: IDENTIFIER;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
-selectItem: expression (AS alias)? | columnName (AS alias)?;
+selectItem: aggregateFunction (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
 
 // Expressions
 expression: columnName ASSIGN literal
@@ -83,6 +91,8 @@ SET: S E T;
 DELETE: D E L E T E;
 ORDER: O R D E R;
 BY: B Y;
+GROUP: G R O U P;
+HAVING: H A V I N G;
 LIMIT: L I M I T;
 ASC: A S C;
 DESC: D E S C;
@@ -101,6 +111,12 @@ ON: O N;
 JOIN: J O I N;
 INNER: I N N E R;
 EXPLAIN: E X P L A I N;
+AS: A S;
+COUNT: C O U N T;
+SUM: S U M;
+AVG: A V G;
+MIN: M I N;
+MAX: M A X;
 
 // Data type keywords
 INT: I N T;

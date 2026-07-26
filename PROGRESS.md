@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **51 / 51** |
-| Current stage | Foundation (Weeks 1-4) — **complete** |
+| Tests passing | **57 / 57** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase B underway (GROUP BY/aggregates done) |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -88,19 +88,28 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
 | `stratosdb-storage` | 10 | 1,686 | Real — disk/buffer/WAL/heap, now with a page-type-agnostic buffer pool and an idempotent shutdown path |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 17 | 993 | Real — ANTLR grammar (now with JOIN/qualified columns) + hand-written AST builder + executor |
+| `stratosdb-sql` | 19 | ~1,250 | Real — ANTLR grammar (JOIN/qualified columns, now GROUP BY/HAVING/aggregates) + hand-written AST builder + executor |
 | `stratosdb-index` | 1 | 304 | Real — B+Tree, tested at scale, wired into query execution via the planner |
 | `stratosdb-network` | 5 | 621 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server, all tested over real sockets |
 | `stratosdb-jdbc` | 6 | 741 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support, verified through `DriverManager` |
 | `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
-| `stratosdb-testing` | 0 (test-only) | — | 18 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 24 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 **Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
 
+## Part 2 progress (see PROJECT_PLAN.md for the full phase breakdown)
+
+### Phase B — GROUP BY / HAVING / aggregates ✅ done (first item)
+
+- ✅ **`GROUP BY`, `HAVING`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`** — previously completely absent (not partial - zero aggregation support existed). New grammar (`GROUP`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` tokens, an `aggregateFunction` rule, `AS`-aliased select-list items), a new `AggregateCall` AST node, and a real grouping/aggregation/HAVING-filter execution path in `ExecutorEngine`. `SUM`/`COUNT` return integral types when all inputs are integral (not always `Double`); `SUM`/`AVG` of zero contributing rows return `NULL`, matching standard SQL semantics, not zero. `EXPLAIN` describes aggregate queries too (`Aggregate GROUP BY x: Seq Scan on ...`).
+  - **Found and fixed a real, pre-existing, dormant bug while building this**: the `AS` keyword was referenced in the grammar's `selectItem` rule but never given an explicit lexer rule (unlike every other keyword). ANTLR auto-generated an implicit token for it, but since the generic `IDENTIFIER` rule was declared earlier and matched the same text, `AS` could **never** actually be recognized as a keyword - every `(AS alias)? ` clause in the grammar was permanently unmatchable. This had been dormant because column aliasing was never actually exercised before (the old `SELECT`-list handling just grabbed raw text and split on commas, ignoring the grammar structure entirely). Fixed by adding the missing `AS: A S;` lexer rule - the same class of "keyword collides with the identifier catch-all because nobody gave it its own rule" bug as the missing `UPDATE` dispatch and `VARCHAR` length issues from earlier weeks.
+  - **Known limitation, stated plainly**: aggregates and `JOIN` don't combine yet - a query with both hits the join code path first, which doesn't consult `GROUP BY`/aggregates at all, so it silently returns per-row joined results rather than grouping them. No index acceleration for aggregate queries either (always a full scan) - both are real, separate follow-ups per `PROJECT_PLAN.md` Phase B.
+  - 6 new tests: `COUNT(*)` with no `GROUP BY` (implicit single group), all five aggregate functions together, `HAVING`, `WHERE` applied before grouping, `EXPLAIN` output, and `COUNT` on an empty result set (must return 0, not error).
+
 ## What to do next
 
-The Foundation phase (Weeks 1-4) is finished. Per `PROJECT_PLAN.md`'s Part 2, the long-term vision is unscheduled by design - see that document for the reorganized feature catalog (JOINs beyond nested-loop, subqueries, aggregations, cost-based optimization, more index types, replication, extensibility, monitoring, scaling). Worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Per `PROJECT_PLAN.md` Phase B, the highest-leverage remaining items: **hash join** (nested-loop degrades badly past small tables) and **statistics collection** (the prerequisite for a real cost-based optimizer, which the current rule-based planner should eventually be replaced by). Beyond Phase B, see `PROJECT_PLAN.md`'s full phase breakdown (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 

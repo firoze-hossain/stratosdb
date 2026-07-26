@@ -218,6 +218,10 @@ public class ExecutorEngine {
             return executeJoinedSelect(stmt, txn);
         }
 
+        if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()) {
+            return executeAggregateSelect(stmt, txn, table);
+        }
+
         ScanPlan plan = planScan(stmt.tableName(), stmt.whereClause());
         List<Tuple> tuples = new ArrayList<>();
 
@@ -260,6 +264,158 @@ public class ExecutorEngine {
         }
 
         return QueryResult.success(tuples);
+    }
+
+    /**
+     * GROUP BY / aggregates (COUNT/SUM/AVG/MIN/MAX) / HAVING.
+     *
+     * Always a full scan - there is no index acceleration for aggregate
+     * queries yet (see PROJECT_PLAN.md Phase B: that needs a real
+     * cost-based optimizer, which doesn't exist yet either). Not combined
+     * with JOIN in this pass - a query with both joins and aggregates hits
+     * executeJoinedSelect first and won't group; that combination is a
+     * real, separate gap, not silently mishandled (executeJoinedSelect
+     * doesn't consult stmt.aggregates()/groupBy() at all, so such a query
+     * would just return per-row joined results, unaggregated).
+     *
+     * With no GROUP BY at all but an aggregate requested (e.g.
+     * "SELECT COUNT(*) FROM t"), the whole filtered result set is treated
+     * as a single implicit group - standard SQL behavior.
+     */
+    private QueryResult executeAggregateSelect(SelectStatement stmt, Transaction txn, HeapTable table) {
+        List<Tuple> filteredRows = new ArrayList<>();
+        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
+            Tuple tuple = Tuple.deserialize(raw);
+            if (matchesWhere(tuple, stmt.whereClause())) {
+                filteredRows.add(tuple);
+            }
+        }
+
+        Map<List<Object>, List<Tuple>> groups = new LinkedHashMap<>();
+        if (stmt.groupBy().isEmpty()) {
+            groups.put(List.of(), filteredRows);
+        } else {
+            for (Tuple tuple : filteredRows) {
+                List<Object> key = new ArrayList<>();
+                for (String col : stmt.groupBy()) {
+                    key.add(findColumnValue(tuple, col));
+                }
+                groups.computeIfAbsent(key, k -> new ArrayList<>()).add(tuple);
+            }
+        }
+
+        List<Tuple> resultRows = new ArrayList<>();
+        for (Map.Entry<List<Object>, List<Tuple>> entry : groups.entrySet()) {
+            List<Object> groupKey = entry.getKey();
+            List<Tuple> groupRows = entry.getValue();
+
+            Tuple outputRow = new Tuple();
+            for (int i = 0; i < stmt.groupBy().size(); i++) {
+                outputRow.addValue(stmt.groupBy().get(i), groupKey.get(i));
+            }
+
+            Map<String, Object> aggregateValues = new LinkedHashMap<>();
+            for (AggregateCall agg : stmt.aggregates()) {
+                Object value = computeAggregate(agg, groupRows);
+                aggregateValues.put(agg.canonicalForm(), value); // HAVING always references the FUNC(arg) form
+                outputRow.addValue(agg.displayName(), value);
+            }
+
+            if (stmt.havingClause() != null && !matchesHaving(stmt.havingClause(), aggregateValues)) {
+                continue;
+            }
+
+            resultRows.add(outputRow);
+        }
+
+        if (stmt.limit() != null) {
+            try {
+                int limit = Integer.parseInt(stmt.limit());
+                if (resultRows.size() > limit) {
+                    resultRows = resultRows.subList(0, limit);
+                }
+            } catch (NumberFormatException e) {
+                // Ignore invalid limit
+            }
+        }
+
+        return QueryResult.success(resultRows);
+    }
+
+    /** COUNT(col) excludes NULLs (standard SQL); COUNT(*) counts every row regardless. SUM/AVG of zero contributing rows is NULL, not zero - also standard. */
+    private Object computeAggregate(AggregateCall agg, List<Tuple> rows) {
+        switch (agg.function()) {
+            case "COUNT": {
+                if (agg.argument().equals("*")) {
+                    return rows.size();
+                }
+                int count = 0;
+                for (Tuple row : rows) {
+                    if (findColumnValue(row, agg.argument()) != null) count++;
+                }
+                return count;
+            }
+            case "SUM": {
+                double sum = 0;
+                boolean any = false;
+                boolean allIntegral = true;
+                for (Tuple row : rows) {
+                    Object v = findColumnValue(row, agg.argument());
+                    if (v instanceof Integer i) { sum += i; any = true; }
+                    else if (v instanceof Long l) { sum += l; any = true; }
+                    else if (v instanceof Double d) { sum += d; any = true; allIntegral = false; }
+                }
+                if (!any) return null;
+                return allIntegral ? (Object) (long) sum : (Object) sum;
+            }
+            case "AVG": {
+                double sum = 0;
+                int count = 0;
+                for (Tuple row : rows) {
+                    Object v = findColumnValue(row, agg.argument());
+                    if (v instanceof Number n) { sum += n.doubleValue(); count++; }
+                }
+                return count > 0 ? sum / count : null;
+            }
+            case "MIN": {
+                Object best = null;
+                for (Tuple row : rows) {
+                    Object v = findColumnValue(row, agg.argument());
+                    if (v != null && (best == null || compareForMinMax(v, best) < 0)) best = v;
+                }
+                return best;
+            }
+            case "MAX": {
+                Object best = null;
+                for (Tuple row : rows) {
+                    Object v = findColumnValue(row, agg.argument());
+                    if (v != null && (best == null || compareForMinMax(v, best) > 0)) best = v;
+                }
+                return best;
+            }
+            default:
+                throw new IllegalArgumentException("Unknown aggregate function: " + agg.function());
+        }
+    }
+
+    private int compareForMinMax(Object a, Object b) {
+        if (a instanceof Number na && b instanceof Number nb) {
+            return Double.compare(na.doubleValue(), nb.doubleValue());
+        }
+        return a.toString().compareTo(b.toString());
+    }
+
+    /** HAVING always references the aggregate's canonical "FUNC(arg)" form, regardless of any SELECT-list alias. */
+    private boolean matchesHaving(String havingClause, Map<String, Object> aggregateValues) {
+        WherePredicate pred = parseWhere(havingClause);
+        if (pred == null) {
+            return true;
+        }
+        Object value = aggregateValues.get(pred.column());
+        if (value == null) {
+            return false;
+        }
+        return evaluatePredicate(value.toString(), pred);
     }
 
     /**
@@ -376,6 +532,12 @@ public class ExecutorEngine {
                   .append(" ON ").append(join.leftColumn()).append("=").append(join.rightColumn());
             }
             return QueryResult.success(sb.toString());
+        }
+
+        if (!select.aggregates().isEmpty() || !select.groupBy().isEmpty()) {
+            String groupDesc = select.groupBy().isEmpty() ? "" : " GROUP BY " + String.join(", ", select.groupBy());
+            return QueryResult.success("Aggregate" + groupDesc + ": Seq Scan on " + select.tableName()
+                + " (no index acceleration for aggregate queries yet)");
         }
 
         ScanPlan plan = planScan(select.tableName(), select.whereClause());
