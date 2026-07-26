@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **59 / 59** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase B underway (GROUP BY/aggregates + hash join done) |
+| Tests passing | **64 / 64** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase B underway (GROUP BY/aggregates + hash join + statistics/cost-based optimizer done) |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -114,9 +114,18 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
   - **Found and fixed a second real, dormant, pre-existing bug while building this - present since the project's very first commit**: `NULL` and `NULL_LITERAL` were two *separate* grammar tokens both matching the identical text `"NULL"` (one for `NOT NULL` column constraints, one meant for `INSERT ... VALUES (..., NULL, ...)`). Since `NULL` was declared first, the lexer could never actually produce a `NULL_LITERAL` token for that text - `INSERT`ing a literal `NULL` value has never worked in this project's history, silently throwing a syntax error every time. Found because a new test needed it (a NULL join key to prove NULLs never match, per standard SQL semantics). Fixed by merging into the single `NULL` token - no Java code needed to change, since nothing referenced `NULL_LITERAL` by name.
   - New tests: NULL join keys are correctly excluded on either side (never match, not even NULL-to-NULL), and a real 1,000×2,000-row join with a tight, measured performance assertion (2s budget - the old algorithm would blow well past this, per the numbers above).
 
+### Phase B — Statistics collection + cost-based optimizer ✅ done (third item)
+
+- ✅ **`ANALYZE <table>`** - a real statistics collector: one full scan computing row count and, per column, a distinct-value count plus numeric min/max. Stored in-memory, consulted by the planner.
+- ✅ **The planner is now genuinely cost-based when statistics exist**, not just rule-based. `planScan` compares an estimated seq-scan cost (proportional to row count) against an estimated index-scan cost (startup cost + estimated matching rows × a per-row cost reflecting real random-I/O overhead vs. sequential - the same spirit as Postgres's own `seq_page_cost`/`random_page_cost` ratio), and picks whichever is actually cheaper. **Without ANALYZE, it falls back to the original rule-based heuristic** ("an index exists, use it") rather than guessing at a cost with no data - the same reasoning Postgres itself uses when statistics are unavailable, and it means every pre-existing index/join test (which never calls ANALYZE) keeps passing unchanged.
+  - **Demonstrated for real, not just asserted**: a 1,000-row table with a low-cardinality column (2 distinct values, 500 rows each) and a high-cardinality column (1,000 distinct values, 1 row each), both indexed. Before `ANALYZE`: both use the index (rule-based fallback). After `ANALYZE`: the low-selectivity predicate correctly switches to `Seq Scan` (cost 1000 vs. an index cost of ~2002 - matching half the table makes the index worse, not better), while the high-selectivity predicate correctly keeps the index (cost ~6 vs. 1000). The actual query results are identical either way - only the plan changes.
+  - `EXPLAIN` now shows the estimated cost (`cost=1000.0`) once statistics exist, or says plainly that none exist yet (`no statistics - run ANALYZE for a cost-based choice`) when they don't.
+  - **Known, named limitation**: selectivity is estimated assuming a *uniform* distribution across a column's distinct values (rowCount / distinctCount). Real Postgres tracks actual most-common-value frequencies and histograms specifically because real data is rarely uniform - a column with 2 distinct values split 999-to-1 looks identical to this simpler model as one split 500-to-500. A real histogram/MCV-list is further work, not attempted here. Statistics also don't auto-refresh on writes (that's autovacuum's job, Phase E) - they can go stale exactly the way Postgres's own do without a periodic `ANALYZE`.
+  - 5 new tests: `ANALYZE`'s row/column count report, the rule-based fallback confirmed *without* `ANALYZE`, the cost-based choice confirmed in *both* directions (low selectivity → Seq Scan, high selectivity → Index Scan) with real data, and `EXPLAIN` showing cost estimates.
+
 ## What to do next
 
-Per `PROJECT_PLAN.md` Phase B, the remaining highest-leverage item is **statistics collection** - the prerequisite for a real cost-based optimizer, which the current rule-based planner (and hash join's simple row-count heuristic) should eventually be replaced by. Beyond Phase B, see `PROJECT_PLAN.md`'s full phase breakdown (subqueries, more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+All three items picked from Phase B (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer) are now done - the core of "query engine depth" that Phase B set out to close. What's left in Phase B: subqueries, merge join (lower priority now - the optimizer exists to inform that choice), window functions, and CTEs. Beyond Phase B, see `PROJECT_PLAN.md`'s full phase breakdown (Phase A's B+Tree delete/vacuum, more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 

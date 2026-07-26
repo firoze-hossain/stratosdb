@@ -35,12 +35,29 @@ public class ExecutorEngine {
     private final Map<String, IndexEntry> indexesByName;
     private final Map<String, List<IndexEntry>> indexesByTable;
 
+    /**
+     * Per-column statistics: distinct-value count (for equality selectivity)
+     * and numeric min/max (for range selectivity). Populated only by
+     * ANALYZE - there is no automatic refresh on INSERT/UPDATE/DELETE (that
+     * would be autovacuum's job, Phase E, not attempted here), so these can
+     * go stale exactly the way Postgres's own statistics do without a
+     * periodic ANALYZE/autovacuum. This is a real, named limitation, not
+     * hidden: a table that grows substantially after ANALYZE was last run
+     * will have the optimizer working from outdated row-count and
+     * selectivity estimates until ANALYZE runs again.
+     */
+    private record ColumnStatistics(long distinctCount, Double min, Double max) {}
+    private record TableStatistics(long rowCount, Map<String, ColumnStatistics> columnStats) {}
+
+    private final Map<String, TableStatistics> statistics;
+
     public ExecutorEngine(BufferPool bufferPool, WALManager walManager, TransactionManager transactionManager) {
         this.parser = new SqlParser();
         this.tables = new ConcurrentHashMap<>();
         this.tableColumns = new ConcurrentHashMap<>();
         this.indexesByName = new ConcurrentHashMap<>();
         this.indexesByTable = new ConcurrentHashMap<>();
+        this.statistics = new ConcurrentHashMap<>();
         this.bufferPool = bufferPool;
         this.walManager = walManager;
         this.transactionManager = transactionManager;
@@ -93,6 +110,7 @@ public class ExecutorEngine {
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
+        if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         return QueryResult.error("Unsupported statement");
     }
 
@@ -167,6 +185,74 @@ public class ExecutorEngine {
             message += " (" + skippedNonNumeric + " row(s) skipped: non-integer column value)";
         }
         return QueryResult.success(message);
+    }
+
+    /**
+     * ANALYZE: a real, if simple, statistics collector - one full scan of
+     * the table computing row count and, per column, a distinct-value
+     * count plus numeric min/max. Used by planScan (below) to make the
+     * seq-scan-vs-index-scan choice genuinely cost-based rather than
+     * rule-based, once this has been run.
+     *
+     * Known simplification, stated plainly: selectivity is estimated by
+     * assuming a UNIFORM distribution across a column's distinct values
+     * (rowCount / distinctCount for equality). Real Postgres tracks actual
+     * most-common-value frequencies and histograms specifically because
+     * real data is rarely uniform - a column with 2 distinct values split
+     * 999-to-1 looks identical to this model as one split 500-to-500. That
+     * gap is real further work (Phase B), not hidden here.
+     */
+    private QueryResult executeAnalyze(AnalyzeStatement stmt, Transaction txn) {
+        HeapTable table = tables.get(stmt.tableName());
+        if (table == null) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+
+        List<String> columnNames = tableColumns.get(stmt.tableName());
+        Map<String, Set<Object>> distinctValues = new HashMap<>();
+        Map<String, Double> minValues = new HashMap<>();
+        Map<String, Double> maxValues = new HashMap<>();
+        if (columnNames != null) {
+            for (String col : columnNames) {
+                distinctValues.put(col, new HashSet<>());
+            }
+        }
+
+        long rowCount = 0;
+        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
+            Tuple tuple = Tuple.deserialize(raw);
+            rowCount++;
+            if (columnNames == null) {
+                continue;
+            }
+            for (String col : columnNames) {
+                Object value = findColumnValue(tuple, col);
+                if (value == null) {
+                    continue;
+                }
+                distinctValues.get(col).add(value);
+                if (value instanceof Number n) {
+                    double d = n.doubleValue();
+                    minValues.merge(col, d, Math::min);
+                    maxValues.merge(col, d, Math::max);
+                }
+            }
+        }
+
+        Map<String, ColumnStatistics> columnStats = new HashMap<>();
+        if (columnNames != null) {
+            for (String col : columnNames) {
+                columnStats.put(col, new ColumnStatistics(
+                    distinctValues.get(col).size(),
+                    minValues.get(col),
+                    maxValues.get(col)));
+            }
+        }
+
+        statistics.put(stmt.tableName(), new TableStatistics(rowCount, columnStats));
+
+        return QueryResult.success("Analyzed " + stmt.tableName() + ": " + rowCount + " row(s), "
+            + (columnNames != null ? columnNames.size() : 0) + " column(s)");
     }
 
     private QueryResult executeInsert(InsertStatement stmt, Transaction txn) {
@@ -591,46 +677,120 @@ public class ExecutorEngine {
         }
 
         ScanPlan plan = planScan(select.tableName(), select.whereClause());
+        String costSuffix = plan.hasStatistics()
+            ? String.format(" (cost=%.1f)", plan.estimatedCost())
+            : " (no statistics - run ANALYZE for a cost-based choice)";
         String description = plan.useIndex()
-            ? String.format("Index Scan using %s on %s (column=%s, range=[%s, %s])",
-                plan.index().indexName(), select.tableName(), plan.index().columnName(), plan.loKey(), plan.hiKey())
-            : "Seq Scan on " + select.tableName();
+            ? String.format("Index Scan using %s on %s (column=%s, range=[%s, %s])%s",
+                plan.index().indexName(), select.tableName(), plan.index().columnName(), plan.loKey(), plan.hiKey(), costSuffix)
+            : "Seq Scan on " + select.tableName() + costSuffix;
         return QueryResult.success(description);
     }
 
-    private record ScanPlan(boolean useIndex, IndexEntry index, Long loKey, Long hiKey) {
-        static ScanPlan seqScan() {
-            return new ScanPlan(false, null, null, null);
+    /**
+     * Constants in the same spirit as Postgres's own seq_page_cost (1.0)
+     * vs. random_page_cost (4.0 by default): an index probe costs more per
+     * matching row than a sequential scan does, because it's a B+Tree
+     * traversal plus a random heap access rather than the next sequential
+     * block. This is what makes the optimizer correctly prefer a seq scan
+     * over an index for a predicate that matches a large fraction of the
+     * table, even when an applicable index exists - "an index exists" and
+     * "the index is worth using" are different questions, and only the
+     * cost model (not the old rule-based planner) can tell them apart.
+     */
+    private static final double SEQ_SCAN_ROW_COST = 1.0;
+    private static final double INDEX_ROW_COST = 4.0;
+    private static final double INDEX_STARTUP_COST = 2.0; // B+Tree root-to-leaf traversal, paid once regardless of match count
+
+    private record ScanPlan(boolean useIndex, IndexEntry index, Long loKey, Long hiKey, double estimatedCost, boolean hasStatistics) {
+        static ScanPlan seqScan(double cost, boolean hasStats) {
+            return new ScanPlan(false, null, null, null, cost, hasStats);
         }
 
-        static ScanPlan indexScan(IndexEntry index, long lo, long hi) {
-            return new ScanPlan(true, index, lo, hi);
+        static ScanPlan indexScan(IndexEntry index, long lo, long hi, double cost, boolean hasStats) {
+            return new ScanPlan(true, index, lo, hi, cost, hasStats);
         }
     }
 
+    /**
+     * Chooses seq scan vs. index scan. Genuinely cost-based when ANALYZE
+     * has been run for this table (compares estimated costs and picks the
+     * cheaper one); falls back to the original rule-based heuristic
+     * ("an applicable index exists, so use it") when it hasn't, since
+     * guessing at a cost with zero data would be worse than the simple
+     * heuristic, not better - the same reasoning Postgres itself uses
+     * when statistics are unavailable.
+     */
     private ScanPlan planScan(String tableName, String whereClause) {
+        TableStatistics stats = statistics.get(tableName);
+        boolean hasStats = stats != null;
+
         WherePredicate pred = parseWhere(whereClause);
         if (pred == null || !pred.isNumeric()) {
-            return ScanPlan.seqScan();
+            return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
         IndexEntry idx = findIndex(tableName, pred.column());
         if (idx == null) {
-            return ScanPlan.seqScan();
+            return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
         long value;
         try {
             value = Long.parseLong(pred.value());
         } catch (NumberFormatException e) {
-            return ScanPlan.seqScan();
+            return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
-        return switch (pred.operator()) {
-            case "=" -> ScanPlan.indexScan(idx, value, value);
-            case ">" -> ScanPlan.indexScan(idx, value + 1, Long.MAX_VALUE);
-            case ">=" -> ScanPlan.indexScan(idx, value, Long.MAX_VALUE);
-            case "<" -> ScanPlan.indexScan(idx, Long.MIN_VALUE, value - 1);
-            case "<=" -> ScanPlan.indexScan(idx, Long.MIN_VALUE, value);
-            default -> ScanPlan.seqScan(); // "!=" isn't a contiguous range - not usable as an index scan
-        };
+
+        long lo, hi;
+        switch (pred.operator()) {
+            case "=" -> { lo = value; hi = value; }
+            case ">" -> { lo = value + 1; hi = Long.MAX_VALUE; }
+            case ">=" -> { lo = value; hi = Long.MAX_VALUE; }
+            case "<" -> { lo = Long.MIN_VALUE; hi = value - 1; }
+            case "<=" -> { lo = Long.MIN_VALUE; hi = value; }
+            default -> { return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats); } // "!=" isn't a contiguous range
+        }
+
+        if (!hasStats) {
+            return ScanPlan.indexScan(idx, lo, hi, 0, false);
+        }
+
+        double seqCost = costSeqScan(stats);
+        double idxCost = costIndexScan(stats, idx.columnName(), pred.operator(), lo, hi);
+        return idxCost < seqCost
+            ? ScanPlan.indexScan(idx, lo, hi, idxCost, true)
+            : ScanPlan.seqScan(seqCost, true);
+    }
+
+    private double costSeqScan(TableStatistics stats) {
+        return stats.rowCount() * SEQ_SCAN_ROW_COST;
+    }
+
+    private double costIndexScan(TableStatistics stats, String column, String operator, long lo, long hi) {
+        long estimatedRows = estimateMatchingRows(stats, column, operator, lo, hi);
+        return INDEX_STARTUP_COST + estimatedRows * INDEX_ROW_COST;
+    }
+
+    private long estimateMatchingRows(TableStatistics stats, String column, String operator, long lo, long hi) {
+        if (stats.rowCount() == 0) {
+            return 0;
+        }
+        ColumnStatistics colStats = stats.columnStats().get(column);
+        if (colStats == null) {
+            return stats.rowCount(); // no per-column stats - assume worst case (matches everything)
+        }
+        if (operator.equals("=")) {
+            long distinct = Math.max(1, colStats.distinctCount());
+            return Math.max(1, stats.rowCount() / distinct);
+        }
+        if (colStats.min() == null || colStats.max() == null || colStats.max() <= colStats.min()) {
+            return stats.rowCount(); // no usable numeric range - assume worst case
+        }
+        double totalWidth = colStats.max() - colStats.min();
+        double rangeLo = Math.max(colStats.min(), lo == Long.MIN_VALUE ? colStats.min() : lo);
+        double rangeHi = Math.min(colStats.max(), hi == Long.MAX_VALUE ? colStats.max() : hi);
+        double rangeWidth = Math.max(0, rangeHi - rangeLo);
+        double selectivity = Math.min(1.0, rangeWidth / totalWidth);
+        return Math.max(1, (long) (stats.rowCount() * selectivity));
     }
 
     private IndexEntry findIndex(String tableName, String columnName) {

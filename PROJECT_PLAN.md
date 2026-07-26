@@ -67,7 +67,7 @@ Given that, the real goal for Part 2 is: close the feature gaps that matter most
 | Storage engine, crash recovery | Real WAL redo, tested via an actual `SIGKILL` | Real, decades-hardened | Moderate — newer and far less battle-tested, not fundamentally different in design |
 | Transactions/isolation | Snapshot isolation (MVCC), auto-commit only, no savepoints, no 2PC | Full isolation levels, savepoints, 2PC, prepared transactions | Moderate–Large |
 | Indexing | B+Tree only, **no delete operation yet**, no index-accelerated joins | B-Tree, Hash, GiST, GIN, BRIN, SP-GiST | Large |
-| Query optimizer | Rule-based ("does an index exist for this predicate? use it") | Cost-based, statistics-driven | Large |
+| Query optimizer | Cost-based for scan choice (seq vs. index) when ANALYZE has run, uniform-distribution assumption; join strategy still unconditional (always hash join) | Cost-based, statistics-driven, histograms/MCV lists | Moderate |
 | JOINs | Hash join (equality only); no merge join, no join reordering | Nested loop, hash join, merge join, join reordering | Moderate |
 | Aggregation | `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` done; no window functions, no CTEs | Full | Moderate |
 | Subqueries | **None** | Full (scalar, correlated, `EXISTS`, CTEs, recursive) | Large |
@@ -106,12 +106,12 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 
 | Task | Priority | Depends on | Notes |
 |---|---|---|---|
-| Statistics collection (`ANALYZE`-equivalent) | 🔴 | none | Row counts and per-column distinct-value estimates, at minimum. Nothing else here can be genuinely cost-based without this — it's a prerequisite, not parallel work. |
-| Cost-based optimizer | 🔴 | Statistics | Replaces the current rule-based planner with real cost comparison. Realistic scope: even a simple model (page-read estimates for seq scan vs. index scan vs. each join strategy) is a substantial rewrite — probably warrants its own `Planner` class, distinct from execution, which doesn't exist as a separate concept yet. |
+| Statistics collection (`ANALYZE`-equivalent) | ✅ done | none | Row counts and per-column distinct-value/min/max estimates - see PROGRESS.md. In-memory only, no auto-refresh on writes (that's autovacuum's job, Phase E) - can go stale exactly like Postgres's own statistics without a periodic ANALYZE. |
+| Cost-based optimizer | ✅ done | Statistics | Replaced the rule-based planner with real cost comparison (seq scan vs. index scan), falling back to the old rule-based heuristic when no statistics exist. Demonstrated with real data switching plans correctly in both directions - see PROGRESS.md. Known limitation: assumes uniform value distribution (no histogram/MCV tracking like real Postgres), and doesn't yet inform join-strategy choice (hash join is still unconditional, not compared against alternatives). |
 | `GROUP BY` / `HAVING` / aggregates (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) | ✅ done | none | Was completely absent, now real - see PROGRESS.md. Known gap: doesn't combine with JOIN yet (a query using both silently skips grouping rather than erroring - a named follow-up). |
 | Hash join | ✅ done | none | Replaced nested-loop as the sole join algorithm - see PROGRESS.md for real measured numbers (4.4x-10.9x, widening with scale, exactly as O(n·m) vs O(n+m) predicts). Not yet a genuine cost-based *choice* between strategies (there's still no statistics to base one on) - it's "always hash join," which is correct since every JOIN this grammar supports is equality-only. |
 | Subqueries (scalar, `EXISTS`, `IN`) | 🟡 | none, but aggregates will likely land first in practice | Needs the grammar extended again (same pattern as JOIN support in Part 1) plus real plan-time handling, not string substitution. |
-| Merge join | 🟡 | Cost-based optimizer | Valuable for pre-sorted inputs specifically; low priority until the optimizer can meaningfully choose between strategies. |
+| Merge join | 🟡 | none | Valuable for pre-sorted inputs specifically. The cost-based optimizer (done, above) only compares scan strategies so far, not join strategies - hash join is still chosen unconditionally for every equality join. Adding merge join as a real alternative needs that comparison extended to joins too, not just scans. |
 | Window functions | 🟢 | Aggregates | `ROW_NUMBER`, `RANK`, etc. — real, but less broadly used than basic aggregation. |
 | CTEs, `WITH RECURSIVE` | 🟢 | Subqueries | Recursive CTEs are a genuinely different execution model (iterate to a fixpoint), not just more grammar. |
 
@@ -156,7 +156,7 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 
 ### If forced to pick just one thing next
 
-**Phase B — query engine depth (statistics, cost-based optimization, joins beyond nested-loop, and aggregation)** is where the gap versus PostgreSQL is both largest and most *visible* to anyone actually using the engine. Two items from this phase are done: `GROUP BY`/aggregates and hash join (both in PROGRESS.md, both with real measured/tested proof, not just claimed). A database with correct MVCC and no `GROUP BY`, doing every join as a nested loop, didn't feel like PostgreSQL; one with real aggregation and a real hash join does — even with plenty of Phase A/C/D/E gaps still open. What's left in this phase, and the honest next answer: **statistics collection** (`ANALYZE`-equivalent) - the prerequisite for an actual cost-based optimizer, which would turn today's simple heuristics (rule-based index-scan choice, hash join's "smaller side" heuristic) into genuine cost comparisons.
+**Phase B — query engine depth (statistics, cost-based optimization, joins beyond nested-loop, and aggregation)** is where the gap versus PostgreSQL is both largest and most *visible* to anyone actually using the engine. Three items from this phase are now done: `GROUP BY`/aggregates, hash join, and statistics + a genuinely cost-based scan planner (all in PROGRESS.md, all with real measured/demonstrated proof, not just claimed). A database with correct MVCC, no `GROUP BY`, every join a nested loop, and a planner that only ever asked "does an index exist" didn't feel like PostgreSQL; one with real aggregation, a real hash join, and a planner that can correctly reject an index for an unselective predicate does — even with plenty of Phase A/C/D/E gaps still open. What's left in this phase: subqueries (the next biggest SQL-surface gap), then merge join, window functions, and CTEs, roughly in that order of payoff versus effort.
 
 ---
 

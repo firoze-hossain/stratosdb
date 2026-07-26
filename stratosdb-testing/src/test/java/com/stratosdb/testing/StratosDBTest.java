@@ -137,7 +137,8 @@ public class StratosDBTest {
 
         QueryResult withoutIndex = database.execute("EXPLAIN SELECT * FROM users WHERE id=1");
         assertTrue(withoutIndex.isSuccess());
-        assertEquals("Seq Scan on users", withoutIndex.getMessage());
+        assertTrue(withoutIndex.getMessage().startsWith("Seq Scan on users"),
+            () -> "unexpected EXPLAIN output: " + withoutIndex.getMessage());
     }
 
     @Test
@@ -389,6 +390,86 @@ public class StratosDBTest {
         assertTrue(elapsedMs < 2000,
             () -> "hash join took " + elapsedMs + "ms for " + userCount + "x" + (userCount * 2)
                 + " rows - expected well under 2s; a regression to nested-loop-style O(n*m) would blow well past this");
+    }
+
+    @Test
+    void testAnalyzeReportsRowAndColumnCount() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'a')");
+        database.execute("INSERT INTO t VALUES (2, 'b')");
+
+        QueryResult result = database.execute("ANALYZE t");
+        assertTrue(result.isSuccess(), () -> "ANALYZE failed: " + result.getError());
+        assertEquals("Analyzed t: 2 row(s), 2 column(s)", result.getMessage());
+    }
+
+    @Test
+    void testWithoutAnalyzePlannerFallsBackToRuleBasedIndexChoice() {
+        database.execute("CREATE TABLE t (id INT, category INT)");
+        for (int i = 0; i < 100; i++) {
+            database.execute("INSERT INTO t VALUES (" + i + ", " + (i % 2) + ")");
+        }
+        database.execute("CREATE INDEX idx_category ON t (category)");
+
+        // No ANALYZE has run - even though category=0 matches half the table
+        // (a predicate a real cost model should reject the index for), the
+        // fallback heuristic has no statistics to reason with, so it keeps
+        // the original "an index exists, use it" behavior.
+        QueryResult result = database.execute("EXPLAIN SELECT * FROM t WHERE category=0");
+        assertTrue(result.isSuccess());
+        assertTrue(result.getMessage().startsWith("Index Scan"),
+            () -> "expected the rule-based fallback without statistics: " + result.getMessage());
+        assertTrue(result.getMessage().contains("no statistics"));
+    }
+
+    @Test
+    void testCostBasedOptimizerRejectsIndexForLowSelectivityPredicate() {
+        database.execute("CREATE TABLE t (id INT, category INT)");
+        for (int i = 0; i < 1000; i++) {
+            // Only 2 distinct values, each matching half the table - genuinely low selectivity.
+            database.execute("INSERT INTO t VALUES (" + i + ", " + (i % 2) + ")");
+        }
+        database.execute("CREATE INDEX idx_category ON t (category)");
+        database.execute("ANALYZE t");
+
+        QueryResult explain = database.execute("EXPLAIN SELECT * FROM t WHERE category=0");
+        assertTrue(explain.isSuccess());
+        assertTrue(explain.getMessage().startsWith("Seq Scan"),
+            () -> "a predicate matching half the table should cost more via the index than a seq scan: " + explain.getMessage());
+
+        // The plan choice must not change the actual answer.
+        QueryResult result = database.execute("SELECT * FROM t WHERE category=0");
+        assertEquals(500, result.getRows().size());
+    }
+
+    @Test
+    void testCostBasedOptimizerKeepsIndexForHighSelectivityPredicate() {
+        database.execute("CREATE TABLE t (id INT, unique_id INT)");
+        for (int i = 0; i < 1000; i++) {
+            // 1000 distinct values - genuinely high selectivity for equality.
+            database.execute("INSERT INTO t VALUES (" + i + ", " + i + ")");
+        }
+        database.execute("CREATE INDEX idx_unique ON t (unique_id)");
+        database.execute("ANALYZE t");
+
+        QueryResult explain = database.execute("EXPLAIN SELECT * FROM t WHERE unique_id=500");
+        assertTrue(explain.isSuccess());
+        assertTrue(explain.getMessage().startsWith("Index Scan"),
+            () -> "a highly selective predicate should still prefer the index: " + explain.getMessage());
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE unique_id=500");
+        assertEquals(1, result.getRows().size());
+    }
+
+    @Test
+    void testExplainShowsCostEstimatesOnceAnalyzed() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'a')");
+        database.execute("ANALYZE t");
+
+        QueryResult result = database.execute("EXPLAIN SELECT * FROM t");
+        assertTrue(result.isSuccess());
+        assertTrue(result.getMessage().contains("cost="), () -> "expected a cost estimate: " + result.getMessage());
     }
 
     private void assertRowCount(String sql, int expected) {

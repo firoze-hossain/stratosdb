@@ -52,6 +52,8 @@ public class SqlParser {
             return new ShowTablesStatement();
         } else if (ctx.explain() != null) {
             return new ExplainStatement(buildSelect(ctx.explain().select()));
+        } else if (ctx.analyze() != null) {
+            return new AnalyzeStatement(ctx.analyze().tableName().getText());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }
