@@ -419,12 +419,24 @@ public class ExecutorEngine {
     }
 
     /**
-     * Nested-loop join - the "at minimum" version from the Week 3 plan.
-     * Each joined table is fully scanned per iteration; there is no index
-     * acceleration for joins yet (a hash join or an index-nested-loop join
-     * would need one), and no join reordering - tables are joined in the
-     * order they're written in the query. Correctness first; join planning
-     * is a real further optimization, not attempted here.
+     * Hash join - replaced the Week 3 nested-loop join (Phase B of
+     * PROJECT_PLAN.md). This is correct as the *only* join algorithm here
+     * (not merely one option among several) because every JOIN this
+     * grammar allows is an equality join (`joinClause: ... ON columnName
+     * ASSIGN columnName` - ASSIGN is `=`, nothing else is accepted), and
+     * hash join is exactly the right tool for equality predicates: O(n+m)
+     * instead of nested-loop's O(n*m).
+     *
+     * Not yet cost-based, stated plainly: there's no statistics collection
+     * or optimizer to weigh join strategies against each other (that's the
+     * next item after this in Phase B), so this always builds the hash
+     * table on whichever side has fewer rows - a real, if simple, heuristic
+     * (less memory, fewer hash computations, on the side that gets
+     * hashed rather than scanned), not a genuine cost comparison. If a
+     * future non-equality join predicate is ever added, it would need a
+     * different algorithm (hash join fundamentally cannot support it) -
+     * nested-loop would be the natural fallback for that case, not
+     * resurrected here speculatively.
      *
      * Every column in the combined result is qualified as
      * "tableName.columnName" to avoid ambiguity when two joined tables
@@ -449,16 +461,7 @@ public class ExecutorEngine {
                 joinedRows.add(qualify(Tuple.deserialize(raw), join.tableName()));
             }
 
-            List<Tuple> next = new ArrayList<>();
-            for (Tuple left : current) {
-                Object leftVal = findColumnValue(left, join.leftColumn());
-                for (Tuple right : joinedRows) {
-                    if (valuesEqual(leftVal, findColumnValue(right, join.rightColumn()))) {
-                        next.add(merge(left, right));
-                    }
-                }
-            }
-            current = next;
+            current = hashJoin(current, join.leftColumn(), joinedRows, join.rightColumn());
         }
 
         List<Tuple> tuples = new ArrayList<>();
@@ -483,6 +486,63 @@ public class ExecutorEngine {
         return QueryResult.success(tuples);
     }
 
+    /**
+     * Classic hash join: build a hash table on the smaller side (by row
+     * count), keyed by the join column, then probe it with the other side.
+     * Output column order is always left-then-right regardless of which
+     * side ended up as the build side internally - that choice is a pure
+     * implementation detail, invisible to the caller.
+     *
+     * NULLs never match, on either side (standard SQL equi-join semantics)
+     * - a row whose join-column value is null contributes nothing whether
+     * it's on the build or probe side.
+     *
+     * Join keys are normalized to a canonical numeric form (double) when
+     * they're any kind of Number before hashing, so values that are equal
+     * numerically but different boxed types still hash/match consistently -
+     * the same "compare by value, not by exact type" philosophy already
+     * used throughout this class (see valuesEqual, evaluatePredicate,
+     * compareForMinMax).
+     */
+    private List<Tuple> hashJoin(List<Tuple> left, String leftColumn, List<Tuple> right, String rightColumn) {
+        boolean buildOnLeft = left.size() <= right.size();
+        List<Tuple> buildSide = buildOnLeft ? left : right;
+        List<Tuple> probeSide = buildOnLeft ? right : left;
+        String buildColumn = buildOnLeft ? leftColumn : rightColumn;
+        String probeColumn = buildOnLeft ? rightColumn : leftColumn;
+
+        Map<Object, List<Tuple>> hashTable = new HashMap<>();
+        for (Tuple row : buildSide) {
+            Object key = normalizeJoinKey(findColumnValue(row, buildColumn));
+            if (key != null) {
+                hashTable.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+            }
+        }
+
+        List<Tuple> result = new ArrayList<>();
+        for (Tuple probeRow : probeSide) {
+            Object key = normalizeJoinKey(findColumnValue(probeRow, probeColumn));
+            if (key == null) {
+                continue;
+            }
+            List<Tuple> matches = hashTable.get(key);
+            if (matches == null) {
+                continue;
+            }
+            for (Tuple buildRow : matches) {
+                result.add(buildOnLeft ? merge(buildRow, probeRow) : merge(probeRow, buildRow));
+            }
+        }
+        return result;
+    }
+
+    private Object normalizeJoinKey(Object value) {
+        if (value instanceof Number n) {
+            return n.doubleValue();
+        }
+        return value;
+    }
+
     private Tuple qualify(Tuple tuple, String tableName) {
         Tuple qualified = new Tuple();
         List<String> columnNames = tuple.getColumnNames();
@@ -505,16 +565,6 @@ public class ExecutorEngine {
         return merged;
     }
 
-    private boolean valuesEqual(Object a, Object b) {
-        if (a == null || b == null) {
-            return false;
-        }
-        try {
-            return Double.parseDouble(a.toString()) == Double.parseDouble(b.toString());
-        } catch (NumberFormatException e) {
-            return a.toString().equals(b.toString());
-        }
-    }
     /** Reports which strategy planScan would pick, without running the query. */
     private QueryResult executeExplain(ExplainStatement stmt) {
         SelectStatement select = stmt.select();
@@ -523,7 +573,7 @@ public class ExecutorEngine {
         }
 
         if (select.joins() != null && !select.joins().isEmpty()) {
-            StringBuilder sb = new StringBuilder("Nested Loop Join: Seq Scan on ").append(select.tableName());
+            StringBuilder sb = new StringBuilder("Hash Join: Seq Scan on ").append(select.tableName());
             for (JoinClause join : select.joins()) {
                 if (!tables.containsKey(join.tableName())) {
                     return QueryResult.error("Table not found: " + join.tableName());

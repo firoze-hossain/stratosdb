@@ -67,7 +67,7 @@ dataType: INT | INTEGER | BIGINT | SMALLINT | TINYINT
         | JSON | JSONB;
 
 // Literals
-literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | BOOLEAN_LITERAL | NULL_LITERAL;
+literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | BOOLEAN_LITERAL | NULL;
 defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP;
 
 // Identifiers
@@ -165,7 +165,6 @@ STRING_LITERAL: '\'' (~['])* '\'';
 INTEGER_LITERAL: [0-9]+;
 FLOAT_LITERAL: [0-9]+ '.' [0-9]+;
 BOOLEAN_LITERAL: TRUE | FALSE;
-NULL_LITERAL: N U L L;
 
 // Boolean literals (must be defined as lexer tokens)
 TRUE: T R U E;

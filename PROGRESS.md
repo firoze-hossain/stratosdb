@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **57 / 57** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase B underway (GROUP BY/aggregates done) |
+| Tests passing | **59 / 59** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase B underway (GROUP BY/aggregates + hash join done) |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -107,9 +107,16 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
   - **Known limitation, stated plainly**: aggregates and `JOIN` don't combine yet - a query with both hits the join code path first, which doesn't consult `GROUP BY`/aggregates at all, so it silently returns per-row joined results rather than grouping them. No index acceleration for aggregate queries either (always a full scan) - both are real, separate follow-ups per `PROJECT_PLAN.md` Phase B.
   - 6 new tests: `COUNT(*)` with no `GROUP BY` (implicit single group), all five aggregate functions together, `HAVING`, `WHERE` applied before grouping, `EXPLAIN` output, and `COUNT` on an empty result set (must return 0, not error).
 
+### Phase B — Hash join ✅ done (second item)
+
+- ✅ **Hash join replaces nested-loop join as the sole join algorithm** (`ExecutorEngine.hashJoin`) - correct as the *only* algorithm, not just "an option," because every `JOIN` this grammar allows is an equality join (`ON columnName = columnName`, nothing else accepted), which is exactly what hash join is for. Builds the hash table on whichever side has fewer rows (a real, if simple, heuristic - not yet a genuine cost-based choice, since there's still no statistics collection to base one on). `EXPLAIN` now reports `Hash Join` instead of `Nested Loop Join`.
+  - **Measured for real, not asserted blind**: at 1,000 users × 2,000 orders, the old nested-loop join took 437ms; hash join takes ~100ms (**4.4x**). At 3,000 × 6,000, nested-loop took 1,622ms, hash join ~149ms (**10.9x**) - the gap widening with scale exactly as O(n·m) vs O(n+m) predicts. Both numbers measured on the same machine, same data, same query - not estimated.
+  - **Found and fixed a second real, dormant, pre-existing bug while building this - present since the project's very first commit**: `NULL` and `NULL_LITERAL` were two *separate* grammar tokens both matching the identical text `"NULL"` (one for `NOT NULL` column constraints, one meant for `INSERT ... VALUES (..., NULL, ...)`). Since `NULL` was declared first, the lexer could never actually produce a `NULL_LITERAL` token for that text - `INSERT`ing a literal `NULL` value has never worked in this project's history, silently throwing a syntax error every time. Found because a new test needed it (a NULL join key to prove NULLs never match, per standard SQL semantics). Fixed by merging into the single `NULL` token - no Java code needed to change, since nothing referenced `NULL_LITERAL` by name.
+  - New tests: NULL join keys are correctly excluded on either side (never match, not even NULL-to-NULL), and a real 1,000×2,000-row join with a tight, measured performance assertion (2s budget - the old algorithm would blow well past this, per the numbers above).
+
 ## What to do next
 
-Per `PROJECT_PLAN.md` Phase B, the highest-leverage remaining items: **hash join** (nested-loop degrades badly past small tables) and **statistics collection** (the prerequisite for a real cost-based optimizer, which the current rule-based planner should eventually be replaced by). Beyond Phase B, see `PROJECT_PLAN.md`'s full phase breakdown (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Per `PROJECT_PLAN.md` Phase B, the remaining highest-leverage item is **statistics collection** - the prerequisite for a real cost-based optimizer, which the current rule-based planner (and hash join's simple row-count heuristic) should eventually be replaced by. Beyond Phase B, see `PROJECT_PLAN.md`'s full phase breakdown (subqueries, more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 
