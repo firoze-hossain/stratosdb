@@ -92,6 +92,26 @@ public class TransactionManager {
         return abortedXids.contains(xid);
     }
 
+    /**
+     * The horizon vacuum needs: a tuple version superseded by a committed
+     * xmax strictly less than this is guaranteed unreachable by every
+     * currently active transaction (every active snapshot already started
+     * after that xmax committed, so MVCCVisibility would already correctly
+     * hide the old version from all of them) - safe to physically reclaim.
+     *
+     * Returns nextXID's current value if there are no active transactions
+     * at all: with nothing active, nothing has a floor to respect, and any
+     * future transaction will be assigned an xid >= that value anyway, so
+     * it can't possibly need to see anything older.
+     */
+    public long getOldestActiveXid() {
+        long min = Long.MAX_VALUE;
+        for (long xid : activeXids) {
+            if (xid < min) min = xid;
+        }
+        return min == Long.MAX_VALUE ? nextXID.get() : min;
+    }
+
     public LockManager getLockManager() {
         return lockManager;
     }

@@ -111,6 +111,7 @@ public class ExecutorEngine {
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
+        if (stmt instanceof VacuumStatement s) return executeVacuum(s);
         return QueryResult.error("Unsupported statement");
     }
 
@@ -253,6 +254,33 @@ public class ExecutorEngine {
 
         return QueryResult.success("Analyzed " + stmt.tableName() + ": " + rowCount + " row(s), "
             + (columnNames != null ? columnNames.size() : 0) + " column(s)");
+    }
+
+    /**
+     * VACUUM: delegates the actual reclamation to HeapTable.vacuum() (see
+     * its javadoc for the full explanation) - this method's only job is
+     * computing the horizon and reporting the result as a QueryResult.
+     *
+     * Index entries are NOT touched here - they're already kept current in
+     * real time by DELETE/UPDATE (see maintainIndexesOnDelete), a separate,
+     * earlier piece of work. This is purely heap-level space reclamation.
+     *
+     * Known limitation, stated plainly: this is manual, not automatic -
+     * there is no autovacuum background process deciding when to run this
+     * on its own (Phase E, not attempted here). A table that's never
+     * VACUUMed behaves exactly as it always has.
+     */
+    private QueryResult executeVacuum(VacuumStatement stmt) {
+        HeapTable table = tables.get(stmt.tableName());
+        if (table == null) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+
+        long horizon = transactionManager.getOldestActiveXid();
+        HeapTable.VacuumResult result = table.vacuum(horizon, transactionManager);
+
+        return QueryResult.success("Vacuumed " + stmt.tableName() + ": reclaimed "
+            + result.reclaimedVersions() + " dead row version(s) across " + result.pagesCompacted() + " page(s)");
     }
 
     private QueryResult executeInsert(InsertStatement stmt, Transaction txn) {

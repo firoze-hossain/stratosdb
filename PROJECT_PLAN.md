@@ -64,7 +64,7 @@ Given that, the real goal for Part 2 is: close the feature gaps that matter most
 
 | Capability | StratosDB today | PostgreSQL | Gap |
 |---|---|---|---|
-| Storage engine, crash recovery | Real WAL redo, tested via an actual `SIGKILL` | Real, decades-hardened | Moderate — newer and far less battle-tested, not fundamentally different in design |
+| Storage engine, crash recovery | Real WAL redo (tested via an actual `SIGKILL`), real vacuum with a proven cross-transaction safety property | Real, decades-hardened | Moderate — newer and far less battle-tested, not fundamentally different in design |
 | Transactions/isolation | Snapshot isolation (MVCC), auto-commit only, no savepoints, no 2PC | Full isolation levels, savepoints, 2PC, prepared transactions | Moderate–Large |
 | Indexing | B+Tree with real delete (borrow/merge/root-collapse); no index-accelerated joins; only one index type | B-Tree, Hash, GiST, GIN, BRIN, SP-GiST | Moderate |
 | Query optimizer | Cost-based for scan choice (seq vs. index) when ANALYZE has run, uniform-distribution assumption; join strategy still unconditional (always hash join) | Cost-based, statistics-driven, histograms/MCV lists | Moderate |
@@ -94,7 +94,8 @@ There's no team to divide across streams, so priority replaces scheduling — wh
 | Task | Priority | Depends on | Notes |
 |---|---|---|---|
 | B+Tree delete | ✅ done | none | Full standard algorithm (borrow from sibling, merge, root collapse) - see PROGRESS.md for the real scale verification (30k insert / 40% delete, point search + full range scan both checked) and the SQL-layer wiring (DELETE/UPDATE now genuinely remove the old index entry). Known limitation: a merge orphans a page rather than reclaiming it - no free-space reuse yet. |
-| Visibility map + real vacuum | 🔴 | none (B+Tree delete is done, so this is now unblocked) | MVCC without vacuum means dead tuples never get reclaimed — every table only grows. Postgres treats this as core infrastructure, not an add-on, for exactly this reason. |
+| Vacuum | ✅ done | none | Real reclamation (mark-then-compact via SlottedPage.defragment, previously a stub), gated on TransactionManager.getOldestActiveXid so an active older transaction's snapshot is never broken - proven directly with real, separately-controlled transactions, not simulated. See PROGRESS.md for two real bugs found and fixed while building this (a slot-wasting updateTuple, and a page-count check that silently scanned zero pages). Known limitation: manual only, no autovacuum background process yet (Phase E). |
+| Visibility map | 🟡 | none | A distinct thing from vacuum, above, though related: a per-page summary of "every tuple here is known-visible to everyone" that Phase C's index-only scans need to confirm visibility without touching the heap at all. Vacuum reclaiming dead tuples doesn't produce this by itself - it's a separate structure to build. |
 | Free-space map | 🟡 | none | `HeapTable.insert()` currently scans every existing page looking for room — O(pages) per insert. A free-space map makes this O(1) amortized. |
 | Real prepared statements (wire-level) | 🟡 | none | `StratosConnection.prepareStatement()` currently throws `SQLFeatureNotSupportedException`. Needs an actual `PARSE`/`BIND`/`EXECUTE` split in the wire protocol — not client-side string substitution, which would just move the SQL-injection-shaped risk around rather than removing it. |
 | Savepoints | 🟢 | Multi-statement transactions (Phase D) | Nested rollback points only make sense once transactions aren't purely auto-commit. |
@@ -156,9 +157,9 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 
 ### If forced to pick just one thing next
 
-Two fronts have real progress now, both with measured/demonstrated proof rather than just claims (see PROGRESS.md for all of it): **Phase A's B+Tree delete** (the single most load-bearing gap in the original foundation - a table under real UPDATE/DELETE traffic no longer accumulates stale index entries forever) and **Phase B's query engine depth** (`GROUP BY`/aggregates, hash join, and a genuinely cost-based scan planner). A database with correct MVCC, an index that could insert but never delete, no `GROUP BY`, every join a nested loop, and a planner that only ever asked "does an index exist" didn't feel like PostgreSQL; one where deletion actually shrinks the index, aggregation is real, joins are real, and the planner can correctly reject an index for an unselective predicate does — even with plenty of gaps still open elsewhere.
+Two fronts have real progress now, both with measured/demonstrated proof rather than just claims (see PROGRESS.md for all of it): **Phase A's storage hardening** (B+Tree delete, then vacuum - a table under real UPDATE/DELETE traffic no longer accumulates stale index entries or dead heap space forever) and **Phase B's query engine depth** (`GROUP BY`/aggregates, hash join, and a genuinely cost-based scan planner). A database with correct MVCC, an index that could insert but never delete, dead tuples that could never be reclaimed, no `GROUP BY`, every join a nested loop, and a planner that only ever asked "does an index exist" didn't feel like PostgreSQL; one where deletion actually shrinks the index, vacuum actually shrinks the heap, aggregation is real, joins are real, and the planner can correctly reject an index for an unselective predicate does — even with plenty of gaps still open elsewhere.
 
-What's newly unblocked: **vacuum** (Phase A) depended on B+Tree delete existing, and now it does. What's still open in Phase B: subqueries (the next biggest SQL-surface gap), then merge join, window functions, and CTEs.
+What's left in Phase A: a free-space map (inserts still scan every existing page for room - an efficiency gap, not a correctness one) and autovacuum (automating what now works manually). What's left in Phase B: subqueries (the next biggest SQL-surface gap), then merge join, window functions, and CTEs.
 
 ---
 

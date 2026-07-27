@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **72 / 72** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A's B+Tree delete done; Phase B (GROUP BY/aggregates, hash join, statistics/cost-based optimizer) done |
+| Tests passing | **78 / 78** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A's B+Tree delete + vacuum done; Phase B (GROUP BY/aggregates, hash join, statistics/cost-based optimizer) done |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -86,14 +86,14 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
 |---|---|---|---|
 | `stratosdb-common` | 11 | 182 | Real — exceptions, constants, utils |
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
-| `stratosdb-storage` | 10 | 1,686 | Real — disk/buffer/WAL/heap, now with a page-type-agnostic buffer pool and an idempotent shutdown path |
+| `stratosdb-storage` | 10 | 1,842 | Real — disk/buffer/WAL/heap, a page-type-agnostic buffer pool, an idempotent shutdown path, and real page compaction (defragment) backing vacuum |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 19 | 1,459 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE) + hand-written AST builder + cost-based executor |
+| `stratosdb-sql` | 20 | 1,492 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM) + hand-written AST builder + cost-based executor |
 | `stratosdb-index` | 1 | 567 | Real — B+Tree with real insert, search, range scan, *and delete* (borrow/merge/root-collapse), tested at scale in both directions, wired into query execution via the planner |
 | `stratosdb-network` | 5 | 621 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server, all tested over real sockets |
 | `stratosdb-jdbc` | 6 | 741 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support, verified through `DriverManager` |
 | `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
-| `stratosdb-testing` | 0 (test-only) | — | 34 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 36 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 **Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
@@ -133,9 +133,23 @@ This was the item flagged as "the single most load-bearing gap in Part 1's own f
 - **Known, named limitation**: a merge orphans a page rather than reclaiming its space - the index file doesn't shrink. A free-space map to reuse that space is separate further work (still open in Phase A), consistent with the heap table's own lack of one.
 - 5 new low-level tests in `BTreeIndexTest` (exact key+RID precision among duplicates, no-op on a missing pair, forced borrow, forced merge-with-root-collapse, and the 30k/40%-delete scale check) plus 3 new SQL-level integration tests in `StratosDBTest` proving the wiring (`DELETE` removes the row from an indexed lookup, `UPDATE` on the indexed column itself moves the entry rather than leaving a duplicate, and deleting then reinserting a reused indexed value returns exactly one row, not two).
 
+## Phase A — Vacuum ✅ done
+
+Unblocked by B+Tree delete (above). MVCC without vacuum means dead tuples never get reclaimed - every table only grows. This closes that gap for the heap table's own storage (index entries were already handled in real time by the B+Tree delete work, not vacuum's job).
+
+- ✅ **`TransactionManager.getOldestActiveXid()`** - the horizon: a row version superseded by a committed xmax strictly less than this is guaranteed unreachable by every currently active transaction, since every active snapshot already started after that xmax committed. A version at or above the horizon is left alone even if it looks old, because some active transaction's snapshot might genuinely still need it.
+- ✅ **`HeapTable.vacuum(horizonXid, txnManager)`** - real physical reclamation, not just a report. For each page: mark truly-dead versions invalid (`SlottedPage.deleteTuple`), then compact out their actual bytes (`SlottedPage.defragment` - previously a stub with a comment, now real). Slot numbers are preserved for every surviving tuple during compaction - only deleted tuples' data bytes move, which matters because index RIDs and any other external reference identify a row by `(pageId, slot)`.
+- ✅ **`VACUUM <table>`** SQL command, a thin wrapper around the above.
+- **A real, load-bearing bug found and fixed while building this, not a cosmetic one**: `SlottedPage.updateTuple()` previously always did "delete old slot, insert as a new slot" - even for an MVCC tombstone, which is *always* exactly the same length as what it replaces (same xmin, same payload, only xmax changes). That meant every single `DELETE`/`UPDATE` permanently wasted one slot, forever, even on a table that's immediately vacuumed - exactly the bloat vacuum exists to undo, being created faster than vacuum could keep up. Fixed: same-length updates now happen truly in place.
+- **A second real bug found via testing, not theory**: the first version of `vacuum()` used `bufferPool.getTablePageCount()` to decide how many pages to scan - but that reads the *on-disk file size*, which only grows as pages are actually flushed. Pages still dirty-only in the buffer pool (the normal case for anything written earlier in the same process) weren't counted, so vacuum silently scanned zero pages and always reported "reclaimed 0," even with dead versions sitting right there. Found by actually running it end-to-end via SQL rather than trusting the implementation - fixed by using `HeapTable`'s own in-memory `lastPageId` field, the same one `insert()`/`scan()` already rely on for this exact reason.
+- **Demonstrated for real**: update the same row 20 times through real SQL, then `VACUUM` - reports "reclaimed 20 dead row version(s) across 1 page(s)," with the visible value and row count completely unaffected either way.
+- **The property that actually matters most, proven directly**: a transaction whose snapshot predates an `UPDATE` must keep seeing the pre-update value for its entire lifetime, even after a `VACUUM` runs while it's still open - proven with real, separately-controlled transactions (not simulated), confirming vacuum reports zero reclaimed while that reader is active, that the reader still reads the correct old value afterward, and that the version *does* become reclaimable the moment the reader commits.
+- **Known, named limitation**: this is manual, not automatic - there's no autovacuum background process (Phase E). A table that's never `VACUUM`ed behaves exactly as it always has.
+- 5 new tests in `VacuumTest` (reclaim correctness, the cross-transaction safety property in both directions, idempotency, and an aborted-delete's xmax correctly NOT being treated as a committed removal) plus 2 SQL-level tests in `StratosDBTest`.
+
 ## What to do next
 
-Phase A's most load-bearing gap is closed, and all three picked Phase B items (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer) are done. What's left in Phase A: vacuum (now unblocked - it depended on B+Tree delete existing) and a free-space map. What's left in Phase B: subqueries, merge join, window functions, and CTEs. See `PROJECT_PLAN.md`'s full phase breakdown for everything else (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are both closed, and all three picked Phase B items (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer) are done. What's left in Phase A: a free-space map (an efficiency improvement - inserts still scan every existing page for room, an O(pages) operation that a map would make O(1)) and autovacuum (an automation improvement - `VACUUM` now works, but only when someone runs it). What's left in Phase B: subqueries, merge join, window functions, and CTEs. See `PROJECT_PLAN.md`'s full phase breakdown for everything else (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 

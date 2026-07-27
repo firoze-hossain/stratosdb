@@ -54,6 +54,8 @@ public class SqlParser {
             return new ExplainStatement(buildSelect(ctx.explain().select()));
         } else if (ctx.analyze() != null) {
             return new AnalyzeStatement(ctx.analyze().tableName().getText());
+        } else if (ctx.vacuum() != null) {
+            return new VacuumStatement(ctx.vacuum().tableName().getText());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }

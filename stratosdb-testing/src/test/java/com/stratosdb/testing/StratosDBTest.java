@@ -523,6 +523,38 @@ public class StratosDBTest {
         assertEquals(2, result.getRows().get(0).getValue("id"));
     }
 
+    @Test
+    void testVacuumReportsZeroOnATableWithNothingDead() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        QueryResult result = database.execute("VACUUM t");
+        assertTrue(result.isSuccess(), () -> "VACUUM failed: " + result.getError());
+        assertEquals("Vacuumed t: reclaimed 0 dead row version(s) across 0 page(s)", result.getMessage());
+    }
+
+    @Test
+    void testVacuumReclaimsRepeatedUpdatesWithoutChangingVisibleData() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        for (int i = 0; i < 20; i++) {
+            database.execute("UPDATE t SET val=" + (100 + i) + " WHERE id=1");
+        }
+
+        QueryResult vacuum = database.execute("VACUUM t");
+        assertTrue(vacuum.isSuccess());
+        assertEquals("Vacuumed t: reclaimed 20 dead row version(s) across 1 page(s)", vacuum.getMessage());
+
+        QueryResult after = database.execute("SELECT * FROM t");
+        assertEquals(1, after.getRows().size(), "vacuum must not change how many rows are visible");
+        assertEquals(119, after.getRows().get(0).getValue("val"), "the current value must be completely unaffected by vacuum");
+
+        // Running it again with nothing new dead must not double-count or error.
+        QueryResult again = database.execute("VACUUM t");
+        assertEquals("Vacuumed t: reclaimed 0 dead row version(s) across 0 page(s)", again.getMessage());
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

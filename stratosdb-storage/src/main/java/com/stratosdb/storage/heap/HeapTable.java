@@ -207,6 +207,73 @@ public class HeapTable {
         return visible;
     }
 
+    public record VacuumResult(int reclaimedVersions, int pagesCompacted) {}
+
+    /**
+     * Reclaims space from row versions that are truly dead: superseded by
+     * a committed xmax strictly less than horizonXid (see
+     * TransactionManager.getOldestActiveXid - the caller is responsible
+     * for computing that horizon, since it needs a live view of every
+     * currently active transaction, which belongs to TransactionManager,
+     * not this class).
+     *
+     * A version below the horizon is safe to physically remove because
+     * every currently active transaction's snapshot was taken after that
+     * xmax committed - MVCCVisibility would already correctly hide the old
+     * version from every one of them. A version at or above the horizon is
+     * left untouched even if it looks "old," because some active
+     * transaction's snapshot might genuinely still need to see it -
+     * reclaiming it early would be a real correctness bug (a still-running
+     * transaction losing a row version its own snapshot is entitled to),
+     * not just a missed optimization.
+     *
+     * Physical reclamation, not just marking: SlottedPage.deleteTuple()
+     * marks the dead version's slot invalid, then SlottedPage.defragment()
+     * compacts out its actual bytes so insert() (which already scans
+     * existing pages for free space before allocating a new one) can
+     * genuinely reuse that space for a future row.
+     */
+    public VacuumResult vacuum(long horizonXid, TransactionManager txnManager) {
+        int reclaimedVersions = 0;
+        int pagesCompacted = 0;
+
+        // lastPageId, not bufferPool.getTablePageCount(name): that queries the
+        // on-disk file size directly, which only grows as pages are actually
+        // flushed - a page still dirty-only in the buffer pool (the common
+        // case for anything written earlier in the same process, before any
+        // checkpoint/close) wouldn't be counted yet, and vacuum would silently
+        // scan zero pages. lastPageId is this table's own in-memory record of
+        // every page it has ever allocated, which is exactly what insert()
+        // and scan() already rely on for the same reason.
+        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+            boolean anyReclaimed = false;
+            for (int slot : page.getValidSlots()) {
+                byte[] stored = page.readTuple(slot);
+                if (stored == null) {
+                    continue;
+                }
+                long xmax = MVCCVisibility.readXmax(stored);
+                if (xmax != MVCCVisibility.NO_XMAX
+                        && txnManager.isCommitted(xmax)
+                        && xmax < horizonXid) {
+                    page.deleteTuple(slot);
+                    reclaimedVersions++;
+                    anyReclaimed = true;
+                }
+            }
+            if (anyReclaimed) {
+                page.defragment();
+                bufferPool.markDirty(name, pageId);
+                pagesCompacted++;
+            }
+            bufferPool.unpinPage(name, pageId);
+        }
+
+        LOG.debug("Vacuumed {}: reclaimed {} dead row version(s) across {} page(s)", name, reclaimedVersions, pagesCompacted);
+        return new VacuumResult(reclaimedVersions, pagesCompacted);
+    }
+
     /**
      * Deletes (tombstones) the row at (pageId, slot) on behalf of xid, after
      * taking an exclusive lock on it. Returns false if the row is not visible

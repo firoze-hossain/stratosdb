@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze;
+sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze | vacuum;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -12,6 +12,7 @@ dropTable: DROP TABLE tableName SEMICOLON?;
 showTables: SHOW TABLES SEMICOLON?;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
+vacuum: VACUUM tableName SEMICOLON?;
 
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
@@ -113,6 +114,7 @@ JOIN: J O I N;
 INNER: I N N E R;
 EXPLAIN: E X P L A I N;
 ANALYZE: A N A L Y Z E;
+VACUUM: V A C U U M;
 AS: A S;
 COUNT: C O U N T;
 SUM: S U M;
