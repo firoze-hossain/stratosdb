@@ -472,6 +472,57 @@ public class StratosDBTest {
         assertTrue(result.getMessage().contains("cost="), () -> "expected a cost estimate: " + result.getMessage());
     }
 
+    @Test
+    void deleteRemovesRowFromIndexedLookupNotJustFromVisibilityFiltering() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("CREATE INDEX idx_val ON t (val)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        database.execute("INSERT INTO t VALUES (2, 100)");
+
+        database.execute("DELETE FROM t WHERE id=1");
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE val=100");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size(), "only the surviving row should match, via the index");
+        assertEquals(2, result.getRows().get(0).getValue("id"));
+    }
+
+    @Test
+    void updateOnIndexedColumnMovesTheIndexEntryNotJustTheRow() {
+        database.execute("CREATE TABLE t (id INT, category INT)");
+        database.execute("CREATE INDEX idx_category ON t (category)");
+        database.execute("INSERT INTO t VALUES (1, 10)");
+
+        database.execute("UPDATE t SET category=20 WHERE id=1");
+
+        QueryResult oldValue = database.execute("SELECT * FROM t WHERE category=10");
+        assertTrue(oldValue.isSuccess());
+        assertEquals(0, oldValue.getRows().size(), "the old indexed value must no longer find this row");
+
+        QueryResult newValue = database.execute("SELECT * FROM t WHERE category=20");
+        assertTrue(newValue.isSuccess());
+        assertEquals(1, newValue.getRows().size(), "the new indexed value must find it");
+        assertEquals(1, newValue.getRows().get(0).getValue("id"));
+    }
+
+    @Test
+    void deleteAndReinsertSameIndexedValueReturnsExactlyOneRow() {
+        // A real-world pattern that would surface a leftover stale index
+        // entry immediately: delete a row, then insert a different row
+        // reusing the same indexed value. Two entries under the same key
+        // would either double-count or return the wrong row's data.
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("CREATE INDEX idx_val ON t (val)");
+        database.execute("INSERT INTO t VALUES (1, 42)");
+        database.execute("DELETE FROM t WHERE id=1");
+        database.execute("INSERT INTO t VALUES (2, 42)");
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE val=42");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals(2, result.getRows().get(0).getValue("id"));
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

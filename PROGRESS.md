@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~3,383 lines |
 | Test source | ~765 lines |
-| Tests passing | **64 / 64** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase B underway (GROUP BY/aggregates + hash join + statistics/cost-based optimizer done) |
+| Tests passing | **72 / 72** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A's B+Tree delete done; Phase B (GROUP BY/aggregates, hash join, statistics/cost-based optimizer) done |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -88,12 +88,12 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
 | `stratosdb-storage` | 10 | 1,686 | Real — disk/buffer/WAL/heap, now with a page-type-agnostic buffer pool and an idempotent shutdown path |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 19 | ~1,250 | Real — ANTLR grammar (JOIN/qualified columns, now GROUP BY/HAVING/aggregates) + hand-written AST builder + executor |
-| `stratosdb-index` | 1 | 304 | Real — B+Tree, tested at scale, wired into query execution via the planner |
+| `stratosdb-sql` | 19 | 1,459 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE) + hand-written AST builder + cost-based executor |
+| `stratosdb-index` | 1 | 567 | Real — B+Tree with real insert, search, range scan, *and delete* (borrow/merge/root-collapse), tested at scale in both directions, wired into query execution via the planner |
 | `stratosdb-network` | 5 | 621 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server, all tested over real sockets |
 | `stratosdb-jdbc` | 6 | 741 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support, verified through `DriverManager` |
 | `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
-| `stratosdb-testing` | 0 (test-only) | — | 24 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 34 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 **Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
@@ -123,9 +123,19 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
   - **Known, named limitation**: selectivity is estimated assuming a *uniform* distribution across a column's distinct values (rowCount / distinctCount). Real Postgres tracks actual most-common-value frequencies and histograms specifically because real data is rarely uniform - a column with 2 distinct values split 999-to-1 looks identical to this simpler model as one split 500-to-500. A real histogram/MCV-list is further work, not attempted here. Statistics also don't auto-refresh on writes (that's autovacuum's job, Phase E) - they can go stale exactly the way Postgres's own do without a periodic `ANALYZE`.
   - 5 new tests: `ANALYZE`'s row/column count report, the rule-based fallback confirmed *without* `ANALYZE`, the cost-based choice confirmed in *both* directions (low selectivity → Seq Scan, high selectivity → Index Scan) with real data, and `EXPLAIN` showing cost estimates.
 
+## Phase A — B+Tree delete ✅ done
+
+This was the item flagged as "the single most load-bearing gap in Part 1's own foundation" - the index had no delete operation at all, meaning a table under real `UPDATE`/`DELETE` traffic accumulated stale entries forever. It's also, honestly, one of the more error-prone parts of a B+Tree to implement correctly - full underflow handling (borrow from a sibling, or merge and propagate upward, including collapsing the root) has real edge cases that a shallow implementation gets subtly wrong.
+
+- ✅ **Real `BTreeIndex.delete(key, RID)`** with the complete standard algorithm: remove from the leaf; if that leaf underflows (drops below the minimum occupancy, and isn't the root, which is exempt), try to borrow a key from a sibling that has spare capacity; if no sibling can lend, merge with one and remove the separator key from the parent, propagating the same underflow check up the tree; if that propagation reaches the root and leaves it with zero keys, the root collapses - its one remaining child becomes the new root, and the tree's height shrinks by one.
+- **Verified at real scale, not just small hand-built cases**: insert 30,000 shuffled keys, delete a different-order shuffled 40% (12,000 keys), then check *both* point search for every key (found exactly when it should be) *and* a full range scan (returns exactly the remaining keys, in order, with no gaps or duplicates - the strongest possible check, since it would catch a corrupted leaf chain from a bad merge that point search alone could miss). Also verified the extreme case directly: 20,000 keys down to 5, confirming the root page ID actually changes (real collapse, not just a claim) and the final range scan returns exactly the 5 survivors.
+- **Wired into the SQL layer**: `DELETE` and `UPDATE` now call `maintainIndexesOnDelete`, genuinely removing the old index entry - not leaving it as MVCC-filtered dead weight the way the codebase previously (correctly, but permanently) tolerated. `UPDATE` specifically removes the old entry using the row's *pre-update* value, which matters when the update changes the very column that's indexed.
+- **Known, named limitation**: a merge orphans a page rather than reclaiming its space - the index file doesn't shrink. A free-space map to reuse that space is separate further work (still open in Phase A), consistent with the heap table's own lack of one.
+- 5 new low-level tests in `BTreeIndexTest` (exact key+RID precision among duplicates, no-op on a missing pair, forced borrow, forced merge-with-root-collapse, and the 30k/40%-delete scale check) plus 3 new SQL-level integration tests in `StratosDBTest` proving the wiring (`DELETE` removes the row from an indexed lookup, `UPDATE` on the indexed column itself moves the entry rather than leaving a duplicate, and deleting then reinserting a reused indexed value returns exactly one row, not two).
+
 ## What to do next
 
-All three items picked from Phase B (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer) are now done - the core of "query engine depth" that Phase B set out to close. What's left in Phase B: subqueries, merge join (lower priority now - the optimizer exists to inform that choice), window functions, and CTEs. Beyond Phase B, see `PROJECT_PLAN.md`'s full phase breakdown (Phase A's B+Tree delete/vacuum, more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Phase A's most load-bearing gap is closed, and all three picked Phase B items (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer) are done. What's left in Phase A: vacuum (now unblocked - it depended on B+Tree delete existing) and a free-space map. What's left in Phase B: subqueries, merge join, window functions, and CTEs. See `PROJECT_PLAN.md`'s full phase breakdown for everything else (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 

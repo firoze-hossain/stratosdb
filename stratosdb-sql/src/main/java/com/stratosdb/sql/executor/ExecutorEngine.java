@@ -817,6 +817,28 @@ public class ExecutorEngine {
         }
     }
 
+    /**
+     * Removes the index entry pointing at (pageId, slot) - the physical
+     * location a row is about to stop occupying, whether because it was
+     * DELETEd outright or is the old version being replaced by an UPDATE.
+     * Uses the row's CURRENT (pre-write) values, since that's what's
+     * actually stored in the index right now - an UPDATE that changes the
+     * indexed column itself must remove the entry keyed by the OLD value,
+     * not the new one, or it would silently leave the real stale entry
+     * behind while removing nothing.
+     */
+    private void maintainIndexesOnDelete(String tableName, Tuple tuple, long pageId, int slot) {
+        List<IndexEntry> tableIndexes = indexesByTable.get(tableName);
+        if (tableIndexes == null) return;
+        for (IndexEntry idx : tableIndexes) {
+            Object value = findColumnValue(tuple, idx.columnName());
+            Long key = toIndexKey(value);
+            if (key != null) {
+                idx.index().delete(key, new BTreePage.RID(pageId, slot));
+            }
+        }
+    }
+
     /** Only Integer/Long column values can be B+Tree keys right now - see executeCreateIndex's javadoc. */
     private Long toIndexKey(Object value) {
         if (value instanceof Integer i) return i.longValue();
@@ -828,10 +850,9 @@ public class ExecutorEngine {
      * Real UPDATE, replacing the previous hardcoded "Updated 0 rows" stub.
      * Scans with positions so each matching visible row can be targeted at
      * its exact (pageId, slot) for the MVCC update (tombstone + reinsert).
-     * Any index on this table is updated to point at the new row version -
-     * the old version's stale index entry is left in place (BTreeIndex has
-     * no delete yet) but is harmless: MVCCVisibility.isVisible filters it
-     * out at read time, same as a stale entry from a plain DELETE.
+     * The old version's index entry is now genuinely removed (BTreeIndex
+     * gained real delete - see PROJECT_PLAN.md Phase A), not just left as
+     * MVCC-filtered dead weight the way it was before.
      */
     private QueryResult executeUpdate(UpdateStatement stmt, Transaction txn) throws DeadlockException {
         HeapTable table = tables.get(stmt.tableName());
@@ -850,6 +871,11 @@ public class ExecutorEngine {
                 continue;
             }
 
+            // Snapshot the old values BEFORE applying assignments - needed to
+            // remove the old index entry by its actual current key, in case
+            // an assignment changes the very column that's indexed.
+            Tuple oldTuple = Tuple.deserialize(oldPayload);
+
             for (Assignment assignment : stmt.assignments()) {
                 setColumnValue(tuple, assignment.column(), parseLiteral(assignment.value()));
             }
@@ -858,6 +884,7 @@ public class ExecutorEngine {
             HeapTable.InsertResult newVersion = table.updateMvcc(row.pageId(), row.slot(), newPayload, txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
             walManager.logUpdate(stmt.tableName(), row.pageId(), row.slot(), oldPayload, newPayload);
+            maintainIndexesOnDelete(stmt.tableName(), oldTuple, row.pageId(), row.slot());
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
             updated++;
         }
@@ -867,6 +894,9 @@ public class ExecutorEngine {
 
     /**
      * Real DELETE, replacing the previous hardcoded "Deleted 0 rows" stub.
+     * The row's index entries are now genuinely removed (BTreeIndex gained
+     * real delete - see PROJECT_PLAN.md Phase A), not left to accumulate
+     * as MVCC-filtered dead weight forever.
      */
     private QueryResult executeDelete(DeleteStatement stmt, Transaction txn) throws DeadlockException {
         HeapTable table = tables.get(stmt.tableName());
@@ -888,6 +918,7 @@ public class ExecutorEngine {
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
             if (removed) {
                 walManager.logDelete(stmt.tableName(), row.pageId(), row.slot());
+                maintainIndexesOnDelete(stmt.tableName(), tuple, row.pageId(), row.slot());
                 deleted++;
             }
         }

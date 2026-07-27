@@ -66,7 +66,7 @@ Given that, the real goal for Part 2 is: close the feature gaps that matter most
 |---|---|---|---|
 | Storage engine, crash recovery | Real WAL redo, tested via an actual `SIGKILL` | Real, decades-hardened | Moderate — newer and far less battle-tested, not fundamentally different in design |
 | Transactions/isolation | Snapshot isolation (MVCC), auto-commit only, no savepoints, no 2PC | Full isolation levels, savepoints, 2PC, prepared transactions | Moderate–Large |
-| Indexing | B+Tree only, **no delete operation yet**, no index-accelerated joins | B-Tree, Hash, GiST, GIN, BRIN, SP-GiST | Large |
+| Indexing | B+Tree with real delete (borrow/merge/root-collapse); no index-accelerated joins; only one index type | B-Tree, Hash, GiST, GIN, BRIN, SP-GiST | Moderate |
 | Query optimizer | Cost-based for scan choice (seq vs. index) when ANALYZE has run, uniform-distribution assumption; join strategy still unconditional (always hash join) | Cost-based, statistics-driven, histograms/MCV lists | Moderate |
 | JOINs | Hash join (equality only); no merge join, no join reordering | Nested loop, hash join, merge join, join reordering | Moderate |
 | Aggregation | `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` done; no window functions, no CTEs | Full | Moderate |
@@ -93,8 +93,8 @@ There's no team to divide across streams, so priority replaces scheduling — wh
 
 | Task | Priority | Depends on | Notes |
 |---|---|---|---|
-| B+Tree delete | 🔴 | none | The index has no delete operation at all right now (see `PROGRESS.md`). A table under real UPDATE/DELETE traffic accumulates stale index entries forever — this is the single most load-bearing gap in Part 1's own foundation. |
-| Visibility map + real vacuum | 🔴 | B+Tree delete | MVCC without vacuum means dead tuples never get reclaimed — every table only grows. Postgres treats this as core infrastructure, not an add-on, for exactly this reason. |
+| B+Tree delete | ✅ done | none | Full standard algorithm (borrow from sibling, merge, root collapse) - see PROGRESS.md for the real scale verification (30k insert / 40% delete, point search + full range scan both checked) and the SQL-layer wiring (DELETE/UPDATE now genuinely remove the old index entry). Known limitation: a merge orphans a page rather than reclaiming it - no free-space reuse yet. |
+| Visibility map + real vacuum | 🔴 | none (B+Tree delete is done, so this is now unblocked) | MVCC without vacuum means dead tuples never get reclaimed — every table only grows. Postgres treats this as core infrastructure, not an add-on, for exactly this reason. |
 | Free-space map | 🟡 | none | `HeapTable.insert()` currently scans every existing page looking for room — O(pages) per insert. A free-space map makes this O(1) amortized. |
 | Real prepared statements (wire-level) | 🟡 | none | `StratosConnection.prepareStatement()` currently throws `SQLFeatureNotSupportedException`. Needs an actual `PARSE`/`BIND`/`EXECUTE` split in the wire protocol — not client-side string substitution, which would just move the SQL-injection-shaped risk around rather than removing it. |
 | Savepoints | 🟢 | Multi-statement transactions (Phase D) | Nested rollback points only make sense once transactions aren't purely auto-commit. |
@@ -156,7 +156,9 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 
 ### If forced to pick just one thing next
 
-**Phase B — query engine depth (statistics, cost-based optimization, joins beyond nested-loop, and aggregation)** is where the gap versus PostgreSQL is both largest and most *visible* to anyone actually using the engine. Three items from this phase are now done: `GROUP BY`/aggregates, hash join, and statistics + a genuinely cost-based scan planner (all in PROGRESS.md, all with real measured/demonstrated proof, not just claimed). A database with correct MVCC, no `GROUP BY`, every join a nested loop, and a planner that only ever asked "does an index exist" didn't feel like PostgreSQL; one with real aggregation, a real hash join, and a planner that can correctly reject an index for an unselective predicate does — even with plenty of Phase A/C/D/E gaps still open. What's left in this phase: subqueries (the next biggest SQL-surface gap), then merge join, window functions, and CTEs, roughly in that order of payoff versus effort.
+Two fronts have real progress now, both with measured/demonstrated proof rather than just claims (see PROGRESS.md for all of it): **Phase A's B+Tree delete** (the single most load-bearing gap in the original foundation - a table under real UPDATE/DELETE traffic no longer accumulates stale index entries forever) and **Phase B's query engine depth** (`GROUP BY`/aggregates, hash join, and a genuinely cost-based scan planner). A database with correct MVCC, an index that could insert but never delete, no `GROUP BY`, every join a nested loop, and a planner that only ever asked "does an index exist" didn't feel like PostgreSQL; one where deletion actually shrinks the index, aggregation is real, joins are real, and the planner can correctly reject an index for an unselective predicate does — even with plenty of gaps still open elsewhere.
+
+What's newly unblocked: **vacuum** (Phase A) depended on B+Tree delete existing, and now it does. What's still open in Phase B: subqueries (the next biggest SQL-surface gap), then merge join, window functions, and CTEs.
 
 ---
 

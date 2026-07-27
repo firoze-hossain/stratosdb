@@ -12,8 +12,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -171,6 +173,155 @@ class BTreeIndexTest {
 
         assertNull(index.search(-1));
         assertNull(index.search(n + 1000));
+    }
+
+    @Test
+    void deleteRemovesExactKeyRidPairOnly() {
+        BTreeIndex index = newIndex("idx_del_exact", 64);
+        // Three duplicates under the same key - deleting one must leave the other two untouched.
+        BTreePage.RID rid1 = new BTreePage.RID(1, 0);
+        BTreePage.RID rid2 = new BTreePage.RID(2, 0);
+        BTreePage.RID rid3 = new BTreePage.RID(3, 0);
+        index.insert(42, rid1);
+        index.insert(42, rid2);
+        index.insert(42, rid3);
+
+        index.delete(42, rid2);
+
+        List<BTreePage.RID> remaining = index.searchAll(42);
+        assertEquals(2, remaining.size());
+        assertTrue(remaining.contains(rid1));
+        assertTrue(remaining.contains(rid3));
+        assertFalse(remaining.contains(rid2));
+    }
+
+    @Test
+    void deletingNonExistentPairIsANoOp() {
+        BTreeIndex index = newIndex("idx_del_noop", 64);
+        index.insert(10, new BTreePage.RID(1, 0));
+
+        assertDoesNotThrow(() -> index.delete(10, new BTreePage.RID(999, 0))); // wrong RID for that key
+        assertDoesNotThrow(() -> index.delete(999, new BTreePage.RID(1, 0))); // key never existed
+
+        assertEquals(new BTreePage.RID(1, 0), index.search(10), "the real entry must be untouched");
+    }
+
+    @Test
+    void deleteTriggersBorrowFromSibling() {
+        // Force at least two leaves, then delete enough from one to drop it
+        // below the minimum while its sibling still has spare keys to lend -
+        // this should borrow, not merge, and the tree must stay searchable.
+        BTreeIndex index = newIndex("idx_del_borrow", 200);
+        int n = 1000; // comfortably forces multiple leaves (MAX_LEAF_KEYS=408)
+        for (long k = 0; k < n; k++) {
+            index.insert(k, new BTreePage.RID(k, 0));
+        }
+
+        // Delete most of the first leaf's worth of keys - enough to force underflow
+        // and a borrow from the next leaf, without deleting so much it must merge.
+        for (long k = 0; k < 250; k++) {
+            index.delete(k, new BTreePage.RID(k, 0));
+        }
+
+        for (long k = 0; k < n; k++) {
+            BTreePage.RID found = index.search(k);
+            if (k < 250) {
+                assertNull(found, "key " + k + " should have been deleted");
+            } else {
+                assertEquals(new BTreePage.RID(k, 0), found, "key " + k + " should still be findable");
+            }
+        }
+        List<BTreePage.RID> all = index.rangeScan(0, n - 1);
+        assertEquals(n - 250, all.size(), "range scan must reflect exactly the remaining keys");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void deleteTriggersMergeAndRootCollapse() {
+        // Enough keys to force a multi-level tree (well past a single
+        // internal node), then delete almost everything - this forces
+        // repeated merging all the way up, including the root itself
+        // collapsing back down as the tree shrinks.
+        BTreeIndex index = newIndex("idx_del_collapse", 500);
+        int n = 20_000;
+        List<Long> insertOrder = new ArrayList<>();
+        for (long k = 0; k < n; k++) insertOrder.add(k);
+        Collections.shuffle(insertOrder, new java.util.Random(7));
+        for (long k : insertOrder) {
+            index.insert(k, new BTreePage.RID(k, 0));
+        }
+        long rootAfterInsert = index.getRootPageId();
+
+        List<Long> deleteOrder = new ArrayList<>(insertOrder);
+        Collections.shuffle(deleteOrder, new java.util.Random(3));
+        int keep = 5;
+        Set<Long> remaining = new HashSet<>(deleteOrder.subList(n - keep, n));
+        for (int i = 0; i < n - keep; i++) {
+            long k = deleteOrder.get(i);
+            index.delete(k, new BTreePage.RID(k, 0));
+        }
+
+        assertNotEquals(rootAfterInsert, index.getRootPageId(),
+            "the root must have collapsed at least once as the tree shrank back toward a single leaf");
+
+        for (long k = 0; k < n; k++) {
+            BTreePage.RID found = index.search(k);
+            assertEquals(remaining.contains(k), found != null, "key " + k + " visibility is wrong after near-total delete");
+        }
+        assertEquals(keep, index.rangeScan(Long.MIN_VALUE, Long.MAX_VALUE).size());
+    }
+
+    /**
+     * The real proof at scale: insert a large shuffled set, delete a large
+     * shuffled fraction (different order than insertion), and check BOTH
+     * point search for every key AND a full range scan - the latter is the
+     * strongest check, since it would catch a corrupted leaf chain (a bad
+     * merge skipping or double-linking a page) that point search alone
+     * could miss.
+     */
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void manyInsertionsThenManyDeletions_staysFullyCorrectAtScale() {
+        int n = 30_000;
+        BTreeIndex index = newIndex("idx_del_scale", 1000);
+
+        List<Long> insertOrder = new ArrayList<>();
+        for (long k = 0; k < n; k++) insertOrder.add(k);
+        Collections.shuffle(insertOrder, new java.util.Random(42));
+        Map<Long, BTreePage.RID> ridOf = new HashMap<>();
+        for (long k : insertOrder) {
+            BTreePage.RID rid = new BTreePage.RID(k, (int) (k % 50));
+            ridOf.put(k, rid);
+            index.insert(k, rid);
+        }
+
+        List<Long> deleteOrder = new ArrayList<>(insertOrder);
+        Collections.shuffle(deleteOrder, new java.util.Random(99));
+        int deleteCount = (int) (n * 0.4);
+        Set<Long> deleted = new HashSet<>(deleteOrder.subList(0, deleteCount));
+        for (long k : deleteOrder.subList(0, deleteCount)) {
+            index.delete(k, ridOf.get(k));
+        }
+
+        for (long k = 0; k < n; k++) {
+            BTreePage.RID found = index.search(k);
+            if (deleted.contains(k)) {
+                assertNull(found, "key " + k + " should have been deleted");
+            } else {
+                assertEquals(ridOf.get(k), found, "key " + k + " should still be findable with its original RID");
+            }
+        }
+
+        List<BTreePage.RID> scan = index.rangeScan(Long.MIN_VALUE, Long.MAX_VALUE);
+        List<Long> expectedRemaining = new ArrayList<>();
+        for (long k = 0; k < n; k++) {
+            if (!deleted.contains(k)) expectedRemaining.add(k);
+        }
+        assertEquals(expectedRemaining.size(), scan.size(), "range scan count must match the remaining set exactly");
+        for (int i = 0; i < scan.size(); i++) {
+            assertEquals((long) expectedRemaining.get(i), scan.get(i).pageId(),
+                "range scan out of order or corrupted at position " + i + " - a bad merge would show up exactly like this");
+        }
     }
 
     @Test

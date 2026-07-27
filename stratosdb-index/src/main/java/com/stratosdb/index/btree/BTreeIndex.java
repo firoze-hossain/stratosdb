@@ -20,19 +20,22 @@ import java.util.List;
  * Page 0 of the index's file is reserved for metadata (root page id).
  * Every other page is a BTreePage (leaf or internal node).
  *
- * What this does: point insert, point search, and range scan, with correct
- * node splitting (leaf and internal) as the tree grows - verified by
- * actually forcing multi-level splits in tests, not just single-page cases.
+ * What this does: point insert, point search, range scan, and point delete
+ * by (key, RID) - correct node splitting on insert and correct node
+ * underflow handling on delete (borrow from a sibling, or merge with one
+ * and propagate upward, including collapsing the root when the tree
+ * shrinks), verified by actually forcing multi-level splits and merges in
+ * tests, not just single-page cases.
  *
  * What this deliberately does NOT do yet, stated plainly rather than
- * glossed over: deletion (no merge/redistribute logic), concurrent
- * insert/search from multiple threads (no latching - callers must
- * serialize writers themselves for now), and integration into the query
- * planner (nothing in ExecutorEngine chooses an index scan yet - that's
- * the very next piece once this is verified solid). Duplicate keys are
- * supported (searchAll/rangeScan return every match); deleting a specific
- * duplicate is therefore not as simple as "remove this key" even once
- * deletion exists, and that's worth remembering when it's built.
+ * glossed over: concurrent insert/search/delete from multiple threads (no
+ * latching - callers must serialize writers themselves for now), and no
+ * page reuse after a merge orphans a page (the file doesn't shrink; a
+ * free-space map to reclaim that space is a separate, further piece of
+ * work - see PROJECT_PLAN.md Phase A). Deletion removes an exact (key,
+ * RID) pair, not "the first row with this key" - necessary because
+ * duplicate keys are supported (searchAll/rangeScan return every match),
+ * so the caller must know which specific row it's removing.
  */
 public class BTreeIndex {
     private static final Logger LOG = LoggerFactory.getLogger(BTreeIndex.class);
@@ -42,6 +45,16 @@ public class BTreeIndex {
     private static final int META_MAGIC = 0x53545242; // "STRB"
     private static final int META_MAGIC_OFFSET = 24; // right after Page's base 24-byte header
     private static final int META_ROOT_OFFSET = 28;
+
+    // A node below this many keys (and not the root, which is exempt) must
+    // borrow from a sibling or merge. Using floor(max/2) rather than
+    // ceil(max/2) is a standard, valid choice - it just affects overall
+    // space utilization slightly, not correctness, as long as insert and
+    // delete agree on it (they don't need to for correctness here, since
+    // insert's split threshold and delete's underflow threshold are
+    // independent invariants that both hold simultaneously).
+    private static final int MIN_LEAF_KEYS = BTreePage.MAX_LEAF_KEYS / 2;
+    private static final int MIN_INTERNAL_KEYS = BTreePage.MAX_INTERNAL_KEYS / 2;
 
     private static final PageFactory<Page> RAW_PAGE_FACTORY = new PageFactory<>() {
         @Override
@@ -233,6 +246,256 @@ public class BTreeIndex {
             idx++;
         }
         return idx;
+    }
+
+    // --- delete ---
+
+    /**
+     * Removes the exact (key, rid) pair. A no-op (not an error) if that
+     * exact pair isn't present - matches the get-out-of-the-way semantics
+     * of most delete APIs rather than forcing every caller to check
+     * existence first.
+     */
+    public void delete(long key, BTreePage.RID rid) {
+        deleteRecursive(rootPageId, key, rid);
+
+        // If deletion propagated all the way up and left the root as an
+        // internal node with zero keys (one remaining child), that child
+        // becomes the new root - the tree's height shrinks by one.
+        BTreePage root = bufferPool.getPage(indexName, rootPageId, BTreePage.FACTORY);
+        if (!root.isLeaf() && root.getKeyCount() == 0) {
+            long onlyChild = root.getChildren().get(0);
+            bufferPool.unpinPage(indexName, rootPageId);
+            rootPageId = onlyChild;
+            saveMetadata();
+            LOG.debug("Root collapsed to page {} for index '{}'", rootPageId, indexName);
+        } else {
+            bufferPool.unpinPage(indexName, rootPageId);
+        }
+    }
+
+    /** Returns true if the page at pageId underflowed (below minimum, and not the root) after the delete. */
+    private boolean deleteRecursive(long pageId, long key, BTreePage.RID rid) {
+        BTreePage page = bufferPool.getPage(indexName, pageId, BTreePage.FACTORY);
+
+        if (page.isLeaf()) {
+            List<Long> keys = new ArrayList<>(page.getKeys());
+            List<BTreePage.RID> values = new ArrayList<>(page.getLeafValues());
+
+            int removeIdx = -1;
+            for (int i = 0; i < keys.size(); i++) {
+                if (keys.get(i) == key && values.get(i).equals(rid)) {
+                    removeIdx = i;
+                    break;
+                }
+            }
+            if (removeIdx == -1) {
+                bufferPool.unpinPage(indexName, pageId);
+                return false; // exact pair not found - nothing to do
+            }
+            keys.remove(removeIdx);
+            values.remove(removeIdx);
+            page.setLeafContents(keys, values);
+            bufferPool.markDirty(indexName, pageId);
+
+            boolean isRoot = (pageId == rootPageId);
+            bufferPool.unpinPage(indexName, pageId);
+            return !isRoot && keys.size() < MIN_LEAF_KEYS;
+        }
+
+        List<Long> keys = page.getKeys();
+        List<Long> children = page.getChildren();
+        int childIdx = findChildIndex(keys, key);
+        long childPageId = children.get(childIdx);
+
+        boolean childUnderflowed = deleteRecursive(childPageId, key, rid);
+        if (!childUnderflowed) {
+            bufferPool.unpinPage(indexName, pageId);
+            return false;
+        }
+
+        boolean selfUnderflowed = rebalanceChild(page, pageId, childIdx);
+        bufferPool.unpinPage(indexName, pageId);
+        return selfUnderflowed;
+    }
+
+    /**
+     * The child at parentChildren[childIdx] underflowed. Try to borrow a
+     * key from a sibling that has more than the minimum first (cheaper,
+     * and keeps the tree denser); only merge if neither sibling can lend.
+     * Returns true if the parent itself now underflows as a result.
+     */
+    private boolean rebalanceChild(BTreePage parent, long parentPageId, int childIdx) {
+        List<Long> parentKeys = new ArrayList<>(parent.getKeys());
+        List<Long> parentChildren = new ArrayList<>(parent.getChildren());
+        long childPageId = parentChildren.get(childIdx);
+        BTreePage child = bufferPool.getPage(indexName, childPageId, BTreePage.FACTORY);
+
+        if (childIdx > 0) {
+            long leftId = parentChildren.get(childIdx - 1);
+            BTreePage left = bufferPool.getPage(indexName, leftId, BTreePage.FACTORY);
+            if (canLend(left)) {
+                borrowFromLeft(parent, parentKeys, parentChildren, childIdx, child, left);
+                bufferPool.markDirty(indexName, parentPageId);
+                bufferPool.unpinPage(indexName, childPageId);
+                bufferPool.unpinPage(indexName, leftId);
+                return false;
+            }
+            bufferPool.unpinPage(indexName, leftId);
+        }
+
+        if (childIdx < parentChildren.size() - 1) {
+            long rightId = parentChildren.get(childIdx + 1);
+            BTreePage right = bufferPool.getPage(indexName, rightId, BTreePage.FACTORY);
+            if (canLend(right)) {
+                borrowFromRight(parent, parentKeys, parentChildren, childIdx, child, right);
+                bufferPool.markDirty(indexName, parentPageId);
+                bufferPool.unpinPage(indexName, childPageId);
+                bufferPool.unpinPage(indexName, rightId);
+                return false;
+            }
+            bufferPool.unpinPage(indexName, rightId);
+        }
+
+        // Neither sibling can lend without underflowing itself - merge.
+        // Prefer merging with the left sibling when one exists (arbitrary
+        // but consistent choice); otherwise merge with the right.
+        if (childIdx > 0) {
+            long leftId = parentChildren.get(childIdx - 1);
+            BTreePage left = bufferPool.getPage(indexName, leftId, BTreePage.FACTORY);
+            mergeChildren(parent, parentKeys, parentChildren, childIdx - 1, left, childIdx, child);
+            bufferPool.unpinPage(indexName, childPageId);
+            bufferPool.unpinPage(indexName, leftId);
+        } else {
+            long rightId = parentChildren.get(childIdx + 1);
+            BTreePage right = bufferPool.getPage(indexName, rightId, BTreePage.FACTORY);
+            mergeChildren(parent, parentKeys, parentChildren, childIdx, child, childIdx + 1, right);
+            bufferPool.unpinPage(indexName, childPageId);
+            bufferPool.unpinPage(indexName, rightId);
+        }
+
+        boolean isParentRoot = (parentPageId == rootPageId);
+        int minForParent = parent.isLeaf() ? MIN_LEAF_KEYS : MIN_INTERNAL_KEYS;
+        return !isParentRoot && parent.getKeyCount() < minForParent;
+    }
+
+    private boolean canLend(BTreePage sibling) {
+        int min = sibling.isLeaf() ? MIN_LEAF_KEYS : MIN_INTERNAL_KEYS;
+        return sibling.getKeyCount() > min;
+    }
+
+    /** Moves left sibling's last entry to become child's new first entry, updating the parent's separator. */
+    private void borrowFromLeft(BTreePage parent, List<Long> parentKeys, List<Long> parentChildren,
+                                 int childIdx, BTreePage child, BTreePage left) {
+        if (child.isLeaf()) {
+            List<Long> leftKeys = new ArrayList<>(left.getKeys());
+            List<BTreePage.RID> leftValues = new ArrayList<>(left.getLeafValues());
+            long borrowedKey = leftKeys.remove(leftKeys.size() - 1);
+            BTreePage.RID borrowedValue = leftValues.remove(leftValues.size() - 1);
+            left.setLeafContents(leftKeys, leftValues);
+            bufferPool.markDirty(indexName, left.getPageId());
+
+            List<Long> childKeys = new ArrayList<>(child.getKeys());
+            List<BTreePage.RID> childValues = new ArrayList<>(child.getLeafValues());
+            childKeys.add(0, borrowedKey);
+            childValues.add(0, borrowedValue);
+            child.setLeafContents(childKeys, childValues);
+            bufferPool.markDirty(indexName, child.getPageId());
+
+            parentKeys.set(childIdx - 1, borrowedKey); // separator = child's new first key
+        } else {
+            List<Long> leftKeys = new ArrayList<>(left.getKeys());
+            List<Long> leftChildren = new ArrayList<>(left.getChildren());
+            long separator = parentKeys.get(childIdx - 1);
+            long movedUpKey = leftKeys.remove(leftKeys.size() - 1);
+            long movedChild = leftChildren.remove(leftChildren.size() - 1);
+            left.setInternalContents(leftKeys, leftChildren);
+            bufferPool.markDirty(indexName, left.getPageId());
+
+            List<Long> childKeys = new ArrayList<>(child.getKeys());
+            List<Long> childChildren = new ArrayList<>(child.getChildren());
+            childKeys.add(0, separator); // parent's old separator becomes child's new first key
+            childChildren.add(0, movedChild);
+            child.setInternalContents(childKeys, childChildren);
+            bufferPool.markDirty(indexName, child.getPageId());
+
+            parentKeys.set(childIdx - 1, movedUpKey); // left sibling's last key rotates up through the parent
+        }
+        parent.setInternalContents(parentKeys, parentChildren);
+    }
+
+    /** Moves right sibling's first entry to become child's new last entry, updating the parent's separator. */
+    private void borrowFromRight(BTreePage parent, List<Long> parentKeys, List<Long> parentChildren,
+                                  int childIdx, BTreePage child, BTreePage right) {
+        if (child.isLeaf()) {
+            List<Long> rightKeys = new ArrayList<>(right.getKeys());
+            List<BTreePage.RID> rightValues = new ArrayList<>(right.getLeafValues());
+            long borrowedKey = rightKeys.remove(0);
+            BTreePage.RID borrowedValue = rightValues.remove(0);
+            right.setLeafContents(rightKeys, rightValues);
+            bufferPool.markDirty(indexName, right.getPageId());
+
+            List<Long> childKeys = new ArrayList<>(child.getKeys());
+            List<BTreePage.RID> childValues = new ArrayList<>(child.getLeafValues());
+            childKeys.add(borrowedKey);
+            childValues.add(borrowedValue);
+            child.setLeafContents(childKeys, childValues);
+            bufferPool.markDirty(indexName, child.getPageId());
+
+            // canLend() already guaranteed right still has >= 1 key left after the removal above.
+            parentKeys.set(childIdx, rightKeys.get(0));
+        } else {
+            List<Long> rightKeys = new ArrayList<>(right.getKeys());
+            List<Long> rightChildren = new ArrayList<>(right.getChildren());
+            long separator = parentKeys.get(childIdx);
+            long movedUpKey = rightKeys.remove(0);
+            long movedChild = rightChildren.remove(0);
+            right.setInternalContents(rightKeys, rightChildren);
+            bufferPool.markDirty(indexName, right.getPageId());
+
+            List<Long> childKeys = new ArrayList<>(child.getKeys());
+            List<Long> childChildren = new ArrayList<>(child.getChildren());
+            childKeys.add(separator);
+            childChildren.add(movedChild);
+            child.setInternalContents(childKeys, childChildren);
+            bufferPool.markDirty(indexName, child.getPageId());
+
+            parentKeys.set(childIdx, movedUpKey);
+        }
+        parent.setInternalContents(parentKeys, parentChildren);
+    }
+
+    /**
+     * Merges rightPage's contents into leftPage (leftPage survives,
+     * rightPage becomes an orphaned, unreferenced page - its space isn't
+     * reclaimed, see this class's javadoc), removing the separator key
+     * between them from the parent along with rightPage's child pointer.
+     */
+    private void mergeChildren(BTreePage parent, List<Long> parentKeys, List<Long> parentChildren,
+                                int leftIdx, BTreePage leftPage, int rightIdx, BTreePage rightPage) {
+        long separator = parentKeys.get(leftIdx);
+
+        if (leftPage.isLeaf()) {
+            List<Long> mergedKeys = new ArrayList<>(leftPage.getKeys());
+            List<BTreePage.RID> mergedValues = new ArrayList<>(leftPage.getLeafValues());
+            mergedKeys.addAll(rightPage.getKeys());
+            mergedValues.addAll(rightPage.getLeafValues());
+            leftPage.setLeafContents(mergedKeys, mergedValues);
+            leftPage.setNextLeafPageId(rightPage.getNextLeafPageId()); // skip the now-orphaned rightPage in the leaf chain
+            bufferPool.markDirty(indexName, leftPage.getPageId());
+        } else {
+            List<Long> mergedKeys = new ArrayList<>(leftPage.getKeys());
+            List<Long> mergedChildren = new ArrayList<>(leftPage.getChildren());
+            mergedKeys.add(separator); // the parent's separator comes down into the merged node
+            mergedKeys.addAll(rightPage.getKeys());
+            mergedChildren.addAll(rightPage.getChildren());
+            leftPage.setInternalContents(mergedKeys, mergedChildren);
+            bufferPool.markDirty(indexName, leftPage.getPageId());
+        }
+
+        parentKeys.remove(leftIdx);
+        parentChildren.remove(rightIdx);
+        parent.setInternalContents(parentKeys, parentChildren);
     }
 
     // --- point search ---
