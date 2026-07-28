@@ -41,17 +41,42 @@ selectList: STAR | selectItem (COMMA selectItem)*;
 selectItem: aggregateFunction (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
 
 // Expressions
-expression: columnName ASSIGN literal
-           | columnName GT literal
-           | columnName LT literal
-           | columnName GE literal
-           | columnName LE literal
-           | columnName NE literal
-           | columnName LIKE literal
-           | columnName IN LPAREN valueList RPAREN
-           | LPAREN expression RPAREN AND expression
-           | LPAREN expression RPAREN OR expression
-           | NOT expression;
+// Alternative order matters for ANTLR4's left-recursion precedence: earlier
+// alternatives bind tighter. Comparisons/IN/EXISTS are the atoms; NOT binds
+// tighter than AND, which binds tighter than OR - standard SQL precedence.
+// Labels (#Name) give each alternative its own generated context class,
+// making SqlParser.buildWhereExpr's tree-walk a straightforward instanceof
+// switch instead of manually checking which optional token is non-null.
+expression: LPAREN expression RPAREN                              #ParenExpr
+          | NOT expression                                        #NotExpr
+          | columnName ASSIGN columnName                           #EqColumnCompare
+          | columnName GT columnName                                #GtColumnCompare
+          | columnName LT columnName                                #LtColumnCompare
+          | columnName GE columnName                                #GeColumnCompare
+          | columnName LE columnName                                #LeColumnCompare
+          | columnName NE columnName                                #NeColumnCompare
+          | columnName ASSIGN literal                              #EqCompare
+          | columnName GT literal                                  #GtCompare
+          | columnName LT literal                                  #LtCompare
+          | columnName GE literal                                  #GeCompare
+          | columnName LE literal                                  #LeCompare
+          | columnName NE literal                                  #NeCompare
+          | columnName LIKE literal                                #LikeCompare
+          | columnName IN LPAREN valueList RPAREN                  #InListExpr
+          | columnName NOT IN LPAREN valueList RPAREN               #NotInListExpr
+          | columnName IN LPAREN select RPAREN                      #InSubqueryExpr
+          | columnName NOT IN LPAREN select RPAREN                  #NotInSubqueryExpr
+          | columnName ASSIGN LPAREN select RPAREN                  #EqSubqueryExpr
+          | columnName GT LPAREN select RPAREN                      #GtSubqueryExpr
+          | columnName LT LPAREN select RPAREN                      #LtSubqueryExpr
+          | columnName GE LPAREN select RPAREN                      #GeSubqueryExpr
+          | columnName LE LPAREN select RPAREN                      #LeSubqueryExpr
+          | columnName NE LPAREN select RPAREN                      #NeSubqueryExpr
+          | EXISTS LPAREN select RPAREN                              #ExistsExpr
+          | NOT EXISTS LPAREN select RPAREN                          #NotExistsExpr
+          | expression AND expression                                #AndExpr
+          | expression OR expression                                 #OrExpr
+          ;
 
 // Values
 valueList: literal (COMMA literal)*;
@@ -102,6 +127,7 @@ AND: A N D;
 OR: O R;
 NOT: N O T;
 IN: I N;
+EXISTS: E X I S T S;
 LIKE: L I K E;
 IS: I S;
 NULL: N U L L;

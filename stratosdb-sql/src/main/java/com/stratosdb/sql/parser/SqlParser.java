@@ -82,8 +82,8 @@ public class SqlParser {
             String value = assignCtx.literal().getText();
             assignments.add(new Assignment(column, value));
         }
-        String whereClause = ctx.expression() != null ? ctx.expression().getText() : null;
-        return new UpdateStatement(tableName, assignments, whereClause);
+        WhereExpr where = buildWhereExpr(ctx.expression());
+        return new UpdateStatement(tableName, assignments, where);
     }
 
     private CreateTableStatement buildCreateTable(StratosSQLParser.CreateTableContext ctx) {
@@ -110,6 +110,115 @@ public class SqlParser {
         }
 
         return new InsertStatement(tableName, values);
+    }
+
+    /**
+     * Recursively walks the labeled `expression` alternatives into a real
+     * WhereExpr tree. Subqueries recurse back into buildSelect, so
+     * arbitrarily nested subqueries (a subquery whose own WHERE contains
+     * another subquery) fall out naturally from the recursion - no special
+     * casing needed for depth.
+     */
+    private WhereExpr buildWhereExpr(StratosSQLParser.ExpressionContext ctx) {
+        if (ctx == null) {
+            return null;
+        }
+        if (ctx instanceof StratosSQLParser.ParenExprContext c) {
+            return buildWhereExpr(c.expression());
+        }
+        if (ctx instanceof StratosSQLParser.NotExprContext c) {
+            return new WhereExpr.Not(buildWhereExpr(c.expression()));
+        }
+        if (ctx instanceof StratosSQLParser.AndExprContext c) {
+            return new WhereExpr.And(buildWhereExpr(c.expression(0)), buildWhereExpr(c.expression(1)));
+        }
+        if (ctx instanceof StratosSQLParser.OrExprContext c) {
+            return new WhereExpr.Or(buildWhereExpr(c.expression(0)), buildWhereExpr(c.expression(1)));
+        }
+        if (ctx instanceof StratosSQLParser.EqColumnCompareContext c) {
+            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "=", c.columnName(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.GtColumnCompareContext c) {
+            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), ">", c.columnName(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.LtColumnCompareContext c) {
+            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "<", c.columnName(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.GeColumnCompareContext c) {
+            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), ">=", c.columnName(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.LeColumnCompareContext c) {
+            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "<=", c.columnName(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.NeColumnCompareContext c) {
+            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "!=", c.columnName(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.EqCompareContext c) {
+            return new WhereExpr.Comparison(c.columnName().getText(), "=", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.GtCompareContext c) {
+            return new WhereExpr.Comparison(c.columnName().getText(), ">", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.LtCompareContext c) {
+            return new WhereExpr.Comparison(c.columnName().getText(), "<", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.GeCompareContext c) {
+            return new WhereExpr.Comparison(c.columnName().getText(), ">=", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.LeCompareContext c) {
+            return new WhereExpr.Comparison(c.columnName().getText(), "<=", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.NeCompareContext c) {
+            return new WhereExpr.Comparison(c.columnName().getText(), "!=", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.LikeCompareContext c) {
+            return new WhereExpr.Like(c.columnName().getText(), c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.InListExprContext c) {
+            return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), false);
+        }
+        if (ctx instanceof StratosSQLParser.NotInListExprContext c) {
+            return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), true);
+        }
+        if (ctx instanceof StratosSQLParser.InSubqueryExprContext c) {
+            return new WhereExpr.InSubquery(c.columnName().getText(), buildSelect(c.select()), false);
+        }
+        if (ctx instanceof StratosSQLParser.NotInSubqueryExprContext c) {
+            return new WhereExpr.InSubquery(c.columnName().getText(), buildSelect(c.select()), true);
+        }
+        if (ctx instanceof StratosSQLParser.EqSubqueryExprContext c) {
+            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "=", buildSelect(c.select()));
+        }
+        if (ctx instanceof StratosSQLParser.GtSubqueryExprContext c) {
+            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), ">", buildSelect(c.select()));
+        }
+        if (ctx instanceof StratosSQLParser.LtSubqueryExprContext c) {
+            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "<", buildSelect(c.select()));
+        }
+        if (ctx instanceof StratosSQLParser.GeSubqueryExprContext c) {
+            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), ">=", buildSelect(c.select()));
+        }
+        if (ctx instanceof StratosSQLParser.LeSubqueryExprContext c) {
+            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "<=", buildSelect(c.select()));
+        }
+        if (ctx instanceof StratosSQLParser.NeSubqueryExprContext c) {
+            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "!=", buildSelect(c.select()));
+        }
+        if (ctx instanceof StratosSQLParser.ExistsExprContext c) {
+            return new WhereExpr.ExistsSubquery(buildSelect(c.select()), false);
+        }
+        if (ctx instanceof StratosSQLParser.NotExistsExprContext c) {
+            return new WhereExpr.ExistsSubquery(buildSelect(c.select()), true);
+        }
+        throw new IllegalArgumentException("Unsupported expression: " + ctx.getText());
+    }
+
+    private List<String> buildValueList(StratosSQLParser.ValueListContext ctx) {
+        List<String> values = new ArrayList<>();
+        for (StratosSQLParser.LiteralContext lit : ctx.literal()) {
+            values.add(lit.getText());
+        }
+        return values;
     }
 
     private SelectStatement buildSelect(StratosSQLParser.SelectContext ctx) {
@@ -151,10 +260,10 @@ public class SqlParser {
         }
 
         String havingClause = ctx.havingClause() != null ? ctx.havingClause().getText() : null;
-        String whereClause = ctx.expression() != null ? ctx.expression().getText() : null;
+        WhereExpr where = buildWhereExpr(ctx.expression());
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, whereClause, null, limit, joins, aggregates, groupBy, havingClause);
+        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause);
     }
 
     private AggregateCall buildAggregateCall(StratosSQLParser.AggregateFunctionContext ctx, String alias) {
@@ -179,8 +288,8 @@ public class SqlParser {
 
     private DeleteStatement buildDelete(StratosSQLParser.DeleteContext ctx) {
         String tableName = ctx.tableName().getText();
-        String whereClause = ctx.expression() != null ? ctx.expression().getText() : null;
-        return new DeleteStatement(tableName, whereClause);
+        WhereExpr where = buildWhereExpr(ctx.expression());
+        return new DeleteStatement(tableName, where);
     }
 
     private DropTableStatement buildDropTable(StratosSQLParser.DropTableContext ctx) {

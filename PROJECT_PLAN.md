@@ -70,7 +70,7 @@ Given that, the real goal for Part 2 is: close the feature gaps that matter most
 | Query optimizer | Cost-based for scan choice (seq vs. index) when ANALYZE has run, uniform-distribution assumption; join strategy still unconditional (always hash join) | Cost-based, statistics-driven, histograms/MCV lists | Moderate |
 | JOINs | Hash join (equality only); no merge join, no join reordering | Nested loop, hash join, merge join, join reordering | Moderate |
 | Aggregation | `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` done; no window functions, no CTEs | Full | Moderate |
-| Subqueries | **None** | Full (scalar, correlated, `EXISTS`, CTEs, recursive) | Large |
+| Subqueries | Scalar, `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS` (correlated) done; no CTEs, no recursive queries | Full (scalar, correlated, `EXISTS`, CTEs, recursive) | Moderate |
 | Wire protocol | Custom, not pg-wire compatible | The format every pg client/tool already speaks | Large (ecosystem, not just code) |
 | Replication | None | Streaming, logical, synchronous options | Large |
 | Extensibility | None (no views, triggers, stored procs) | Views, triggers, PL/pgSQL, hundreds of extensions | Large |
@@ -111,10 +111,10 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 | Cost-based optimizer | ✅ done | Statistics | Replaced the rule-based planner with real cost comparison (seq scan vs. index scan), falling back to the old rule-based heuristic when no statistics exist. Demonstrated with real data switching plans correctly in both directions - see PROGRESS.md. Known limitation: assumes uniform value distribution (no histogram/MCV tracking like real Postgres), and doesn't yet inform join-strategy choice (hash join is still unconditional, not compared against alternatives). |
 | `GROUP BY` / `HAVING` / aggregates (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) | ✅ done | none | Was completely absent, now real - see PROGRESS.md. Known gap: doesn't combine with JOIN yet (a query using both silently skips grouping rather than erroring - a named follow-up). |
 | Hash join | ✅ done | none | Replaced nested-loop as the sole join algorithm - see PROGRESS.md for real measured numbers (4.4x-10.9x, widening with scale, exactly as O(n·m) vs O(n+m) predicts). Not yet a genuine cost-based *choice* between strategies (there's still no statistics to base one on) - it's "always hash join," which is correct since every JOIN this grammar supports is equality-only. |
-| Subqueries (scalar, `EXISTS`, `IN`) | 🟡 | none, but aggregates will likely land first in practice | Needs the grammar extended again (same pattern as JOIN support in Part 1) plus real plan-time handling, not string substitution. |
+| Subqueries (scalar, `EXISTS`, `IN`) | ✅ done | none | Scalar comparison, `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS` including correlated `EXISTS` - see PROGRESS.md. Built on top of a real WHERE-clause expression tree that replaced the previous raw-text design (which had silently broken `AND`/`OR`/`NOT`/`LIKE`/`IN` - a real bug found and fixed along the way, not a hypothetical one). Known limit: correlation isn't threaded through a subquery that itself contains a JOIN or GROUP BY. |
 | Merge join | 🟡 | none | Valuable for pre-sorted inputs specifically. The cost-based optimizer (done, above) only compares scan strategies so far, not join strategies - hash join is still chosen unconditionally for every equality join. Adding merge join as a real alternative needs that comparison extended to joins too, not just scans. |
 | Window functions | 🟢 | Aggregates | `ROW_NUMBER`, `RANK`, etc. — real, but less broadly used than basic aggregation. |
-| CTEs, `WITH RECURSIVE` | 🟢 | Subqueries | Recursive CTEs are a genuinely different execution model (iterate to a fixpoint), not just more grammar. |
+| CTEs, `WITH RECURSIVE` | 🟢 | none (subqueries, above, are done) | Recursive CTEs are a genuinely different execution model (iterate to a fixpoint), not just more grammar. |
 
 ### Phase C — More indexing 🟡
 
@@ -157,9 +157,9 @@ The largest single gap versus PostgreSQL, and the highest-leverage phase for "fe
 
 ### If forced to pick just one thing next
 
-Two fronts have real progress now, both with measured/demonstrated proof rather than just claims (see PROGRESS.md for all of it): **Phase A's storage hardening** (B+Tree delete, then vacuum - a table under real UPDATE/DELETE traffic no longer accumulates stale index entries or dead heap space forever) and **Phase B's query engine depth** (`GROUP BY`/aggregates, hash join, and a genuinely cost-based scan planner). A database with correct MVCC, an index that could insert but never delete, dead tuples that could never be reclaimed, no `GROUP BY`, every join a nested loop, and a planner that only ever asked "does an index exist" didn't feel like PostgreSQL; one where deletion actually shrinks the index, vacuum actually shrinks the heap, aggregation is real, joins are real, and the planner can correctly reject an index for an unselective predicate does — even with plenty of gaps still open elsewhere.
+Two fronts have real progress now, both with measured/demonstrated proof rather than just claims (see PROGRESS.md for all of it): **Phase A's storage hardening** (B+Tree delete, then vacuum - a table under real UPDATE/DELETE traffic no longer accumulates stale index entries or dead heap space forever) and **Phase B's query engine depth** (`GROUP BY`/aggregates, hash join, a genuinely cost-based scan planner, and - the latest addition - a real WHERE-clause expression tree with subqueries, which along the way surfaced and fixed a real bug: `AND`/`OR`/`NOT`/`LIKE`/`IN` were accepted by the grammar but silently misevaluated, returning wrong rows for any compound condition). A database with correct MVCC, an index that could insert but never delete, dead tuples that could never be reclaimed, no `GROUP BY`, every join a nested loop, a planner that only ever asked "does an index exist," and a WHERE clause that quietly ignored AND didn't feel like PostgreSQL; one where all of that is real does — even with plenty of gaps still open elsewhere.
 
-What's left in Phase A: a free-space map (inserts still scan every existing page for room - an efficiency gap, not a correctness one) and autovacuum (automating what now works manually). What's left in Phase B: subqueries (the next biggest SQL-surface gap), then merge join, window functions, and CTEs.
+What's left in Phase A: a free-space map (inserts still scan every existing page for room - an efficiency gap, not a correctness one) and autovacuum (automating what now works manually). What's left in Phase B: merge join, window functions, and CTEs.
 
 ---
 

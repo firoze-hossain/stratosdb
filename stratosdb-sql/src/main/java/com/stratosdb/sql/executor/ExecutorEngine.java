@@ -336,7 +336,7 @@ public class ExecutorEngine {
             return executeAggregateSelect(stmt, txn, table);
         }
 
-        ScanPlan plan = planScan(stmt.tableName(), stmt.whereClause());
+        ScanPlan plan = planScan(stmt.tableName(), stmt.where());
         List<Tuple> tuples = new ArrayList<>();
 
         if (plan.useIndex()) {
@@ -350,7 +350,7 @@ public class ExecutorEngine {
                     continue; // stale index entry (from an update/delete) or not visible to this snapshot
                 }
                 Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
-                if (!matchesWhere(tuple, stmt.whereClause())) {
+                if (!matchesWhere(tuple, stmt.where(), txn)) {
                     continue; // defensive re-check, keeps index-scan results identical to seq-scan results
                 }
                 tuples.add(project(tuple, stmt.columns()));
@@ -359,7 +359,7 @@ public class ExecutorEngine {
             List<byte[]> visibleRows = table.scanMvcc(txn.getSnapshot(), transactionManager);
             for (byte[] data : visibleRows) {
                 Tuple tuple = Tuple.deserialize(data);
-                if (!matchesWhere(tuple, stmt.whereClause())) {
+                if (!matchesWhere(tuple, stmt.where(), txn)) {
                     continue;
                 }
                 tuples.add(project(tuple, stmt.columns()));
@@ -400,7 +400,7 @@ public class ExecutorEngine {
         List<Tuple> filteredRows = new ArrayList<>();
         for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
             Tuple tuple = Tuple.deserialize(raw);
-            if (matchesWhere(tuple, stmt.whereClause())) {
+            if (matchesWhere(tuple, stmt.where(), txn)) {
                 filteredRows.add(tuple);
             }
         }
@@ -580,7 +580,7 @@ public class ExecutorEngine {
 
         List<Tuple> tuples = new ArrayList<>();
         for (Tuple row : current) {
-            if (!matchesWhere(row, stmt.whereClause())) {
+            if (!matchesWhere(row, stmt.where(), txn)) {
                 continue;
             }
             tuples.add(project(row, stmt.columns()));
@@ -704,7 +704,7 @@ public class ExecutorEngine {
                 + " (no index acceleration for aggregate queries yet)");
         }
 
-        ScanPlan plan = planScan(select.tableName(), select.whereClause());
+        ScanPlan plan = planScan(select.tableName(), select.where());
         String costSuffix = plan.hasStatistics()
             ? String.format(" (cost=%.1f)", plan.estimatedCost())
             : " (no statistics - run ANALYZE for a cost-based choice)";
@@ -749,12 +749,16 @@ public class ExecutorEngine {
      * heuristic, not better - the same reasoning Postgres itself uses
      * when statistics are unavailable.
      */
-    private ScanPlan planScan(String tableName, String whereClause) {
+    private ScanPlan planScan(String tableName, WhereExpr where) {
         TableStatistics stats = statistics.get(tableName);
         boolean hasStats = stats != null;
 
-        WherePredicate pred = parseWhere(whereClause);
-        if (pred == null || !pred.isNumeric()) {
+        WhereExpr.Comparison cmp = extractSimpleComparison(where);
+        if (cmp == null) {
+            return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
+        }
+        WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), cmp.literal());
+        if (!pred.isNumeric()) {
             return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
         IndexEntry idx = findIndex(tableName, pred.column());
@@ -787,6 +791,27 @@ public class ExecutorEngine {
         return idxCost < seqCost
             ? ScanPlan.indexScan(idx, lo, hi, idxCost, true)
             : ScanPlan.seqScan(seqCost, true);
+    }
+
+    /**
+     * Extracts one top-level equality/range comparison usable for index
+     * scan planning, if the WHERE clause is simple enough - just one
+     * Comparison, or an AND containing one (the first one found; picking
+     * a single driving comparison out of several AND'd conditions and
+     * filtering the rest afterward via matchesWhere's defensive re-check
+     * is standard practice, not a shortcut unique to this planner).
+     * OR/NOT/LIKE/IN/subqueries aren't usable for this simple contiguous-
+     * range mechanism and correctly fall back to a full scan.
+     */
+    private WhereExpr.Comparison extractSimpleComparison(WhereExpr where) {
+        if (where instanceof WhereExpr.Comparison cmp) {
+            return cmp;
+        }
+        if (where instanceof WhereExpr.And and) {
+            WhereExpr.Comparison left = extractSimpleComparison(and.left());
+            return left != null ? left : extractSimpleComparison(and.right());
+        }
+        return null;
     }
 
     private double costSeqScan(TableStatistics stats) {
@@ -895,7 +920,7 @@ public class ExecutorEngine {
             }
             byte[] oldPayload = MVCCVisibility.readPayload(row.stored());
             Tuple tuple = Tuple.deserialize(oldPayload);
-            if (!matchesWhere(tuple, stmt.whereClause())) {
+            if (!matchesWhere(tuple, stmt.where(), txn)) {
                 continue;
             }
 
@@ -938,7 +963,7 @@ public class ExecutorEngine {
                 continue;
             }
             Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
-            if (!matchesWhere(tuple, stmt.whereClause())) {
+            if (!matchesWhere(tuple, stmt.where(), txn)) {
                 continue;
             }
 
@@ -1056,38 +1081,266 @@ public class ExecutorEngine {
     }
 
     /**
-     * WHERE-clause row matching, factored out so UPDATE/DELETE/SELECT share
-     * one implementation. Also fixes a second real bug alongside the parser
-     * fix above: this used to detect an operator only to decide how to split
-     * the clause, then unconditionally check equality regardless of which
-     * operator was found - so "WHERE age>25" silently behaved exactly like
-     * "WHERE age=25". Every operator is now actually evaluated.
+     * WHERE-clause evaluation over a real expression tree - replaces the
+     * previous design, which captured the whole clause as raw text and
+     * treated it as a single flat "column op literal" predicate no matter
+     * what it actually contained. AND/OR/NOT/LIKE/IN were all accepted by
+     * the grammar but silently misevaluated: a compound AND condition like
+     * "(age>25) AND status='active'" returned WRONG rows rather than an
+     * error, because the old code just grabbed whichever comparison
+     * operator it found anywhere in the raw text and ignored the rest.
+     * Found by testing this specific case, not by inspection - see
+     * PROGRESS.md.
+     *
+     * outerRow is non-null only when evaluating a correlated subquery's
+     * own WHERE clause (see runSubquerySelect) - consulted as a fallback
+     * whenever a column reference isn't found in the row actually being
+     * tested, which is exactly what correlation means: "not a column of
+     * my own table."
      */
-    private boolean matchesWhere(Tuple tuple, String whereClause) {
-        WherePredicate pred = parseWhere(whereClause);
-        if (pred == null) {
-            return true; // no WHERE clause, or unparsable - same permissive fallback as before
-        }
+    private boolean matchesWhere(Tuple tuple, WhereExpr where, Transaction txn) {
+        return matchesWhere(tuple, where, txn, null);
+    }
 
-        Object value = findColumnValue(tuple, pred.column());
+    private boolean matchesWhere(Tuple tuple, WhereExpr where, Transaction txn, Tuple outerRow) {
+        if (where == null) {
+            return true;
+        }
+        return evaluateWhereExpr(tuple, where, txn, outerRow);
+    }
+
+    private boolean evaluateWhereExpr(Tuple row, WhereExpr expr, Transaction txn, Tuple outerRow) {
+        if (expr instanceof WhereExpr.And and) {
+            return evaluateWhereExpr(row, and.left(), txn, outerRow) && evaluateWhereExpr(row, and.right(), txn, outerRow);
+        }
+        if (expr instanceof WhereExpr.Or or) {
+            return evaluateWhereExpr(row, or.left(), txn, outerRow) || evaluateWhereExpr(row, or.right(), txn, outerRow);
+        }
+        if (expr instanceof WhereExpr.Not not) {
+            return !evaluateWhereExpr(row, not.inner(), txn, outerRow);
+        }
+        if (expr instanceof WhereExpr.Comparison cmp) {
+            return evaluateComparison(row, cmp, outerRow);
+        }
+        if (expr instanceof WhereExpr.ColumnComparison colCmp) {
+            Object left = resolveColumnValue(row, colCmp.leftColumn(), outerRow);
+            Object right = resolveColumnValue(row, colCmp.rightColumn(), outerRow);
+            return left != null && right != null && compareValues(left, colCmp.operator(), right);
+        }
+        if (expr instanceof WhereExpr.Like like) {
+            Object value = resolveColumnValue(row, like.column(), outerRow);
+            return value != null && matchesLikePattern(value.toString(), stripQuotes(like.pattern()));
+        }
+        if (expr instanceof WhereExpr.InList inList) {
+            Object value = resolveColumnValue(row, inList.column(), outerRow);
+            if (value == null) {
+                return false;
+            }
+            boolean found = false;
+            for (String literalText : inList.values()) {
+                if (compareValues(value, "=", stripQuotes(literalText))) {
+                    found = true;
+                    break;
+                }
+            }
+            return inList.negated() != found;
+        }
+        if (expr instanceof WhereExpr.InSubquery inSub) {
+            Object value = resolveColumnValue(row, inSub.column(), outerRow);
+            if (value == null) {
+                return false;
+            }
+            List<Object> subValues = evaluateSubqueryValues(inSub.subquery(), txn, row);
+            boolean found = subValues.stream().anyMatch(sv -> sv != null && compareValues(value, "=", sv));
+            return inSub.negated() != found;
+        }
+        if (expr instanceof WhereExpr.ScalarSubqueryComparison scalarCmp) {
+            Object value = resolveColumnValue(row, scalarCmp.column(), outerRow);
+            if (value == null) {
+                return false;
+            }
+            Object subValue = evaluateScalarSubqueryValue(scalarCmp.subquery(), txn, row);
+            return subValue != null && compareValues(value, scalarCmp.operator(), subValue);
+        }
+        if (expr instanceof WhereExpr.ExistsSubquery existsSub) {
+            boolean hasRows = evaluateSubqueryHasRows(existsSub.subquery(), txn, row);
+            return existsSub.negated() != hasRows;
+        }
+        throw new IllegalStateException("Unhandled WhereExpr type: " + expr.getClass());
+    }
+
+    /** Preserves a pre-existing, non-standard fallback: if the named column isn't found anywhere, an equality comparison still matches if ANY column in the row equals the literal. Ordering comparisons have no sensible version of this and simply don't match. */
+    private boolean evaluateComparison(Tuple row, WhereExpr.Comparison cmp, Tuple outerRow) {
+        Object value = resolveColumnValue(row, cmp.column(), outerRow);
+        WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), cmp.literal());
         if (value != null) {
             return evaluatePredicate(value.toString(), pred);
         }
-
-        // Column name didn't match anything in this tuple. The original code
-        // fell back to "does ANY column hold this value" for such cases -
-        // preserved here, but only for equality: an ordering comparison
-        // ("> 25") doesn't have a sensible "check every column" fallback.
         if (!pred.operator().equals("=")) {
             return false;
         }
-        for (int i = 0; i < tuple.size(); i++) {
-            Object anyValue = tuple.getValue(i);
+        for (int i = 0; i < row.size(); i++) {
+            Object anyValue = row.getValue(i);
             if (anyValue != null && evaluatePredicate(anyValue.toString(), pred)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private Object resolveColumnValue(Tuple row, String column, Tuple outerRow) {
+        Object value = findColumnValue(row, column);
+        if (value == null && outerRow != null) {
+            value = findColumnValue(outerRow, column);
+        }
+        return value;
+    }
+
+    private WherePredicate toPredicate(String column, String operator, String literalText) {
+        String value = stripQuotes(literalText);
+        boolean isNumeric;
+        try {
+            Double.parseDouble(value);
+            isNumeric = true;
+        } catch (NumberFormatException e) {
+            isNumeric = false;
+        }
+        return new WherePredicate(column, operator, value, isNumeric);
+    }
+
+    private String stripQuotes(String literalText) {
+        if (literalText.startsWith("'") && literalText.endsWith("'")) {
+            return literalText.substring(1, literalText.length() - 1);
+        }
+        return literalText;
+    }
+
+    /** Numeric-aware equality/ordering between two already-resolved values (as opposed to evaluatePredicate, which compares a resolved value against raw literal text). */
+    private boolean compareValues(Object a, String operator, Object b) {
+        Double da = asNumberOrNull(a);
+        Double db = asNumberOrNull(b);
+        if (da != null && db != null) {
+            return switch (operator) {
+                case "=" -> da.doubleValue() == db.doubleValue();
+                case "!=" -> da.doubleValue() != db.doubleValue();
+                case ">" -> da > db;
+                case ">=" -> da >= db;
+                case "<" -> da < db;
+                case "<=" -> da <= db;
+                default -> false;
+            };
+        }
+        String sa = a.toString();
+        String sb = b.toString();
+        return switch (operator) {
+            case "=" -> sa.equals(sb);
+            case "!=" -> !sa.equals(sb);
+            default -> false; // ordering comparisons on non-numeric values aren't supported
+        };
+    }
+
+    private Double asNumberOrNull(Object value) {
+        if (value instanceof Number n) {
+            return n.doubleValue();
+        }
+        try {
+            return Double.parseDouble(value.toString());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** SQL LIKE semantics: % matches any sequence (including empty), _ matches exactly one character. */
+    private boolean matchesLikePattern(String value, String pattern) {
+        StringBuilder regex = new StringBuilder();
+        for (char c : pattern.toCharArray()) {
+            switch (c) {
+                case '%' -> regex.append(".*");
+                case '_' -> regex.append(".");
+                case '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|', '\\' -> regex.append('\\').append(c);
+                default -> regex.append(c);
+            }
+        }
+        return value.matches(regex.toString());
+    }
+
+    // --- subqueries ---
+
+    /**
+     * Runs a subquery for WHERE-clause evaluation (IN / EXISTS / scalar
+     * comparison). Supports correlation: if outerRow is non-null, any
+     * column in the subquery's own WHERE clause not found in the row
+     * currently being tested falls back to outerRow - the same mechanism
+     * findColumnValue already uses for qualified-column fallback in
+     * joins, just reaching one level further out.
+     *
+     * Scope, stated plainly: this handles the common case (a plain scan
+     * with a WHERE clause). JOINs or GROUP BY/aggregates inside a
+     * subquery still work, but not combined with correlation - a
+     * correlated reference inside a joined or aggregated subquery isn't
+     * threaded through here. That's a real, further limitation, not
+     * silently miscalculated: such a reference just wouldn't resolve,
+     * behaving as if the column doesn't exist (the same well-defined
+     * "not found" behavior as any other unresolvable column reference).
+     */
+    private QueryResult runSubquerySelect(SelectStatement subquery, Transaction txn, Tuple outerRow) {
+        if (subquery.joins() != null && !subquery.joins().isEmpty()) {
+            return executeJoinedSelect(subquery, txn);
+        }
+        HeapTable table = tables.get(subquery.tableName());
+        if (table == null) {
+            return QueryResult.error("Table not found: " + subquery.tableName());
+        }
+        if (!subquery.aggregates().isEmpty() || !subquery.groupBy().isEmpty()) {
+            return executeAggregateSelect(subquery, txn, table);
+        }
+
+        List<Tuple> tuples = new ArrayList<>();
+        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
+            // Qualifying the inner row (the same mechanism JOIN uses) is what
+            // makes correlation safe: "orders.customer_id = customers.id"
+            // then resolves "orders.customer_id" by an exact match against
+            // this row, and "customers.id" correctly finds no match here at
+            // all (falling through to outerRow) instead of risking an
+            // accidental match against some unrelated same-named column of
+            // this table (both "orders" and "customers" happen to have an
+            // "id" column - without qualifying, a naive bare-name fallback
+            // could resolve "customers.id" against orders' OWN id by mistake).
+            Tuple tuple = qualify(Tuple.deserialize(raw), subquery.tableName());
+            if (matchesWhere(tuple, subquery.where(), txn, outerRow)) {
+                tuples.add(project(tuple, subquery.columns()));
+            }
+        }
+        return QueryResult.success(tuples);
+    }
+
+    /** Every value from the subquery's (single) result column - for IN (SELECT ...). */
+    private List<Object> evaluateSubqueryValues(SelectStatement subquery, Transaction txn, Tuple outerRow) {
+        QueryResult result = runSubquerySelect(subquery, txn, outerRow);
+        if (!result.isSuccess() || result.getRows() == null) {
+            return List.of();
+        }
+        List<Object> values = new ArrayList<>();
+        for (Tuple row : result.getRows()) {
+            if (row.size() > 0) {
+                values.add(row.getValue(0));
+            }
+        }
+        return values;
+    }
+
+    /** For a scalar comparison, e.g. "salary > (SELECT AVG(salary) FROM employees)" - errors if the subquery returns more than one row, matching standard SQL scalar-subquery semantics. */
+    private Object evaluateScalarSubqueryValue(SelectStatement subquery, Transaction txn, Tuple outerRow) {
+        List<Object> values = evaluateSubqueryValues(subquery, txn, outerRow);
+        if (values.size() > 1) {
+            throw new IllegalStateException("Scalar subquery returned more than one row");
+        }
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    private boolean evaluateSubqueryHasRows(SelectStatement subquery, Transaction txn, Tuple outerRow) {
+        QueryResult result = runSubquerySelect(subquery, txn, outerRow);
+        return result.isSuccess() && result.getRows() != null && !result.getRows().isEmpty();
     }
 
     private Object findColumnValue(Tuple tuple, String columnName) {
@@ -1109,6 +1362,18 @@ public class ExecutorEngine {
             String suffix = "." + columnName.toLowerCase();
             for (int i = 0; i < columnNames.size(); i++) {
                 if (columnNames.get(i).toLowerCase().endsWith(suffix)) {
+                    return tuple.getValue(i);
+                }
+            }
+        } else {
+            // The reverse direction: a QUALIFIED request ("orders.customer_id")
+            // against a PLAIN, unqualified tuple (customer_id) - the shape a
+            // correlated subquery predicate takes when compared against its
+            // own (non-joined) FROM table's scan, since only JOIN's qualify()
+            // actually prefixes column names; a plain table scan never does.
+            String unqualified = columnName.substring(columnName.lastIndexOf('.') + 1);
+            for (int i = 0; i < columnNames.size(); i++) {
+                if (columnNames.get(i).equalsIgnoreCase(unqualified)) {
                     return tuple.getValue(i);
                 }
             }

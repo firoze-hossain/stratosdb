@@ -555,6 +555,172 @@ public class StratosDBTest {
         assertEquals("Vacuumed t: reclaimed 0 dead row version(s) across 0 page(s)", again.getMessage());
     }
 
+    // --- Compound WHERE clauses: AND/OR/NOT/LIKE/IN were previously broken -
+    // the grammar accepted them but the executor silently misevaluated
+    // anything beyond a single flat predicate. See PROJECT_PLAN.md/PROGRESS.md
+    // for how this was found (a real bug, not a hypothetical one).
+
+    @Test
+    void testAndCorrectlyExcludesRowsFailingEitherSide() {
+        database.execute("CREATE TABLE t (id INT, age INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 30, 'active')");
+        database.execute("INSERT INTO t VALUES (2, 20, 'inactive')");
+        database.execute("INSERT INTO t VALUES (3, 40, 'active')");
+        database.execute("INSERT INTO t VALUES (4, 20, 'active')"); // active but age<=25 - AND must exclude this
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE age>25 AND status='active'");
+        assertTrue(result.isSuccess());
+        assertEquals(2, result.getRows().size(), "only id 1 and 3 satisfy both conditions");
+    }
+
+    @Test
+    void testOrIncludesRowsMatchingEitherSide() {
+        database.execute("CREATE TABLE t (id INT, age INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 30, 'active')");
+        database.execute("INSERT INTO t VALUES (2, 20, 'inactive')");
+        database.execute("INSERT INTO t VALUES (3, 10, 'dormant')");
+
+        assertRowCount("SELECT * FROM t WHERE age>25 OR status='inactive'", 2); // id 1, 2
+    }
+
+    @Test
+    void testNotInvertsTheInnerCondition() {
+        database.execute("CREATE TABLE t (id INT, age INT)");
+        database.execute("INSERT INTO t VALUES (1, 30)");
+        database.execute("INSERT INTO t VALUES (2, 20)");
+
+        assertRowCount("SELECT * FROM t WHERE NOT age>25", 1); // id 2
+    }
+
+    @Test
+    void testInAndNotInWithLiteralList() {
+        database.execute("CREATE TABLE t (id INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'active')");
+        database.execute("INSERT INTO t VALUES (2, 'inactive')");
+        database.execute("INSERT INTO t VALUES (3, 'active')");
+
+        assertRowCount("SELECT * FROM t WHERE status IN ('active')", 2);
+        assertRowCount("SELECT * FROM t WHERE status NOT IN ('active')", 1);
+    }
+
+    @Test
+    void testLikePatternMatching() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'Alice')");
+        database.execute("INSERT INTO t VALUES (2, 'Bob')");
+        database.execute("INSERT INTO t VALUES (3, 'Alan')");
+
+        assertRowCount("SELECT * FROM t WHERE name LIKE 'Al%'", 2); // Alice, Alan
+        assertRowCount("SELECT * FROM t WHERE name LIKE '_ob'", 1); // Bob
+    }
+
+    @Test
+    void testNestedAndOrWithParentheses() {
+        database.execute("CREATE TABLE t (id INT, age INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 30, 'active')");
+        database.execute("INSERT INTO t VALUES (2, 20, 'inactive')");
+        database.execute("INSERT INTO t VALUES (3, 40, 'dormant')");
+
+        assertRowCount("SELECT * FROM t WHERE (age>25 AND status='active') OR id=2", 2); // id 1, 2
+    }
+
+    // --- Subqueries: previously entirely absent ---
+
+    @Test
+    void testInSubquery() {
+        database.execute("CREATE TABLE customers (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, customer_id INT)");
+        database.execute("INSERT INTO customers VALUES (1, 'Alice')");
+        database.execute("INSERT INTO customers VALUES (2, 'Bob')");
+        database.execute("INSERT INTO orders VALUES (100, 1)");
+
+        QueryResult result = database.execute("SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders)");
+        assertTrue(result.isSuccess(), () -> "IN subquery failed: " + result.getError());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Alice", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testNotInSubquery() {
+        database.execute("CREATE TABLE customers (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, customer_id INT)");
+        database.execute("INSERT INTO customers VALUES (1, 'Alice')");
+        database.execute("INSERT INTO customers VALUES (2, 'Bob')");
+        database.execute("INSERT INTO orders VALUES (100, 1)");
+
+        QueryResult result = database.execute("SELECT * FROM customers WHERE id NOT IN (SELECT customer_id FROM orders)");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Bob", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testScalarSubqueryComparison() {
+        database.execute("CREATE TABLE orders (id INT, amount INT)");
+        database.execute("INSERT INTO orders VALUES (1, 50)");
+        database.execute("INSERT INTO orders VALUES (2, 150)");
+        database.execute("INSERT INTO orders VALUES (3, 300)");
+
+        // average = (50+150+300)/3 = 166.67
+        QueryResult result = database.execute("SELECT * FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)");
+        assertTrue(result.isSuccess(), () -> "scalar subquery failed: " + result.getError());
+        assertEquals(1, result.getRows().size());
+        assertEquals(300, result.getRows().get(0).getValue("amount"));
+    }
+
+    @Test
+    void testCorrelatedExists() {
+        database.execute("CREATE TABLE customers (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, customer_id INT)");
+        database.execute("INSERT INTO customers VALUES (1, 'Alice')"); // has an order
+        database.execute("INSERT INTO customers VALUES (2, 'Bob')");   // has no orders
+        database.execute("INSERT INTO orders VALUES (100, 1)");
+
+        QueryResult result = database.execute(
+            "SELECT * FROM customers WHERE EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id)");
+        assertTrue(result.isSuccess(), () -> "correlated EXISTS failed: " + result.getError());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Alice", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testCorrelatedNotExists() {
+        database.execute("CREATE TABLE customers (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE orders (id INT, customer_id INT)");
+        database.execute("INSERT INTO customers VALUES (1, 'Alice')");
+        database.execute("INSERT INTO customers VALUES (2, 'Bob')");
+        database.execute("INSERT INTO orders VALUES (100, 1)");
+
+        QueryResult result = database.execute(
+            "SELECT * FROM customers WHERE NOT EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id)");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Bob", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testSubqueriesWorkWithUpdateAndDelete() {
+        database.execute("CREATE TABLE customers (id INT, name VARCHAR, flagged INT)");
+        database.execute("CREATE TABLE orders (id INT, customer_id INT, amount INT)");
+        database.execute("INSERT INTO customers VALUES (1, 'Alice', 0)");
+        database.execute("INSERT INTO customers VALUES (2, 'Bob', 0)");
+        database.execute("INSERT INTO orders VALUES (100, 1, 500)");
+
+        QueryResult updateResult = database.execute(
+            "UPDATE customers SET flagged=1 WHERE id IN (SELECT customer_id FROM orders WHERE amount > 100)");
+        assertTrue(updateResult.isSuccess(), () -> "UPDATE with subquery failed: " + updateResult.getError());
+        assertEquals("Updated 1 row(s)", updateResult.getMessage());
+
+        assertRowCount("SELECT * FROM customers WHERE flagged=1", 1);
+
+        QueryResult deleteResult = database.execute(
+            "DELETE FROM customers WHERE id NOT IN (SELECT customer_id FROM orders)");
+        assertTrue(deleteResult.isSuccess(), () -> "DELETE with subquery failed: " + deleteResult.getError());
+        assertEquals("Deleted 1 row(s)", deleteResult.getMessage()); // Bob has no orders
+
+        assertRowCount("SELECT * FROM customers", 1);
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

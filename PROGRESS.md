@@ -7,10 +7,10 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Main source | ~3,383 lines |
-| Test source | ~765 lines |
-| Tests passing | **78 / 78** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A's B+Tree delete + vacuum done; Phase B (GROUP BY/aggregates, hash join, statistics/cost-based optimizer) done |
+| Main source | ~6,760 lines |
+| Test source | ~2,454 lines |
+| Tests passing | **90 / 90** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A's B+Tree delete + vacuum done; Phase B (GROUP BY/aggregates, hash join, statistics/cost-based optimizer, subqueries) done |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -88,12 +88,12 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
 | `stratosdb-storage` | 10 | 1,842 | Real — disk/buffer/WAL/heap, a page-type-agnostic buffer pool, an idempotent shutdown path, and real page compaction (defragment) backing vacuum |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 20 | 1,492 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM) + hand-written AST builder + cost-based executor |
+| `stratosdb-sql` | 21 | 1,904 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM, subqueries) + hand-written AST builder + a real WHERE-clause expression tree + cost-based executor |
 | `stratosdb-index` | 1 | 567 | Real — B+Tree with real insert, search, range scan, *and delete* (borrow/merge/root-collapse), tested at scale in both directions, wired into query execution via the planner |
 | `stratosdb-network` | 5 | 621 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server, all tested over real sockets |
 | `stratosdb-jdbc` | 6 | 741 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support, verified through `DriverManager` |
 | `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
-| `stratosdb-testing` | 0 (test-only) | — | 36 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 48 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 **Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
@@ -147,9 +147,21 @@ Unblocked by B+Tree delete (above). MVCC without vacuum means dead tuples never 
 - **Known, named limitation**: this is manual, not automatic - there's no autovacuum background process (Phase E). A table that's never `VACUUM`ed behaves exactly as it always has.
 - 5 new tests in `VacuumTest` (reclaim correctness, the cross-transaction safety property in both directions, idempotency, and an aborted-delete's xmax correctly NOT being treated as a committed removal) plus 2 SQL-level tests in `StratosDBTest`.
 
+## Phase B — Real WHERE-clause evaluation + subqueries ✅ done (fourth item)
+
+Set out to add subqueries. Found something bigger first, and fixed that before building on top of it - see below.
+
+- **A major, previously-undiscovered bug found and fixed**: `AND`, `OR`, `NOT`, `LIKE`, and `IN` were all accepted by the grammar but silently misevaluated by the executor, which treated every WHERE clause as a single flat "column op literal" predicate no matter how it was actually written. `WHERE (age>25) AND status='active'` returned **wrong rows, not an error** - a row with `status='active'` but `age<=25` was incorrectly included, because the old code just grabbed whichever comparison operator it found anywhere in the raw clause text and ignored the rest. Confirmed with a deliberately constructed test case designed to distinguish correct AND logic from the old buggy fallback (not one that would coincidentally pass either way) before touching any code.
+- ✅ **A real expression tree (`WhereExpr`) replaces the old raw-text WHERE clause**, built once at parse time and evaluated recursively - `Comparison`, `ColumnComparison` (needed for correlated predicates like `orders.customer_id = customers.id`, where neither side is a literal), `Like` (real `%`/`_` pattern matching, previously a no-op), `InList`, `And`/`Or`/`Not`, plus the new subquery variants below. Grammar rewritten with correct operator precedence (`NOT` > `AND` > `OR`, standard SQL) using ANTLR's left-recursion handling.
+- ✅ **Subqueries**: `IN (SELECT ...)`, `NOT IN (SELECT ...)`, scalar comparison (`WHERE amount > (SELECT AVG(amount) FROM orders)`), and `EXISTS`/`NOT EXISTS`, including **correlated** `EXISTS` (`WHERE EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id)`) - the subquery's own WHERE clause can reference the outer row.
+  - Getting correlation right took two real bugs, both found by testing rather than assumed away: first, the grammar had no way to compare two columns to each other at all (only column-to-literal) - added `columnName op columnName`. Second, once that parsed, correlated `EXISTS` still returned wrong results: two tables sharing a column name (both `orders` and `customers` have an `id`) could cross-match a reference to the wrong table's column. Fixed by qualifying a subquery's own scan rows with its table name - the same mechanism `JOIN` already uses - so `orders.customer_id` resolves by exact match against the inner row and `customers.id` correctly finds no match there, falling through to the outer row instead of an accidental same-named collision.
+  - **Known, named scope limit**: correlation is threaded through for the common case (a subquery that's a plain scan with a WHERE clause). A subquery that itself contains a JOIN or a GROUP BY still runs correctly on its own, but a correlated reference *inside* one of those isn't resolved - it behaves as an unresolvable column reference rather than silently miscalculating.
+- 12 new tests in `StratosDBTest`: the AND/OR/NOT/LIKE/IN fixes (each with data specifically designed to catch the old bug, not just re-confirm the happy path), `IN`/`NOT IN`/scalar/correlated-`EXISTS`/correlated-`NOT EXISTS` subqueries, and subqueries working inside `UPDATE`/`DELETE` WHERE clauses too, not just `SELECT`.
+- **Zero regressions**: this rewrite touched WHERE evaluation in every query path (`SELECT`, `JOIN`, aggregates, `UPDATE`, `DELETE`) - the full existing suite (78 tests before this round) still passes unchanged.
+
 ## What to do next
 
-Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are both closed, and all three picked Phase B items (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer) are done. What's left in Phase A: a free-space map (an efficiency improvement - inserts still scan every existing page for room, an O(pages) operation that a map would make O(1)) and autovacuum (an automation improvement - `VACUUM` now works, but only when someone runs it). What's left in Phase B: subqueries, merge join, window functions, and CTEs. See `PROJECT_PLAN.md`'s full phase breakdown for everything else (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed, and Phase B's core "query engine depth" items (`GROUP BY`/aggregates, hash join, statistics + cost-based optimizer, and now real compound WHERE evaluation + subqueries) are done. What's left in Phase A: a free-space map (efficiency - inserts still scan every existing page for room) and autovacuum (automation - `VACUUM` now works, but only when someone runs it). What's left in Phase B: merge join, window functions, and CTEs. See `PROJECT_PLAN.md`'s full phase breakdown for everything else (more indexing, PostgreSQL wire protocol compatibility, replication, extensibility) - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 
