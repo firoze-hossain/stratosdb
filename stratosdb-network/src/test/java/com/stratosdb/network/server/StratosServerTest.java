@@ -211,6 +211,43 @@ class StratosServerTest {
         assertTrue(result.success(), "authentication should have succeeded: " + result.message());
     }
 
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void abandonedTransactionIsRolledBackWhenTheConnectionCloses() throws Exception {
+        // A client that sends BEGIN and then just disconnects, without
+        // COMMIT or ROLLBACK, must not leave that transaction open forever -
+        // that would permanently block VACUUM's horizon (every table's dead
+        // tuples would look "possibly still needed" by an active transaction
+        // that will in fact never resume). The server must roll it back the
+        // moment the connection ends.
+        try (Socket socket = new Socket("localhost", port)) {
+            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+            DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+            authenticate(out, in, "", "");
+            assertTrue(sendAndReceive(out, in, "CREATE TABLE t (id INT)").isSuccess());
+            assertTrue(sendAndReceive(out, in, "BEGIN").isSuccess());
+            assertTrue(sendAndReceive(out, in, "INSERT INTO t VALUES (1)").isSuccess());
+            // Socket closes here via try-with-resources - no COMMIT, no ROLLBACK.
+        }
+
+        // Give the server's per-connection thread a moment to run its cleanup.
+        Thread.sleep(300);
+
+        try (Socket socket = new Socket("localhost", port)) {
+            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+            DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+            authenticate(out, in, "", "");
+
+            QueryResult result = sendAndReceive(out, in, "SELECT * FROM t");
+            assertTrue(result.isSuccess());
+            assertEquals(0, result.getRows().size(), "the abandoned transaction's insert must not be visible");
+
+            // A fresh connection must be able to operate normally - not blocked by the dangling session.
+            assertTrue(sendAndReceive(out, in, "INSERT INTO t VALUES (2)").isSuccess());
+            assertTrue(sendAndReceive(out, in, "VACUUM t").isSuccess());
+        }
+    }
+
     private QueryResult sendAndReceive(DataOutputStream out, DataInputStream in, String sql) throws Exception {
         WireProtocol.writeQuery(out, sql);
         int type = WireProtocol.readMessageType(in);

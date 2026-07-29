@@ -64,40 +64,159 @@ public class ExecutorEngine {
     }
 
     /**
-     * Every statement runs inside its own transaction (begin -> handler ->
-     * commit, or abort on any failure) - auto-commit, one statement per
-     * transaction. That's a real transaction lifecycle now, not a formality:
-     * INSERT/SELECT/UPDATE/DELETE all go through MVCC snapshots and, for
-     * writers, real row-level locking with deadlock detection.
+     * Per-calling-thread session state for explicit transactions. A thread
+     * (in practice, one virtual thread per network connection - see
+     * StratosServer) that sends BEGIN keeps its Transaction here across
+     * however many subsequent execute() calls it makes, until COMMIT or
+     * ROLLBACK. "poisoned" implements the same rule Postgres uses: once any
+     * statement inside an explicit transaction fails, the whole transaction
+     * is dead - every further statement is rejected until ROLLBACK, rather
+     * than silently continuing on a transaction that's already partially
+     * inconsistent from the caller's point of view.
+     */
+    private static final class SessionState {
+        Transaction transaction;
+        boolean poisoned;
+    }
+
+    private final ThreadLocal<SessionState> session = ThreadLocal.withInitial(SessionState::new);
+
+    /**
+     * Every statement runs inside a transaction - either one this call
+     * begins and commits/aborts itself (auto-commit, the default, one
+     * statement per transaction), or an explicit one opened by a prior
+     * BEGIN on this same session and held open across calls until COMMIT
+     * or ROLLBACK. Real transaction lifecycle either way: INSERT/SELECT/
+     * UPDATE/DELETE all go through MVCC snapshots and, for writers, real
+     * row-level locking with deadlock detection.
      *
      * The WAL commit record is written and forced to disk BEFORE the
      * transaction is marked committed in memory - if the process dies
      * between those two lines, redo on restart will still replay this
      * transaction's operations, and no reader can have seen it as committed
-     * before it truly was.
+     * before it truly was. Since Phase D, redo also checks that a commit
+     * record actually exists for each operation's transaction before
+     * replaying it (see WALManager.recover) - essential once a transaction
+     * can span more than one statement, since a multi-statement transaction
+     * that crashes before COMMIT must leave zero trace, not a partial one.
      */
     public QueryResult execute(String sql) {
-        Transaction txn = transactionManager.begin();
+        Statement stmt;
         try {
-            Statement stmt = parser.parse(sql);
+            stmt = parser.parse(sql);
+        } catch (Exception e) {
+            return QueryResult.error(e.getMessage());
+        }
+
+        if (stmt instanceof BeginStatement) {
+            return executeBegin();
+        }
+        if (stmt instanceof CommitStatement) {
+            return executeCommit();
+        }
+        if (stmt instanceof RollbackStatement) {
+            return executeRollback();
+        }
+
+        SessionState state = session.get();
+        if (state.poisoned) {
+            return QueryResult.error("Current transaction is aborted, commands ignored until ROLLBACK");
+        }
+
+        boolean explicit = state.transaction != null;
+        Transaction txn = explicit ? state.transaction : transactionManager.begin();
+        try {
             QueryResult result = dispatch(stmt, txn);
 
             if (result.isSuccess()) {
-                walManager.logCommit(txn.getXID());
-                transactionManager.commit(txn);
+                if (!explicit) {
+                    walManager.logCommit(txn.getXID());
+                    transactionManager.commit(txn);
+                }
+                // else: stays open, part of the caller's explicit transaction until COMMIT/ROLLBACK
+            } else if (explicit) {
+                state.poisoned = true;
             } else {
                 transactionManager.abort(txn);
             }
             return result;
         } catch (DeadlockException e) {
-            transactionManager.abort(txn);
+            if (explicit) {
+                state.poisoned = true;
+            } else {
+                transactionManager.abort(txn);
+            }
             LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
             return QueryResult.error("Deadlock detected, transaction aborted: " + e.getMessage());
         } catch (Exception e) {
-            transactionManager.abort(txn);
+            if (explicit) {
+                state.poisoned = true;
+            } else {
+                transactionManager.abort(txn);
+            }
             LOG.error("Execution failed: {}", sql, e);
             return QueryResult.error(e.getMessage());
         }
+    }
+
+    private QueryResult executeBegin() {
+        SessionState state = session.get();
+        if (state.transaction != null) {
+            return QueryResult.error("Already in a transaction - nested BEGIN is not supported");
+        }
+        state.transaction = transactionManager.begin();
+        state.poisoned = false;
+        return QueryResult.success("BEGIN");
+    }
+
+    private QueryResult executeCommit() {
+        SessionState state = session.get();
+        if (state.transaction == null) {
+            return QueryResult.error("No transaction in progress");
+        }
+        if (state.poisoned) {
+            // Matches real Postgres: COMMIT on an already-aborted transaction
+            // rolls it back instead - there is nothing valid left to commit.
+            transactionManager.abort(state.transaction);
+            state.transaction = null;
+            state.poisoned = false;
+            return QueryResult.error("Current transaction is aborted, rolled back instead of committed");
+        }
+        walManager.logCommit(state.transaction.getXID());
+        transactionManager.commit(state.transaction);
+        state.transaction = null;
+        return QueryResult.success("COMMIT");
+    }
+
+    private QueryResult executeRollback() {
+        SessionState state = session.get();
+        if (state.transaction == null) {
+            return QueryResult.error("No transaction in progress");
+        }
+        transactionManager.abort(state.transaction);
+        state.transaction = null;
+        state.poisoned = false;
+        return QueryResult.success("ROLLBACK");
+    }
+
+    /**
+     * Call when a connection/session ends (see StratosServer/StratosDB),
+     * not just between statements. Without this, a client that sends BEGIN
+     * and then simply disconnects - never sending COMMIT or ROLLBACK -
+     * would leave its transaction "active" in TransactionManager forever:
+     * getOldestActiveXid() would permanently report that abandoned xid as
+     * the horizon, and VACUUM would never be able to reclaim anything
+     * created after it, for the life of the process. Rolling back
+     * whatever's still open is the same thing a real database does when a
+     * connection drops mid-transaction.
+     */
+    public void closeSession() {
+        SessionState state = session.get();
+        if (state.transaction != null) {
+            LOG.warn("Session ending with an open transaction (xid={}) - rolling it back", state.transaction.getXID());
+            transactionManager.abort(state.transaction);
+        }
+        session.remove();
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn) throws DeadlockException {
@@ -309,7 +428,7 @@ public class ExecutorEngine {
         byte[] data = tuple.serialize();
         HeapTable.InsertResult result = table.insertMvcc(data, txn.getXID());
 
-        walManager.logInsert(stmt.tableName(), result.pageId, result.slot, data);
+        walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, data);
         maintainIndexesOnWrite(stmt.tableName(), tuple, result.pageId, result.slot);
 
         return QueryResult.success("Inserted row at " + result.pageId + "/" + result.slot);
@@ -936,7 +1055,7 @@ public class ExecutorEngine {
 
             HeapTable.InsertResult newVersion = table.updateMvcc(row.pageId(), row.slot(), newPayload, txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
-            walManager.logUpdate(stmt.tableName(), row.pageId(), row.slot(), oldPayload, newPayload);
+            walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, newPayload);
             maintainIndexesOnDelete(stmt.tableName(), oldTuple, row.pageId(), row.slot());
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
             updated++;
@@ -970,7 +1089,7 @@ public class ExecutorEngine {
             boolean removed = table.deleteMvcc(row.pageId(), row.slot(), txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
             if (removed) {
-                walManager.logDelete(stmt.tableName(), row.pageId(), row.slot());
+                walManager.logDelete(stmt.tableName(), txn.getXID(), row.pageId(), row.slot());
                 maintainIndexesOnDelete(stmt.tableName(), tuple, row.pageId(), row.slot());
                 deleted++;
             }

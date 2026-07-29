@@ -721,6 +721,100 @@ public class StratosDBTest {
         assertRowCount("SELECT * FROM customers", 1);
     }
 
+    @Test
+    void testExplicitCommitMakesAllStatementsVisible() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+
+        assertEquals("BEGIN", database.execute("BEGIN").getMessage());
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        database.execute("INSERT INTO t VALUES (2, 200)");
+        assertEquals("COMMIT", database.execute("COMMIT").getMessage());
+
+        assertRowCount("SELECT * FROM t", 2);
+    }
+
+    @Test
+    void testExplicitRollbackDiscardsAllStatements() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)"); // committed via auto-commit, before the explicit transaction
+
+        database.execute("BEGIN");
+        database.execute("INSERT INTO t VALUES (2, 200)");
+        database.execute("INSERT INTO t VALUES (3, 300)");
+        assertEquals("ROLLBACK", database.execute("ROLLBACK").getMessage());
+
+        assertRowCount("SELECT * FROM t", 1); // only the pre-transaction row survives
+    }
+
+    @Test
+    void testFailedStatementPoisonsTheWholeTransactionNotJustItself() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+
+        database.execute("BEGIN");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        QueryResult badStatement = database.execute("SELECT * FROM nonexistent_table");
+        assertFalse(badStatement.isSuccess());
+
+        QueryResult afterFailure = database.execute("INSERT INTO t VALUES (2, 200)");
+        assertFalse(afterFailure.isSuccess(), "a statement after a failure in the same transaction must be rejected");
+        assertTrue(afterFailure.getError().contains("aborted"),
+            () -> "expected an 'aborted' error, got: " + afterFailure.getError());
+
+        database.execute("ROLLBACK");
+        assertRowCount("SELECT * FROM t", 0, "not even the row inserted before the failure should survive - the whole transaction is poisoned");
+    }
+
+    @Test
+    void testCommitOnAPoisonedTransactionRollsBackInstead() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("BEGIN");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("SELECT * FROM nonexistent_table"); // poisons the transaction
+
+        QueryResult commitResult = database.execute("COMMIT");
+        assertFalse(commitResult.isSuccess(), "COMMIT on a poisoned transaction must fail, not silently succeed");
+        assertRowCount("SELECT * FROM t", 0);
+    }
+
+    @Test
+    void testCommitOrRollbackWithNoOpenTransactionIsAnError() {
+        database.execute("CREATE TABLE t (id INT)");
+        assertFalse(database.execute("COMMIT").isSuccess());
+        assertFalse(database.execute("ROLLBACK").isSuccess());
+    }
+
+    @Test
+    void testNestedBeginIsRejected() {
+        database.execute("BEGIN");
+        QueryResult nested = database.execute("BEGIN");
+        assertFalse(nested.isSuccess(), "a BEGIN while already in a transaction must be rejected, not silently accepted");
+        database.execute("ROLLBACK");
+    }
+
+    @Test
+    void testUncommittedTransactionIsInvisibleToAnotherThread() throws InterruptedException {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("BEGIN");
+        database.execute("INSERT INTO t VALUES (1)");
+
+        // A different thread is a different session (transaction state is
+        // thread-local) - simulating a genuinely separate connection.
+        int[] otherThreadRowCount = new int[1];
+        Thread other = new Thread(() -> otherThreadRowCount[0] = database.execute("SELECT * FROM t").getRows().size());
+        other.start();
+        other.join();
+        assertEquals(0, otherThreadRowCount[0], "another session must not see this thread's uncommitted insert");
+
+        database.execute("COMMIT");
+        assertRowCount("SELECT * FROM t", 1);
+    }
+
+    private void assertRowCount(String sql, int expected, String message) {
+        QueryResult result = database.execute(sql);
+        assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());
+        assertEquals(expected, result.getRows().size(), message);
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

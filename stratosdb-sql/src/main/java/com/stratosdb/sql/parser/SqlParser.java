@@ -56,6 +56,12 @@ public class SqlParser {
             return new AnalyzeStatement(ctx.analyze().tableName().getText());
         } else if (ctx.vacuum() != null) {
             return new VacuumStatement(ctx.vacuum().tableName().getText());
+        } else if (ctx.beginTxn() != null) {
+            return new BeginStatement();
+        } else if (ctx.commitTxn() != null) {
+            return new CommitStatement();
+        } else if (ctx.rollbackTxn() != null) {
+            return new RollbackStatement();
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }

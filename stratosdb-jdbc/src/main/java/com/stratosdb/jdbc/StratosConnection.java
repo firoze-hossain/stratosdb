@@ -19,11 +19,19 @@ import java.sql.SQLException;
 import static com.stratosdb.jdbc.JdbcSupport.notSupported;
 
 /**
- * Real behavior: connect/close/isClosed, createStatement, commit (a no-op -
- * every statement already auto-commits per Week 2's design),
- * setAutoCommit(true) (setAutoCommit(false) throws - there is no
- * multi-statement transaction protocol over the wire yet), isValid,
- * getCatalog/getSchema (both null - no such concept here).
+ * Real behavior: connect/close/isClosed, createStatement, isValid,
+ * getCatalog/getSchema (both null - no such concept here), and now real
+ * multi-statement transactions: setAutoCommit(false) sends BEGIN,
+ * commit()/rollback() send COMMIT/ROLLBACK (each immediately followed by
+ * a fresh BEGIN while still in manual-commit mode - standard JDBC
+ * semantics: setAutoCommit(false) opens an ongoing sequence of
+ * transactions, not just one), and setAutoCommit(true) while a manual
+ * transaction is open commits it first, matching the JDBC spec. This
+ * works correctly over the wire with no server-side protocol changes
+ * needed: StratosServer runs one thread per connection for that
+ * connection's whole lifetime, and ExecutorEngine's transaction session
+ * state is thread-local - so a connection's BEGIN/statements/COMMIT
+ * naturally share the same session simply by being on the same thread.
  *
  * Every connection performs the AUTH handshake (see WireProtocol) as soon
  * as the socket opens, sending whatever username/password were passed to
@@ -50,6 +58,7 @@ class StratosConnection implements InvocationHandler {
     private final DataInputStream in;
     private final DataOutputStream out;
     private volatile boolean closed = false;
+    private volatile boolean autoCommit = true;
     private Connection proxy;
 
     private StratosConnection(Socket socket, String username, String password) throws IOException, SQLException {
@@ -118,6 +127,17 @@ class StratosConnection implements InvocationHandler {
             case "close":
                 if (!closed) {
                     closed = true;
+                    if (!autoCommit) {
+                        // Standard driver behavior: closing a connection with an open
+                        // manual transaction rolls it back - there's no way to commit
+                        // work the caller never explicitly committed. Best-effort: if
+                        // the socket is already in a bad state, closing it is more
+                        // important than this cleanup succeeding.
+                        try {
+                            execute("ROLLBACK");
+                        } catch (SQLException ignored) {
+                        }
+                    }
                     socket.close();
                 }
                 return null;
@@ -125,19 +145,38 @@ class StratosConnection implements InvocationHandler {
                 return closed;
             case "isValid":
                 return !closed;
-            case "setAutoCommit":
-                if (!((Boolean) args[0])) {
-                    throw new java.sql.SQLFeatureNotSupportedException(
-                        "StratosDB auto-commits every statement (see Week 2); "
-                        + "multi-statement transactions over JDBC are not implemented yet");
+            case "setAutoCommit": {
+                boolean requested = (Boolean) args[0];
+                if (!requested && autoCommit) {
+                    requireSuccess(execute("BEGIN"), "start a transaction");
+                    autoCommit = false;
+                } else if (requested && !autoCommit) {
+                    // Per the JDBC spec: switching back to auto-commit while a
+                    // transaction is open commits that transaction first.
+                    requireSuccess(execute("COMMIT"), "commit the current transaction before switching to auto-commit");
+                    autoCommit = true;
                 }
                 return null;
+            }
             case "getAutoCommit":
-                return true;
+                return autoCommit;
             case "commit":
-                return null; // no-op: whatever was executed already committed when its result arrived
+                if (autoCommit) {
+                    return null; // nothing to commit - matches JDBC drivers that tolerate a defensive commit() call
+                }
+                requireSuccess(execute("COMMIT"), "commit");
+                // Manual-commit mode is an ongoing sequence of transactions, not just
+                // one - immediately open the next one, same as every real driver does.
+                requireSuccess(execute("BEGIN"), "start the next transaction after commit");
+                return null;
             case "rollback":
-                throw new java.sql.SQLFeatureNotSupportedException("Nothing to roll back - every statement auto-commits");
+                if (autoCommit) {
+                    throw new java.sql.SQLFeatureNotSupportedException(
+                        "Nothing to roll back - not currently in a transaction (autoCommit is true)");
+                }
+                requireSuccess(execute("ROLLBACK"), "roll back");
+                requireSuccess(execute("BEGIN"), "start the next transaction after rollback");
+                return null;
             case "getCatalog":
             case "getSchema":
                 return null;
@@ -153,6 +192,12 @@ class StratosConnection implements InvocationHandler {
                 return System.identityHashCode(p);
             default:
                 throw notSupported("Connection", name);
+        }
+    }
+
+    private void requireSuccess(QueryResult result, String action) throws SQLException {
+        if (!result.isSuccess()) {
+            throw new SQLException("Failed to " + action + ": " + result.getError());
         }
     }
 

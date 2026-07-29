@@ -114,7 +114,7 @@ class CrashRecoveryTest {
                 byte[] data = tuple.serialize();
 
                 HeapTable.InsertResult result = table.insert(data);
-                walManager.logInsert("crash_test", result.pageId, result.slot, data);
+                walManager.logInsert("crash_test", i, result.pageId, result.slot, data);
                 walManager.logCommit(i);
                 insertedIds.add(i);
             }
@@ -216,6 +216,96 @@ class CrashRecoveryTest {
             + "WALManager.recover() - e.g. missing ids " + sample(lost, 5) + ". "
             + "WALManager.recover()'s switch statement has empty case bodies (no actual redo "
             + "logic), so committed WAL records are never replayed into the heap on restart.");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void uncommittedMultiRowTransactionDoesNotSurviveAHardCrash() throws Exception {
+        // The property that matters most once transactions can span more than
+        // one statement: every row here is logged under the SAME xid, and that
+        // xid is deliberately never committed before the hard kill. Real
+        // atomicity means NONE of these rows should be recoverable - not "the
+        // first few" or "however many made it to disk," none at all, because
+        // the transaction that wrote them never told the WAL it was done.
+        int totalRows = 200;
+        long xid = 9001;
+
+        Process process = runHarness(totalRows, xid, false);
+        waitForMarkerThenKill(process);
+
+        DiskManager diskManager = new DiskManager(dataDir);
+        BufferPoolManager bufferPool = track(new BufferPoolManager(64, diskManager));
+        WALManager walManager = track(new WALManager(dataDir));
+        walManager.recover(diskManager);
+        HeapTable table = new HeapTable("txn_crash_test", bufferPool);
+
+        List<byte[]> recovered = table.scan(totalRows * 2);
+        assertEquals(0, recovered.size(),
+            "an uncommitted transaction's writes must not survive a crash - found "
+            + recovered.size() + " row(s) from a transaction that never committed. "
+            + "This means recover() replayed operations with no matching OP_COMMIT record.");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void committedMultiRowTransactionSurvivesAHardCrash() throws Exception {
+        // The positive counterpart, using the same harness and the same
+        // multi-row-one-transaction shape - proves the atomicity fix didn't
+        // just make recovery overly conservative (reject everything).
+        int totalRows = 200;
+        long xid = 9002;
+
+        Process process = runHarness(totalRows, xid, true);
+        waitForMarkerThenKill(process);
+
+        DiskManager diskManager = new DiskManager(dataDir);
+        BufferPoolManager bufferPool = track(new BufferPoolManager(64, diskManager));
+        WALManager walManager = track(new WALManager(dataDir));
+        walManager.recover(diskManager);
+        HeapTable table = new HeapTable("txn_crash_test", bufferPool);
+
+        Set<Integer> recoveredIds = new HashSet<>();
+        for (byte[] raw : table.scan(totalRows * 2)) {
+            recoveredIds.add((Integer) Tuple.deserialize(raw).getValue("id"));
+        }
+
+        Set<Integer> expected = new HashSet<>();
+        for (int i = 0; i < totalRows; i++) expected.add(i);
+
+        assertEquals(expected, recoveredIds,
+            "a committed multi-row transaction must fully survive a crash - all " + totalRows
+            + " rows should be recoverable since their shared transaction DID commit before the kill");
+    }
+
+    private Process runHarness(int totalRows, long xid, boolean commit) throws Exception {
+        String classpath = System.getProperty("java.class.path");
+        ProcessBuilder pb = new ProcessBuilder(
+            System.getProperty("java.home") + "/bin/java",
+            "-cp", classpath,
+            "com.stratosdb.storage.UncommittedTxnCrashHarnessMain",
+            dataDir,
+            String.valueOf(totalRows),
+            String.valueOf(xid),
+            String.valueOf(commit)
+        );
+        pb.redirectErrorStream(true);
+        pb.redirectOutput(new File(dataDir, "harness.out"));
+        return pb.start();
+    }
+
+    /** Waits until the harness has finished writing (and optionally committing) all its rows, then kills it - isolating the commit-record property from mid-write timing. */
+    private void waitForMarkerThenKill(Process process) throws Exception {
+        File marker = new File(dataDir, "harness.marker");
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (!marker.exists() && System.currentTimeMillis() < deadline) {
+            assertTrue(process.isAlive(), "Harness exited before writing its completion marker - check harness.out");
+            Thread.sleep(20);
+        }
+        assertTrue(marker.exists(), "Harness never wrote its completion marker within the timeout");
+
+        process.destroyForcibly();
+        boolean exited = process.waitFor(10, TimeUnit.SECONDS);
+        assertTrue(exited, "Killed process did not terminate in time");
     }
 
     private static int readMarker(String path) throws Exception {

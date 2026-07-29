@@ -116,41 +116,53 @@ public class StratosServer {
         }
         LOG.debug("Client connected: {}", remote);
 
-        try (Socket s = socket;
-             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
-             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
+        try {
+            try (Socket s = socket;
+                 DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
+                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
 
-            if (!authenticate(in, out, remote)) {
-                return;
+                if (!authenticate(in, out, remote)) {
+                    return;
+                }
+
+                while (running) {
+                    int type;
+                    try {
+                        type = WireProtocol.readMessageType(in);
+                    } catch (EOFException e) {
+                        break; // client closed the connection cleanly between messages
+                    }
+
+                    if (type != WireProtocol.MSG_QUERY) {
+                        LOG.warn("Unexpected message type {} from {}, closing connection", type, remote);
+                        break;
+                    }
+
+                    String sql = WireProtocol.readQueryBody(in);
+                    QueryResult result;
+                    try {
+                        result = db.execute(sql);
+                    } catch (Exception e) {
+                        // A query that throws instead of returning QueryResult.error(...) must
+                        // still get a RESULT message back - otherwise the client hangs waiting
+                        // for a reply that will never come.
+                        result = QueryResult.error(e.getMessage());
+                    }
+                    WireProtocol.writeResult(out, result);
+                }
+            } catch (IOException e) {
+                LOG.debug("Connection {} closed: {}", remote, e.getMessage());
             }
-
-            while (running) {
-                int type;
-                try {
-                    type = WireProtocol.readMessageType(in);
-                } catch (EOFException e) {
-                    break; // client closed the connection cleanly between messages
-                }
-
-                if (type != WireProtocol.MSG_QUERY) {
-                    LOG.warn("Unexpected message type {} from {}, closing connection", type, remote);
-                    break;
-                }
-
-                String sql = WireProtocol.readQueryBody(in);
-                QueryResult result;
-                try {
-                    result = db.execute(sql);
-                } catch (Exception e) {
-                    // A query that throws instead of returning QueryResult.error(...) must
-                    // still get a RESULT message back - otherwise the client hangs waiting
-                    // for a reply that will never come.
-                    result = QueryResult.error(e.getMessage());
-                }
-                WireProtocol.writeResult(out, result);
-            }
-        } catch (IOException e) {
-            LOG.debug("Connection {} closed: {}", remote, e.getMessage());
+        } finally {
+            // Regardless of how the connection ended (clean disconnect, a
+            // protocol error, or an exception) - if this client left a
+            // transaction open (BEGIN with no matching COMMIT/ROLLBACK), it
+            // must be rolled back here. Without this, an abandoned session's
+            // transaction stays in TransactionManager's active set forever,
+            // permanently pinning VACUUM's horizon and blocking reclamation
+            // of anything newer than the abandoned transaction, for every
+            // table, indefinitely - a real resource leak, not a cosmetic one.
+            db.closeSession();
         }
         LOG.debug("Client disconnected: {}", remote);
     }

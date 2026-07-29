@@ -44,7 +44,7 @@ public class CrashHarnessMain {
             byte[] data = tuple.serialize();
 
             HeapTable.InsertResult result = table.insert(data);
-            walManager.logInsert("crash_test", result.pageId, result.slot, data);
+            walManager.logInsert("crash_test", i, result.pageId, result.slot, data);
             walManager.logCommit(i);
 
             // Ground truth: this row has been "told to the world" as committed.

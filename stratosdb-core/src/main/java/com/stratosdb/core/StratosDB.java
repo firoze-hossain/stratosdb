@@ -43,6 +43,17 @@ public class StratosDB {
     }
 
     /**
+     * Call when a connection/session ends (not between individual
+     * statements) - see ExecutorEngine.closeSession's javadoc for why this
+     * matters: a client that sends BEGIN and then just disconnects,
+     * without COMMIT or ROLLBACK, would otherwise leave that transaction
+     * "active" forever, permanently blocking VACUUM's horizon.
+     */
+    public void closeSession() {
+        executor.closeSession();
+    }
+
+    /**
      * Marks this instance as "running" - a state flag for callers that want
      * to track it, nothing more. This does NOT open a network listener:
      * stratosdb-core has no networking dependency by design, so embedding

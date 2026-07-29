@@ -113,12 +113,48 @@ class StratosDriverTest {
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
     void unsupportedFeaturesThrowClearlyRatherThanSilentlyNoOp() throws Exception {
         try (Connection conn = DriverManager.getConnection(url)) {
-            assertThrows(SQLFeatureNotSupportedException.class, () -> conn.setAutoCommit(false));
+            // rollback() with no active transaction (autoCommit still true) has
+            // nothing to roll back and should say so clearly, not silently no-op.
             assertThrows(SQLFeatureNotSupportedException.class, conn::rollback);
-            // setAutoCommit(true) and commit() ARE supported (as honest no-ops) - only the
-            // "not how this engine works" cases should throw.
+            // setAutoCommit(true) and commit() while already auto-committing ARE
+            // supported (as honest no-ops) - only the "nothing to do" case throws.
             conn.setAutoCommit(true);
             conn.commit();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void manualTransactionsCommitAndRollbackForReal() throws Exception {
+        try (Connection conn = DriverManager.getConnection(url);
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE t (id INT, val INT)");
+
+            conn.setAutoCommit(false);
+            assertFalse(conn.getAutoCommit());
+            stmt.executeUpdate("INSERT INTO t VALUES (1, 100)");
+            stmt.executeUpdate("INSERT INTO t VALUES (2, 200)");
+            conn.commit();
+
+            try (ResultSet rs = stmt.executeQuery("SELECT * FROM t")) {
+                int count = 0;
+                while (rs.next()) count++;
+                assertEquals(2, count, "both inserts must be visible after commit");
+            }
+
+            // Manual mode is still active after commit (JDBC semantics: an
+            // ongoing sequence of transactions, not just one) - this insert
+            // should be rolled back, not silently committed.
+            stmt.executeUpdate("INSERT INTO t VALUES (3, 300)");
+            conn.rollback();
+
+            try (ResultSet rs = stmt.executeQuery("SELECT * FROM t")) {
+                int count = 0;
+                while (rs.next()) count++;
+                assertEquals(2, count, "the rolled-back insert must not be visible");
+            }
+
+            conn.setAutoCommit(true);
         }
     }
 

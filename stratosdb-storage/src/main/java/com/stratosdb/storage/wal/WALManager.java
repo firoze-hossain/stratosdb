@@ -58,12 +58,20 @@ public class WALManager {
     }
     
     /**
-     * Log an insert operation
+     * Log an insert operation. xid is the writing transaction's id - not
+     * used at write time, but essential at recover() time: redo only
+     * replays operations whose xid has a matching OP_COMMIT record
+     * elsewhere in the log. Without this, an INSERT from a transaction
+     * that crashed before committing would still get replayed on restart,
+     * a real atomicity violation - previously an accepted, documented
+     * limitation (see recover()'s javadoc) that became untenable once
+     * transactions could span more than one statement.
      */
-    public void logInsert(String tableName, long pageId, int slot, byte[] tupleData) {
+    public void logInsert(String tableName, long xid, long pageId, int slot, byte[] tupleData) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(1024 + tupleData.length);
             buffer.putInt(OP_INSERT);
+            buffer.putLong(xid);
             
             byte[] tableBytes = tableName.getBytes();
             buffer.putInt(tableBytes.length);
@@ -81,12 +89,13 @@ public class WALManager {
     }
     
     /**
-     * Log a delete operation
+     * Log a delete operation. xid: see logInsert's javadoc.
      */
-    public void logDelete(String tableName, long pageId, int slot) {
+    public void logDelete(String tableName, long xid, long pageId, int slot) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(256);
             buffer.putInt(OP_DELETE);
+            buffer.putLong(xid);
             
             byte[] tableBytes = tableName.getBytes();
             buffer.putInt(tableBytes.length);
@@ -102,12 +111,13 @@ public class WALManager {
     }
     
     /**
-     * Log an update operation
+     * Log an update operation. xid: see logInsert's javadoc.
      */
-    public void logUpdate(String tableName, long pageId, int slot, byte[] oldData, byte[] newData) {
+    public void logUpdate(String tableName, long xid, long pageId, int slot, byte[] oldData, byte[] newData) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(1024 + oldData.length + newData.length);
             buffer.putInt(OP_UPDATE);
+            buffer.putLong(xid);
             
             byte[] tableBytes = tableName.getBytes();
             buffer.putInt(tableBytes.length);
@@ -189,42 +199,63 @@ public class WALManager {
      * Needs a DiskManager so replayed inserts/updates/deletes can actually be
      * written back to pages on disk, not just parsed and discarded.
      *
-     * Known limitations (call these out rather than pretend they don't exist):
-     *  - Not idempotent / not LSN-gated. Redo replays every record in the log
-     *    unconditionally. Pages are never stamped with the LSN that last modified
-     *    them (pd_lsn in the page header exists but is never written), so if a page
-     *    was already flushed before the crash, redo re-applies its inserts on top
-     *    and duplicates them. Safe for a log that only ever describes pages that
-     *    were never flushed (true for a from-empty crash scenario); NOT safe as a
-     *    general-purpose recovery routine yet. Fixing this properly means stamping
-     *    each page write with its LSN and skipping WAL records whose LSN is <= the
-     *    page's current pd_lsn on redo - standard ARIES-style redo.
-     *  - Insert/update/delete records are not associated with a transaction id, so
-     *    redo cannot currently distinguish "committed" from "never committed"
-     *    operations - it replays everything regardless of whether a matching
-     *    OP_COMMIT exists. Real atomicity requires threading a transaction id
-     *    through logInsert/logUpdate/logDelete, which belongs with the
-     *    transaction manager / MVCC work.
+     * Two passes, standard for a WAL that logs operations before knowing
+     * whether their transaction will commit:
+     *   1. Scan the whole log once just to collect the set of xids with a
+     *      matching OP_COMMIT record - this is what makes redo transaction-
+     *      aware rather than blindly replaying everything (see below).
+     *   2. Scan again and replay only INSERT/UPDATE/DELETE records whose xid
+     *      is in that committed set. A transaction that crashed before
+     *      COMMIT leaves its operations logged but with no matching commit
+     *      record, so pass 2 correctly skips them - real atomicity, not
+     *      "redo everything and hope only committed work was logged."
+     *
+     * This directly replaces this method's previous, explicitly documented
+     * limitation ("redo cannot currently distinguish committed from never
+     * committed operations... real atomicity requires threading a
+     * transaction id through logInsert/logUpdate/logDelete") - that
+     * threading is now in place (see logInsert/logUpdate/logDelete), which
+     * is what makes this two-pass approach possible.
+     *
+     * Known limitation still open, stated plainly: not idempotent / not
+     * LSN-gated. Redo replays every committed record unconditionally. Pages
+     * are never stamped with the LSN that last modified them (pd_lsn in the
+     * page header exists but is never written), so if a page was already
+     * flushed before the crash, redo re-applies its writes on top and
+     * duplicates them. Safe for a log that only ever describes pages that
+     * were never flushed (true for a from-empty crash scenario); NOT safe
+     * as a general-purpose recovery routine yet. Fixing this properly means
+     * stamping each page write with its LSN and skipping WAL records whose
+     * LSN is <= the page's current pd_lsn on redo - standard ARIES-style
+     * redo, a separate piece of work from the transaction-awareness fixed here.
      */
     public void recover(com.stratosdb.storage.disk.DiskManager diskManager) {
         try {
             LOG.info("Starting recovery...");
 
-            walChannel.position(0);
             long fileSize = walChannel.size();
 
-            // Pages touched during redo, keyed by "table:pageId". Kept in memory for
-            // the whole pass (mirroring what a buffer pool would hold) and flushed
-            // once at the end, after every record has been replayed.
+            java.util.Set<Long> committedXids = new java.util.HashSet<>();
+            walChannel.position(0);
+            while (walChannel.position() < fileSize) {
+                Integer opType = readIntOrNull();
+                if (opType == null) break;
+                if (!skipOrCollectCommit(opType, committedXids, fileSize)) {
+                    break; // unknown record type - same "stop cleanly" behavior as before
+                }
+            }
+
             java.util.Map<String, com.stratosdb.storage.page.SlottedPage> dirtyPages = new java.util.HashMap<>();
             int replayedOps = 0;
 
+            walChannel.position(0);
             while (walChannel.position() < fileSize) {
                 Integer opType = readIntOrNull();
                 if (opType == null) break; // truncated/partial trailing record - stop cleanly
 
                 switch (opType) {
                     case OP_INSERT: {
+                        long xid = readLong();
                         String tableName = readLengthPrefixedString();
                         long pageId = readLong();
                         readInt(); // logged slot - redo re-derives the slot deterministically
@@ -232,24 +263,30 @@ public class WALManager {
                         int len = readInt();
                         byte[] tupleData = readBytes(len);
 
-                        com.stratosdb.storage.page.SlottedPage page =
-                            loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
-                        page.insertTuple(tupleData);
-                        replayedOps++;
+                        if (committedXids.contains(xid)) {
+                            com.stratosdb.storage.page.SlottedPage page =
+                                loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
+                            page.insertTuple(tupleData);
+                            replayedOps++;
+                        }
                         break;
                     }
                     case OP_DELETE: {
+                        long xid = readLong();
                         String tableName = readLengthPrefixedString();
                         long pageId = readLong();
                         int slot = readInt();
 
-                        com.stratosdb.storage.page.SlottedPage page =
-                            loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
-                        page.deleteTuple(slot);
-                        replayedOps++;
+                        if (committedXids.contains(xid)) {
+                            com.stratosdb.storage.page.SlottedPage page =
+                                loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
+                            page.deleteTuple(slot);
+                            replayedOps++;
+                        }
                         break;
                     }
                     case OP_UPDATE: {
+                        long xid = readLong();
                         String tableName = readLengthPrefixedString();
                         long pageId = readLong();
                         int slot = readInt();
@@ -258,14 +295,16 @@ public class WALManager {
                         int newLen = readInt();
                         byte[] newData = readBytes(newLen);
 
-                        com.stratosdb.storage.page.SlottedPage page =
-                            loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
-                        page.updateTuple(slot, newData);
-                        replayedOps++;
+                        if (committedXids.contains(xid)) {
+                            com.stratosdb.storage.page.SlottedPage page =
+                                loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
+                            page.updateTuple(slot, newData);
+                            replayedOps++;
+                        }
                         break;
                     }
                     case OP_COMMIT: {
-                        readLong(); // transactionId - see javadoc limitation above
+                        readLong(); // transactionId - already collected in pass 1
                         break;
                     }
                     case OP_CHECKPOINT: {
@@ -287,10 +326,57 @@ public class WALManager {
                 diskManager.writePage(tableName, entry.getValue());
             }
 
-            LOG.info("Recovery complete: replayed {} operation(s) across {} page(s)",
-                replayedOps, dirtyPages.size());
+            LOG.info("Recovery complete: replayed {} operation(s) from {} committed transaction(s) across {} page(s)",
+                replayedOps, committedXids.size(), dirtyPages.size());
         } catch (Exception e) {
             LOG.error("Recovery failed", e);
+        }
+    }
+
+    /** Pass 1 of recover(): advances past a record's bytes without applying it, recording its xid into committedXids if it's an OP_COMMIT. Returns false for an unrecognized record type (caller should stop the scan). */
+    private boolean skipOrCollectCommit(int opType, java.util.Set<Long> committedXids, long fileSize) throws java.io.IOException {
+        switch (opType) {
+            case OP_INSERT: {
+                readLong(); // xid
+                readLengthPrefixedString(); // tableName
+                readLong(); // pageId
+                readInt(); // slot
+                int len = readInt();
+                readBytes(len);
+                return true;
+            }
+            case OP_DELETE: {
+                readLong(); // xid
+                readLengthPrefixedString(); // tableName
+                readLong(); // pageId
+                readInt(); // slot
+                return true;
+            }
+            case OP_UPDATE: {
+                readLong(); // xid
+                readLengthPrefixedString(); // tableName
+                readLong(); // pageId
+                readInt(); // slot
+                int oldLen = readInt();
+                readBytes(oldLen);
+                int newLen = readInt();
+                readBytes(newLen);
+                return true;
+            }
+            case OP_COMMIT: {
+                long xid = readLong();
+                committedXids.add(xid);
+                return true;
+            }
+            case OP_CHECKPOINT: {
+                readLong(); // timestamp
+                return true;
+            }
+            default: {
+                LOG.warn("Unknown WAL record type {} during pass 1 scan; stopping", opType);
+                walChannel.position(fileSize);
+                return false;
+            }
         }
     }
 
