@@ -3,12 +3,15 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn;
+sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN (USING (HASH | BTREE))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
+createView: CREATE VIEW viewName AS select SEMICOLON?;
+dropView: DROP VIEW viewName SEMICOLON?;
+viewName: IDENTIFIER;
 showTables: SHOW TABLES SEMICOLON?;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
@@ -109,6 +112,7 @@ limitValue: INTEGER_LITERAL;
 // Lexer rules
 CREATE: C R E A T E;
 TABLE: T A B L E;
+VIEW: V I E W;
 DROP: D R O P;
 INSERT: I N S E R T;
 INTO: I N T O;

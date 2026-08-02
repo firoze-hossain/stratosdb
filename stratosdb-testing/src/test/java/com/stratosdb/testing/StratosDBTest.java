@@ -892,6 +892,102 @@ public class StratosDBTest {
         assertEquals(expected, result.getRows().size(), message);
     }
 
+    @Test
+    void testCreateViewAndSelectFromIt() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR, active INT)");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice', 1)");
+        database.execute("INSERT INTO employees VALUES (2, 'Bob', 0)");
+        database.execute("INSERT INTO employees VALUES (3, 'Carol', 1)");
+
+        QueryResult createResult = database.execute("CREATE VIEW active_employees AS SELECT id, name FROM employees WHERE active=1");
+        assertTrue(createResult.isSuccess(), () -> "CREATE VIEW failed: " + createResult.getError());
+
+        QueryResult result = database.execute("SELECT * FROM active_employees");
+        assertTrue(result.isSuccess());
+        assertEquals(2, result.getRows().size());
+    }
+
+    @Test
+    void testWhereClauseComposesOnTopOfAView() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR, salary INT, active INT)");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice', 90000, 1)");
+        database.execute("INSERT INTO employees VALUES (2, 'Carol', 120000, 1)");
+        database.execute("CREATE VIEW active_employees AS SELECT id, name, salary FROM employees WHERE active=1");
+
+        QueryResult result = database.execute("SELECT * FROM active_employees WHERE salary > 100000");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals("Carol", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testViewIsNotMaterializedAndReflectsCurrentData() {
+        database.execute("CREATE TABLE employees (id INT, active INT)");
+        database.execute("INSERT INTO employees VALUES (1, 1)");
+        database.execute("CREATE VIEW active_employees AS SELECT id FROM employees WHERE active=1");
+        assertRowCount("SELECT * FROM active_employees", 1);
+
+        database.execute("INSERT INTO employees VALUES (2, 1)");
+        assertRowCount("SELECT * FROM active_employees", 2, "a view must reflect data inserted after it was created - it isn't a snapshot");
+    }
+
+    @Test
+    void testTableAndViewNamesCannotCollide() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE VIEW v AS SELECT * FROM t");
+
+        assertFalse(database.execute("CREATE TABLE v (id INT)").isSuccess(), "a table can't take an existing view's name");
+        assertFalse(database.execute("CREATE VIEW t AS SELECT * FROM t").isSuccess(), "a view can't take an existing table's name");
+    }
+
+    @Test
+    void testDropView() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE VIEW v AS SELECT * FROM t");
+        assertTrue(database.execute("SELECT * FROM v").isSuccess());
+
+        QueryResult dropResult = database.execute("DROP VIEW v");
+        assertTrue(dropResult.isSuccess());
+
+        assertFalse(database.execute("SELECT * FROM v").isSuccess(), "querying a dropped view must fail");
+        assertFalse(database.execute("DROP VIEW v").isSuccess(), "dropping an already-dropped view must fail, not silently succeed");
+    }
+
+    @Test
+    void testViewCombinedWithJoinOrAggregateFailsCleanlyRatherThanSilentlyIgnoringThem() {
+        // A real bug found and fixed while building this: the views lookup
+        // used to run before the join/aggregate checks, so a query
+        // combining either with a view silently fell through to plain
+        // WHERE/projection logic that has no idea how to join or
+        // aggregate - "SELECT COUNT(*) FROM aView" would silently return
+        // the view's raw rows instead of a count, with no error at all.
+        database.execute("CREATE TABLE employees (id INT, dept_id INT)");
+        database.execute("CREATE TABLE departments (id INT)");
+        database.execute("CREATE VIEW emp_view AS SELECT id, dept_id FROM employees");
+
+        QueryResult joinResult = database.execute("SELECT * FROM emp_view JOIN departments ON emp_view.dept_id = departments.id");
+        assertFalse(joinResult.isSuccess(), "a view combined with JOIN must fail cleanly, not silently ignore the join");
+
+        QueryResult aggResult = database.execute("SELECT COUNT(*) FROM emp_view");
+        assertFalse(aggResult.isSuccess(), "a view combined with an aggregate must fail cleanly, not silently ignore the aggregate");
+    }
+
+    @Test
+    void testSubqueryFailureIsSurfacedNotSilentlyTreatedAsNoMatch() {
+        // A second real bug found while testing the above: when a subquery
+        // itself fails (here, because it references a view - not supported
+        // inside a subquery), the failure must be surfaced as a real error,
+        // not silently treated as "the subquery matched nothing," which
+        // would make the enclosing WHERE clause quietly (and wrongly) match
+        // zero rows instead of reporting what actually went wrong.
+        database.execute("CREATE TABLE employees (id INT)");
+        database.execute("INSERT INTO employees VALUES (1)");
+        database.execute("CREATE VIEW emp_view AS SELECT id FROM employees");
+
+        QueryResult result = database.execute("SELECT * FROM employees WHERE id IN (SELECT id FROM emp_view)");
+        assertFalse(result.isSuccess(), "a subquery referencing a view isn't supported yet and must fail, not silently match nothing");
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

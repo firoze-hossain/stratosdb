@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
-| Tests passing | **112 / 112** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A (B+Tree delete, vacuum) done; Phase B (query engine depth) done; Phase C's hash index done; Phase D's multi-statement transactions done |
+| Tests passing | **119 / 119** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A (B+Tree delete, vacuum) done; Phase B (query engine depth) done; Phase C's hash index done; Phase D's multi-statement transactions done; Phase E's views done |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -88,12 +88,12 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
 | `stratosdb-core` | 2 | 87 | Real — wires everything together |
 | `stratosdb-storage` | 10 | 1,842 | Real — disk/buffer/WAL/heap, a page-type-agnostic buffer pool, an idempotent shutdown path, and real page compaction (defragment) backing vacuum |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 24 | 2,068 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM, subqueries, `CREATE INDEX ... USING HASH`) + hand-written AST builder + a real WHERE-clause expression tree + cost-based executor |
+| `stratosdb-sql` | 26 | 2,189 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM, subqueries, `CREATE INDEX ... USING HASH`, views) + hand-written AST builder + a real WHERE-clause expression tree + cost-based executor |
 | `stratosdb-index` | 3 | 773 | Real — B+Tree (insert, search, range scan, delete with borrow/merge/root-collapse) and now a static hash index (overflow chaining), both tested at scale, sharing a `KeyValueIndex` interface the planner uses uniformly |
 | `stratosdb-network` | 5 | 633 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server that correctly cleans up an abandoned transaction when a connection drops, all tested over real sockets |
 | `stratosdb-jdbc` | 6 | 786 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support and real multi-statement transactions (`setAutoCommit`/`commit`/`rollback`), verified through `DriverManager` |
 | `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
-| `stratosdb-testing` | 0 (test-only) | — | 60 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 67 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 **Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
@@ -181,9 +181,18 @@ Worth being precise about provenance here: the SQL-engine core of this (grammar,
 - 6 new low-level tests in `HashIndexTest` (basic insert/search, duplicates, exact-pair delete among duplicates, no-op on a missing pair, persistence across reopen, the 100k-key/40%-delete scale test) plus 5 SQL-level integration tests in `StratosDBTest` (`USING HASH` creates and uses a hash index, the default without `USING` is B+Tree, a hash index is never chosen for a range query, hash is preferred over B+Tree for equality when both exist on the same column, and correctness holds across `UPDATE`/`DELETE` on a hash-indexed column).
 - **Known, named limitations**: static hashing only - no dynamic bucket splitting as the index grows, so heavy skew or a much larger dataset than the fixed 251 buckets anticipated degrades toward long overflow chains rather than rehashing (the standard tradeoff of static over extendible hashing). No range scan, by design, not by gap.
 
+## Phase E — Views ✅ done (first item)
+
+- ✅ **`CREATE VIEW name AS SELECT ...`** and **`DROP VIEW`**. A view is never materialized - just its defining query, remembered under a name; `SELECT ... FROM aView` re-runs that query fresh every time (reusing the exact same execution path a normal query would), then applies the outer query's `WHERE`/projection/`LIMIT` to the result. A view always reflects current data, the standard tradeoff of a non-materialized view.
+- **Found and fixed two real bugs while testing this, both "silently wrong" rather than "loudly broken," and worse for it:**
+  1. The very first version checked whether a `FROM` name was a view *before* checking whether the outer query had a `JOIN` or an aggregate/`GROUP BY` - so `SELECT COUNT(*) FROM aView` didn't error, it silently returned the view's raw, unaggregated rows, having quietly ignored the `COUNT(*)` entirely. Found immediately by testing that exact query rather than assuming the join/aggregate code paths would reject it (they never got the chance - the views check ran first and intercepted before they could). Fixed: combining a view with a `JOIN` or an aggregate now fails with a clear, specific error instead of running incorrectly.
+  2. Chasing that fix uncovered a second, older bug in the subquery work from a previous round: when a subquery itself failed for any reason, the code silently treated that as "the subquery matched nothing" instead of surfacing the failure - so `WHERE id IN (SELECT ... FROM somethingThatFails)` would quietly evaluate to "matches zero rows" rather than reporting an actual error. Fixed by propagating the failure as a real exception, caught by `execute()`'s existing top-level handler (which already converts any thrown exception into a proper error result and correctly poisons an open transaction) - no new error-handling machinery needed, just routing through what already existed correctly for every other failure path.
+- **Known, named scope limit**: a view can be plainly `SELECT`-ed with a `WHERE` clause on top; joining a view against another table, aggregating over a view, or referencing a view from inside a subquery all correctly fail with a clear error rather than doing something wrong - real further work, not silently unsupported.
+- 7 new tests in `StratosDBTest`: creation and selection, `WHERE` composing on top of a view, confirming a view is *not* materialized (it sees rows inserted after the view was created), table/view name collisions in both directions, `DROP VIEW` (including that dropping an already-dropped view fails rather than silently succeeding), and the two bugs above each get their own regression test.
+
 ## What to do next
 
-Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed. Phase B's core "query engine depth" items are done. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions) is done. What's left in Phase A: a free-space map (efficiency) and autovacuum (automation) - savepoints are now unblocked too. What's left in Phase B: merge join, window functions, and CTEs. What's left in Phase C: index-only scans (blocked on a visibility map, which doesn't exist yet), bitmap index, GiST/GIN-equivalents. What's left in Phase D: PostgreSQL wire protocol compatibility, SCRAM auth, client-side TLS certificate verification, streaming replication, connection pooling. See `PROJECT_PLAN.md`'s full phase breakdown for everything else - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed. Phase B's core "query engine depth" items are done. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions) is done. Phase E's highest-priority item (views) is done. What's left in Phase A: a free-space map (efficiency) and autovacuum (automation) - savepoints are now unblocked too. What's left in Phase B: merge join, window functions, and CTEs. What's left in Phase C: index-only scans (blocked on a visibility map, which doesn't exist yet), bitmap index, GiST/GIN-equivalents. What's left in Phase D: PostgreSQL wire protocol compatibility, SCRAM auth, client-side TLS certificate verification, streaming replication, connection pooling. What's left in Phase E: metrics, autovacuum, triggers, slow-query logging, stored procedures. See `PROJECT_PLAN.md`'s full phase breakdown for everything else - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 

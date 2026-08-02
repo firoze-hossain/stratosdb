@@ -29,6 +29,14 @@ public class ExecutorEngine {
     // Store column names for each table
     private final Map<String, List<String>> tableColumns;
 
+    /**
+     * CREATE VIEW just remembers the defining query - a view is never
+     * materialized. SELECT-ing from a view re-runs that query fresh every
+     * time (see executeSelectOverView), so it always reflects the current
+     * data, the same tradeoff any non-materialized view makes.
+     */
+    private final Map<String, SelectStatement> views = new ConcurrentHashMap<>();
+
     /** One index (B+Tree or hash), and what it indexes. Only integer/long-valued columns are indexable (see toIndexKey). */
     private record IndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.KeyValueIndex index) {}
 
@@ -231,12 +239,17 @@ public class ExecutorEngine {
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
+        if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
+        if (stmt instanceof DropViewStatement s) return executeDropView(s);
         return QueryResult.error("Unsupported statement");
     }
 
     private QueryResult executeCreateTable(CreateTableStatement stmt) {
         if (tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table already exists: " + stmt.tableName());
+        }
+        if (views.containsKey(stmt.tableName())) {
+            return QueryResult.error("A view already exists with that name: " + stmt.tableName());
         }
 
         HeapTable table = new HeapTable(stmt.tableName(), bufferPool);
@@ -446,6 +459,25 @@ public class ExecutorEngine {
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn) {
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
+            SelectStatement viewQuery = views.get(stmt.tableName());
+            if (viewQuery != null) {
+                boolean hasJoin = stmt.joins() != null && !stmt.joins().isEmpty();
+                boolean hasAggregate = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
+                if (hasJoin || hasAggregate) {
+                    // executeSelectOverView only applies WHERE/projection/LIMIT to
+                    // the view's rows - it doesn't know how to join or aggregate.
+                    // Silently falling through to it would silently ignore the
+                    // outer query's join/aggregate entirely (a real bug this
+                    // check replaced, found by actually testing "SELECT COUNT(*)
+                    // FROM aView" rather than assuming the join/aggregate code
+                    // paths would reject it themselves - they never got the chance,
+                    // since this views check runs first).
+                    return QueryResult.error("Querying a view (" + stmt.tableName()
+                        + ") together with a JOIN or an aggregate/GROUP BY isn't supported yet - "
+                        + "a plain SELECT ... FROM " + stmt.tableName() + " [WHERE ...] works");
+                }
+                return executeSelectOverView(stmt, viewQuery, txn);
+            }
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
@@ -499,6 +531,48 @@ public class ExecutorEngine {
         }
 
         return QueryResult.success(tuples);
+    }
+
+    /**
+     * A SELECT whose FROM clause names a view: run the view's own stored
+     * query fresh (which may itself join, aggregate, filter, or reference
+     * a subquery - whatever it was defined with), then apply THIS outer
+     * query's WHERE/projection/LIMIT to the view's result rows. No
+     * materialization or caching - a view always reflects current data,
+     * the standard non-materialized-view tradeoff.
+     *
+     * Known, named scope limit: this handles "SELECT ... FROM aView"
+     * directly. Joining a view against another table, or aggregating over
+     * a view, isn't threaded through here - executeJoinedSelect and
+     * executeAggregateSelect both look a FROM name up in the tables map
+     * only, so a query trying either against a view name fails with
+     * "table not found" rather than silently doing something wrong.
+     */
+    private QueryResult executeSelectOverView(SelectStatement outer, SelectStatement viewQuery, Transaction txn) {
+        QueryResult viewResult = executeSelect(viewQuery, txn);
+        if (!viewResult.isSuccess()) {
+            return viewResult;
+        }
+
+        List<Tuple> filtered = new ArrayList<>();
+        for (Tuple row : viewResult.getRows()) {
+            if (matchesWhere(row, outer.where(), txn)) {
+                filtered.add(project(row, outer.columns()));
+            }
+        }
+
+        if (outer.limit() != null) {
+            try {
+                int limit = Integer.parseInt(outer.limit());
+                if (filtered.size() > limit) {
+                    filtered = filtered.subList(0, limit);
+                }
+            } catch (NumberFormatException e) {
+                // Ignore invalid limit
+            }
+        }
+
+        return QueryResult.success(filtered);
     }
 
     /**
@@ -1134,6 +1208,33 @@ public class ExecutorEngine {
     }
 
     /**
+     * A view is never materialized - just its defining query, remembered
+     * under a name. See executeSelectOverView for how a SELECT against a
+     * view actually runs. No circular-view-definition check: a view that
+     * (directly or transitively) selects from itself would recurse until
+     * a StackOverflowError, a real, named gap rather than a silent
+     * infinite loop with no diagnostic.
+     */
+    private QueryResult executeCreateView(CreateViewStatement stmt) {
+        if (tables.containsKey(stmt.viewName())) {
+            return QueryResult.error("A table already exists with that name: " + stmt.viewName());
+        }
+        if (views.containsKey(stmt.viewName())) {
+            return QueryResult.error("View already exists: " + stmt.viewName());
+        }
+        views.put(stmt.viewName(), stmt.query());
+        return QueryResult.success("View created: " + stmt.viewName());
+    }
+
+    private QueryResult executeDropView(DropViewStatement stmt) {
+        if (!views.containsKey(stmt.viewName())) {
+            return QueryResult.error("View not found: " + stmt.viewName());
+        }
+        views.remove(stmt.viewName());
+        return QueryResult.success("View dropped: " + stmt.viewName());
+    }
+
+    /**
      * Returns one row per table, with a single "table_name" column - not a
      * message string. This used to return QueryResult.success("Tables: a, b")
      * or QueryResult.success("No tables found"), which worked fine for the
@@ -1461,7 +1562,14 @@ public class ExecutorEngine {
     /** Every value from the subquery's (single) result column - for IN (SELECT ...). */
     private List<Object> evaluateSubqueryValues(SelectStatement subquery, Transaction txn, Tuple outerRow) {
         QueryResult result = runSubquerySelect(subquery, txn, outerRow);
-        if (!result.isSuccess() || result.getRows() == null) {
+        if (!result.isSuccess()) {
+            // Must propagate, not silently treat as "no matching values" - a
+            // subquery that fails (e.g. references an unsupported view
+            // combination) would otherwise make its enclosing WHERE clause
+            // silently evaluate as if nothing matched, with no error at all.
+            throw new IllegalStateException("Subquery failed: " + result.getError());
+        }
+        if (result.getRows() == null) {
             return List.of();
         }
         List<Object> values = new ArrayList<>();
@@ -1484,7 +1592,10 @@ public class ExecutorEngine {
 
     private boolean evaluateSubqueryHasRows(SelectStatement subquery, Transaction txn, Tuple outerRow) {
         QueryResult result = runSubquerySelect(subquery, txn, outerRow);
-        return result.isSuccess() && result.getRows() != null && !result.getRows().isEmpty();
+        if (!result.isSuccess()) {
+            throw new IllegalStateException("Subquery failed: " + result.getError());
+        }
+        return result.getRows() != null && !result.getRows().isEmpty();
     }
 
     private Object findColumnValue(Tuple tuple, String columnName) {
