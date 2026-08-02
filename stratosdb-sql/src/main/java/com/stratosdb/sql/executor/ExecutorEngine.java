@@ -29,8 +29,8 @@ public class ExecutorEngine {
     // Store column names for each table
     private final Map<String, List<String>> tableColumns;
 
-    /** One B+Tree index, and what it indexes. Only integer/long-valued columns are indexable (see toIndexKey). */
-    private record IndexEntry(String indexName, String tableName, String columnName, BTreeIndex index) {}
+    /** One index (B+Tree or hash), and what it indexes. Only integer/long-valued columns are indexable (see toIndexKey). */
+    private record IndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.KeyValueIndex index) {}
 
     private final Map<String, IndexEntry> indexesByName;
     private final Map<String, List<IndexEntry>> indexesByTable;
@@ -277,7 +277,9 @@ public class ExecutorEngine {
             return QueryResult.error("Column not found: " + stmt.columnName() + " on table " + stmt.tableName());
         }
 
-        BTreeIndex index = new BTreeIndex(stmt.indexName(), bufferPool);
+        com.stratosdb.index.KeyValueIndex index = stmt.indexType() == CreateIndexStatement.IndexType.HASH
+            ? new com.stratosdb.index.hash.HashIndex(stmt.indexName(), bufferPool)
+            : new BTreeIndex(stmt.indexName(), bufferPool);
         int indexed = 0;
         int skippedNonNumeric = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -299,7 +301,7 @@ public class ExecutorEngine {
         indexesByName.put(stmt.indexName(), entry);
         indexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
 
-        String message = "Index created: " + stmt.indexName() + " on " + stmt.tableName()
+        String message = "Index created: " + stmt.indexName() + " (" + stmt.indexType() + ") on " + stmt.tableName()
             + "(" + stmt.columnName() + "), indexed " + indexed + " row(s)";
         if (skippedNonNumeric > 0) {
             message += " (" + skippedNonNumeric + " row(s) skipped: non-integer column value)";
@@ -460,8 +462,8 @@ public class ExecutorEngine {
 
         if (plan.useIndex()) {
             List<BTreePage.RID> rids = plan.loKey().equals(plan.hiKey())
-                ? plan.index().index().searchAll(plan.loKey())
-                : plan.index().index().rangeScan(plan.loKey(), plan.hiKey());
+                ? plan.index().index().searchAll(plan.loKey()) // equality: any KeyValueIndex (hash or btree) can serve this
+                : ((BTreeIndex) plan.index().index()).rangeScan(plan.loKey(), plan.hiKey()); // range: planScan's findRangeCapableIndex guarantees this is always a BTreeIndex
 
             for (BTreePage.RID rid : rids) {
                 byte[] stored = table.readTuple(rid.pageId(), rid.slot());
@@ -880,7 +882,10 @@ public class ExecutorEngine {
         if (!pred.isNumeric()) {
             return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
-        IndexEntry idx = findIndex(tableName, pred.column());
+        boolean isEquality = pred.operator().equals("=");
+        IndexEntry idx = isEquality
+            ? findEqualityIndex(tableName, pred.column())   // hash preferred (O(1) vs O(log n)), btree acceptable
+            : findRangeCapableIndex(tableName, pred.column()); // hashing destroys order - only btree can serve a range
         if (idx == null) {
             return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
@@ -965,11 +970,31 @@ public class ExecutorEngine {
         return Math.max(1, (long) (stats.rowCount() * selectivity));
     }
 
-    private IndexEntry findIndex(String tableName, String columnName) {
+    /** For an equality predicate: prefers a hash index (O(1) vs O(log n)) when one exists on this column, else a B+Tree one. */
+    private IndexEntry findEqualityIndex(String tableName, String columnName) {
+        List<IndexEntry> tableIndexes = indexesByTable.get(tableName);
+        if (tableIndexes == null) return null;
+        IndexEntry btreeFallback = null;
+        for (IndexEntry idx : tableIndexes) {
+            if (!idx.columnName().equalsIgnoreCase(columnName)) continue;
+            if (idx.index() instanceof com.stratosdb.index.hash.HashIndex) {
+                return idx; // hash is strictly cheaper for equality when available - no need to keep looking
+            }
+            if (btreeFallback == null) {
+                btreeFallback = idx;
+            }
+        }
+        return btreeFallback;
+    }
+
+    /** For a range predicate (&gt;, &lt;, &gt;=, &lt;=): only a B+Tree index can serve it - hashing destroys key order on purpose. */
+    private IndexEntry findRangeCapableIndex(String tableName, String columnName) {
         List<IndexEntry> tableIndexes = indexesByTable.get(tableName);
         if (tableIndexes == null) return null;
         for (IndexEntry idx : tableIndexes) {
-            if (idx.columnName().equalsIgnoreCase(columnName)) return idx;
+            if (idx.columnName().equalsIgnoreCase(columnName) && idx.index() instanceof BTreeIndex) {
+                return idx;
+            }
         }
         return null;
     }

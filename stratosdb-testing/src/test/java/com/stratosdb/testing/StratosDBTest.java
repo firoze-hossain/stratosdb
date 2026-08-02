@@ -809,6 +809,83 @@ public class StratosDBTest {
         assertRowCount("SELECT * FROM t", 1);
     }
 
+    @Test
+    void testCreateHashIndexAndEqualityLookup() {
+        database.execute("CREATE TABLE t (id INT, category INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        database.execute("INSERT INTO t VALUES (2, 200)");
+
+        QueryResult createResult = database.execute("CREATE INDEX idx_hash ON t (category) USING HASH");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX USING HASH failed: " + createResult.getError());
+        assertTrue(createResult.getMessage().contains("HASH"));
+
+        QueryResult explain = database.execute("EXPLAIN SELECT * FROM t WHERE category=200");
+        assertTrue(explain.getMessage().startsWith("Index Scan using idx_hash"),
+            () -> "expected the hash index to be used: " + explain.getMessage());
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE category=200");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals(2, result.getRows().get(0).getValue("id"));
+    }
+
+    @Test
+    void testDefaultIndexTypeIsBTreeWithoutUsingClause() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        QueryResult result = database.execute("CREATE INDEX idx_default ON t (val)");
+        assertTrue(result.isSuccess());
+        assertTrue(result.getMessage().contains("BTREE"), () -> "expected BTREE as the default index type: " + result.getMessage());
+    }
+
+    @Test
+    void testHashIndexIsNotUsedForRangeQueries() {
+        // A hash index can't serve a range query - the planner must not even
+        // attempt it, falling back to a seq scan (or a btree index, if one
+        // also exists on this column) instead of producing wrong results.
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        for (int i = 0; i < 10; i++) {
+            database.execute("INSERT INTO t VALUES (" + i + ", " + i + ")");
+        }
+        database.execute("CREATE INDEX idx_hash ON t (val) USING HASH");
+
+        QueryResult explain = database.execute("EXPLAIN SELECT * FROM t WHERE val>5");
+        assertTrue(explain.isSuccess());
+        assertFalse(explain.getMessage().contains("idx_hash"),
+            () -> "a hash index must never be chosen for a range predicate: " + explain.getMessage());
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE val>5");
+        assertTrue(result.isSuccess());
+        assertEquals(4, result.getRows().size(), "correctness must hold regardless of which scan strategy was used");
+    }
+
+    @Test
+    void testHashIndexPrefersOverBTreeForEquality() {
+        // When both exist on the same column, equality should choose the
+        // hash index (cheaper - O(1) vs O(log n)) over the B+Tree one.
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 42)");
+        database.execute("CREATE INDEX idx_btree ON t (val) USING BTREE");
+        database.execute("CREATE INDEX idx_hash ON t (val) USING HASH");
+
+        QueryResult explain = database.execute("EXPLAIN SELECT * FROM t WHERE val=42");
+        assertTrue(explain.getMessage().contains("idx_hash"),
+            () -> "expected the hash index to be preferred for equality when both exist: " + explain.getMessage());
+    }
+
+    @Test
+    void testHashIndexStaysCorrectAcrossDeleteAndUpdate() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("CREATE INDEX idx_hash ON t (val) USING HASH");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        database.execute("UPDATE t SET val=200 WHERE id=1");
+        assertRowCount("SELECT * FROM t WHERE val=100", 0, "the old hash-indexed value must no longer find this row");
+        assertRowCount("SELECT * FROM t WHERE val=200", 1, "the new hash-indexed value must find it");
+
+        database.execute("DELETE FROM t WHERE id=1");
+        assertRowCount("SELECT * FROM t WHERE val=200", 0, "a deleted row must not be findable via the hash index either");
+    }
+
     private void assertRowCount(String sql, int expected, String message) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

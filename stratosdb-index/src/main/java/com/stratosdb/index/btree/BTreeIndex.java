@@ -37,7 +37,7 @@ import java.util.List;
  * duplicate keys are supported (searchAll/rangeScan return every match),
  * so the caller must know which specific row it's removing.
  */
-public class BTreeIndex {
+public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private static final Logger LOG = LoggerFactory.getLogger(BTreeIndex.class);
 
     private static final long META_PAGE_ID = 0;

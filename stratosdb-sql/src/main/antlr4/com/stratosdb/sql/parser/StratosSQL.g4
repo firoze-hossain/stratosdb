@@ -7,7 +7,7 @@ sqlStatement: createTable | createIndex | insert | select | update | delete | dr
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
-createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN SEMICOLON?;
+createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN (USING (HASH | BTREE))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
 showTables: SHOW TABLES SEMICOLON?;
 explain: EXPLAIN select;
@@ -139,6 +139,9 @@ SHOW: S H O W;
 TABLES: T A B L E S;
 INDEX: I N D E X;
 ON: O N;
+USING: U S I N G;
+HASH: H A S H;
+BTREE: B T R E E;
 JOIN: J O I N;
 INNER: I N N E R;
 EXPLAIN: E X P L A I N;

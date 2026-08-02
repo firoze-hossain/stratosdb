@@ -70,7 +70,10 @@ public class SqlParser {
         String indexName = ctx.indexName().getText();
         String tableName = ctx.tableName().getText();
         String columnName = ctx.columnName().getText();
-        return new CreateIndexStatement(indexName, tableName, columnName);
+        CreateIndexStatement.IndexType indexType = ctx.HASH() != null
+            ? CreateIndexStatement.IndexType.HASH
+            : CreateIndexStatement.IndexType.BTREE; // default, matching Postgres's own convention
+        return new CreateIndexStatement(indexName, tableName, columnName, indexType);
     }
 
     /**
