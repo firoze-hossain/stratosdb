@@ -9,6 +9,11 @@ import com.stratosdb.transaction.TransactionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
 public class StratosDB {
     private static final Logger LOG = LoggerFactory.getLogger(StratosDB.class);
 
@@ -20,6 +25,8 @@ public class StratosDB {
     private final ExecutorEngine executor;
 
     private boolean running = false;
+    private ScheduledExecutorService autovacuumExecutor;
+    private ScheduledFuture<?> autovacuumTask;
 
     public StratosDB(DatabaseConfig config) {
         this.config = config;
@@ -30,9 +37,16 @@ public class StratosDB {
         this.walManager = new WALManager(config.getDataDirectory());
         this.transactionManager = new TransactionManager();
         this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager);
+        if (config.getSlowQueryThresholdMs() >= 0) {
+            this.executor.setSlowQueryThresholdMs(config.getSlowQueryThresholdMs());
+        }
 
         // Recover from WAL
         this.walManager.recover(diskManager);
+
+        if (config.getAutovacuumIntervalMs() > 0) {
+            startAutovacuum(config.getAutovacuumIntervalMs());
+        }
 
         LOG.info("StratosDB initialized at {}", config.getDataDirectory());
     }
@@ -51,6 +65,71 @@ public class StratosDB {
      */
     public void closeSession() {
         executor.closeSession();
+    }
+
+    /**
+     * Runs one autovacuum pass: VACUUM on every current table, right now,
+     * synchronously. Exposed directly (not just via the scheduled timer)
+     * so it can be tested deterministically without waiting on a clock,
+     * and so a caller wanting to force an immediate pass doesn't have to
+     * stop and restart the scheduled one to do it.
+     *
+     * Each table's VACUUM runs through execute("VACUUM tableName") - the
+     * exact same path a person typing that command would use. That's a
+     * deliberate choice, not a shortcut: it means autovacuum carries
+     * exactly the same concurrency characteristics manual VACUUM already
+     * had (see PROGRESS.md for the full reasoning) rather than introducing
+     * a new, separately-reasoned-about code path that bypasses the normal
+     * statement-execution machinery.
+     */
+    public void runAutovacuumPass() {
+        for (String tableName : executor.getTableNames()) {
+            QueryResult result = execute("VACUUM " + tableName);
+            if (result.isSuccess()) {
+                LOG.debug("Autovacuum: {}", result.getMessage());
+            } else {
+                // One table failing (e.g. dropped mid-pass) must not stop the
+                // rest of the pass from covering every other table.
+                LOG.warn("Autovacuum failed for table {}: {}", tableName, result.getError());
+            }
+        }
+    }
+
+    /**
+     * Starts a background daemon thread that calls runAutovacuumPass every
+     * intervalMs. Safe to call again after stopAutovacuum; calling it while
+     * already running replaces the previous schedule rather than running
+     * two overlapping ones.
+     */
+    public synchronized void startAutovacuum(long intervalMs) {
+        stopAutovacuum();
+        autovacuumExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "stratos-autovacuum");
+            t.setDaemon(true); // must never keep the JVM alive on its own
+            return t;
+        });
+        autovacuumTask = autovacuumExecutor.scheduleWithFixedDelay(() -> {
+            try {
+                runAutovacuumPass();
+            } catch (Exception e) {
+                // The scheduler silently stops future runs if a task throws -
+                // catching here keeps autovacuum running across a bad pass
+                // instead of quietly dying after the first exception.
+                LOG.error("Autovacuum pass failed unexpectedly", e);
+            }
+        }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+        LOG.info("Autovacuum started, running every {} ms", intervalMs);
+    }
+
+    public synchronized void stopAutovacuum() {
+        if (autovacuumTask != null) {
+            autovacuumTask.cancel(false);
+            autovacuumTask = null;
+        }
+        if (autovacuumExecutor != null) {
+            autovacuumExecutor.shutdownNow();
+            autovacuumExecutor = null;
+        }
     }
 
     /**
@@ -75,6 +154,7 @@ public class StratosDB {
     public void shutdown() {
         LOG.info("Shutting down StratosDB...");
         running = false;
+        stopAutovacuum();
         bufferPool.close(); // flushes every heap-table page and closes DiskManager's file handles
         walManager.close(); // checkpoints internally, then closes its own separate wal.log file
                              // handle - bufferPool.close() never touched that handle, so it used

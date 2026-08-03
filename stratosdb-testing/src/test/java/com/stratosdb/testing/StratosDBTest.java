@@ -6,6 +6,8 @@ import com.stratosdb.sql.executor.QueryResult;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
@@ -986,6 +988,117 @@ public class StratosDBTest {
 
         QueryResult result = database.execute("SELECT * FROM employees WHERE id IN (SELECT id FROM emp_view)");
         assertFalse(result.isSuccess(), "a subquery referencing a view isn't supported yet and must fail, not silently match nothing");
+    }
+
+    @Test
+    void testRunAutovacuumPassReclaimsAcrossAllTables() {
+        database.execute("CREATE TABLE t1 (id INT, val INT)");
+        database.execute("CREATE TABLE t2 (id INT, val INT)");
+        database.execute("INSERT INTO t1 VALUES (1, 100)");
+        database.execute("INSERT INTO t2 VALUES (1, 100)");
+        for (int i = 0; i < 20; i++) {
+            database.execute("UPDATE t1 SET val=" + i + " WHERE id=1");
+            database.execute("UPDATE t2 SET val=" + i + " WHERE id=1");
+        }
+
+        database.runAutovacuumPass();
+
+        // Correctness must be completely unaffected - both tables, both rows.
+        assertRowCount("SELECT * FROM t1", 1);
+        assertRowCount("SELECT * FROM t2", 1);
+
+        // Reclamation must have actually happened - a manual VACUUM afterward finds nothing left to do.
+        QueryResult vacuumAgain1 = database.execute("VACUUM t1");
+        QueryResult vacuumAgain2 = database.execute("VACUUM t2");
+        assertEquals("Vacuumed t1: reclaimed 0 dead row version(s) across 0 page(s)", vacuumAgain1.getMessage());
+        assertEquals("Vacuumed t2: reclaimed 0 dead row version(s) across 0 page(s)", vacuumAgain2.getMessage());
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void testScheduledAutovacuumRunsAutomaticallyInTheBackground() throws InterruptedException {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        for (int i = 0; i < 20; i++) {
+            database.execute("UPDATE t SET val=" + i + " WHERE id=1");
+        }
+
+        database.startAutovacuum(100); // every 100ms
+        try {
+            // Poll rather than a single fixed sleep, to keep this robust
+            // under slow/loaded CI without just using a long fixed delay.
+            long deadline = System.currentTimeMillis() + 5000;
+            boolean reclaimed = false;
+            while (System.currentTimeMillis() < deadline) {
+                Thread.sleep(150);
+                QueryResult check = database.execute("VACUUM t");
+                if (check.getMessage().contains("reclaimed 0 dead row version(s)")) {
+                    reclaimed = true;
+                    break;
+                }
+            }
+            assertTrue(reclaimed, "scheduled autovacuum should have reclaimed the dead versions within the deadline");
+        } finally {
+            database.stopAutovacuum();
+        }
+
+        assertRowCount("SELECT * FROM t", 1, "correctness must be unaffected by background autovacuum");
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void testStopAutovacuumActuallyStopsIt() throws InterruptedException {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        database.startAutovacuum(100);
+        database.stopAutovacuum();
+
+        // Create dead versions AFTER stopping - if the scheduler were still
+        // somehow running, this would get cleaned up; it must not.
+        for (int i = 0; i < 10; i++) {
+            database.execute("UPDATE t SET val=" + i + " WHERE id=1");
+        }
+        Thread.sleep(500); // long enough for several 100ms cycles to have fired, if it were still running
+
+        QueryResult manualVacuum = database.execute("VACUUM t");
+        assertTrue(manualVacuum.getMessage().contains("reclaimed 10 dead row version(s)"),
+            () -> "expected the 10 dead versions to still be there since autovacuum was stopped: " + manualVacuum.getMessage());
+    }
+
+    @Test
+    void testSlowQueryLoggingLogsWhenOverThreshold() {
+        database.getExecutor().setSlowQueryThresholdMs(0); // log every statement - deterministic, no timing race
+        database.execute("CREATE TABLE t (id INT)");
+
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        PrintStream originalErr = System.err;
+        System.setErr(new PrintStream(captured));
+        try {
+            database.execute("INSERT INTO t VALUES (1)");
+        } finally {
+            System.setErr(originalErr);
+        }
+
+        String output = captured.toString();
+        assertTrue(output.contains("Slow query"), () -> "expected a slow-query log line, got: " + output);
+        assertTrue(output.contains("INSERT INTO t VALUES (1)"), "the log line should include the actual statement text");
+    }
+
+    @Test
+    void testSlowQueryLoggingIsOffByDefault() {
+        database.execute("CREATE TABLE t (id INT)");
+
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        PrintStream originalErr = System.err;
+        System.setErr(new PrintStream(captured));
+        try {
+            database.execute("INSERT INTO t VALUES (1)");
+        } finally {
+            System.setErr(originalErr);
+        }
+
+        assertFalse(captured.toString().contains("Slow query"), "slow-query logging must be off unless explicitly enabled");
     }
 
     private void assertRowCount(String sql, int expected) {

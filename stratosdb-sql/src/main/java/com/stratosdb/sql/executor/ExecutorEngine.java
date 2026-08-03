@@ -108,7 +108,32 @@ public class ExecutorEngine {
      * can span more than one statement, since a multi-statement transaction
      * that crashes before COMMIT must leave zero trace, not a partial one.
      */
+    /**
+     * Slow-query logging: 0 or negative disables it (the default, matching
+     * this project's opt-in pattern for other operational features).
+     * Timing wraps the entire statement - parse, dispatch, and the
+     * commit/abort bookkeeping around it - not just the dispatch call, so
+     * "slow" reflects what a caller actually experienced end to end.
+     */
+    private volatile long slowQueryThresholdMs = -1;
+
+    public void setSlowQueryThresholdMs(long thresholdMs) {
+        this.slowQueryThresholdMs = thresholdMs;
+    }
+
     public QueryResult execute(String sql) {
+        long startNanos = System.nanoTime();
+        QueryResult result = executeInternal(sql);
+        if (slowQueryThresholdMs >= 0) {
+            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+            if (elapsedMs >= slowQueryThresholdMs) {
+                LOG.warn("Slow query ({} ms, threshold {} ms): {}", elapsedMs, slowQueryThresholdMs, sql);
+            }
+        }
+        return result;
+    }
+
+    private QueryResult executeInternal(String sql) {
         Statement stmt;
         try {
             stmt = parser.parse(sql);
@@ -225,6 +250,11 @@ public class ExecutorEngine {
             transactionManager.abort(state.transaction);
         }
         session.remove();
+    }
+
+    /** A snapshot of current table names - views are not included. Used by autovacuum to know what to vacuum. */
+    public java.util.Set<String> getTableNames() {
+        return new java.util.HashSet<>(tables.keySet());
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn) throws DeadlockException {

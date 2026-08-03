@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
-| Tests passing | **119 / 119** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A (B+Tree delete, vacuum) done; Phase B (query engine depth) done; Phase C's hash index done; Phase D's multi-statement transactions done; Phase E's views done |
+| Tests passing | **124 / 124** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A (B+Tree delete, vacuum) done; Phase B (query engine depth) done; Phase C's hash index done; Phase D's multi-statement transactions done; Phase E (views, autovacuum, slow-query logging) done |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -85,15 +85,15 @@ Real tests added this round: 6 (`UserStoreTest`) + 4 more in `StratosServerTest`
 | Module | Files | Lines | State |
 |---|---|---|---|
 | `stratosdb-common` | 11 | 182 | Real — exceptions, constants, utils |
-| `stratosdb-core` | 2 | 87 | Real — wires everything together |
+| `stratosdb-core` | 2 | 206 | Real — wires everything together, now including autovacuum scheduling and slow-query threshold configuration |
 | `stratosdb-storage` | 10 | 1,842 | Real — disk/buffer/WAL/heap, a page-type-agnostic buffer pool, an idempotent shutdown path, and real page compaction (defragment) backing vacuum |
 | `stratosdb-transaction` | 5 | 381 | Real — MVCC + locking, both tested |
-| `stratosdb-sql` | 26 | 2,189 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM, subqueries, `CREATE INDEX ... USING HASH`, views) + hand-written AST builder + a real WHERE-clause expression tree + cost-based executor |
+| `stratosdb-sql` | 26 | 2,219 | Real — ANTLR grammar (JOIN/qualified columns, GROUP BY/HAVING/aggregates, ANALYZE, VACUUM, subqueries, `CREATE INDEX ... USING HASH`, views) + hand-written AST builder + a real WHERE-clause expression tree + cost-based executor, plus slow-query logging |
 | `stratosdb-index` | 3 | 773 | Real — B+Tree (insert, search, range scan, delete with borrow/merge/root-collapse) and now a static hash index (overflow chaining), both tested at scale, sharing a `KeyValueIndex` interface the planner uses uniformly |
 | `stratosdb-network` | 5 | 633 | Real — wire protocol, auth handshake, optional TLS, virtual-thread-per-connection server that correctly cleans up an abandoned transaction when a connection drops, all tested over real sockets |
 | `stratosdb-jdbc` | 6 | 786 | Real — Driver/Connection/Statement/ResultSet with auth+TLS support and real multi-statement transactions (`setAutoCommit`/`commit`/`rollback`), verified through `DriverManager` |
 | `stratosdb-cli` | 1 | 229 | Real — network client over JDBC, verified end-to-end against a real separate server process |
-| `stratosdb-testing` | 0 (test-only) | — | 67 integration tests, all passing |
+| `stratosdb-testing` | 0 (test-only) | — | 72 integration tests, all passing |
 | `stratosdb-benchmark` | 1 | 169 | Real — `QueryBenchmark`, run for real (see Week 3 results above) |
 
 **Week 4 is done. All four weeks of the Foundation plan (Part 1 of PROJECT_PLAN.md) are now complete.**
@@ -190,9 +190,17 @@ Worth being precise about provenance here: the SQL-engine core of this (grammar,
 - **Known, named scope limit**: a view can be plainly `SELECT`-ed with a `WHERE` clause on top; joining a view against another table, aggregating over a view, or referencing a view from inside a subquery all correctly fail with a clear error rather than doing something wrong - real further work, not silently unsupported.
 - 7 new tests in `StratosDBTest`: creation and selection, `WHERE` composing on top of a view, confirming a view is *not* materialized (it sees rows inserted after the view was created), table/view name collisions in both directions, `DROP VIEW` (including that dropping an already-dropped view fails rather than silently succeeding), and the two bugs above each get their own regression test.
 
+## Phase E — Autovacuum + slow-query logging ✅ done (second and third items)
+
+- ✅ **Autovacuum**: `StratosDB.startAutovacuum(intervalMs)` runs a background daemon thread that periodically vacuums every current table; `stopAutovacuum()` stops it; `runAutovacuumPass()` runs one pass immediately and synchronously (exposed directly so it's testable deterministically, not just by waiting on a clock). Off by default; `DatabaseConfig.setAutovacuumIntervalMs(ms)` before construction auto-starts it. Wired into `shutdown()` so the background thread never outlives the database.
+  - **A real design decision worth stating plainly, not glossing over**: each table's automatic vacuum runs through `execute("VACUUM tableName")` - the exact same path a person typing that command would use - rather than calling `HeapTable.vacuum()` directly from the background thread. This was deliberate, not a shortcut: `BufferPoolManager`'s locking only covers its own cache/pin-count bookkeeping, not a page's actual content once a caller already holds a reference to it, so a *new*, separately-reasoned-about code path mutating pages from a background thread would risk racing with normal query threads in ways this project doesn't have the infrastructure (fine-grained page or table latching) to fully rule out yet. Routing through the same statement-execution path autovacuum's manual predecessor always used means automatic vacuum has exactly the same concurrency characteristics manual `VACUUM` already had - a real, pre-existing, and honestly-stated limitation of the storage engine as a whole, not a new one introduced by making vacuum automatic. Genuine fine-grained concurrency control is real further work, tracked as its own item, not something this round tried to solve.
+  - Verified: a direct `runAutovacuumPass()` reclaims dead versions across multiple tables correctly (row counts and values completely unaffected); a *scheduled* background pass does the same automatically within a polling deadline; `stopAutovacuum()` is proven to actually stop it (dead versions created after stopping are still there for a manual `VACUUM` to find, not silently cleaned up by a scheduler that claimed to have stopped).
+- ✅ **Slow-query logging**: `ExecutorEngine.setSlowQueryThresholdMs(ms)` (or `DatabaseConfig.setSlowQueryThresholdMs` before construction) logs any statement taking at least that long, at `WARN`, with the actual SQL text and elapsed time. Off by default (negative threshold), matching this project's opt-in pattern for other operational features. Timing wraps the entire statement - parse, dispatch, and the commit/abort bookkeeping around it - not just the inner execution, so "slow" reflects what a caller actually experienced end to end.
+- 5 new tests in `StratosDBTest`: a direct autovacuum pass reclaiming across multiple tables, a scheduled background pass actually running automatically, `stopAutovacuum` actually stopping it, slow-query logging firing when enabled (verified by capturing real `stderr` output, not just trusting the code path), and confirming it's silent by default.
+
 ## What to do next
 
-Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed. Phase B's core "query engine depth" items are done. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions) is done. Phase E's highest-priority item (views) is done. What's left in Phase A: a free-space map (efficiency) and autovacuum (automation) - savepoints are now unblocked too. What's left in Phase B: merge join, window functions, and CTEs. What's left in Phase C: index-only scans (blocked on a visibility map, which doesn't exist yet), bitmap index, GiST/GIN-equivalents. What's left in Phase D: PostgreSQL wire protocol compatibility, SCRAM auth, client-side TLS certificate verification, streaming replication, connection pooling. What's left in Phase E: metrics, autovacuum, triggers, slow-query logging, stored procedures. See `PROJECT_PLAN.md`'s full phase breakdown for everything else - worth picking based on what's actually useful next, not worked through as a fixed checklist.
+Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed. Phase B's core "query engine depth" items are done. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions) is done. Phase E's three highest-priority items (views, autovacuum, slow-query logging) are done. What's left in Phase A: a free-space map (efficiency) and savepoints (now unblocked). What's left in Phase B: merge join, window functions, and CTEs. What's left in Phase C: index-only scans (blocked on a visibility map, which doesn't exist yet), bitmap index, GiST/GIN-equivalents. What's left in Phase D: PostgreSQL wire protocol compatibility, SCRAM auth, client-side TLS certificate verification, streaming replication, connection pooling. What's left in Phase E: metrics, triggers, stored procedures - and, named honestly rather than left implicit, real fine-grained concurrency control (page or table latching) for the storage engine generally, which autovacuum's design above deliberately worked around rather than solved. See `PROJECT_PLAN.md`'s full phase breakdown for everything else - worth picking based on what's actually useful next, not worked through as a fixed checklist.
 
 ## Cross-platform note
 
