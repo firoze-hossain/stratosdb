@@ -66,6 +66,12 @@ public class SqlParser {
             return new CreateViewStatement(ctx.createView().viewName().getText(), buildSelect(ctx.createView().select()));
         } else if (ctx.dropView() != null) {
             return new DropViewStatement(ctx.dropView().viewName().getText());
+        } else if (ctx.savepoint() != null) {
+            return new SavepointStatement(ctx.savepoint().savepointName().getText());
+        } else if (ctx.releaseSavepoint() != null) {
+            return new ReleaseSavepointStatement(ctx.releaseSavepoint().savepointName().getText());
+        } else if (ctx.rollbackToSavepoint() != null) {
+            return new RollbackToSavepointStatement(ctx.rollbackToSavepoint().savepointName().getText());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }

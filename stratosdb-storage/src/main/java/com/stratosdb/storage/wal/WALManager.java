@@ -326,6 +326,25 @@ public class WALManager {
                 diskManager.writePage(tableName, entry.getValue());
             }
 
+            // Now that every redone operation is durably on disk (writePage
+            // above forces each one individually), the log itself is fully
+            // redundant - truncate it so a LATER restart doesn't read these
+            // same records again and redo them a second time. Without this,
+            // recover() always replays from byte 0 with no notion of "already
+            // applied past this point," so every subsequent restart -
+            // whether after a clean shutdown or another crash - would
+            // silently re-insert/re-update/re-delete everything this
+            // recovery just did, permanently duplicating data on every
+            // single restart. This is safe regardless of whether THIS
+            // recovery followed a graceful shutdown or a real crash: by this
+            // exact point, every redone write is independently fsynced,
+            // so there's nothing left in the log that isn't already
+            // reflected on disk.
+            walChannel.truncate(0);
+            walChannel.position(0);
+            currentLSN.set(0);
+            walChannel.force(true);
+
             LOG.info("Recovery complete: replayed {} operation(s) from {} committed transaction(s) across {} page(s)",
                 replayedOps, committedXids.size(), dirtyPages.size());
         } catch (Exception e) {
@@ -472,6 +491,18 @@ public class WALManager {
         }
         try {
             checkpoint(); // writes to walChannel, so this MUST run before the isOpen() check above would be false
+            walChannel.force(true);
+            // Truncate now that everything is durably flushed (bufferPool.close()
+            // already ran before this - see StratosDB.shutdown()'s ordering) -
+            // the same reasoning as recover()'s own truncation, just for the
+            // graceful-shutdown path instead of the crash-recovery path. Without
+            // this, even the FIRST restart after a perfectly clean shutdown would
+            // redo everything in the log once, creating a one-time duplicate
+            // before recover()'s own truncation ever gets a chance to prevent
+            // anything further - found via testing three sequential restarts
+            // with data added in the middle one, not by inspection.
+            walChannel.truncate(0);
+            currentLSN.set(0);
             walChannel.force(true);
             walChannel.close();
         } catch (Exception e) {

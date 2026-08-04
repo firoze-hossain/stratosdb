@@ -320,4 +320,74 @@ class CrashRecoveryTest {
     private static String sample(Set<Integer> ids, int n) {
         return ids.stream().sorted().limit(n).toList().toString();
     }
+
+    /**
+     * A real, significant bug found while working on schema catalog
+     * persistence (a separate piece of work - see stratosdb-testing):
+     * recover() always replayed every committed WAL record starting from
+     * byte zero, with no notion of "already applied." Since a graceful
+     * shutdown's checkpoint() wrote a marker but never actually cleared
+     * the log, even a single restart after a perfectly clean shutdown
+     * re-inserted every already-durable row a second time - and every
+     * further restart would have re-applied the growing log again,
+     * permanently duplicating data on every single restart.
+     *
+     * Tested here at the raw HeapTable/WALManager level (bypassing SQL and
+     * MVCC visibility entirely, via HeapTable.scan()'s unfiltered physical
+     * row count) across THREE sequential sessions specifically to prove
+     * duplication doesn't just get avoided once but stays fixed across
+     * repeated restarts.
+     */
+    @Test
+    @Timeout(value = 15, unit = TimeUnit.SECONDS)
+    void walDoesNotDuplicateRowsAcrossMultipleRestarts() throws Exception {
+        String dir = tempDir.toString();
+
+        // Session 1: two inserts, clean shutdown.
+        DiskManager dm1 = new DiskManager(dir);
+        BufferPoolManager bp1 = new BufferPoolManager(64, dm1);
+        WALManager wal1 = new WALManager(dir);
+        wal1.recover(dm1); // nothing to recover yet - fresh directory
+        HeapTable table1 = new HeapTable("dedup_test", bp1);
+
+        for (int i = 0; i < 2; i++) {
+            Tuple tuple = new Tuple();
+            tuple.addValue("id", i);
+            byte[] data = tuple.serialize();
+            HeapTable.InsertResult result = table1.insert(data);
+            wal1.logInsert("dedup_test", i, result.pageId, result.slot, data);
+            wal1.logCommit(i);
+        }
+        bp1.close();
+        wal1.close();
+
+        // Session 2: reopen, recover, check the count is still 2 (not 4).
+        DiskManager dm2 = new DiskManager(dir);
+        BufferPoolManager bp2 = new BufferPoolManager(64, dm2);
+        WALManager wal2 = new WALManager(dir);
+        wal2.recover(dm2);
+        HeapTable table2 = new HeapTable("dedup_test", bp2);
+        assertEquals(2, table2.scan().size(), "session 2 must see exactly 2 rows, not 4 from a duplicated redo");
+
+        // One more insert in session 2, then another clean shutdown.
+        Tuple tuple2 = new Tuple();
+        tuple2.addValue("id", 99);
+        byte[] data2 = tuple2.serialize();
+        HeapTable.InsertResult result2 = table2.insert(data2);
+        wal2.logInsert("dedup_test", 100, result2.pageId, result2.slot, data2);
+        wal2.logCommit(100);
+        bp2.close();
+        wal2.close();
+
+        // Session 3: a SECOND restart - proves the fix holds up over repeated
+        // restarts, not just the first one.
+        DiskManager dm3 = new DiskManager(dir);
+        BufferPoolManager bp3 = new BufferPoolManager(64, dm3);
+        WALManager wal3 = new WALManager(dir);
+        wal3.recover(dm3);
+        HeapTable table3 = new HeapTable("dedup_test", bp3);
+        assertEquals(3, table3.scan().size(), "session 3 must see exactly 3 rows (2 + 1), not 6 or more from accumulated duplication");
+        bp3.close();
+        wal3.close();
+    }
 }

@@ -59,7 +59,45 @@ public class ExecutorEngine {
 
     private final Map<String, TableStatistics> statistics;
 
+    /**
+     * Where CREATE TABLE / CREATE INDEX / CREATE VIEW / their DROP
+     * counterparts get durably recorded, so a restart - crash or clean
+     * shutdown - can reconstruct which tables/indexes/views exist. Null
+     * means "no catalog persistence" (schema is in-memory only, lost on
+     * restart) - kept as a valid, explicit option for the 3-arg
+     * constructor rather than silently requiring every caller to have a
+     * real directory.
+     *
+     * This was a real, significant gap found while working on savepoints:
+     * a table's heap file (t.dat) already survived a restart correctly -
+     * DiskManager/HeapTable have always handled that - but nothing told a
+     * freshly started ExecutorEngine that table "t" existed at all, so a
+     * restarted engine reported "Table not found" for data that was
+     * sitting right there on disk. Proven with a real kill -9 test before
+     * being treated as real, not assumed from reading the code. See
+     * PROGRESS.md for the full story.
+     */
+    private final String dataDirectory;
+
+    /**
+     * indexName -> the catalog line needed to reconstruct it structurally
+     * (name/table/column/type), NOT by replaying "CREATE INDEX" as SQL -
+     * that would rescan the table and re-insert every row into an index
+     * whose file already has those exact entries from before the restart,
+     * silently duplicating every entry. Tables and views don't have this
+     * problem (recreating a HeapTable object for a name is idempotent
+     * regardless of whether its file already has data - HeapTable already
+     * seeds itself from the existing file's actual state), so those are
+     * simply replayed as their original CREATE TABLE / CREATE VIEW SQL text.
+     */
+    private final LinkedHashMap<String, String> catalogLines = new LinkedHashMap<>();
+    private boolean loadingCatalog = false;
+
     public ExecutorEngine(BufferPool bufferPool, WALManager walManager, TransactionManager transactionManager) {
+        this(bufferPool, walManager, transactionManager, null);
+    }
+
+    public ExecutorEngine(BufferPool bufferPool, WALManager walManager, TransactionManager transactionManager, String dataDirectory) {
         this.parser = new SqlParser();
         this.tables = new ConcurrentHashMap<>();
         this.tableColumns = new ConcurrentHashMap<>();
@@ -69,6 +107,105 @@ public class ExecutorEngine {
         this.bufferPool = bufferPool;
         this.walManager = walManager;
         this.transactionManager = transactionManager;
+        this.dataDirectory = dataDirectory;
+        loadCatalog();
+    }
+
+    /** Called after any successfully-dispatched statement; updates the catalog only for the schema-changing statement types. */
+    private void recordCatalogChange(Statement stmt, String sql) {
+        if (dataDirectory == null) return; // no persistence configured
+        if (stmt instanceof CreateTableStatement s) {
+            catalogLines.put("TABLE:" + s.tableName(), "TABLE|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropTableStatement s) {
+            catalogLines.remove("TABLE:" + s.tableName());
+            saveCatalog();
+        } else if (stmt instanceof CreateViewStatement s) {
+            catalogLines.put("VIEW:" + s.viewName(), "VIEW|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropViewStatement s) {
+            catalogLines.remove("VIEW:" + s.viewName());
+            saveCatalog();
+        } else if (stmt instanceof CreateIndexStatement s) {
+            catalogLines.put("INDEX:" + s.indexName(),
+                "INDEX|" + s.indexName() + "|" + s.tableName() + "|" + s.columnName() + "|" + s.indexType());
+            saveCatalog();
+        }
+        // No DropIndexStatement exists yet in this grammar - nothing to remove for that case.
+    }
+
+    private java.io.File catalogFile() {
+        return dataDirectory == null ? null : new java.io.File(dataDirectory, "catalog.txt");
+    }
+
+    private void saveCatalog() {
+        if (loadingCatalog) return; // deferred to one final write at the end of loadCatalog - see its javadoc
+        java.io.File file = catalogFile();
+        if (file == null) return;
+        try {
+            java.nio.file.Files.write(file.toPath(), catalogLines.values());
+        } catch (java.io.IOException e) {
+            LOG.error("Failed to save schema catalog to {}", file, e);
+        }
+    }
+
+    /**
+     * Runs once at construction. Tables and views replay their original
+     * DDL text through the normal execute() path - safe and idempotent
+     * because HeapTable already correctly adapts to an existing data file
+     * rather than assuming it's empty. Indexes reconstruct structurally
+     * (see catalogLines' javadoc) to avoid re-scanning and duplicating
+     * entries in an index file that already has them.
+     *
+     * The catalog file itself is NOT rewritten after each individual
+     * entry replays (see the loadingCatalog guard in saveCatalog) - doing
+     * that would mean an interruption partway through a large replay
+     * leaves the catalog file holding only the entries processed so far,
+     * silently losing every entry after that point. One save, after the
+     * whole replay succeeds, avoids that.
+     */
+    private void loadCatalog() {
+        java.io.File file = catalogFile();
+        if (file == null || !file.exists()) return;
+        loadingCatalog = true;
+        try {
+            for (String line : java.nio.file.Files.readAllLines(file.toPath())) {
+                if (line.isBlank()) continue;
+                String[] parts = line.split("\\|", 2);
+                String kind = parts[0];
+                if (kind.equals("INDEX")) {
+                    String[] indexParts = parts[1].split("\\|");
+                    String indexName = indexParts[0], tableName = indexParts[1], columnName = indexParts[2], type = indexParts[3];
+                    reconstructIndex(indexName, tableName, columnName, type);
+                    catalogLines.put("INDEX:" + indexName, line);
+                } else {
+                    // TABLE or VIEW - parts[1] is the original raw SQL text.
+                    // execute() already records this back into catalogLines
+                    // via recordCatalogChange on success, so nothing extra
+                    // needed here beyond checking it actually worked.
+                    QueryResult result = execute(parts[1]);
+                    if (!result.isSuccess()) {
+                        LOG.error("Failed to replay catalog entry on startup: {} -> {}", parts[1], result.getError());
+                    }
+                }
+            }
+            LOG.info("Schema catalog loaded: {} table(s)/view(s)/index(es)", catalogLines.size());
+        } catch (Exception e) {
+            LOG.error("Failed to load schema catalog from {}", file, e);
+        } finally {
+            loadingCatalog = false;
+        }
+        saveCatalog(); // one real write, now that loadingCatalog is false, reflecting everything that just replayed
+    }
+
+    /** Recreates an index's in-memory registration and its BTreeIndex/HashIndex object WITHOUT rescanning the table - the index's own file already has every entry from before the restart. */
+    private void reconstructIndex(String indexName, String tableName, String columnName, String type) {
+        com.stratosdb.index.KeyValueIndex index = type.equals("HASH")
+            ? new com.stratosdb.index.hash.HashIndex(indexName, bufferPool)
+            : new BTreeIndex(indexName, bufferPool);
+        IndexEntry entry = new IndexEntry(indexName, tableName, columnName, index);
+        indexesByName.put(indexName, entry);
+        indexesByTable.computeIfAbsent(tableName, k -> new ArrayList<>()).add(entry);
     }
 
     /**
@@ -85,9 +222,50 @@ public class ExecutorEngine {
     private static final class SessionState {
         Transaction transaction;
         boolean poisoned;
+        List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
+    }
+
+    private static final class Savepoint {
+        final String name;
+        final List<UndoAction> actions = new ArrayList<>();
+        Savepoint(String name) { this.name = name; }
+    }
+
+    /**
+     * What ROLLBACK TO SAVEPOINT actually undoes. MVCC visibility already
+     * gives exactly the primitive this needs for free: MVCCVisibility.
+     * isVisible() treats a version whose xmax equals the CURRENT snapshot's
+     * own xid as invisible "even to me" (see its javadoc) - so
+     * self-tombstoning a row this same transaction created makes it vanish
+     * for the rest of this transaction, permanently, without needing any
+     * new visibility rule. Undoing an UPDATE or DELETE needs the reverse
+     * primitive too - clearing a tombstone back to NO_XMAX to restore a
+     * version this transaction had removed - which MVCCVisibility.withXmax
+     * already supports (it was written generically as "set xmax to X," not
+     * specifically "set xmax to a real xid").
+     *
+     * Recorded (and later undone) in exactly the same terms this class
+     * already maintains indexes in: an undo doesn't just flip a tombstone
+     * bit, it also runs maintainIndexesOnWrite/maintainIndexesOnDelete to
+     * keep the index consistent with whatever the undo just did to
+     * visibility - the same pairing the forward INSERT/UPDATE/DELETE path
+     * already uses, just run in the opposite direction.
+     */
+    private sealed interface UndoAction {
+        record UndoInsert(String tableName, long pageId, int slot) implements UndoAction {}
+        record UndoDelete(String tableName, long pageId, int slot) implements UndoAction {}
+        record UndoUpdate(String tableName, long oldPageId, int oldSlot, long newPageId, int newSlot) implements UndoAction {}
     }
 
     private final ThreadLocal<SessionState> session = ThreadLocal.withInitial(SessionState::new);
+
+    /** Only tracks anything when at least one savepoint is currently active - ordinary statements outside a savepoint pay zero bookkeeping cost. */
+    private void recordUndo(UndoAction action) {
+        SessionState state = session.get();
+        if (!state.savepoints.isEmpty()) {
+            state.savepoints.get(state.savepoints.size() - 1).actions.add(action);
+        }
+    }
 
     /**
      * Every statement runs inside a transaction - either one this call
@@ -150,10 +328,19 @@ public class ExecutorEngine {
         if (stmt instanceof RollbackStatement) {
             return executeRollback();
         }
+        if (stmt instanceof RollbackToSavepointStatement s) {
+            return executeRollbackToSavepoint(s);
+        }
 
         SessionState state = session.get();
         if (state.poisoned) {
             return QueryResult.error("Current transaction is aborted, commands ignored until ROLLBACK");
+        }
+        if (stmt instanceof SavepointStatement s) {
+            return executeSavepoint(s, state);
+        }
+        if (stmt instanceof ReleaseSavepointStatement s) {
+            return executeReleaseSavepoint(s, state);
         }
 
         boolean explicit = state.transaction != null;
@@ -162,6 +349,7 @@ public class ExecutorEngine {
             QueryResult result = dispatch(stmt, txn);
 
             if (result.isSuccess()) {
+                recordCatalogChange(stmt, sql);
                 if (!explicit) {
                     walManager.logCommit(txn.getXID());
                     transactionManager.commit(txn);
@@ -199,6 +387,7 @@ public class ExecutorEngine {
         }
         state.transaction = transactionManager.begin();
         state.poisoned = false;
+        state.savepoints.clear();
         return QueryResult.success("BEGIN");
     }
 
@@ -213,11 +402,13 @@ public class ExecutorEngine {
             transactionManager.abort(state.transaction);
             state.transaction = null;
             state.poisoned = false;
+            state.savepoints.clear();
             return QueryResult.error("Current transaction is aborted, rolled back instead of committed");
         }
         walManager.logCommit(state.transaction.getXID());
         transactionManager.commit(state.transaction);
         state.transaction = null;
+        state.savepoints.clear();
         return QueryResult.success("COMMIT");
     }
 
@@ -229,7 +420,130 @@ public class ExecutorEngine {
         transactionManager.abort(state.transaction);
         state.transaction = null;
         state.poisoned = false;
+        state.savepoints.clear();
         return QueryResult.success("ROLLBACK");
+    }
+
+    private QueryResult executeSavepoint(SavepointStatement stmt, SessionState state) {
+        if (state.transaction == null) {
+            return QueryResult.error("SAVEPOINT can only be used inside a transaction - BEGIN first");
+        }
+        state.savepoints.add(new Savepoint(stmt.name()));
+        return QueryResult.success("SAVEPOINT " + stmt.name());
+    }
+
+    /**
+     * Per the SQL standard: releasing a savepoint also releases every
+     * savepoint established after it (they're nested inside it) - but
+     * their combined changes are NOT undone, only forgotten as separate
+     * rollback targets. If an enclosing savepoint (or the plain
+     * transaction) is later rolled back further out, it still needs to
+     * undo everything that happened in here - so the released savepoints'
+     * undo actions are folded into the parent rather than discarded.
+     */
+    private QueryResult executeReleaseSavepoint(ReleaseSavepointStatement stmt, SessionState state) {
+        if (state.transaction == null) {
+            return QueryResult.error("RELEASE SAVEPOINT can only be used inside a transaction");
+        }
+        int idx = findSavepointIndex(state, stmt.name());
+        if (idx == -1) {
+            return QueryResult.error("No such savepoint: " + stmt.name());
+        }
+        List<UndoAction> merged = new ArrayList<>();
+        while (state.savepoints.size() > idx) {
+            merged.addAll(state.savepoints.remove(idx).actions);
+        }
+        if (idx > 0) {
+            state.savepoints.get(idx - 1).actions.addAll(merged);
+        }
+        return QueryResult.success("RELEASE SAVEPOINT " + stmt.name());
+    }
+
+    /**
+     * The one command allowed to run even on a poisoned (aborted-by-error)
+     * transaction - see the dispatch order in execute(): this is exactly
+     * how a real transaction recovers from a mid-transaction error without
+     * losing everything committed before it, by rolling back to a
+     * checkpoint taken earlier and continuing from there.
+     */
+    private QueryResult executeRollbackToSavepoint(RollbackToSavepointStatement stmt) {
+        SessionState state = session.get();
+        if (state.transaction == null) {
+            return QueryResult.error("ROLLBACK TO SAVEPOINT can only be used inside a transaction");
+        }
+        int idx = findSavepointIndex(state, stmt.name());
+        if (idx == -1) {
+            return QueryResult.error("No such savepoint: " + stmt.name());
+        }
+
+        long myXid = state.transaction.getXID();
+        // Undo every action from the most recently created savepoint back
+        // through (and including) the target, newest action first overall -
+        // standard undo-log order.
+        for (int i = state.savepoints.size() - 1; i >= idx; i--) {
+            List<UndoAction> actions = state.savepoints.get(i).actions;
+            for (int j = actions.size() - 1; j >= 0; j--) {
+                undoAction(actions.get(j), myXid);
+            }
+        }
+        // Discard every savepoint created after the target; the target
+        // itself survives (ROLLBACK TO SAVEPOINT does not remove it - a
+        // second ROLLBACK TO the same savepoint is valid) with its action
+        // list cleared, since those actions are now undone.
+        while (state.savepoints.size() > idx + 1) {
+            state.savepoints.remove(state.savepoints.size() - 1);
+        }
+        state.savepoints.get(idx).actions.clear();
+
+        state.poisoned = false; // recovering from whatever error (if any) led here is the whole point
+        return QueryResult.success("ROLLBACK TO SAVEPOINT " + stmt.name());
+    }
+
+    private int findSavepointIndex(SessionState state, String name) {
+        // Search newest-first: a reused savepoint name refers to the most recently established one, matching standard SQL.
+        for (int i = state.savepoints.size() - 1; i >= 0; i--) {
+            if (state.savepoints.get(i).name.equals(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void undoAction(UndoAction action, long myXid) {
+        if (action instanceof UndoAction.UndoInsert u) {
+            HeapTable table = tables.get(u.tableName());
+            if (table == null) return; // table was dropped mid-transaction - nothing left to undo
+            byte[] stored = table.readTuple(u.pageId(), u.slot());
+            if (stored == null) return;
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+            table.update(u.pageId(), u.slot(), MVCCVisibility.withXmax(stored, myXid));
+            maintainIndexesOnDelete(u.tableName(), tuple, u.pageId(), u.slot());
+        } else if (action instanceof UndoAction.UndoDelete u) {
+            HeapTable table = tables.get(u.tableName());
+            if (table == null) return;
+            byte[] stored = table.readTuple(u.pageId(), u.slot());
+            if (stored == null) return;
+            byte[] restored = MVCCVisibility.withXmax(stored, MVCCVisibility.NO_XMAX);
+            table.update(u.pageId(), u.slot(), restored);
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(restored));
+            maintainIndexesOnWrite(u.tableName(), tuple, u.pageId(), u.slot());
+        } else if (action instanceof UndoAction.UndoUpdate u) {
+            HeapTable table = tables.get(u.tableName());
+            if (table == null) return;
+            byte[] oldStored = table.readTuple(u.oldPageId(), u.oldSlot());
+            if (oldStored != null) {
+                byte[] restored = MVCCVisibility.withXmax(oldStored, MVCCVisibility.NO_XMAX);
+                table.update(u.oldPageId(), u.oldSlot(), restored);
+                Tuple oldTuple = Tuple.deserialize(MVCCVisibility.readPayload(restored));
+                maintainIndexesOnWrite(u.tableName(), oldTuple, u.oldPageId(), u.oldSlot());
+            }
+            byte[] newStored = table.readTuple(u.newPageId(), u.newSlot());
+            if (newStored != null) {
+                Tuple newTuple = Tuple.deserialize(MVCCVisibility.readPayload(newStored));
+                table.update(u.newPageId(), u.newSlot(), MVCCVisibility.withXmax(newStored, myXid));
+                maintainIndexesOnDelete(u.tableName(), newTuple, u.newPageId(), u.newSlot());
+            }
+        }
     }
 
     /**
@@ -475,6 +789,7 @@ public class ExecutorEngine {
 
         walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, data);
         maintainIndexesOnWrite(stmt.tableName(), tuple, result.pageId, result.slot);
+        recordUndo(new UndoAction.UndoInsert(stmt.tableName(), result.pageId, result.slot));
 
         return QueryResult.success("Inserted row at " + result.pageId + "/" + result.slot);
     }
@@ -1187,6 +1502,7 @@ public class ExecutorEngine {
             walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, newPayload);
             maintainIndexesOnDelete(stmt.tableName(), oldTuple, row.pageId(), row.slot());
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
+            recordUndo(new UndoAction.UndoUpdate(stmt.tableName(), row.pageId(), row.slot(), newVersion.pageId, newVersion.slot));
             updated++;
         }
 
@@ -1220,6 +1536,7 @@ public class ExecutorEngine {
             if (removed) {
                 walManager.logDelete(stmt.tableName(), txn.getXID(), row.pageId(), row.slot());
                 maintainIndexesOnDelete(stmt.tableName(), tuple, row.pageId(), row.slot());
+                recordUndo(new UndoAction.UndoDelete(stmt.tableName(), row.pageId(), row.slot()));
                 deleted++;
             }
         }

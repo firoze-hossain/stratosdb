@@ -35,8 +35,8 @@ public class StratosDB {
         this.diskManager = new DiskManager(config.getDataDirectory());
         this.bufferPool = new BufferPoolManager(config.getBufferPoolSize(), diskManager);
         this.walManager = new WALManager(config.getDataDirectory());
-        this.transactionManager = new TransactionManager();
-        this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager);
+        this.transactionManager = new TransactionManager(config.getDataDirectory());
+        this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager, config.getDataDirectory());
         if (config.getSlowQueryThresholdMs() >= 0) {
             this.executor.setSlowQueryThresholdMs(config.getSlowQueryThresholdMs());
         }
@@ -161,6 +161,7 @@ public class StratosDB {
                              // to stay open for the life of the process (invisible on Linux, a
                              // locked file on Windows - the bug this project's test suite hit
                              // before this method was fixed to call walManager.close() at all).
+        transactionManager.close(); // closes the persisted commit log's own separate file handle
         LOG.info("StratosDB shutdown complete");
     }
 

@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView;
+sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -19,6 +19,10 @@ vacuum: VACUUM tableName SEMICOLON?;
 beginTxn: BEGIN TRANSACTION? SEMICOLON? | START TRANSACTION SEMICOLON?;
 commitTxn: COMMIT SEMICOLON?;
 rollbackTxn: ROLLBACK SEMICOLON?;
+savepoint: SAVEPOINT savepointName SEMICOLON?;
+releaseSavepoint: RELEASE SAVEPOINT? savepointName SEMICOLON?;
+rollbackToSavepoint: ROLLBACK TO SAVEPOINT? savepointName SEMICOLON?;
+savepointName: IDENTIFIER;
 
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
@@ -156,6 +160,9 @@ START: S T A R T;
 TRANSACTION: T R A N S A C T I O N;
 COMMIT: C O M M I T;
 ROLLBACK: R O L L B A C K;
+SAVEPOINT: S A V E P O I N T;
+RELEASE: R E L E A S E;
+TO: T O;
 AS: A S;
 COUNT: C O U N T;
 SUM: S U M;

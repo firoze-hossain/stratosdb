@@ -1101,6 +1101,244 @@ public class StratosDBTest {
         assertFalse(captured.toString().contains("Slow query"), "slow-query logging must be off unless explicitly enabled");
     }
 
+    // --- Schema catalog persistence: a real, significant gap found this
+    // round - CREATE TABLE/INDEX/VIEW were purely in-memory, so a table's
+    // heap file survived a restart correctly but the engine had no record
+    // that the table existed at all. Proven with an actual restart, not
+    // assumed from reading the code - see PROGRESS.md.
+    //
+    // Row-level visibility across a restart is now also reliable (see the
+    // persisted commit-status log + persisted xid counter, added right
+    // after this round first shipped - a real gap this round found but
+    // initially left open, since fully solving it took more work than the
+    // schema-catalog fix alone). These tests assert exact row counts
+    // across real restarts specifically because that visibility fix makes
+    // it safe to depend on now, and doing so gives this fix real
+    // regression coverage.
+
+    @Test
+    void testTableIndexAndViewSurviveARestart() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        database.execute("CREATE INDEX idx_val ON t (val) USING HASH");
+        database.execute("CREATE VIEW v AS SELECT * FROM t WHERE val > 0");
+
+        database.shutdown();
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config); // fresh instance, same directory - simulates a real restart
+
+        QueryResult tableResult = database.execute("SELECT * FROM t");
+        assertTrue(tableResult.isSuccess(), () -> "table must survive a restart: " + tableResult.getError());
+        assertEquals(1, tableResult.getRows().size(), "the row inserted before the restart must be visible after it");
+
+        QueryResult viewResult = database.execute("SELECT * FROM v");
+        assertTrue(viewResult.isSuccess(), () -> "view must survive a restart: " + viewResult.getError());
+        assertEquals(1, viewResult.getRows().size());
+
+        QueryResult explainResult = database.execute("EXPLAIN SELECT * FROM t WHERE val=100");
+        assertTrue(explainResult.isSuccess());
+        assertTrue(explainResult.getMessage().contains("idx_val"), () -> "index must survive a restart and still be used: " + explainResult.getMessage());
+        assertEquals(1, database.execute("SELECT * FROM t WHERE val=100").getRows().size(), "the index must still find the pre-restart row correctly");
+
+        database.execute("INSERT INTO t VALUES (2, 200)");
+        assertRowCount("SELECT * FROM t", 2, "old and new rows must both be visible after the restart");
+    }
+
+    @Test
+    @Timeout(value = 15, unit = TimeUnit.SECONDS)
+    void testDataSurvivesMultipleRestartsWithMixedOperations() {
+        // The adversarial pattern that originally exposed the bug this
+        // fixes: ONE schema-catalog entry (so replay only consumes a
+        // single transaction id on startup) followed by MANY inserts (so
+        // their transaction ids run far ahead of what a naive restart
+        // would recognize as "committed"). Before the persisted
+        // commit-status log, this specific shape - few catalog entries,
+        // many later transactions - reliably lost every row past the
+        // first few, because a fresh session's empty in-memory commit set
+        // had no record that those later transaction ids had ever
+        // committed. Four sequential real restarts, with inserts, an
+        // update, and a delete spread across them.
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        for (int i = 0; i < 20; i++) {
+            database.execute("INSERT INTO t VALUES (" + i + ", " + (i * 10) + ")");
+        }
+        assertRowCount("SELECT * FROM t", 20);
+
+        database.shutdown();
+        DatabaseConfig config2 = new DatabaseConfig();
+        config2.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config2);
+        assertRowCount("SELECT * FROM t", 20, "all 20 pre-restart rows must survive the first restart");
+        database.execute("INSERT INTO t VALUES (100, 1000)");
+
+        database.shutdown();
+        DatabaseConfig config3 = new DatabaseConfig();
+        config3.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config3);
+        assertRowCount("SELECT * FROM t", 21, "the second restart must see all 20 original rows plus the one added after the first restart");
+        database.execute("UPDATE t SET val=9999 WHERE id=0");
+        database.execute("DELETE FROM t WHERE id=1");
+
+        database.shutdown();
+        DatabaseConfig config4 = new DatabaseConfig();
+        config4.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config4);
+        assertRowCount("SELECT * FROM t", 20, "the third restart must see one fewer row after the delete");
+        assertEquals(9999, database.execute("SELECT * FROM t WHERE id=0").getRows().get(0).getValue("val"),
+            "the update from before the third restart must have taken effect and survived it");
+        assertRowCount("SELECT * FROM t WHERE id=1", 0, "the deleted row must stay deleted across the restart");
+    }
+
+    @Test
+    void testDroppedTableAndViewStayDroppedAfterRestart() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE TABLE keep (id INT)");
+        database.execute("CREATE VIEW v AS SELECT * FROM keep");
+        database.execute("DROP TABLE t");
+
+        database.shutdown();
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config);
+
+        assertFalse(database.execute("SELECT * FROM t").isSuccess(), "a dropped table must stay dropped after a restart");
+        assertTrue(database.execute("SELECT * FROM keep").isSuccess(), "an undropped table must still be there");
+        assertTrue(database.execute("SELECT * FROM v").isSuccess(), "an undropped view must still be there");
+
+        database.execute("DROP VIEW v");
+        database.shutdown();
+        DatabaseConfig config2 = new DatabaseConfig();
+        config2.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config2);
+        assertFalse(database.execute("SELECT * FROM v").isSuccess(), "a dropped view must stay dropped after a restart");
+    }
+
+    // --- Savepoints: MVCC's own "removed by my own transaction is
+    // invisible even to me" visibility rule (see MVCCVisibility.isVisible)
+    // turns out to be exactly the primitive SAVEPOINT rollback needs -
+    // self-tombstoning an undone insert makes it vanish permanently for the
+    // rest of the transaction, and clearing a tombstone back to NO_XMAX
+    // restores an undone update/delete. See PROGRESS.md for the full design.
+
+    @Test
+    void testSavepointRollbackUndoesInsertsAfterIt() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("BEGIN");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+        database.execute("SAVEPOINT sp1");
+        database.execute("INSERT INTO t VALUES (2, 200)");
+        assertRowCount("SELECT * FROM t", 2);
+
+        assertTrue(database.execute("ROLLBACK TO SAVEPOINT sp1").isSuccess());
+        assertRowCount("SELECT * FROM t", 1, "the insert after sp1 must be undone");
+
+        database.execute("COMMIT");
+        assertRowCount("SELECT * FROM t", 1, "only the pre-savepoint insert survives the commit");
+    }
+
+    @Test
+    void testSavepointRollbackRestoresUpdatedAndDeletedRows() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        database.execute("BEGIN");
+        database.execute("SAVEPOINT sp1");
+        database.execute("UPDATE t SET val=999 WHERE id=1");
+        assertEquals(999, database.execute("SELECT * FROM t").getRows().get(0).getValue("val"));
+        database.execute("ROLLBACK TO SAVEPOINT sp1");
+        assertEquals(100, database.execute("SELECT * FROM t").getRows().get(0).getValue("val"), "update must be undone");
+
+        database.execute("SAVEPOINT sp2");
+        database.execute("DELETE FROM t WHERE id=1");
+        assertRowCount("SELECT * FROM t", 0);
+        database.execute("ROLLBACK TO SAVEPOINT sp2");
+        assertRowCount("SELECT * FROM t", 1, "delete must be undone");
+        assertEquals(100, database.execute("SELECT * FROM t").getRows().get(0).getValue("val"), "restored row has its original value");
+
+        database.execute("COMMIT");
+    }
+
+    @Test
+    void testNestedSavepointRollbackDiscardsInnerSavepoints() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("BEGIN");
+        database.execute("SAVEPOINT outer1");
+        database.execute("INSERT INTO t VALUES (2)");
+        database.execute("SAVEPOINT inner1");
+        database.execute("INSERT INTO t VALUES (3)");
+        assertRowCount("SELECT * FROM t", 3);
+
+        database.execute("ROLLBACK TO SAVEPOINT outer1");
+        assertRowCount("SELECT * FROM t", 1, "rolling back to the outer savepoint must undo everything after it, including the inner savepoint's own insert");
+
+        database.execute("ROLLBACK");
+    }
+
+    @Test
+    void testReleaseSavepointKeepsChangesButInvalidatesTheTarget() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("BEGIN");
+        database.execute("SAVEPOINT sp1");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("RELEASE SAVEPOINT sp1");
+
+        QueryResult rollbackToReleased = database.execute("ROLLBACK TO SAVEPOINT sp1");
+        assertFalse(rollbackToReleased.isSuccess(), "rolling back to a released savepoint must fail");
+        assertRowCount("SELECT * FROM t", 1, "a released savepoint's changes are kept, not undone");
+
+        database.execute("COMMIT");
+        assertRowCount("SELECT * FROM t", 1);
+    }
+
+    @Test
+    void testRollbackToSavepointRecoversFromAPoisonedTransaction() {
+        // The one command allowed to run on an aborted-by-error transaction -
+        // exactly how a real transaction recovers from a mid-transaction
+        // error without losing everything committed before it.
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("BEGIN");
+        database.execute("SAVEPOINT sp1");
+        database.execute("INSERT INTO t VALUES (1)");
+        QueryResult badStatement = database.execute("SELECT * FROM nonexistent_table");
+        assertFalse(badStatement.isSuccess());
+
+        QueryResult poisonedCheck = database.execute("INSERT INTO t VALUES (2)");
+        assertFalse(poisonedCheck.isSuccess());
+        assertTrue(poisonedCheck.getError().contains("aborted"));
+
+        QueryResult recovered = database.execute("ROLLBACK TO SAVEPOINT sp1");
+        assertTrue(recovered.isSuccess(), () -> "ROLLBACK TO SAVEPOINT must work even on a poisoned transaction: " + recovered.getError());
+
+        assertTrue(database.execute("INSERT INTO t VALUES (3)").isSuccess(), "the transaction must be usable again after recovering via savepoint");
+        database.execute("COMMIT");
+        assertRowCount("SELECT * FROM t", 1, "only the row inserted after recovery survives");
+    }
+
+    @Test
+    void testSavepointRollbackKeepsIndexesConsistent() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("CREATE INDEX idx_val ON t (val)");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        database.execute("BEGIN");
+        database.execute("SAVEPOINT sp1");
+        database.execute("INSERT INTO t VALUES (2, 200)");
+        database.execute("UPDATE t SET val=999 WHERE id=1");
+        database.execute("ROLLBACK TO SAVEPOINT sp1");
+        database.execute("COMMIT");
+
+        assertRowCount("SELECT * FROM t WHERE val=100", 1, "index must find the restored original value");
+        assertRowCount("SELECT * FROM t WHERE val=200", 0, "index must not find the undone insert's value");
+        assertRowCount("SELECT * FROM t WHERE val=999", 0, "index must not find the undone update's value");
+    }
+
+    @Test
+    void testSavepointRequiresAnOpenTransaction() {
+        assertFalse(database.execute("SAVEPOINT sp1").isSuccess(), "SAVEPOINT outside a transaction must fail");
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());
