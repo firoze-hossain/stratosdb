@@ -223,6 +223,16 @@ public class ExecutorEngine {
         Transaction transaction;
         boolean poisoned;
         List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
+        /**
+         * CTE name -> its query, active only while executing the one
+         * statement that defined it. Session-local (ThreadLocal-backed,
+         * since SessionState itself is), NOT a shared map like `views` -
+         * two concurrent connections both using a CTE named the same thing
+         * must not interfere with each other, which a shared map mutated
+         * around each execution would risk (one connection's cleanup
+         * removing the other's still-in-use entry mid-execution).
+         */
+        Map<String, SelectStatement> activeCtes = new java.util.HashMap<>();
     }
 
     private static final class Savepoint {
@@ -580,12 +590,41 @@ public class ExecutorEngine {
         if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
+        if (stmt instanceof ShowStatsStatement) return executeShowStats();
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
         if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
         if (stmt instanceof DropViewStatement s) return executeDropView(s);
+        if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
         return QueryResult.error("Unsupported statement");
+    }
+
+    /**
+     * WITH cteName AS (cteQuery) outerQuery - registers the CTE as a
+     * temporary, session-local, statement-scoped entry (see SessionState.
+     * activeCtes' javadoc for why this isn't the shared `views` map) so
+     * the outer query's normal table-name resolution finds it via
+     * executeSelect's existing view-lookup fallback, then always removes
+     * it afterward regardless of success or failure - a CTE must never
+     * leak into any statement after the one that defined it.
+     *
+     * Known, named simplification: a single, non-recursive CTE only.
+     * Multiple CTEs in one WITH clause and WITH RECURSIVE are real
+     * further work, not attempted here. Also unlike real Postgres, a CTE
+     * here only takes effect when no real table of the same name exists
+     * (true shadowing of an existing table is a further refinement, not
+     * a correctness gap for the common case of picking a name that
+     * doesn't collide with anything).
+     */
+    private QueryResult executeCteSelect(CteSelectStatement stmt, Transaction txn) {
+        SessionState state = session.get();
+        state.activeCtes.put(stmt.cteName(), stmt.cteQuery());
+        try {
+            return executeSelect(stmt.outerQuery(), txn);
+        } finally {
+            state.activeCtes.remove(stmt.cteName());
+        }
     }
 
     private QueryResult executeCreateTable(CreateTableStatement stmt) {
@@ -805,6 +844,11 @@ public class ExecutorEngine {
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             SelectStatement viewQuery = views.get(stmt.tableName());
+            if (viewQuery == null) {
+                // Not a real table, not a persisted view - maybe it's an active CTE
+                // (WITH cteName AS (...) ...), scoped to just this one statement.
+                viewQuery = session.get().activeCtes.get(stmt.tableName());
+            }
             if (viewQuery != null) {
                 boolean hasJoin = stmt.joins() != null && !stmt.joins().isEmpty();
                 boolean hasAggregate = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
@@ -1601,6 +1645,38 @@ public class ExecutorEngine {
             rows.add(row);
         }
         return QueryResult.success(rows);
+    }
+
+    /**
+     * A real, queryable snapshot of engine internals - the metrics
+     * themselves already existed (buffer pool hit ratio, WAL LSN, and so
+     * on were already tracked and shown by the CLI's own \status
+     * command), just not reachable via SQL, meaning nothing but that one
+     * specific CLI command could ever see them. SHOW STATS exposes the
+     * same numbers as an ordinary query result, so any client (psql, a
+     * monitoring script, a BI tool) that can run SQL can read them too -
+     * a genuine step toward a real pg_stat-style interface, though a
+     * proper pg_stat_activity/pg_stat_user_tables-shaped SQL surface with
+     * per-table and per-connection breakdowns is real further work, not
+     * attempted here.
+     */
+    private QueryResult executeShowStats() {
+        List<Tuple> rows = new ArrayList<>();
+        addStat(rows, "buffer_pool_hit_ratio", String.format("%.4f", bufferPool.getCacheHitRatio()));
+        addStat(rows, "buffer_pool_cache_size", String.valueOf(bufferPool.getCacheSize()));
+        addStat(rows, "wal_current_lsn", String.valueOf(walManager.getCurrentLSN()));
+        addStat(rows, "table_count", String.valueOf(tables.size()));
+        addStat(rows, "view_count", String.valueOf(views.size()));
+        addStat(rows, "index_count", String.valueOf(indexesByName.size()));
+        addStat(rows, "oldest_active_xid", String.valueOf(transactionManager.getOldestActiveXid()));
+        return QueryResult.success(rows);
+    }
+
+    private void addStat(List<Tuple> rows, String metricName, String value) {
+        Tuple row = new Tuple();
+        row.addValue("metric", metricName);
+        row.addValue("value", value);
+        rows.add(row);
     }
 
     /**

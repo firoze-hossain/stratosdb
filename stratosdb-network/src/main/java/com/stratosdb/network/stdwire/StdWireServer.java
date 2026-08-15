@@ -171,6 +171,10 @@ public class StdWireServer {
 
     /** Returns the new inTransaction state after executing one statement. */
     private boolean executeAndRespond(String sql, DataOutputStream out, boolean inTransaction) throws IOException {
+        if (tryHandleTableListingQuery(sql, out)) {
+            return inTransaction; // a catalog-introspection query is never itself transaction control
+        }
+
         QueryResult result;
         try {
             result = db.execute(sql);
@@ -210,6 +214,50 @@ public class StdWireServer {
         }
 
         return updateTransactionState(sql, inTransaction);
+    }
+
+    /**
+     * Detects the specific query psql's `\dt` meta-command sends (captured
+     * from a real psql client - see PROGRESS.md) and, if matched,
+     * synthesizes a correct response directly from StratosDB's own real
+     * table metadata (ExecutorEngine.getTableNames()) - bypassing the
+     * normal SQL execution path entirely, since StratosDB's parser has no
+     * concept of `pg_catalog.pg_class`, `pg_namespace`, or any of the
+     * other real Postgres system-catalog machinery this query references.
+     *
+     * Scope, stated plainly: this recognizes the `\dt` pattern specifically
+     * (matching on the pg_class + pg_namespace signature any Postgres
+     * version's `\dt` uses), not general pg_catalog SQL. `\d TABLENAME`
+     * and `\l` are NOT handled here - `\d` needs a multi-query,
+     * OID-based lookup sequence (captured and confirmed materially more
+     * complex - see PROGRESS.md), and `\l` needs a "multiple databases"
+     * concept StratosDB doesn't have at all (this engine is one database
+     * per data directory). Implementing those properly is real further
+     * work, not attempted here rather than half-done and left to surprise
+     * someone later.
+     */
+    private boolean tryHandleTableListingQuery(String sql, DataOutputStream out) throws IOException {
+        String normalized = sql.toLowerCase();
+        if (!normalized.contains("pg_catalog.pg_class") || !normalized.contains("pg_namespace")) {
+            return false;
+        }
+
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("Schema", 25, (short) -1),
+            new StdWireMessages.Column("Name", 25, (short) -1),
+            new StdWireMessages.Column("Type", 25, (short) -1),
+            new StdWireMessages.Column("Owner", 25, (short) -1)
+        );
+        StdWireMessages.writeRowDescription(out, columns);
+
+        java.util.List<String> tableNames = new java.util.ArrayList<>(db.getExecutor().getTableNames());
+        java.util.Collections.sort(tableNames);
+        for (String tableName : tableNames) {
+            StdWireMessages.writeDataRow(out, List.of("public", tableName, "table", "stratosdb"));
+        }
+
+        StdWireMessages.writeCommandComplete(out, "SELECT " + tableNames.size());
+        return true;
     }
 
     private List<StdWireMessages.Column> describeColumns(List<Tuple> rows) {

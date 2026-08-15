@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | select | update | delete | dropTable | showTables | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -13,6 +13,7 @@ createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
 showTables: SHOW TABLES SEMICOLON?;
+showStats: SHOW STATS SEMICOLON?;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
@@ -27,6 +28,8 @@ savepointName: IDENTIFIER;
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
 select: SELECT selectList FROM tableName joinClause* (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
+selectWithCte: WITH cteName AS LPAREN select RPAREN select;
+cteName: IDENTIFIER;
 joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
 groupByList: columnName (COMMA columnName)*;
 havingClause: aggregateFunction ASSIGN literal
@@ -117,6 +120,8 @@ limitValue: INTEGER_LITERAL;
 CREATE: C R E A T E;
 TABLE: T A B L E;
 VIEW: V I E W;
+AS: A S;
+WITH: W I T H;
 DROP: D R O P;
 INSERT: I N S E R T;
 INTO: I N T O;
@@ -145,6 +150,7 @@ NULL: N U L L;
 DEFAULT: D E F A U L T;
 SHOW: S H O W;
 TABLES: T A B L E S;
+STATS: S T A T S;
 INDEX: I N D E X;
 ON: O N;
 USING: U S I N G;
@@ -163,7 +169,7 @@ ROLLBACK: R O L L B A C K;
 SAVEPOINT: S A V E P O I N T;
 RELEASE: R E L E A S E;
 TO: T O;
-AS: A S;
+
 COUNT: C O U N T;
 SUM: S U M;
 AVG: A V G;

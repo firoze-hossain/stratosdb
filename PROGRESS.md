@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
-| Tests passing | **143 / 143** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/E all with real, verified work done; Phase D's multi-statement transactions done, and now real PostgreSQL wire protocol compatibility - verified against actual `psql`, not a hand-rolled simulation |
+| Tests passing | **149 / 149** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done, including PostgreSQL wire protocol compatibility (verified against actual `psql`), `\dt` support via captured real-client queries, CTEs, and a queryable `SHOW STATS` metrics interface |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -249,11 +249,35 @@ The single highest-leverage *ecosystem* item on the whole plan: `psql`, pgAdmin,
 - 8 new tests in `StdWireServerTest`: startup handshake, a full create/insert/select round trip, NULL encoding, transactions (commit and rollback), transaction poisoning matching real Postgres, 8 genuinely concurrent connections, and 2 tests driving a real `psql` subprocess (skipped gracefully via `Assumptions.assumeTrue` if `psql` isn't installed).
 - **A real test-design bug found and fixed while building these tests**: an early test helper opened a fresh socket connection per SQL statement instead of reusing one connection per test - meaning `BEGIN`/`INSERT`/`COMMIT` each ran on a different `ThreadLocal` session, so `BEGIN` on one "connection" had zero effect on `INSERT` on a different one. Not a server bug (real client sessions all use one connection throughout) - a test design flaw, caught by the transaction test itself failing in a way that pointed straight at the cause, and fixed by reusing one connection per test.
 
+## Phase D — `\dt` support via targeted `pg_catalog` interception ✅ done
+
+`psql`'s `\dt` now works and shows StratosDB's real tables - a real step past "SQL-capable" toward "feels like a real Postgres connection."
+
+- ✅ Captured `\dt`'s exact query (`FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ...`) from a real `psql` client, then implemented `StdWireServer.tryHandleTableListingQuery()`: detects that specific signature and synthesizes a correct `RowDescription`/`DataRow`/`CommandComplete` response directly from `ExecutorEngine.getTableNames()` - bypassing the SQL parser entirely, since it has no concept of `pg_catalog` syntax at all.
+- Verified against real `psql`: shows real tables, correctly *excludes* views (matching real Postgres's own `\dt` filtering), and correctly reports "Did not find any relations" when empty. Confirmed no regression on ordinary `SELECT` queries.
+- **Scope, stated plainly rather than left implicit**: this recognizes `\dt`'s specific pattern, not general `pg_catalog` SQL. `\d TABLENAME` and `\l` are explicitly NOT handled - their actual queries were captured too and confirmed materially more complex: `\d` needs a multi-query, OID-based lookup sequence (find the table's OID via a regex match against `pg_class`, then separately query `pg_attribute`/`pg_index` using that OID), and `\l` needs a "multiple databases" concept StratosDB doesn't have at all (one database per data directory, by design). Attempting a fragile, partial version of either was rejected in favor of naming the real scope honestly.
+- 1 new test in `StdWireServerTest`, driving real `psql`.
+
+## Phase B — CTEs (single, non-recursive `WITH`) ✅ done
+
+- ✅ `WITH cteName AS (query) outerQuery` - reuses views' own execution path (`executeSelectOverView`) almost entirely, since a CTE is conceptually "a view scoped to one statement" rather than a different mechanism. Inherits views' existing protections for free: combining a CTE with `JOIN` or an aggregate fails cleanly with the same clear error views already give, rather than needing its own separate check.
+- **A real concurrency risk identified and designed around, not discovered after the fact**: the obvious implementation - temporarily registering the CTE in the shared `views` map, then removing it after - would race under concurrent connections: two connections both naming a CTE `tmp` could have one connection's cleanup remove the other's still-in-use entry mid-execution. Fixed by storing active CTEs in `SessionState` (already `ThreadLocal`-backed per connection) instead of the shared map. Verified directly: 6 concurrent threads all using a CTE named identically (`tmp`) but backed by different source tables each correctly saw only their own data.
+- Verified end to end through the wire protocol with real `psql`, not just the in-process executor.
+- **Known, named simplification**: single, non-recursive CTE only. Multiple CTEs in one `WITH` clause and `WITH RECURSIVE` are real further work. A CTE also only takes effect when no real table of the same name exists - true shadowing of an existing table (as real Postgres does) is a further refinement, not attempted here.
+- 4 new tests in `StratosDBTest`: basic CTE with an outer filter, confirming a CTE's name doesn't leak into a later statement, CTE+JOIN/aggregate failing cleanly, and the concurrency test above.
+
+## Phase E — `SHOW STATS`, a queryable metrics interface ✅ done
+
+- ✅ `SHOW STATS` returns engine internals (buffer pool hit ratio, buffer pool cache size, current WAL LSN, table/view/index counts, oldest active transaction id) as an ordinary query result. The metrics themselves already existed - the CLI's `\status` command already tracked and displayed some of them - but were reachable only from that one specific command. Now any SQL client can read them: `psql`, a monitoring script, a BI tool, no StratosDB-specific tooling required.
+- Verified both directly (exact counts matching real created tables/views/indexes, WAL LSN reflecting real logged activity rather than a placeholder) and through the wire protocol with real `psql`.
+- **Honestly scoped**: this is a flat key-value snapshot, not a proper `pg_stat_activity`/`pg_stat_user_tables`-shaped SQL surface with per-table or per-connection breakdowns - a real, further step, not attempted here.
+- 1 new test in `StratosDBTest`.
+
 ## What to do next
 
-Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed, savepoints are done, and the persisted commit-status log closes out the restart-correctness work that round turned into. Phase B's core "query engine depth" items are done. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions) *and* its highest-leverage ecosystem item (PostgreSQL wire protocol compatibility) are both done. Phase E's three highest-priority items (views, autovacuum, slow-query logging) are done.
+Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed, savepoints are done, and the persisted commit-status log closes out the restart-correctness work that round turned into. Phase B's core "query engine depth" items are done, and CTEs close out its next-highest item. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions), its highest-leverage ecosystem item (PostgreSQL wire protocol compatibility), and now `\dt` support are done. Phase E's four highest-priority items (views, autovacuum, slow-query logging, and now a queryable metrics interface) are done.
 
-What's left in Phase A: WAL-logging savepoints' own undo actions (now genuinely unblocked - the persisted commit-status log this round added is exactly the missing piece that made "does a savepoint rollback survive a crash" reliably testable), and a free-space map (efficiency, not correctness). What's left in Phase B: merge join, window functions, and CTEs. What's left in Phase C: index-only scans (blocked on a visibility map, which doesn't exist yet), bitmap index, GiST/GIN-equivalents. What's left in Phase D: the extended query protocol (real server-side prepared statements), SCRAM auth, `pg_catalog` emulation (for `\dt`/`\d`/`\l`/tab-completion), client-side TLS certificate verification, streaming replication, connection pooling. What's left in Phase E: metrics, triggers, stored procedures, and real fine-grained concurrency control (page or table latching), which autovacuum's design deliberately worked around rather than solved. See `PROJECT_PLAN.md`'s full phase breakdown for everything else.
+What's left in Phase A: WAL-logging savepoints' own undo actions (now genuinely unblocked - the persisted commit-status log this round added is exactly the missing piece that made "does a savepoint rollback survive a crash" reliably testable), and a free-space map (efficiency, not correctness). What's left in Phase B: merge join and window functions. What's left in Phase C: index-only scans (blocked on a visibility map, which doesn't exist yet), bitmap index, GiST/GIN-equivalents. What's left in Phase D: the extended query protocol (real server-side prepared statements), SCRAM auth, `\d TABLENAME`/`\l`/tab-completion (confirmed materially harder than `\dt` - see above), client-side TLS certificate verification, streaming replication, connection pooling. What's left in Phase E: a proper `pg_stat`-shaped SQL surface (per-table/per-connection breakdowns, not just a flat snapshot), triggers, stored procedures, and real fine-grained concurrency control (page or table latching), which autovacuum's design deliberately worked around rather than solved. See `PROJECT_PLAN.md`'s full phase breakdown for everything else.
 
 ## Cross-platform note
 

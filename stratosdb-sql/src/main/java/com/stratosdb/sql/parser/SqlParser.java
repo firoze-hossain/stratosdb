@@ -50,6 +50,8 @@ public class SqlParser {
             return buildDropTable(ctx.dropTable());
         } else if (ctx.showTables() != null) {
             return new ShowTablesStatement();
+        } else if (ctx.showStats() != null) {
+            return new ShowStatsStatement();
         } else if (ctx.explain() != null) {
             return new ExplainStatement(buildSelect(ctx.explain().select()));
         } else if (ctx.analyze() != null) {
@@ -72,6 +74,12 @@ public class SqlParser {
             return new ReleaseSavepointStatement(ctx.releaseSavepoint().savepointName().getText());
         } else if (ctx.rollbackToSavepoint() != null) {
             return new RollbackToSavepointStatement(ctx.rollbackToSavepoint().savepointName().getText());
+        } else if (ctx.selectWithCte() != null) {
+            StratosSQLParser.SelectWithCteContext cteCtx = ctx.selectWithCte();
+            String cteName = cteCtx.cteName().getText();
+            SelectStatement cteQuery = buildSelect(cteCtx.select(0));
+            SelectStatement outerQuery = buildSelect(cteCtx.select(1));
+            return new CteSelectStatement(cteName, cteQuery, outerQuery);
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }

@@ -232,6 +232,24 @@ class StdWireServerTest {
         }
     }
 
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void realPsqlBackslashDtListsActualTablesAndExcludesViews() throws Exception {
+        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE employees (id INT, name VARCHAR)");
+            conn.query("CREATE TABLE departments (id INT)");
+            conn.query("CREATE VIEW active_emp AS SELECT * FROM employees");
+        }
+
+        String output = runPsql("\\dt");
+        assertTrue(output.contains("employees"), () -> "expected \\dt to list the real table 'employees', got:\n" + output);
+        assertTrue(output.contains("departments"), () -> "expected \\dt to list the real table 'departments', got:\n" + output);
+        assertFalse(output.contains("active_emp"), () -> "\\dt must exclude views, matching real Postgres - got:\n" + output);
+        assertTrue(output.contains("(2 rows)"), () -> "expected exactly 2 rows (the 2 tables, not the view), got:\n" + output);
+    }
+
     private String runPsql(String sql) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
             "psql", "-h", "localhost", "-p", String.valueOf(port), "-U", "testuser", "-d", "testdb", "-c", sql

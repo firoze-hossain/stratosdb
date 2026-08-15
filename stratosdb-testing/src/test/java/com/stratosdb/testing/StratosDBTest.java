@@ -1339,6 +1339,112 @@ public class StratosDBTest {
         assertFalse(database.execute("SAVEPOINT sp1").isSuccess(), "SAVEPOINT outside a transaction must fail");
     }
 
+    // --- CTEs: a single, non-recursive WITH clause, reusing the same
+    // execution path views already use (executeSelectOverView), just with
+    // session-local (not persisted, not shared across connections) scoping.
+
+    @Test
+    void testBasicCteWithOuterFilter() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR, salary INT)");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice', 90000)");
+        database.execute("INSERT INTO employees VALUES (2, 'Bob', 60000)");
+        database.execute("INSERT INTO employees VALUES (3, 'Carol', 120000)");
+
+        QueryResult basic = database.execute("WITH high_earners AS (SELECT id, name, salary FROM employees WHERE salary > 70000) SELECT * FROM high_earners");
+        assertTrue(basic.isSuccess(), () -> "basic CTE must succeed: " + basic.getError());
+        assertEquals(2, basic.getRows().size());
+
+        QueryResult filtered = database.execute("WITH high_earners AS (SELECT id, name, salary FROM employees WHERE salary > 70000) SELECT * FROM high_earners WHERE salary > 100000");
+        assertTrue(filtered.isSuccess());
+        assertEquals(1, filtered.getRows().size());
+        assertEquals("Carol", filtered.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testCteDoesNotLeakToALaterStatement() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("WITH tmp AS (SELECT * FROM t) SELECT * FROM tmp");
+
+        assertFalse(database.execute("SELECT * FROM tmp").isSuccess(),
+            "a CTE's name must not be resolvable in any statement after the one that defined it");
+    }
+
+    @Test
+    void testCteCombinedWithJoinOrAggregateFailsCleanly() {
+        // Same real bug class views hit and got fixed for - reusing views'
+        // own executeSelectOverView means CTEs inherit the same protection.
+        database.execute("CREATE TABLE employees (id INT, dept_id INT)");
+        database.execute("CREATE TABLE departments (id INT)");
+
+        QueryResult joinResult = database.execute("WITH e AS (SELECT id, dept_id FROM employees) SELECT * FROM e JOIN departments ON e.dept_id = departments.id");
+        assertFalse(joinResult.isSuccess(), "a CTE combined with JOIN must fail cleanly, not silently ignore the join");
+
+        QueryResult aggResult = database.execute("WITH e AS (SELECT id FROM employees) SELECT COUNT(*) FROM e");
+        assertFalse(aggResult.isSuccess(), "a CTE combined with an aggregate must fail cleanly, not silently ignore the aggregate");
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void testConcurrentConnectionsUsingTheSameCteNameDoNotInterfere() throws Exception {
+        // The real risk this design was built to avoid: a shared "views"-style
+        // map mutated around each CTE's execution would let one connection's
+        // cleanup remove another connection's still-in-use entry mid-execution.
+        database.execute("CREATE TABLE a (id INT)");
+        database.execute("CREATE TABLE b (id INT)");
+        database.execute("INSERT INTO a VALUES (1)");
+        database.execute("INSERT INTO b VALUES (2)");
+
+        int n = 6;
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(n);
+        java.util.concurrent.atomic.AtomicInteger successes = new java.util.concurrent.atomic.AtomicInteger(0);
+        for (int i = 0; i < n; i++) {
+            final String table = (i % 2 == 0) ? "a" : "b";
+            final int expectedId = (i % 2 == 0) ? 1 : 2;
+            new Thread(() -> {
+                try {
+                    // Every thread uses the SAME CTE name "tmp" but a DIFFERENT source table.
+                    QueryResult r = database.execute("WITH tmp AS (SELECT * FROM " + table + ") SELECT * FROM tmp");
+                    if (r.isSuccess() && r.getRows().size() == 1 && ((Number) r.getRows().get(0).getValue("id")).intValue() == expectedId) {
+                        successes.incrementAndGet();
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    latch.countDown();
+                }
+            }).start();
+        }
+        assertTrue(latch.await(8, TimeUnit.SECONDS));
+        assertEquals(n, successes.get(), "every thread must see only its OWN CTE's data, never another thread's");
+    }
+
+    // --- SHOW STATS: exposes engine internals (already tracked, previously
+    // only reachable via the CLI's own \status command) as an ordinary,
+    // SQL-queryable result - a real step toward a pg_stat-style interface.
+
+    @Test
+    void testShowStatsReturnsRealMetrics() {
+        database.execute("CREATE TABLE t (id INT, val INT)");
+        database.execute("CREATE INDEX idx_val ON t (val)");
+        database.execute("CREATE VIEW v AS SELECT * FROM t");
+        database.execute("INSERT INTO t VALUES (1, 100)");
+
+        QueryResult result = database.execute("SHOW STATS");
+        assertTrue(result.isSuccess(), () -> "SHOW STATS must succeed: " + result.getError());
+
+        java.util.Map<String, String> metrics = new java.util.HashMap<>();
+        for (com.stratosdb.storage.page.Tuple row : result.getRows()) {
+            metrics.put((String) row.getValue("metric"), (String) row.getValue("value"));
+        }
+
+        assertEquals("1", metrics.get("table_count"), "must reflect the actual number of real tables");
+        assertEquals("1", metrics.get("view_count"), "must reflect the actual number of views");
+        assertEquals("1", metrics.get("index_count"), "must reflect the actual number of indexes");
+        assertNotNull(metrics.get("buffer_pool_hit_ratio"), "buffer pool hit ratio must be present");
+        assertNotNull(metrics.get("wal_current_lsn"), "WAL LSN must be present");
+        assertTrue(Long.parseLong(metrics.get("wal_current_lsn")) > 0, "WAL LSN must reflect real logged activity, not just a placeholder zero");
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());
