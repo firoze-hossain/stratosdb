@@ -23,19 +23,7 @@ mvn clean install -DskipTests
 mvn test
 ```
 
-**Expect 51 passing tests** across 9 test classes:
-
-| Test class | Tests | What it actually checks |
-|---|---|---|
-| `CrashRecoveryTest` | 2 | Forks a real second JVM, sends it a real `SIGKILL` mid-write, restarts, verifies WAL redo recovers exactly the committed rows |
-| `MvccIsolationTest` | 3 | Snapshot isolation: uncommitted writes are invisible to others, old snapshots don't see later commits |
-| `LockManagerDeadlockTest` | 2 | Two real threads in a genuine circular wait; verifies exactly one is aborted with a deadlock error |
-| `BTreeIndexTest` | 6 | Point search, range scan, duplicates, persistence across reopen, and 250,000 shuffled keys forcing real multi-level node splits |
-| `UserStoreTest` | 6 | Real PBKDF2 password hashing: correct/wrong password, unknown user, removed user, shared-password independence |
-| `StratosServerTest` | 7 | Real socket round-trips, server errors, shared data across connections, and the AUTH handshake (open access with no `UserStore`, correct/wrong credentials, a connection that skips AUTH entirely) |
-| `StratosDriverTest` | 4 | The JDBC driver through `java.sql.DriverManager` exactly as a real application would use it: full CRUD, server errors becoming real `SQLException`s, unsupported features throwing clearly, URL-acceptance rules |
-| `TlsIntegrationTest` | 3 | Real TLS with a certificate generated via the JDK's own `keytool`: a JDBC client over real encryption, a plain socket correctly failing against a TLS-only server, and auth+TLS working together |
-| `StratosDBTest` | 18 | Full SQL round-trips: CRUD, `CREATE INDEX`, index-vs-seq-scan planning via `EXPLAIN`, comparison-operator correctness on both scan paths, JOIN, and a shutdown-idempotency regression test |
+**Expect 143 passing tests** across the full suite, spanning real crash injection (a forked, `SIGKILL`'d JVM), real multi-threaded deadlocks, real TLS handshakes, and — most recently — real external `psql`/`psycopg2` client processes verifying PostgreSQL wire protocol compatibility. See `PROGRESS.md` for the full, current breakdown by test class; the table that used to be here listed 9 classes and 51 tests, which is now out of date enough that repeating stale numbers here would be actively misleading rather than just incomplete.
 
 Two things not to be alarmed by:
 - `BTreeIndexTest`'s large test inserts 250,000 keys — it may take several seconds.
@@ -100,6 +88,21 @@ EXPLAIN SELECT * FROM users JOIN orders ON users.id = orders.user_id;
 ```
 
 Then **stop the server (Ctrl+C) and restart it pointed at the same data directory**, then reconnect the CLI — the table, its rows, and the index should all still be there. That's Week 1 and Week 2's durability and transaction work, visible from the outside rather than just in a test file.
+
+### Connecting with a real PostgreSQL client instead
+
+Add `--pgwire` to also start a real PostgreSQL wire protocol server against the same database, on `port + 1` by default (or a specific port via `--pgwire=PORT`):
+
+```bash
+java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./stratosdb_data 5432 --pgwire
+# custom protocol on 5432, PostgreSQL wire protocol on 5433
+```
+
+```bash
+psql -h localhost -p 5433 -U anyuser -d anydb
+```
+
+Any real PostgreSQL client works here, not just `psql` — this was verified against `psql` and Python's `psycopg2` independently (see `PROGRESS.md`). Known limits: only the simple query protocol (no server-side prepared statements yet), trust auth only (no password over this path yet), and `psql`'s `\dt`/`\d`/`\l`/tab-completion don't work (they query real Postgres system catalog tables StratosDB doesn't emulate yet) — plain SQL statements work regardless.
 
 ## 4. Try authentication and TLS
 
