@@ -1,4 +1,4 @@
-package com.stratosdb.network.pgwire;
+package com.stratosdb.network.stdwire;
 
 import com.stratosdb.core.DatabaseConfig;
 import com.stratosdb.core.StratosDB;
@@ -42,14 +42,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *   `psql` isn't on the PATH, since requiring it changes what this test
  *   suite depends on to even build.
  */
-class PgWireServerTest {
+class StdWireServerTest {
 
     @TempDir
     Path tempDir;
 
     private int port;
     private StratosDB db;
-    private PgWireServer server;
+    private StdWireServer server;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -57,7 +57,7 @@ class PgWireServerTest {
         DatabaseConfig config = new DatabaseConfig();
         config.setDataDirectory(tempDir.toString());
         db = new StratosDB(config);
-        server = new PgWireServer(port, db);
+        server = new StdWireServer(port, db);
         server.start();
         Thread.sleep(200); // give the accept thread a moment to actually be listening
     }
@@ -85,7 +85,7 @@ class PgWireServerTest {
 
             // SSLRequest - exactly the bytes a real libpq client sends first by default.
             out.writeInt(8);
-            out.writeInt(PgWireMessages.SSL_REQUEST_CODE);
+            out.writeInt(StdWireMessages.SSL_REQUEST_CODE);
             out.flush();
             assertEquals('N', in.readUnsignedByte(), "server must decline SSL with a single 'N' byte");
 
@@ -310,7 +310,7 @@ class PgWireServerTest {
     private void sendStartup(DataOutputStream out, String user, String database) throws IOException {
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         DataOutputStream bodyOut = new DataOutputStream(body);
-        bodyOut.writeInt(PgWireMessages.PROTOCOL_VERSION_3);
+        bodyOut.writeInt(StdWireMessages.PROTOCOL_VERSION_3);
         writeCString(bodyOut, "user"); writeCString(bodyOut, user);
         writeCString(bodyOut, "database"); writeCString(bodyOut, database);
         bodyOut.writeByte(0);

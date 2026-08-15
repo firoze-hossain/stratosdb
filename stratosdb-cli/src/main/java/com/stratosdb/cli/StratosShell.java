@@ -197,7 +197,7 @@ public class StratosShell {
     /**
      * Args: [host] [port] [username] [password] [--ssl]
      * All positional args are optional; --ssl can appear anywhere.
-     * Defaults: localhost, 5432, no credentials, no TLS.
+     * Defaults: localhost, ProtocolConstants.DEFAULT_PORT, no credentials, no TLS.
      *
      * Requires a StratosDB server already running (stratosdb-network's
      * StratosServerMain) - this no longer starts one itself.
@@ -214,7 +214,7 @@ public class StratosShell {
         }
 
         String host = positional.size() > 0 ? positional.get(0) : "localhost";
-        int port = positional.size() > 1 ? Integer.parseInt(positional.get(1)) : 5432;
+        int port = positional.size() > 1 ? Integer.parseInt(positional.get(1)) : com.stratosdb.common.constants.ProtocolConstants.DEFAULT_PORT;
         String username = positional.size() > 2 ? positional.get(2) : null;
         String password = positional.size() > 3 ? positional.get(3) : null;
 

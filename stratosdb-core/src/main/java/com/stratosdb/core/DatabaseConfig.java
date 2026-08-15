@@ -1,8 +1,10 @@
 package com.stratosdb.core;
 
+import com.stratosdb.common.constants.ProtocolConstants;
+
 public class DatabaseConfig {
     private String dataDirectory = "./stratosdb_data";
-    private int port = 5432;
+    private int port = ProtocolConstants.DEFAULT_PORT;
     private int bufferPoolSize = 1024;
     private boolean syncWAL = true;
     private int maxConnections = 100;

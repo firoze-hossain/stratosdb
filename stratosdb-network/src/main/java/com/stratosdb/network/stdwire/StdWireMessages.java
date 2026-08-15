@@ -1,4 +1,4 @@
-package com.stratosdb.network.pgwire;
+package com.stratosdb.network.stdwire;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -25,8 +25,8 @@ import java.nio.charset.StandardCharsets;
  * project's own plan, which lists SCRAM-SHA-256 (the actual mechanism real
  * pg-wire clients negotiate) as a distinct, later item, not bundled in here.
  */
-public final class PgWireMessages {
-    private PgWireMessages() {}
+public final class StdWireMessages {
+    private StdWireMessages() {}
 
     public static final int SSL_REQUEST_CODE = 80877103;
     public static final int PROTOCOL_VERSION_3 = 0x00030000;

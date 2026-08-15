@@ -40,14 +40,14 @@ The CLI is a **network client** now, not an embedded engine — it connects to a
 java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar [dataDirectory] [port]
 ```
 
-Defaults to `./stratosdb_data` and port 5432.
+Defaults to `./stratosdb_data` and port 6582.
 
 ```bash
 # Terminal 2: the CLI
 java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar [host] [port] [username] [password] [--ssl]
 ```
 
-Defaults to `localhost` and `5432`, no credentials, no TLS. All args are optional and positional except `--ssl`, which can appear anywhere.
+Defaults to `localhost` and `6582`, no credentials, no TLS. All args are optional and positional except `--ssl`, which can appear anywhere.
 
 The shell reads one line at a time, so **type each statement on a single line** (no multi-line SQL yet). Try this session to prove out CRUD, MVCC, and the new planner all at once:
 
@@ -91,15 +91,15 @@ Then **stop the server (Ctrl+C) and restart it pointed at the same data director
 
 ### Connecting with a real PostgreSQL client instead
 
-Add `--pgwire` to also start a real PostgreSQL wire protocol server against the same database, on `port + 1` by default (or a specific port via `--pgwire=PORT`):
+Add `--stdwire` to also start a real PostgreSQL wire protocol server against the same database, on `port + 1` by default (or a specific port via `--stdwire=PORT`):
 
 ```bash
-java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./stratosdb_data 5432 --pgwire
-# custom protocol on 5432, PostgreSQL wire protocol on 5433
+java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./stratosdb_data 6582 --stdwire
+# custom protocol on 6582, PostgreSQL-wire-compatible protocol on 6583
 ```
 
 ```bash
-psql -h localhost -p 5433 -U anyuser -d anydb
+psql -h localhost -p 6583 -U anyuser -d anydb
 ```
 
 Any real PostgreSQL client works here, not just `psql` — this was verified against `psql` and Python's `psycopg2` independently (see `PROGRESS.md`). Known limits: only the simple query protocol (no server-side prepared statements yet), trust auth only (no password over this path yet), and `psql`'s `\dt`/`\d`/`\l`/tab-completion don't work (they query real Postgres system catalog tables StratosDB doesn't emulate yet) — plain SQL statements work regardless.
@@ -129,7 +129,7 @@ keytool -genkeypair -alias stratosdb -keyalg RSA -keysize 2048 -validity 365 \
 Then connect the CLI with credentials and TLS:
 
 ```bash
-java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar localhost 5432 alice correct-horse-battery-staple --ssl
+java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar localhost 6582 alice correct-horse-battery-staple --ssl
 ```
 
 Or via raw JDBC:
@@ -139,7 +139,7 @@ Properties props = new Properties();
 props.setProperty("user", "alice");
 props.setProperty("password", "correct-horse-battery-staple");
 props.setProperty("ssl", "true");
-Connection conn = DriverManager.getConnection("jdbc:stratos://localhost:5432/", props);
+Connection conn = DriverManager.getConnection("jdbc:stratos://localhost:6582/", props);
 ```
 
 **Read this before relying on TLS for anything real**: the client currently trusts *any* certificate the server presents - there is no certificate verification wired up yet. That's still real encryption (a passive eavesdropper reading the raw bytes off the wire gets nothing useful), but it does **not** protect against an active attacker who intercepts the connection and presents their own certificate - the client has no way to tell a genuine StratosDB server from an impostor. `TlsSupport`'s javadoc says this explicitly. Treat this as "encryption," not "authentication of the server," until real certificate/truststore verification is added.

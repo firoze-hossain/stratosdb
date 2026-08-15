@@ -1,4 +1,4 @@
-package com.stratosdb.network.pgwire;
+package com.stratosdb.network.stdwire;
 
 import com.stratosdb.core.StratosDB;
 import com.stratosdb.sql.executor.QueryResult;
@@ -30,10 +30,10 @@ import java.util.regex.Pattern;
  * the database, they just speak different protocols to reach it.
  *
  * Scope: the startup handshake and the simple query protocol (see
- * PgWireMessages' javadoc for exactly what that does and doesn't cover).
+ * StdWireMessages' javadoc for exactly what that does and doesn't cover).
  */
-public class PgWireServer {
-    private static final Logger LOG = LoggerFactory.getLogger(PgWireServer.class);
+public class StdWireServer {
+    private static final Logger LOG = LoggerFactory.getLogger(StdWireServer.class);
 
     private final int port;
     private final StratosDB db;
@@ -42,7 +42,7 @@ public class PgWireServer {
     private ExecutorService connectionExecutor;
     private final AtomicInteger nextPid = new AtomicInteger(1000);
 
-    public PgWireServer(int port, StratosDB db) {
+    public StdWireServer(int port, StratosDB db) {
         this.port = port;
         this.db = db;
     }
@@ -51,7 +51,7 @@ public class PgWireServer {
         serverSocket = new ServerSocket(port);
         running = true;
         connectionExecutor = Executors.newVirtualThreadPerTaskExecutor();
-        LOG.info("PgWireServer listening on port {}", port);
+        LOG.info("StdWireServer listening on port {}", port);
 
         Thread acceptThread = new Thread(() -> {
             while (running) {
@@ -62,7 +62,7 @@ public class PgWireServer {
                     if (running) LOG.error("Accept failed", e);
                 }
             }
-        }, "pgwire-accept");
+        }, "stdwire-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
     }
@@ -91,9 +91,9 @@ public class PgWireServer {
 
             boolean inTransaction = false;
             while (running) {
-                PgWireMessages.TypedMessage msg;
+                StdWireMessages.TypedMessage msg;
                 try {
-                    msg = PgWireMessages.readTypedMessage(in);
+                    msg = StdWireMessages.readTypedMessage(in);
                 } catch (EOFException e) {
                     break;
                 }
@@ -103,8 +103,8 @@ public class PgWireServer {
                 }
                 if (msg.type() != 'Q') {
                     // Anything from the extended query protocol (Parse/Bind/Describe/Execute/
-                    // Sync/Close) lands here - not implemented yet (see PgWireMessages' javadoc).
-                    PgWireMessages.writeErrorResponse(out, "Only the simple query protocol is supported right now");
+                    // Sync/Close) lands here - not implemented yet (see StdWireMessages' javadoc).
+                    StdWireMessages.writeErrorResponse(out, "Only the simple query protocol is supported right now");
                     out.flush();
                     continue;
                 }
@@ -116,12 +116,12 @@ public class PgWireServer {
                 // each one in order, same as a real server would.
                 for (String statement : splitStatements(sql)) {
                     if (statement.isBlank()) {
-                        PgWireMessages.writeEmptyQueryResponse(out);
+                        StdWireMessages.writeEmptyQueryResponse(out);
                         continue;
                     }
                     inTransaction = executeAndRespond(statement, out, inTransaction);
                 }
-                PgWireMessages.writeReadyForQuery(out, inTransaction ? 'T' : 'I');
+                StdWireMessages.writeReadyForQuery(out, inTransaction ? 'T' : 'I');
                 out.flush();
             }
         } catch (IOException e) {
@@ -134,37 +134,37 @@ public class PgWireServer {
 
     /** Returns false if the connection should be closed (SSL request handled, then the client is expected to reconnect in plaintext, or the startup was malformed). */
     private boolean performStartup(DataInputStream in, DataOutputStream out) throws IOException {
-        byte[] body = PgWireMessages.readUntypedPacket(in);
+        byte[] body = StdWireMessages.readUntypedPacket(in);
         int code = readInt(body, 0);
 
-        if (code == PgWireMessages.SSL_REQUEST_CODE) {
-            PgWireMessages.writeSslDecline(out);
+        if (code == StdWireMessages.SSL_REQUEST_CODE) {
+            StdWireMessages.writeSslDecline(out);
             out.flush();
             // A real client falls back to a plaintext StartupMessage next on the SAME connection.
-            body = PgWireMessages.readUntypedPacket(in);
+            body = StdWireMessages.readUntypedPacket(in);
             code = readInt(body, 0);
         }
 
-        if (code != PgWireMessages.PROTOCOL_VERSION_3) {
-            PgWireMessages.writeErrorResponse(out, "Only protocol version 3.0 is supported");
+        if (code != StdWireMessages.PROTOCOL_VERSION_3) {
+            StdWireMessages.writeErrorResponse(out, "Only protocol version 3.0 is supported");
             out.flush();
             return false;
         }
 
-        Map<String, String> params = PgWireMessages.parseStartupParams(body, 4);
+        Map<String, String> params = StdWireMessages.parseStartupParams(body, 4);
         LOG.info("pg-wire startup: user={} database={} application_name={}",
             params.get("user"), params.get("database"), params.get("application_name"));
 
         // Trust auth: no password required. A real, stated scope limit - see
-        // PgWireMessages' javadoc for why (SCRAM is a separate, later item).
-        PgWireMessages.writeAuthenticationOk(out);
-        PgWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB pg-wire compatibility layer)");
-        PgWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
-        PgWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");
-        PgWireMessages.writeParameterStatus(out, "DateStyle", "ISO, MDY");
-        PgWireMessages.writeParameterStatus(out, "integer_datetimes", "on");
-        PgWireMessages.writeBackendKeyData(out, nextPid.getAndIncrement(), 12345);
-        PgWireMessages.writeReadyForQuery(out, 'I');
+        // StdWireMessages' javadoc for why (SCRAM is a separate, later item).
+        StdWireMessages.writeAuthenticationOk(out);
+        StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB pg-wire compatibility layer)");
+        StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
+        StdWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");
+        StdWireMessages.writeParameterStatus(out, "DateStyle", "ISO, MDY");
+        StdWireMessages.writeParameterStatus(out, "integer_datetimes", "on");
+        StdWireMessages.writeBackendKeyData(out, nextPid.getAndIncrement(), 12345);
+        StdWireMessages.writeReadyForQuery(out, 'I');
         out.flush();
         return true;
     }
@@ -176,12 +176,12 @@ public class PgWireServer {
             result = db.execute(sql);
         } catch (Exception e) {
             LOG.warn("Statement failed unexpectedly: {}", sql, e);
-            PgWireMessages.writeErrorResponse(out, e.getMessage());
+            StdWireMessages.writeErrorResponse(out, e.getMessage());
             return inTransaction;
         }
 
         if (!result.isSuccess()) {
-            PgWireMessages.writeErrorResponse(out, result.getError());
+            StdWireMessages.writeErrorResponse(out, result.getError());
             // A failed statement inside an explicit transaction leaves it open
             // but poisoned - ExecutorEngine already tracks that internally;
             // from the wire client's point of view it's still "in a transaction".
@@ -194,26 +194,26 @@ public class PgWireServer {
             // columns from the first row (every row in one result shares the
             // same shape) and stream each row, even if there are zero rows
             // (RowDescription must still go out so the client knows the shape).
-            List<PgWireMessages.Column> columns = describeColumns(rows);
-            PgWireMessages.writeRowDescription(out, columns);
+            List<StdWireMessages.Column> columns = describeColumns(rows);
+            StdWireMessages.writeRowDescription(out, columns);
             for (Tuple row : rows) {
                 List<String> values = new ArrayList<>(row.size());
                 for (int i = 0; i < row.size(); i++) {
                     Object v = row.getValue(i);
                     values.add(v == null ? null : v.toString());
                 }
-                PgWireMessages.writeDataRow(out, values);
+                StdWireMessages.writeDataRow(out, values);
             }
-            PgWireMessages.writeCommandComplete(out, buildCommandTag(sql, rows.size()));
+            StdWireMessages.writeCommandComplete(out, buildCommandTag(sql, rows.size()));
         } else {
-            PgWireMessages.writeCommandComplete(out, buildCommandTag(sql, extractAffectedCount(result.getMessage())));
+            StdWireMessages.writeCommandComplete(out, buildCommandTag(sql, extractAffectedCount(result.getMessage())));
         }
 
         return updateTransactionState(sql, inTransaction);
     }
 
-    private List<PgWireMessages.Column> describeColumns(List<Tuple> rows) {
-        List<PgWireMessages.Column> columns = new ArrayList<>();
+    private List<StdWireMessages.Column> describeColumns(List<Tuple> rows) {
+        List<StdWireMessages.Column> columns = new ArrayList<>();
         if (rows.isEmpty()) {
             return columns; // no rows at all means no way to know column names from this result alone - a real, minor limitation of the simple query protocol without a schema catalog behind it
         }
@@ -221,7 +221,7 @@ public class PgWireServer {
         for (int i = 0; i < first.size(); i++) {
             String name = first.getColumnNames().get(i);
             Object sampleValue = first.getValue(i);
-            columns.add(new PgWireMessages.Column(name, inferTypeOid(sampleValue), inferTypeSize(sampleValue)));
+            columns.add(new StdWireMessages.Column(name, inferTypeOid(sampleValue), inferTypeSize(sampleValue)));
         }
         return columns;
     }

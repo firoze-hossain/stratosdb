@@ -46,9 +46,9 @@ mvn test
 Start a server and connect with a real PostgreSQL client:
 
 ```bash
-java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./data 5432 --pgwire
-# custom protocol on 5432, PostgreSQL wire protocol on 5433 (port + 1 by default)
-psql -h localhost -p 5433 -U anyuser -d anydb
+java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./data 6582 --stdwire
+# custom protocol on 6582, PostgreSQL-wire-compatible protocol on 6583 (port + 1 by default)
+psql -h localhost -p 6583 -U anyuser -d anydb
 ```
 
 ```sql
