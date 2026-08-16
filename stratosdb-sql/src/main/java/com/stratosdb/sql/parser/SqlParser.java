@@ -78,6 +78,17 @@ public class SqlParser {
         } else if (ctx.selectWithCte() != null) {
             StratosSQLParser.SelectWithCteContext cteCtx = ctx.selectWithCte();
             String cteName = cteCtx.cteName().getText();
+            boolean hasRecursiveKeyword = cteCtx.RECURSIVE() != null;
+            boolean hasUnionAllStructure = cteCtx.select().size() == 3;
+            if (hasRecursiveKeyword != hasUnionAllStructure) {
+                throw new IllegalArgumentException("WITH RECURSIVE requires a \"base UNION ALL recursive\" structure inside the parentheses, and vice versa - got RECURSIVE=" + hasRecursiveKeyword + " but a UNION ALL structure=" + hasUnionAllStructure);
+            }
+            if (hasRecursiveKeyword) {
+                SelectStatement baseQuery = buildSelect(cteCtx.select(0));
+                SelectStatement recursiveQuery = buildSelect(cteCtx.select(1));
+                SelectStatement outerQuery = buildSelect(cteCtx.select(2));
+                return new RecursiveCteSelectStatement(cteName, baseQuery, recursiveQuery, outerQuery);
+            }
             SelectStatement cteQuery = buildSelect(cteCtx.select(0));
             SelectStatement outerQuery = buildSelect(cteCtx.select(1));
             return new CteSelectStatement(cteName, cteQuery, outerQuery);
@@ -305,13 +316,16 @@ public class SqlParser {
         String tableName = ctx.tableName().getText();
         List<String> columns = new ArrayList<>();
         List<AggregateCall> aggregates = new ArrayList<>();
+        List<WindowFunctionCall> windowFunctions = new ArrayList<>();
 
         if (ctx.selectList().STAR() != null) {
             columns.add("*");
         } else {
             for (StratosSQLParser.SelectItemContext itemCtx : ctx.selectList().selectItem()) {
                 String alias = itemCtx.alias() != null ? itemCtx.alias().getText() : null;
-                if (itemCtx.aggregateFunction() != null) {
+                if (itemCtx.windowFunction() != null) {
+                    windowFunctions.add(buildWindowFunctionCall(itemCtx.windowFunction(), alias));
+                } else if (itemCtx.aggregateFunction() != null) {
                     aggregates.add(buildAggregateCall(itemCtx.aggregateFunction(), alias));
                 } else if (itemCtx.columnName() != null) {
                     // No alias support for plain columns yet (a separate, smaller gap than
@@ -343,7 +357,31 @@ public class SqlParser {
         WhereExpr where = buildWhereExpr(ctx.expression());
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause);
+        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause, windowFunctions);
+    }
+
+    private WindowFunctionCall buildWindowFunctionCall(StratosSQLParser.WindowFunctionContext ctx, String alias) {
+        String functionName;
+        if (ctx.ROW_NUMBER() != null) functionName = "ROW_NUMBER";
+        else if (ctx.RANK() != null) functionName = "RANK";
+        else functionName = "DENSE_RANK";
+
+        List<String> partitionBy = new ArrayList<>();
+        if (ctx.groupByList() != null) {
+            for (StratosSQLParser.ColumnNameContext colCtx : ctx.groupByList().columnName()) {
+                partitionBy.add(colCtx.getText());
+            }
+        }
+
+        List<WindowOrderItem> orderBy = new ArrayList<>();
+        if (ctx.orderList() != null) {
+            for (StratosSQLParser.OrderItemContext itemCtx : ctx.orderList().orderItem()) {
+                boolean descending = itemCtx.DESC() != null;
+                orderBy.add(new WindowOrderItem(itemCtx.columnName().getText(), descending));
+            }
+        }
+
+        return new WindowFunctionCall(functionName, partitionBy, orderBy, alias != null ? alias : functionName);
     }
 
     private AggregateCall buildAggregateCall(StratosSQLParser.AggregateFunctionContext ctx, String alias) {

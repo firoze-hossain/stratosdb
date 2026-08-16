@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
-| Tests passing | **159 / 159** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. This round: sequences and SERIAL columns, plus two real, severe pre-existing bugs found and fixed along the way - INSERT's explicit column list was silently discarded, and a genuine data-loss race condition in HeapTable.insert() under concurrent writes to the same table |
+| Tests passing | **172 / 172** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. This round: merge join (a real second join strategy), window functions (`ROW_NUMBER`/`RANK`/`DENSE_RANK`), and recursive CTEs (fixpoint iteration with hierarchy/graph-traversal support) - closing out this project's entire original query-engine gap list |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -301,9 +301,35 @@ Root cause, found by reading the actual code rather than guessing further: `Heap
 - 3 new tests for the column-list fix, 1 for defaults, 5 for sequences/SERIAL/`currval()` semantics/persistence/concurrency in `StratosDBTest`, and a dedicated `HeapTableConcurrencyTest` in `stratosdb-storage` exercising the actual bug's mechanism directly against the raw storage API.
 - **Known, honestly-stated limitations**: a single sequence is not tied to `NOT NULL`/uniqueness enforcement (StratosDB doesn't enforce either yet at all - a separate, existing gap); sequences don't support `CYCLE`/`MAXVALUE`/`MINVALUE`; `SERIAL` doesn't currently support explicit shadowing of an already-existing table column of the same auto-generated sequence name beyond a clean rejection.
 
+## Merge join, window functions, and recursive CTEs
+
+### Merge join ✅ done
+
+- ✅ A genuine second join strategy alongside hash join, chosen by `chooseJoinAlgorithm` using a simple, honest row-count threshold (10,000 rows on both sides) - hash join needs its whole build side to fit as one in-memory hash table, which becomes a real cost once both sides are large; merge join instead sorts both sides (no single huge structure), which pays off once the sort is cheaper than that risk.
+- Verified two ways: proved algorithmically identical to hash join on hand-built input with duplicate join keys on both sides and NULL keys (which must never match either side) - not just "looks similar," an exact set-equality check between the two algorithms' output. Then proved the *planner* actually routes large joins to it, using 10,001 synthetic in-memory rows per side (fast - no SQL/transaction overhead - while still exercising the real threshold check against real row counts) rather than a slow, real 20,000-row SQL insert.
+- 3 new tests in `StratosDBTest`.
+
+### Window functions ✅ done
+
+`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, each with optional `PARTITION BY`/`ORDER BY`. Verified thoroughly against real Postgres semantics before considering it done: correct partitioning, `RANK()`'s real skip-ahead-past-ties behavior (1, 1, 3 - not 1, 1, 2) versus `DENSE_RANK()`'s real no-skip behavior (1, 1, 2), the correct default of "whole table as one partition" when `PARTITION BY` is omitted, clean rejection when combined with `JOIN` or `GROUP BY`, and an empty table.
+
+**A real mix-up worth naming honestly**: mid-round, this looked like it might already exist in the codebase from an earlier, pre-tracking phase - but checking directly against the actual GitHub repository (not just local sandbox state) confirmed it did not; this is genuinely new work built and tested this round, not a correction of a stale claim. Recorded here so the history in this file stays accurate rather than repeating a belief that turned out to be wrong.
+
+- ✅ **Confirmed working**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, each with optional `PARTITION BY`/`ORDER BY`.
+- 6 new tests added to `StratosDBTest`.
+
+### Recursive CTEs (`WITH RECURSIVE`) ✅ done
+
+- ✅ `WITH RECURSIVE cteName AS (baseQuery UNION ALL recursiveQuery) outerQuery`, evaluated by fixpoint iteration: run `baseQuery` once to seed the result, then repeatedly run `recursiveQuery` with `cteName` resolving to only the *previous* iteration's new rows (real "working table" semantics, matching Postgres - not the whole accumulated set each time), until an iteration adds nothing new or a 1000-iteration safety cap is hit (a real, non-terminating recursive query - e.g. an actual cycle in the data - fails with a clear error instead of hanging or exhausting memory).
+- **A real design flaw caught before it shipped, not after**: the obvious reuse of the existing non-recursive CTE's "no JOIN allowed" restriction would have made recursive CTEs nearly useless, since the standard, valuable pattern (`FROM realTable JOIN cteName ON ...` for hierarchy/graph traversal) requires the CTE to work as a *join target* - not just a bare `FROM cteName`. Fixed by extending join-source resolution (`resolveJoinSource`) to check for a recursive CTE's materialized rows alongside real tables.
+- **A real bug found by actually testing a real hierarchy query, not by inspection**: an employee-hierarchy traversal (CEO → VPs → managers → ICs) silently stopped after one recursive step, returning 3 rows instead of the correct 6. Root cause: the recursive branch's own column names (`employees.id`, since it explicitly wrote them that way) didn't match the base branch's names (`id`), so the *next* iteration's join condition (looking for `org_chart.id`) silently found nothing. Real SQL's `UNION ALL` matches columns by *position*, not name, across its two branches - fixed by aligning every iteration's output columns to the base query's schema positionally before using them as the next iteration's working set.
+- Verified with a real 6-person, multi-level hierarchy (exact row count, every id present, exactly once), a genuine cycle (fails cleanly within milliseconds via the iteration cap, not a hang), rejection of `WITH RECURSIVE` without an actual `UNION ALL` structure, and a regression check that ordinary non-recursive CTEs still work.
+- **Known, honestly-stated limitation**: no cycle detection beyond the iteration cap - a real cycle in the data will keep "finding" new rows every iteration until the cap is hit, rather than detecting the revisit directly. Real Postgres's plain `UNION` (as opposed to `UNION ALL`) deduplicates for exactly this reason; that dedup-based cycle safety is further work, not attempted here. Also surfaced, incidentally, while testing this: StratosDB doesn't support negative number literals or table aliases in SQL at all yet - both real, separate, pre-existing gaps, unrelated to CTEs specifically.
+- 4 new tests in `StratosDBTest`.
+
 ## What to do next
 
-Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed, savepoints are done, and the persisted commit-status log closes out the restart-correctness work that round turned into. Phase B's core "query engine depth" items are done, and CTEs close out its next-highest item. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions), its highest-leverage ecosystem item (PostgreSQL wire protocol compatibility), and now `\dt` support are done. Phase E's four highest-priority items (views, autovacuum, slow-query logging, and now a queryable metrics interface) are done. Sequences and SERIAL columns are done, and along the way, two real bugs - one purely in the SQL layer, one a genuine concurrency bug in the storage engine itself - were found and fixed, not just the new feature.
+Phase A's two most load-bearing gaps (B+Tree delete, vacuum) are closed, savepoints are done, and the persisted commit-status log closes out the restart-correctness work that round turned into. Phase B's core "query engine depth" items are done - CTEs (recursive and non-recursive), merge join, and window functions (confirmed correct, now tested) close out everything on this project's own "missing from Postgres" query-engine list. Phase C's highest-priority indexing item (hash index) is done. Phase D's most critical item (multi-statement transactions), its highest-leverage ecosystem item (PostgreSQL wire protocol compatibility), and now `\dt` support are done. Phase E's four highest-priority items (views, autovacuum, slow-query logging, and now a queryable metrics interface) are done. Sequences and SERIAL columns are done, and along the way, two real bugs - one purely in the SQL layer, one a genuine concurrency bug in the storage engine itself - were found and fixed, not just the new feature.
 
 **Worth naming as a real, separate follow-up**: the `HeapTable.insert()` fix closes the specific race this round found and proved, but it's a narrow, targeted fix (a per-table lock around one method), not the general fine-grained concurrency control (page/row-level latching) this project has already named as a known, open architectural gap in earlier rounds. Other write paths may have similar unexamined races - this one was found because sequences happened to create exactly the right stress pattern to expose it, not because a systematic audit was done.
 

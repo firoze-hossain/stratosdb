@@ -31,7 +31,7 @@ savepointName: IDENTIFIER;
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
 select: SELECT selectList FROM tableName joinClause* (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
-selectWithCte: WITH cteName AS LPAREN select RPAREN select;
+selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: IDENTIFIER;
 joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
 groupByList: columnName (COMMA columnName)*;
@@ -54,7 +54,8 @@ indexName: IDENTIFIER;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
-selectItem: aggregateFunction (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
+selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
+windowFunction: (ROW_NUMBER | RANK | DENSE_RANK) LPAREN RPAREN OVER LPAREN (PARTITION BY groupByList)? (ORDER BY orderList)? RPAREN;
 
 // Expressions
 // Alternative order matters for ANTLR4's left-recursion precedence: earlier
@@ -126,6 +127,9 @@ TABLE: T A B L E;
 VIEW: V I E W;
 AS: A S;
 WITH: W I T H;
+UNION: U N I O N;
+ALL: A L L;
+RECURSIVE: R E C U R S I V E;
 DROP: D R O P;
 INSERT: I N S E R T;
 INTO: I N T O;
@@ -156,6 +160,11 @@ SHOW: S H O W;
 TABLES: T A B L E S;
 STATS: S T A T S;
 SEQUENCE: S E Q U E N C E;
+ROW_NUMBER: R O W '_' N U M B E R;
+RANK: R A N K;
+DENSE_RANK: D E N S E '_' R A N K;
+OVER: O V E R;
+PARTITION: P A R T I T I O N;
 INCREMENT: I N C R E M E N T;
 NEXTVAL: N E X T V A L;
 CURRVAL: C U R R V A L;

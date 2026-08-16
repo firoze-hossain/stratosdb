@@ -248,6 +248,8 @@ public class ExecutorEngine {
         Map<String, SelectStatement> activeCtes = new java.util.HashMap<>();
         /** sequenceName -> the last value nextval() returned FOR THIS SESSION - real Postgres's currval() is explicitly per-session, not "whatever the sequence's global value happens to be" (which could reflect a completely different connection's nextval() call). */
         Map<String, Long> lastNextvalBySequence = new java.util.HashMap<>();
+        /** cteName -> its rows for THIS iteration of a recursive CTE's fixpoint (see executeRecursiveCteSelect) - resolved directly, bypassing query re-execution entirely, since a recursive CTE's self-reference must see specific, already-computed rows (the previous iteration's new ones), not a re-runnable query. */
+        Map<String, List<Tuple>> materializedCteRows = new java.util.HashMap<>();
     }
 
     private static final class Savepoint {
@@ -612,6 +614,7 @@ public class ExecutorEngine {
         if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
         if (stmt instanceof DropViewStatement s) return executeDropView(s);
         if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
+        if (stmt instanceof RecursiveCteSelectStatement s) return executeRecursiveCteSelect(s, txn);
         if (stmt instanceof CreateSequenceStatement s) return executeCreateSequence(s);
         if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
         return QueryResult.error("Unsupported statement");
@@ -626,13 +629,15 @@ public class ExecutorEngine {
      * it afterward regardless of success or failure - a CTE must never
      * leak into any statement after the one that defined it.
      *
-     * Known, named simplification: a single, non-recursive CTE only.
-     * Multiple CTEs in one WITH clause and WITH RECURSIVE are real
-     * further work, not attempted here. Also unlike real Postgres, a CTE
-     * here only takes effect when no real table of the same name exists
-     * (true shadowing of an existing table is a further refinement, not
-     * a correctness gap for the common case of picking a name that
-     * doesn't collide with anything).
+     * Known, named simplification: a single, non-recursive CTE only -
+     * multiple CTEs in one WITH clause is real further work, not
+     * attempted here. (WITH RECURSIVE is a separate statement type - see
+     * executeRecursiveCteSelect - since a recursive CTE's execution model
+     * is different enough to not fit this same code path.) Also unlike
+     * real Postgres, a CTE here only takes effect when no real table of
+     * the same name exists (true shadowing of an existing table is a
+     * further refinement, not a correctness gap for the common case of
+     * picking a name that doesn't collide with anything).
      */
     private QueryResult executeCteSelect(CteSelectStatement stmt, Transaction txn) {
         SessionState state = session.get();
@@ -642,6 +647,117 @@ public class ExecutorEngine {
         } finally {
             state.activeCtes.remove(stmt.cteName());
         }
+    }
+
+    /**
+     * Real limit against a recursive query that never converges (e.g. a
+     * cycle in the underlying data with no guard against revisiting a
+     * node, or simply a WHERE clause that always matches) - fails with a
+     * clear, actionable error rather than an infinite loop or an
+     * out-of-memory crash. 1000 is a generous ceiling for legitimate
+     * hierarchical data (a 1000-level-deep tree/chain is already an
+     * unusual shape) while still bounding worst-case work to something
+     * that fails fast.
+     */
+    private static final int RECURSIVE_CTE_MAX_ITERATIONS = 1000;
+
+    /**
+     * WITH RECURSIVE cteName AS (baseQuery UNION ALL recursiveQuery) outerQuery.
+     *
+     * Fixpoint iteration, the standard evaluation strategy for a recursive
+     * CTE: run baseQuery once to seed both the accumulated result and the
+     * "new rows" working set; then repeatedly run recursiveQuery with
+     * cteName resolving to ONLY the previous iteration's new rows (not the
+     * whole accumulated set so far - real "working table" semantics,
+     * matching Postgres, and also what keeps each iteration's work
+     * bounded to genuinely new data rather than reprocessing everything
+     * accumulated so far), adding whatever comes out to the accumulated
+     * result, until an iteration produces nothing new (the fixpoint) or
+     * the safety iteration limit is hit.
+     *
+     * Uses materializedCteRows (SessionState), not activeCtes - the
+     * recursive branch needs to resolve to a SPECIFIC, already-computed
+     * row list each iteration, not a re-executable query definition (see
+     * executeSelect's lookup chain and resolveJoinSource for where this is
+     * actually consumed - critically, resolveJoinSource is what lets the
+     * recursive branch be "FROM realTable JOIN cteName ON ..." - the
+     * standard, valuable hierarchy/graph-traversal pattern - not just a
+     * bare "FROM cteName").
+     *
+     * Known, honestly-stated limitation: no cycle detection beyond the
+     * iteration cap - a graph with an actual cycle (not just a deep tree)
+     * will keep finding "new" rows every iteration until the cap is hit,
+     * since nothing here checks for a row's key having been seen before.
+     * Real cycle-safe recursive CTEs (Postgres's own UNION, as opposed to
+     * UNION ALL, does deduplicate) are further work, not attempted here.
+     */
+    private QueryResult executeRecursiveCteSelect(RecursiveCteSelectStatement stmt, Transaction txn) {
+        QueryResult baseResult = executeSelect(stmt.baseQuery(), txn);
+        if (!baseResult.isSuccess()) {
+            return baseResult;
+        }
+
+        // UNION ALL matches columns by POSITION, not by name, across its two
+        // branches - real SQL requires both sides to have the same column
+        // count for exactly this reason. Every row from every iteration is
+        // renamed to the base query's own column names, positionally,
+        // before being used as the next iteration's working set. Without
+        // this, a recursive branch that writes its own column names
+        // explicitly (e.g. "SELECT employees.id, ..." rather than a bare
+        // "id") produces differently-named columns each iteration, which
+        // silently breaks the NEXT iteration's join resolution (a real bug
+        // found this way: a real employee-hierarchy query stopped after one
+        // recursive step, silently missing the deeper levels, because
+        // "employees.id" from the recursive branch didn't match what a
+        // later join condition like "org_chart.id" was actually looking
+        // for once re-qualified).
+        List<String> baseColumnNames = baseResult.getRows().isEmpty() ? List.of() : baseResult.getRows().get(0).getColumnNames();
+        List<Tuple> accumulated = new ArrayList<>(alignColumnsToBaseSchema(baseResult.getRows(), baseColumnNames));
+        List<Tuple> newRowsFromLastIteration = accumulated;
+
+        SessionState state = session.get();
+        int iterations = 0;
+        while (!newRowsFromLastIteration.isEmpty()) {
+            iterations++;
+            if (iterations > RECURSIVE_CTE_MAX_ITERATIONS) {
+                return QueryResult.error("Recursive CTE \"" + stmt.cteName() + "\" exceeded "
+                    + RECURSIVE_CTE_MAX_ITERATIONS + " iterations without reaching a fixpoint - "
+                    + "likely a non-terminating recursion (does the recursive branch actually converge toward a base case, "
+                    + "or could there be a cycle in the underlying data?)");
+            }
+
+            state.materializedCteRows.put(stmt.cteName(), newRowsFromLastIteration);
+            QueryResult stepResult;
+            try {
+                stepResult = executeSelect(stmt.recursiveQuery(), txn);
+            } finally {
+                state.materializedCteRows.remove(stmt.cteName());
+            }
+            if (!stepResult.isSuccess()) {
+                return stepResult;
+            }
+
+            newRowsFromLastIteration = alignColumnsToBaseSchema(stepResult.getRows(), baseColumnNames);
+            accumulated.addAll(newRowsFromLastIteration);
+        }
+
+        return applyOuterQueryToRows(stmt.outerQuery(), accumulated, txn);
+    }
+
+    /** Rebuilds each row with the base query's own column names, matched positionally - see executeRecursiveCteSelect's javadoc for why this matters. A no-op (values unchanged) when the names already match, which is the common case for a simply-written recursive branch. */
+    private List<Tuple> alignColumnsToBaseSchema(List<Tuple> rows, List<String> baseColumnNames) {
+        if (baseColumnNames.isEmpty()) {
+            return rows;
+        }
+        List<Tuple> aligned = new ArrayList<>(rows.size());
+        for (Tuple row : rows) {
+            Tuple renamed = new Tuple();
+            for (int i = 0; i < baseColumnNames.size() && i < row.getColumnNames().size(); i++) {
+                renamed.addValue(baseColumnNames.get(i), row.getValue(i));
+            }
+            aligned.add(renamed);
+        }
+        return aligned;
     }
 
     private QueryResult executeCreateSequence(CreateSequenceStatement stmt) {
@@ -953,6 +1069,23 @@ public class ExecutorEngine {
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn) {
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
+            List<Tuple> materializedRows = session.get().materializedCteRows.get(stmt.tableName());
+            if (materializedRows != null) {
+                // A recursive CTE's self-reference - already-computed rows from
+                // the previous fixpoint iteration, not a query to re-execute.
+                // Same join/aggregate/window-function restriction as views and
+                // non-recursive CTEs below, for the same reason.
+                boolean hasJoin = stmt.joins() != null && !stmt.joins().isEmpty();
+                boolean hasAggregate = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
+                boolean hasWindowFunction = !stmt.windowFunctions().isEmpty();
+                if (hasJoin || hasAggregate || hasWindowFunction) {
+                    return QueryResult.error("A recursive CTE's self-reference (" + stmt.tableName()
+                        + ") combined with a JOIN, an aggregate/GROUP BY, or a window function isn't supported yet - "
+                        + "a plain SELECT ... FROM " + stmt.tableName() + " [WHERE ...] works");
+                }
+                return applyOuterQueryToRows(stmt, materializedRows, txn);
+            }
+
             SelectStatement viewQuery = views.get(stmt.tableName());
             if (viewQuery == null) {
                 // Not a real table, not a persisted view - maybe it's an active CTE
@@ -962,17 +1095,18 @@ public class ExecutorEngine {
             if (viewQuery != null) {
                 boolean hasJoin = stmt.joins() != null && !stmt.joins().isEmpty();
                 boolean hasAggregate = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
-                if (hasJoin || hasAggregate) {
+                boolean hasWindowFunction = !stmt.windowFunctions().isEmpty();
+                if (hasJoin || hasAggregate || hasWindowFunction) {
                     // executeSelectOverView only applies WHERE/projection/LIMIT to
-                    // the view's rows - it doesn't know how to join or aggregate.
-                    // Silently falling through to it would silently ignore the
-                    // outer query's join/aggregate entirely (a real bug this
-                    // check replaced, found by actually testing "SELECT COUNT(*)
-                    // FROM aView" rather than assuming the join/aggregate code
-                    // paths would reject it themselves - they never got the chance,
-                    // since this views check runs first).
+                    // the view's rows - it doesn't know how to join, aggregate, or
+                    // compute a window function. Silently falling through to it
+                    // would silently ignore the outer query's real intent entirely
+                    // (a real bug this check replaced, found by actually testing
+                    // "SELECT COUNT(*) FROM aView" rather than assuming the
+                    // join/aggregate code paths would reject it themselves - they
+                    // never got the chance, since this views check runs first).
                     return QueryResult.error("Querying a view (" + stmt.tableName()
-                        + ") together with a JOIN or an aggregate/GROUP BY isn't supported yet - "
+                        + ") together with a JOIN, an aggregate/GROUP BY, or a window function isn't supported yet - "
                         + "a plain SELECT ... FROM " + stmt.tableName() + " [WHERE ...] works");
                 }
                 return executeSelectOverView(stmt, viewQuery, txn);
@@ -981,11 +1115,21 @@ public class ExecutorEngine {
         }
 
         if (stmt.joins() != null && !stmt.joins().isEmpty()) {
+            if (!stmt.windowFunctions().isEmpty()) {
+                return QueryResult.error("Window functions combined with JOIN aren't supported yet");
+            }
             return executeJoinedSelect(stmt, txn);
         }
 
         if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()) {
+            if (!stmt.windowFunctions().isEmpty()) {
+                return QueryResult.error("Window functions combined with GROUP BY/aggregates aren't supported yet");
+            }
             return executeAggregateSelect(stmt, txn, table);
+        }
+
+        if (!stmt.windowFunctions().isEmpty()) {
+            return executeWindowFunctionSelect(stmt, txn, table);
         }
 
         ScanPlan plan = planScan(stmt.tableName(), stmt.where());
@@ -1052,9 +1196,22 @@ public class ExecutorEngine {
         if (!viewResult.isSuccess()) {
             return viewResult;
         }
+        return applyOuterQueryToRows(outer, viewResult.getRows(), txn);
+    }
 
+    /**
+     * Applies an outer query's WHERE/projection/LIMIT to an already-available
+     * row list, rather than a table/view/CTE it would need to scan or
+     * execute itself. Factored out of executeSelectOverView so recursive
+     * CTEs (see executeRecursiveCteSelect) can reuse the exact same
+     * WHERE/projection/LIMIT logic against a materialized row list (the
+     * fixpoint iteration's accumulated result) without needing an
+     * executable SelectStatement to run - there isn't one; the CTE's
+     * "content" at that point is just a list of tuples already computed.
+     */
+    private QueryResult applyOuterQueryToRows(SelectStatement outer, List<Tuple> rows, Transaction txn) {
         List<Tuple> filtered = new ArrayList<>();
-        for (Tuple row : viewResult.getRows()) {
+        for (Tuple row : rows) {
             if (matchesWhere(row, outer.where(), txn)) {
                 filtered.add(project(row, outer.columns()));
             }
@@ -1090,7 +1247,134 @@ public class ExecutorEngine {
      * "SELECT COUNT(*) FROM t"), the whole filtered result set is treated
      * as a single implicit group - standard SQL behavior.
      */
+
+    /**
+     * ROW_NUMBER()/RANK()/DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...).
+     *
+     * Unlike GROUP BY, a window function never collapses rows - every row
+     * that matched WHERE stays in the result, just with an extra computed
+     * column added. So the shape here is deliberately different from
+     * executeAggregateSelect: scan and filter once, compute each window
+     * function's value per row by INDEX (not by Tuple identity/equality,
+     * which would be fragile), then project.
+     *
+     * Known, honestly-stated limitations: no combining with JOIN or
+     * GROUP BY/aggregates yet (rejected cleanly - see executeSelect), and
+     * NULLs in a partition or order-by column always sort last regardless
+     * of ASC/DESC, a real simplification of Postgres's own NULLS FIRST/LAST
+     * rules.
+     */
+    private QueryResult executeWindowFunctionSelect(SelectStatement stmt, Transaction txn, HeapTable table) {
+        List<Tuple> rows = new ArrayList<>();
+        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
+            Tuple tuple = Tuple.deserialize(raw);
+            if (matchesWhere(tuple, stmt.where(), txn)) {
+                rows.add(tuple);
+            }
+        }
+
+        // alias -> this window function's value for each row, by index into `rows`.
+        Map<String, long[]> windowValuesByAlias = new java.util.LinkedHashMap<>();
+        for (WindowFunctionCall call : stmt.windowFunctions()) {
+            windowValuesByAlias.put(call.alias(), computeWindowValues(rows, call));
+        }
+
+        List<Tuple> result = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Tuple projected = project(rows.get(i), stmt.columns());
+            for (Map.Entry<String, long[]> entry : windowValuesByAlias.entrySet()) {
+                projected.addValue(entry.getKey(), entry.getValue()[i]);
+            }
+            result.add(projected);
+        }
+
+        if (stmt.limit() != null) {
+            try {
+                int limit = Integer.parseInt(stmt.limit());
+                if (result.size() > limit) {
+                    result = result.subList(0, limit);
+                }
+            } catch (NumberFormatException e) {
+                // Ignore invalid limit, matching this engine's existing plain-select behavior.
+            }
+        }
+
+        return QueryResult.success(result);
+    }
+
+    private long[] computeWindowValues(List<Tuple> rows, WindowFunctionCall call) {
+        long[] result = new long[rows.size()];
+
+        Map<Object, List<Integer>> partitions = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < rows.size(); i++) {
+            partitions.computeIfAbsent(buildCompositeKey(rows.get(i), call.partitionBy()), k -> new ArrayList<>()).add(i);
+        }
+
+        for (List<Integer> partitionIndices : partitions.values()) {
+            partitionIndices.sort((a, b) -> compareForWindowOrder(rows.get(a), rows.get(b), call.orderBy()));
+
+            long rowNumber = 0;
+            long rank = 0;
+            long denseRank = 0;
+            Object previousOrderKey = null;
+            for (int idx : partitionIndices) {
+                rowNumber++;
+                Object currentOrderKey = buildOrderKey(rows.get(idx), call.orderBy());
+                boolean tiedWithPrevious = previousOrderKey != null && previousOrderKey.equals(currentOrderKey);
+                if (!tiedWithPrevious) {
+                    rank = rowNumber; // RANK: ties share a rank, the next distinct value skips ahead (1,1,3 - not 1,1,2)
+                    denseRank++;      // DENSE_RANK: ties share a rank, the next distinct value is just +1 (1,1,2)
+                }
+                result[idx] = switch (call.functionName()) {
+                    case "ROW_NUMBER" -> rowNumber;
+                    case "RANK" -> rank;
+                    default -> denseRank;
+                };
+                previousOrderKey = currentOrderKey;
+            }
+        }
+        return result;
+    }
+
+    /** A composite key built from possibly-multiple columns' values, safe to use directly as a Map key since List already implements content-based equals/hashCode. Empty column list means "everything is one partition/one order group" - the correct behavior for an omitted PARTITION BY or ORDER BY. */
+    private Object buildCompositeKey(Tuple row, List<String> columns) {
+        List<Object> key = new ArrayList<>();
+        for (String col : columns) {
+            key.add(normalizeJoinKey(findColumnValue(row, col)));
+        }
+        return key;
+    }
+
+    private Object buildOrderKey(Tuple row, List<WindowOrderItem> orderBy) {
+        List<Object> key = new ArrayList<>();
+        for (WindowOrderItem item : orderBy) {
+            key.add(normalizeJoinKey(findColumnValue(row, item.column())));
+        }
+        return key;
+    }
+
+    private int compareForWindowOrder(Tuple a, Tuple b, List<WindowOrderItem> orderBy) {
+        for (WindowOrderItem item : orderBy) {
+            Object valA = normalizeJoinKey(findColumnValue(a, item.column()));
+            Object valB = normalizeJoinKey(findColumnValue(b, item.column()));
+            int cmp = compareNullsLast(valA, valB);
+            if (cmp != 0) {
+                return item.descending() ? -cmp : cmp;
+            }
+        }
+        return 0;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private int compareNullsLast(Object a, Object b) {
+        if (a == null && b == null) return 0;
+        if (a == null) return 1;
+        if (b == null) return -1;
+        return ((Comparable) a).compareTo(b);
+    }
+
     private QueryResult executeAggregateSelect(SelectStatement stmt, Transaction txn, HeapTable table) {
+
         List<Tuple> filteredRows = new ArrayList<>();
         for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
             Tuple tuple = Tuple.deserialize(raw);
@@ -1253,23 +1537,18 @@ public class ExecutorEngine {
      * findColumnValue's suffix-match fallback.
      */
     private QueryResult executeJoinedSelect(SelectStatement stmt, Transaction txn) {
-        List<Tuple> current = new ArrayList<>();
-        for (byte[] raw : tables.get(stmt.tableName()).scanMvcc(txn.getSnapshot(), transactionManager)) {
-            current.add(qualify(Tuple.deserialize(raw), stmt.tableName()));
+        List<Tuple> current = resolveJoinSource(stmt.tableName(), txn);
+        if (current == null) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
         for (JoinClause join : stmt.joins()) {
-            HeapTable joinedTable = tables.get(join.tableName());
-            if (joinedTable == null) {
+            List<Tuple> joinedRows = resolveJoinSource(join.tableName(), txn);
+            if (joinedRows == null) {
                 return QueryResult.error("Table not found: " + join.tableName());
             }
 
-            List<Tuple> joinedRows = new ArrayList<>();
-            for (byte[] raw : joinedTable.scanMvcc(txn.getSnapshot(), transactionManager)) {
-                joinedRows.add(qualify(Tuple.deserialize(raw), join.tableName()));
-            }
-
-            current = hashJoin(current, join.leftColumn(), joinedRows, join.rightColumn());
+            current = chooseJoinAlgorithm(current, join.leftColumn(), joinedRows, join.rightColumn());
         }
 
         List<Tuple> tuples = new ArrayList<>();
@@ -1295,6 +1574,47 @@ public class ExecutorEngine {
     }
 
     /**
+     * Resolves one JOIN's source (or a query's own primary FROM table, used
+     * the same way) to its qualified rows - either a real table (a plain
+     * scan, as always) or a recursive CTE's own materialized self-reference
+     * rows (this iteration's previous-iteration data - see
+     * executeRecursiveCteSelect). This is specifically what lets a
+     * recursive CTE's recursive branch do "FROM realTable JOIN cteName ON
+     * ..." - the standard, most valuable recursive CTE pattern (hierarchy/
+     * graph traversal) - rather than being limited to a bare "FROM
+     * cteName" with no real table involved at all.
+     *
+     * Known, honestly-stated limitation: doesn't resolve a persisted VIEW
+     * or a non-recursive CTE as a join target, only as a query's own
+     * primary FROM table (see executeSelect) - a further generalization,
+     * not attempted here since it wasn't needed for recursive CTEs
+     * specifically. Returns null (rather than throwing) when the name
+     * resolves to nothing at all, so the caller can produce its own
+     * specific "table not found" error.
+     */
+    private List<Tuple> resolveJoinSource(String name, Transaction txn) {
+        HeapTable table = tables.get(name);
+        if (table != null) {
+            List<Tuple> rows = new ArrayList<>();
+            for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
+                rows.add(qualify(Tuple.deserialize(raw), name));
+            }
+            return rows;
+        }
+
+        List<Tuple> materialized = session.get().materializedCteRows.get(name);
+        if (materialized != null) {
+            List<Tuple> rows = new ArrayList<>();
+            for (Tuple row : materialized) {
+                rows.add(qualify(row, name));
+            }
+            return rows;
+        }
+
+        return null;
+    }
+
+    /**
      * Classic hash join: build a hash table on the smaller side (by row
      * count), keyed by the join column, then probe it with the other side.
      * Output column order is always left-then-right regardless of which
@@ -1312,6 +1632,29 @@ public class ExecutorEngine {
      * used throughout this class (see valuesEqual, evaluatePredicate,
      * compareForMinMax).
      */
+    /**
+     * Real join-strategy choice, replacing "always hash join": hash join's
+     * whole build side has to fit in memory as one hash table, which
+     * becomes a real cost once both sides are large; merge join instead
+     * needs to sort both sides (an O(n log n) cost with no single huge
+     * in-memory structure), which pays off once both inputs are big enough
+     * that the sort is cheaper than the risk/cost of a huge hash table.
+     *
+     * Deliberately simple and named as such: a row-count threshold using
+     * the actual, already-scanned sizes in hand (not stale ANALYZE
+     * statistics, not a real memory-cost model) - the same honest,
+     * rule-based spirit as this engine's existing scan-choice planner,
+     * not a full cost-based join optimizer.
+     */
+    private static final int MERGE_JOIN_ROW_THRESHOLD = 10_000;
+
+    private List<Tuple> chooseJoinAlgorithm(List<Tuple> left, String leftColumn, List<Tuple> right, String rightColumn) {
+        if (left.size() >= MERGE_JOIN_ROW_THRESHOLD && right.size() >= MERGE_JOIN_ROW_THRESHOLD) {
+            return mergeJoin(left, leftColumn, right, rightColumn);
+        }
+        return hashJoin(left, leftColumn, right, rightColumn);
+    }
+
     private List<Tuple> hashJoin(List<Tuple> left, String leftColumn, List<Tuple> right, String rightColumn) {
         boolean buildOnLeft = left.size() <= right.size();
         List<Tuple> buildSide = buildOnLeft ? left : right;
@@ -1342,6 +1685,75 @@ public class ExecutorEngine {
             }
         }
         return result;
+    }
+
+    /**
+     * Sort-merge join: sort both sides by their join column, then advance
+     * through them in lockstep, matching keys as they line up. Same output
+     * contract as hashJoin (left-then-right column order, NULLs on either
+     * side never match) and produces the exact same SET of result rows -
+     * verified directly by testing both algorithms against identical input
+     * and comparing results, not just trusting the implementation.
+     *
+     * The one real complication sort-merge has that hash join doesn't:
+     * duplicate keys on either side need a full cross-product of the two
+     * matching groups, not a simple one-to-one advance - handled by finding
+     * each side's full run of equal keys before pairing them up.
+     *
+     * Chosen by the caller when both inputs are large enough that hash
+     * join's full in-memory hash table becomes a real memory concern (see
+     * executeJoinedSelect) - a simple, honest, row-count-based rule using
+     * the actual scanned sizes already in hand, not a full cost model with
+     * real memory/IO estimates.
+     */
+    private List<Tuple> mergeJoin(List<Tuple> left, String leftColumn, List<Tuple> right, String rightColumn) {
+        List<Tuple> sortedLeft = new ArrayList<>();
+        for (Tuple row : left) {
+            if (normalizeJoinKey(findColumnValue(row, leftColumn)) != null) sortedLeft.add(row);
+        }
+        List<Tuple> sortedRight = new ArrayList<>();
+        for (Tuple row : right) {
+            if (normalizeJoinKey(findColumnValue(row, rightColumn)) != null) sortedRight.add(row);
+        }
+        sortedLeft.sort((a, b) -> compareKeys(normalizeJoinKey(findColumnValue(a, leftColumn)), normalizeJoinKey(findColumnValue(b, leftColumn))));
+        sortedRight.sort((a, b) -> compareKeys(normalizeJoinKey(findColumnValue(a, rightColumn)), normalizeJoinKey(findColumnValue(b, rightColumn))));
+
+        List<Tuple> result = new ArrayList<>();
+        int i = 0, j = 0;
+        while (i < sortedLeft.size() && j < sortedRight.size()) {
+            Object leftKey = normalizeJoinKey(findColumnValue(sortedLeft.get(i), leftColumn));
+            Object rightKey = normalizeJoinKey(findColumnValue(sortedRight.get(j), rightColumn));
+            int cmp = compareKeys(leftKey, rightKey);
+            if (cmp < 0) {
+                i++;
+            } else if (cmp > 0) {
+                j++;
+            } else {
+                int leftRunEnd = i;
+                while (leftRunEnd < sortedLeft.size()
+                    && compareKeys(normalizeJoinKey(findColumnValue(sortedLeft.get(leftRunEnd), leftColumn)), leftKey) == 0) {
+                    leftRunEnd++;
+                }
+                int rightRunEnd = j;
+                while (rightRunEnd < sortedRight.size()
+                    && compareKeys(normalizeJoinKey(findColumnValue(sortedRight.get(rightRunEnd), rightColumn)), rightKey) == 0) {
+                    rightRunEnd++;
+                }
+                for (int a = i; a < leftRunEnd; a++) {
+                    for (int b = j; b < rightRunEnd; b++) {
+                        result.add(merge(sortedLeft.get(a), sortedRight.get(b)));
+                    }
+                }
+                i = leftRunEnd;
+                j = rightRunEnd;
+            }
+        }
+        return result;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private int compareKeys(Object a, Object b) {
+        return ((Comparable) a).compareTo(b);
     }
 
     private Object normalizeJoinKey(Object value) {
