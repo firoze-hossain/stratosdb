@@ -274,6 +274,9 @@ public class SqlParser {
         if (ctx instanceof StratosSQLParser.ArrayContainsCompareContext c) {
             return new WhereExpr.ArrayContains(c.columnName().getText(), c.literal().getText());
         }
+        if (ctx instanceof StratosSQLParser.JsonExtractTextEqCompareContext c) {
+            return new WhereExpr.JsonExtractTextEquals(c.columnName().getText(), c.literal(0).getText(), c.literal(1).getText());
+        }
         if (ctx instanceof StratosSQLParser.InListExprContext c) {
             return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), false);
         }

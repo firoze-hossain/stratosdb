@@ -2029,6 +2029,92 @@ public class StratosDBTest {
         assertEquals(2, result.getRows().size(), "a row inserted after GIN index creation on an array column must be reflected immediately");
     }
 
+    // --- JSON/JSONB columns: real validation at insert time, ->>'key' text
+    // extraction, and GIN indexing of key-value pairs - closing this
+    // project's own previously-named "GIN also indexes JSONB, which
+    // StratosDB doesn't have" gap, alongside the array support that
+    // closed the corresponding array half two rounds ago.
+
+    @Test
+    void testValidJsonInsertsAndParsesCorrectly() {
+        database.execute("CREATE TABLE t (id INT, data JSON)");
+        QueryResult insert = database.execute("INSERT INTO t VALUES (1, '{\"status\": \"active\", \"count\": 42}')");
+        assertTrue(insert.isSuccess(), () -> "inserting valid JSON must succeed: " + insert.getError());
+
+        Object value = database.execute("SELECT * FROM t").getRows().get(0).getValue("data");
+        assertInstanceOf(java.util.Map.class, value, "a JSON column's value must be stored as a parsed structure, not raw text");
+        assertEquals("active", ((java.util.Map<?, ?>) value).get("status"));
+    }
+
+    @Test
+    void testInvalidJsonIsRejectedAtInsertTime() {
+        database.execute("CREATE TABLE t (id INT, data JSON)");
+        QueryResult insert = database.execute("INSERT INTO t VALUES (1, '{invalid json}')");
+        assertFalse(insert.isSuccess(), "malformed JSON must be rejected at INSERT time, not silently stored as garbage text");
+    }
+
+    @Test
+    void testJsonExtractTextOperator() {
+        database.execute("CREATE TABLE t (id INT, data JSON)");
+        database.execute("INSERT INTO t VALUES (1, '{\"status\": \"active\", \"count\": 42}')");
+        database.execute("INSERT INTO t VALUES (2, '{\"status\": \"inactive\", \"count\": 5}')");
+        database.execute("INSERT INTO t VALUES (3, '{\"status\": \"active\", \"count\": 100}')");
+
+        QueryResult statusMatch = database.execute("SELECT id FROM t WHERE data ->> 'status' = 'active'");
+        assertTrue(statusMatch.isSuccess(), () -> "->> extraction must succeed: " + statusMatch.getError());
+        assertEquals(2, statusMatch.getRows().size(), "rows 1 and 3 both have status active");
+
+        // A JSON number is stored as Double but must compare correctly against a plain string literal.
+        QueryResult numberMatch = database.execute("SELECT id FROM t WHERE data ->> 'count' = '42'");
+        assertEquals(1, numberMatch.getRows().size());
+
+        QueryResult missingKey = database.execute("SELECT id FROM t WHERE data ->> 'nonexistent' = 'x'");
+        assertEquals(0, missingKey.getRows().size(), "a missing key must never match, not error or return everything");
+    }
+
+    @Test
+    void testGinIndexOnJsonIndexesKeyValuePairs() {
+        database.execute("CREATE TABLE t (id INT, data JSON)");
+        database.execute("INSERT INTO t VALUES (1, '{\"status\": \"active\", \"count\": 42}')");
+        database.execute("INSERT INTO t VALUES (2, '{\"status\": \"inactive\", \"count\": 5}')");
+        database.execute("INSERT INTO t VALUES (3, '{\"status\": \"active\", \"count\": 100}')");
+
+        QueryResult createResult = database.execute("CREATE INDEX idx_data ON t (data) USING GIN");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX ... USING GIN on a JSON column must succeed: " + createResult.getError());
+
+        QueryResult withIndex = database.execute("SELECT id FROM t WHERE data ->> 'status' = 'active'");
+        assertTrue(withIndex.isSuccess());
+        assertEquals(2, withIndex.getRows().size());
+
+        QueryResult numberMatch = database.execute("SELECT id FROM t WHERE data ->> 'count' = '42'");
+        assertEquals(1, numberMatch.getRows().size());
+    }
+
+    @Test
+    void testGinIndexOnJsonMaintainedOnNewInserts() {
+        // The same staleness bug class found and fixed for BRIN/bitmap/GIN, and re-verified
+        // for array-element indexing - re-verified again specifically for JSON key-value indexing.
+        database.execute("CREATE TABLE t (id INT, data JSON)");
+        database.execute("INSERT INTO t VALUES (1, '{\"status\": \"active\"}')");
+        database.execute("CREATE INDEX idx_data ON t (data) USING GIN");
+
+        database.execute("INSERT INTO t VALUES (2, '{\"status\": \"active\"}')");
+        QueryResult result = database.execute("SELECT id FROM t WHERE data ->> 'status' = 'active'");
+        assertEquals(2, result.getRows().size(), "a row inserted after GIN index creation on a JSON column must be reflected immediately");
+    }
+
+    @Test
+    void testJsonExtractWorksWithoutAnyIndex() {
+        // ->> must work correctly even with no GIN index present at all - the same relationship every other operator has with its optional index.
+        database.execute("CREATE TABLE t (id INT, data JSON)");
+        database.execute("INSERT INTO t VALUES (1, '{\"status\": \"active\"}')");
+        database.execute("INSERT INTO t VALUES (2, '{\"status\": \"inactive\"}')");
+
+        QueryResult result = database.execute("SELECT id FROM t WHERE data ->> 'status' = 'active'");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+    }
+
     private Tuple qualifiedTuple(String table, String col1, Object val1, String col2, Object val2) {
         Tuple t = new Tuple();
         t.addValue(table + "." + col1, val1);

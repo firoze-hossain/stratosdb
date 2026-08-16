@@ -117,6 +117,16 @@ public class Tuple {
             for (Object element : list) {
                 writeValue(out, element);
             }
+        } else if (value instanceof java.util.Map) {
+            java.util.Map<?, ?> map = (java.util.Map<?, ?>) value;
+            out.writeInt(7);
+            out.writeInt(map.size());
+            for (java.util.Map.Entry<?, ?> entry : map.entrySet()) {
+                byte[] keyBytes = entry.getKey().toString().getBytes(StandardCharsets.UTF_8);
+                out.writeInt(keyBytes.length);
+                out.write(keyBytes);
+                writeValue(out, entry.getValue());
+            }
         } else {
             throw new IllegalArgumentException("Unsupported type: " + value.getClass());
         }
@@ -174,6 +184,18 @@ public class Tuple {
                     list.add(readValue(in));
                 }
                 return list;
+            }
+            case 7: {
+                int size = in.readInt();
+                java.util.Map<String, Object> map = new java.util.LinkedHashMap<>(); // LinkedHashMap: preserves key insertion order, matching JsonParser's own choice
+                for (int i = 0; i < size; i++) {
+                    int keyLen = in.readInt();
+                    byte[] keyBytes = new byte[keyLen];
+                    in.readFully(keyBytes);
+                    String key = new String(keyBytes, StandardCharsets.UTF_8);
+                    map.put(key, readValue(in));
+                }
+                return map;
             }
             case -1:
                 return null;

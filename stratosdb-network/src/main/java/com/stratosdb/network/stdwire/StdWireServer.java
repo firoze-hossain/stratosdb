@@ -204,7 +204,7 @@ public class StdWireServer {
                 List<String> values = new ArrayList<>(row.size());
                 for (int i = 0; i < row.size(); i++) {
                     Object v = row.getValue(i);
-                    values.add(v == null ? null : v.toString());
+                    values.add(v == null ? null : formatValueForWire(v));
                 }
                 StdWireMessages.writeDataRow(out, values);
             }
@@ -258,6 +258,24 @@ public class StdWireServer {
 
         StdWireMessages.writeCommandComplete(out, "SELECT " + tableNames.size());
         return true;
+    }
+
+    /**
+     * Formats one column's value for the wire protocol - almost always
+     * just Object.toString(), with one real exception: a JSON/JSONB
+     * column's value is stored internally as a parsed Map/List/scalar
+     * structure (see JsonParser and Tuple's own Map serialization
+     * support), and Java's default Map.toString() format ({@code
+     * {status=active}}) isn't valid JSON at all (no quotes around keys or
+     * string values, "=" instead of ":") - actively misleading output for
+     * a real client to receive from what's supposed to be a JSON column.
+     * Converted back to real JSON text here instead.
+     */
+    private String formatValueForWire(Object value) {
+        if (value instanceof java.util.Map) {
+            return com.stratosdb.sql.executor.JsonParser.toJsonText(value);
+        }
+        return value.toString();
     }
 
     private List<StdWireMessages.Column> describeColumns(List<Tuple> rows) {

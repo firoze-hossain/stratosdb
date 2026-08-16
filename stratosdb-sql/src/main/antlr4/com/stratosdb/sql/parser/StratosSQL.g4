@@ -81,6 +81,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName LIKE literal                                #LikeCompare
           | columnName CONTAINS literal                            #ContainsCompare
           | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
+          | columnName JSON_EXTRACT_TEXT literal ASSIGN literal    #JsonExtractTextEqCompare
           | columnName IN LPAREN valueList RPAREN                  #InListExpr
           | columnName NOT IN LPAREN valueList RPAREN               #NotInListExpr
           | columnName IN LPAREN select RPAREN                      #InSubqueryExpr
@@ -245,6 +246,7 @@ GE: '>=';
 LE: '<=';
 NE: '!=';
 ARRAY_CONTAINS: '@>';
+JSON_EXTRACT_TEXT: '->>';
 STAR: '*';
 
 // Literals

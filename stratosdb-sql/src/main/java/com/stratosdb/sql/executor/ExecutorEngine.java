@@ -31,6 +31,8 @@ public class ExecutorEngine {
     private final Map<String, List<String>> tableColumns;
     /** tableName -> columnName -> its raw default expression text (a literal, or once SERIAL/sequences exist, a "nextval('seqname')" marker) - null/absent means no default, so an omitted column gets SQL NULL. */
     private final Map<String, Map<String, String>> tableColumnDefaults = new ConcurrentHashMap<>();
+    /** tableName -> columnName -> its declared type text (e.g. "JSON", "VARCHAR", "INT[]") - didn't exist at all before this; needed so INSERT can tell a JSON/JSONB column apart from a plain VARCHAR one and validate/parse its incoming value accordingly. */
+    private final Map<String, Map<String, String>> tableColumnTypes = new ConcurrentHashMap<>();
     private final Map<String, Sequence> sequences = new ConcurrentHashMap<>();
 
     /**
@@ -825,8 +827,10 @@ public class ExecutorEngine {
 
         List<String> columns = new ArrayList<>();
         Map<String, String> defaults = new java.util.HashMap<>();
+        Map<String, String> types = new java.util.HashMap<>();
         for (ColumnDefinition col : stmt.columns()) {
             columns.add(col.name());
+            types.put(col.name(), col.type());
             String seqName = autoSequenceNames.get(col.name());
             if (seqName != null) {
                 sequences.put(seqName, new Sequence(seqName, 1, 1, sequenceFile(seqName)));
@@ -838,6 +842,7 @@ public class ExecutorEngine {
         }
         tableColumns.put(stmt.tableName(), columns);
         tableColumnDefaults.put(stmt.tableName(), defaults);
+        tableColumnTypes.put(stmt.tableName(), types);
         if (!autoSequenceNames.isEmpty()) {
             saveCatalog(); // one write covering every auto-created sequence's new catalog entry
         }
@@ -996,7 +1001,12 @@ public class ExecutorEngine {
      * actual shape: an array value gets each element indexed EXACTLY (no
      * tokenization - GinIndex.insertExact), since real Postgres's own GIN
      * indexes an array's individual elements this way, enabling a fast
-     * @> lookup. A plain text value still gets tokenized for word search
+     * @> lookup. A JSON object gets each top-level key-value pair indexed
+     * as a single composite "key:value" exact key (e.g. "status:active"),
+     * enabling data->>'status' = 'active' to become a direct GIN lookup
+     * rather than a full scan - the same real, common real-world use for
+     * GIN on JSONB that array-element indexing already established for
+     * arrays. A plain text value still gets tokenized for word search
      * (GinIndex.insert), the original, separate use case this index type
      * already supported. Shared by both the initial CREATE INDEX build
      * and every subsequent INSERT's maintenance, so both paths can never
@@ -1009,9 +1019,20 @@ public class ExecutorEngine {
                     index.insertExact(element.toString(), rid);
                 }
             }
+        } else if (value instanceof Map<?, ?> jsonObject) {
+            for (Map.Entry<?, ?> entry : jsonObject.entrySet()) {
+                if (entry.getValue() != null) {
+                    index.insertExact(jsonKeyValueIndexKey(entry.getKey().toString(), entry.getValue()), rid);
+                }
+            }
         } else {
             index.insert(value.toString(), rid);
         }
+    }
+
+    /** The exact composite key a JSON key-value pair is indexed under - "key:value", using the same text rendering as ->>'key' comparisons (jsonScalarAsText) so a lookup built from a WHERE clause and an index entry built from INSERT always agree on what "the same value" looks like as text. */
+    private String jsonKeyValueIndexKey(String key, Object value) {
+        return key + ":" + jsonScalarAsText(value);
     }
 
     /**
@@ -1140,12 +1161,14 @@ public class ExecutorEngine {
         }
 
         Map<String, Object> givenValues = new java.util.LinkedHashMap<>();
+        Map<String, String> columnTypes = tableColumnTypes.getOrDefault(stmt.tableName(), Map.of());
         for (int i = 0; i < targetColumns.size(); i++) {
             String colName = targetColumns.get(i);
             if (!allColumns.contains(colName)) {
                 return QueryResult.error("Column not found: " + colName + " on table " + stmt.tableName());
             }
-            givenValues.put(colName, resolveValue(stmt.values().get(i)));
+            Object resolved = resolveValue(stmt.values().get(i));
+            givenValues.put(colName, coerceForColumnType(colName, columnTypes.get(colName), resolved));
         }
 
         // Build the tuple in the TABLE's OWN column order (not the statement's
@@ -1158,7 +1181,7 @@ public class ExecutorEngine {
             if (givenValues.containsKey(col)) {
                 tuple.addValue(col, givenValues.get(col));
             } else if (defaults.containsKey(col)) {
-                tuple.addValue(col, resolveValue(defaults.get(col)));
+                tuple.addValue(col, coerceForColumnType(col, columnTypes.get(col), resolveValue(defaults.get(col))));
             } else {
                 tuple.addValue(col, null);
             }
@@ -1409,6 +1432,17 @@ public class ExecutorEngine {
             // text, not stripped/lowered the way word-search's Contains is.
             Object targetElement = parseLiteral(arrayContains.literalElement());
             candidateRids = ginEntry.index().search(targetElement.toString());
+        } else if (stmt.where() instanceof WhereExpr.JsonExtractTextEquals jsonExtract) {
+            GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), jsonExtract.column());
+            if (ginEntry == null) {
+                return null;
+            }
+            // Key-value pairs were indexed as a single composite "key:value"
+            // exact key (see indexGinValue/jsonKeyValueIndexKey) - the lookup
+            // key must be built the exact same way for the two to ever match.
+            String key = stripQuotes(jsonExtract.key());
+            String value = stripQuotes(jsonExtract.value());
+            candidateRids = ginEntry.index().search(key + ":" + value);
         } else if (stmt.where() instanceof WhereExpr.Comparison cmp && cmp.operator().equals("=")
             && findEqualityIndex(stmt.tableName(), cmp.column()) == null) {
             // Only used when no BTREE/HASH already covers this column - those are strictly
@@ -2134,6 +2168,25 @@ public class ExecutorEngine {
         return value;
     }
 
+    /**
+     * Renders a JSON scalar (String/Double/Boolean - see JsonParser) as
+     * comparison text for ->>'key' = 'value' - matching real Postgres's
+     * own ->> ("extract as text") semantics. JSON numbers are always
+     * stored as Double (matching the JSON spec, which has one numeric
+     * type), so a whole-number value like 42.0 needs to render as "42",
+     * not "42.0" - the form a user would naturally write when comparing
+     * against it (data->>'count' = '42'), not Java's own Double.toString().
+     */
+    private String jsonScalarAsText(Object jsonValue) {
+        if (jsonValue instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d)) {
+                return String.valueOf(d.longValue());
+            }
+            return String.valueOf(d);
+        }
+        return jsonValue.toString();
+    }
+
     private Tuple qualify(Tuple tuple, String tableName) {
         Tuple qualified = new Tuple();
         List<String> columnNames = tuple.getColumnNames();
@@ -2748,6 +2801,23 @@ public class ExecutorEngine {
             }
             return false;
         }
+        if (expr instanceof WhereExpr.JsonExtractTextEquals jsonExtract) {
+            Object value = resolveColumnValue(row, jsonExtract.column(), outerRow);
+            if (!(value instanceof Map)) {
+                return false; // not a JSON column at all, or NULL
+            }
+            String key = stripQuotes(jsonExtract.key());
+            Object extracted = ((Map<?, ?>) value).get(key);
+            if (extracted == null) {
+                return false; // key doesn't exist in this document, or its value is JSON null - either way, not equal to any comparison value
+            }
+            String targetText = stripQuotes(jsonExtract.value());
+            // JSON scalars are stored as String/Double/Boolean (see JsonParser) -
+            // compare as text, matching real Postgres's own ->>'key' semantics
+            // (the "text" extraction operator, as opposed to -> which preserves
+            // the JSON type).
+            return jsonScalarAsText(extracted).equals(targetText);
+        }
         if (expr instanceof WhereExpr.InList inList) {
             Object value = resolveColumnValue(row, inList.column(), outerRow);
             if (value == null) {
@@ -3063,6 +3133,35 @@ public class ExecutorEngine {
             return parseArrayLiteral(arrayMatch.group(1));
         }
         return parseLiteral(raw);
+    }
+
+    /**
+     * Applies column-type-specific coercion to an already-resolved value -
+     * currently just JSON/JSONB validation, the one type in this engine
+     * whose input needs real structural checking rather than just being
+     * stored as-is. A column declared JSON or JSONB receives its value as
+     * an ordinary string literal (matching how a real Postgres client
+     * sends JSON too), which gets parsed and validated here - malformed
+     * JSON is rejected with a clear error rather than silently stored as
+     * an un-parsed string that would break every later ->>'key' lookup or
+     * GIN index build against it. A column that's already been resolved
+     * to something other than a String (e.g. an array, or NULL) is left
+     * untouched - only a JSON/JSONB column's own raw text input goes
+     * through this parsing step.
+     */
+    private Object coerceForColumnType(String columnName, String declaredType, Object resolvedValue) {
+        if (declaredType == null || resolvedValue == null || !(resolvedValue instanceof String)) {
+            return resolvedValue;
+        }
+        String normalizedType = declaredType.trim().toUpperCase();
+        if (normalizedType.equals("JSON") || normalizedType.equals("JSONB")) {
+            try {
+                return JsonParser.parse((String) resolvedValue);
+            } catch (JsonParser.JsonParseException e) {
+                throw new IllegalArgumentException("Invalid JSON for column \"" + columnName + "\": " + e.getMessage());
+            }
+        }
+        return resolvedValue;
     }
 
     /**
