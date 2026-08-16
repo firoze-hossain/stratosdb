@@ -1242,11 +1242,69 @@ public class ExecutorEngine {
         List<Tuple> tuples = new ArrayList<>();
 
         if (plan.useIndex()) {
-            List<BTreePage.RID> rids = plan.loKey().equals(plan.hiKey())
+            boolean isEqualityScan = plan.loKey().equals(plan.hiKey());
+            List<BTreePage.RID> rids = isEqualityScan
                 ? plan.index().index().searchAll(plan.loKey()) // equality: any KeyValueIndex (hash or btree) can serve this
                 : ((BTreeIndex) plan.index().index()).rangeScan(plan.loKey(), plan.hiKey()); // range: planScan's findRangeCapableIndex guarantees this is always a BTreeIndex
 
+            // Index-only scan eligibility, checked once per query rather than
+            // per row: the WHERE clause must be EXACTLY this one comparison
+            // (not combined with anything else via AND - verifying an
+            // additional condition needs the heap tuple's other columns,
+            // which an index-only scan by definition never fetches), the
+            // projection must ask for ONLY the indexed column (the index
+            // has no other column's value to offer), and it must be an
+            // EQUALITY scan specifically - for a range scan, each RID could
+            // correspond to a DIFFERENT key within the range, and
+            // BTreeIndex.rangeScan() currently returns bare RIDs, not
+            // key-RID pairs, so there's no per-row key available to trust
+            // without fetching the heap anyway. A real, named, separate gap
+            // - not attempted here - rather than returning a wrong value.
+            boolean indexOnlyEligible = isEqualityScan
+                && stmt.where() instanceof WhereExpr.Comparison
+                && stmt.columns().size() == 1
+                && stmt.columns().get(0).equalsIgnoreCase(plan.index().columnName());
+
             for (BTreePage.RID rid : rids) {
+                if (indexOnlyEligible && table.isAllVisible(rid.pageId())) {
+                    // The page is guaranteed all-visible (see HeapTable's
+                    // visibilityMap javadoc) - trust the index's own key
+                    // value directly instead of fetching the heap tuple at
+                    // all, the entire point of an index-only scan.
+                    //
+                    // A real type-consistency bug was found here by testing,
+                    // not by inspection, in two separate layers: first,
+                    // toIndexKey() converts both Integer and Long column
+                    // values to the SAME Long key type, losing which one
+                    // the column actually was, so this path originally
+                    // returned java.lang.Long even for a plain INT column
+                    // while the normal heap-fetch path (SELECT *) returned
+                    // java.lang.Integer for the identical value. Fixing
+                    // that surfaced a SECOND bug, a classic Java gotcha:
+                    // `condition ? keyValue.intValue() : keyValue` looks
+                    // like it produces an Integer or a Long depending on
+                    // the branch, but Java's ternary operator applies
+                    // binary numeric promotion (JLS 15.25) when one branch
+                    // is primitive (intValue()'s int) and the other is
+                    // boxed (Long) - the WHOLE expression's type becomes
+                    // long, silently widening the int branch back to long
+                    // regardless of which branch actually ran, then
+                    // autoboxing to Long on assignment to Object. Caught
+                    // only because the fix was re-verified by printing the
+                    // actual runtime type, not by re-reading the code and
+                    // assuming it now did what it looked like it should.
+                    Long keyValue = plan.loKey();
+                    Object valueToReturn;
+                    if (keyValue >= Integer.MIN_VALUE && keyValue <= Integer.MAX_VALUE) {
+                        valueToReturn = Integer.valueOf(keyValue.intValue());
+                    } else {
+                        valueToReturn = keyValue;
+                    }
+                    Tuple indexOnlyTuple = new Tuple();
+                    indexOnlyTuple.addValue(plan.index().columnName(), valueToReturn);
+                    tuples.add(indexOnlyTuple);
+                    continue;
+                }
                 byte[] stored = table.readTuple(rid.pageId(), rid.slot());
                 if (stored == null || !MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
                     continue; // stale index entry (from an update/delete) or not visible to this snapshot

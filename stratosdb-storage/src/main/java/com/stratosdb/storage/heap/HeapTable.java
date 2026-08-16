@@ -12,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 
 /**
@@ -23,7 +24,30 @@ public class HeapTable {
     private final String name;
     private final BufferPool bufferPool;
     private long lastPageId;
-    
+
+    /**
+     * The visibility map: bit i set means page i is currently "all
+     * visible" - every tuple on it has a committed xmin and NO xmax at
+     * all (never deleted/updated, ever - not just "the delete is old
+     * enough to reclaim"). That distinction matters: a tuple with any
+     * xmax set has visibility that genuinely differs between an old
+     * snapshot and a new one, even before vacuum's horizon check makes
+     * it safe to physically reclaim - so "all visible" must mean nothing
+     * on the page has any xmax, not just "nothing reclaimable remains."
+     *
+     * Only ever SET by vacuum() (after physically reclaiming anything
+     * reclaimable, checking what's left), and CLEARED by insert()/
+     * update()/deleteMvcc() the moment they touch a page - inserting a
+     * new (possibly uncommitted) tuple, or giving an existing tuple an
+     * xmax, both invalidate the "everything here is safely visible to
+     * everyone" guarantee until the next vacuum re-establishes it.
+     *
+     * This is what index-only scans (see ExecutorEngine) actually check
+     * before trusting an index's key value directly instead of fetching
+     * the heap tuple to verify visibility.
+     */
+    private final BitSet visibilityMap = new BitSet();
+
     public HeapTable(String name, BufferPool bufferPool) {
         this.name = name;
         this.bufferPool = bufferPool;
@@ -35,7 +59,12 @@ public class HeapTable {
         long existingPages = bufferPool.getTablePageCount(name);
         this.lastPageId = existingPages > 0 ? existingPages - 1 : 0;
     }
-    
+
+    /** Whether pageId is currently known to be "all visible" - see visibilityMap's own javadoc for the exact guarantee this means. Conservatively false (never crashes) for a pageId never observed. */
+    public boolean isAllVisible(long pageId) {
+        return pageId >= 0 && pageId <= Integer.MAX_VALUE && visibilityMap.get((int) pageId);
+    }
+
     /**
      * Insert a tuple.
      *
@@ -66,6 +95,7 @@ public class HeapTable {
                 if (slot != -1) {
                     bufferPool.markDirty(name, pageId);
                     bufferPool.unpinPage(name, pageId);
+                    visibilityMap.clear((int) pageId); // a new (possibly uncommitted) tuple just landed here
                     LOG.debug("Inserted at {}/{}", pageId, slot);
                     return new InsertResult(pageId, slot);
                 }
@@ -85,6 +115,7 @@ public class HeapTable {
         
         bufferPool.markDirty(name, newPageId);
         bufferPool.unpinPage(name, newPageId);
+        visibilityMap.clear((int) newPageId); // a brand new page always starts NOT all-visible
         
         lastPageId = newPageId;
         LOG.debug("Created new page {} for insertion", newPageId);
@@ -162,6 +193,7 @@ public class HeapTable {
         boolean result = page.updateTuple(slot, newData);
         if (result) {
             bufferPool.markDirty(name, pageId);
+            visibilityMap.clear((int) pageId); // e.g. an xmax was just set (deleteMvcc's tombstone) - visibility on this page is now snapshot-dependent
         }
         bufferPool.unpinPage(name, pageId);
         return result;
@@ -283,6 +315,33 @@ public class HeapTable {
                 bufferPool.markDirty(name, pageId);
                 pagesCompacted++;
             }
+
+            // Visibility map: after reclaiming whatever was safe to reclaim,
+            // this page qualifies as "all visible" only if EVERY remaining
+            // tuple has a committed xmin and NO xmax at all - not merely "no
+            // xmax below the horizon." A tuple with any xmax set (even one
+            // not yet old enough to reclaim) has visibility that genuinely
+            // differs between snapshots, which disqualifies the whole page
+            // regardless of how much dead space vacuum just cleaned up.
+            boolean allVisible = true;
+            for (int slot : page.getValidSlots()) {
+                byte[] stored = page.readTuple(slot);
+                if (stored == null) {
+                    continue;
+                }
+                long xmin = MVCCVisibility.readXmin(stored);
+                long xmax = MVCCVisibility.readXmax(stored);
+                if (!txnManager.isCommitted(xmin) || xmax != MVCCVisibility.NO_XMAX) {
+                    allVisible = false;
+                    break;
+                }
+            }
+            if (allVisible) {
+                visibilityMap.set((int) pageId);
+            } else {
+                visibilityMap.clear((int) pageId);
+            }
+
             bufferPool.unpinPage(name, pageId);
         }
 

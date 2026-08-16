@@ -1872,6 +1872,80 @@ public class StratosDBTest {
         assertEquals(1, result.getRows().size());
     }
 
+    // --- Index-only scans: a real capability unlocked by this round's
+    // visibility map. Scoped honestly (see PROGRESS.md) to equality
+    // queries whose projection asks for only the indexed column, since
+    // that's the one case where the index's own key value can be trusted
+    // directly without fetching the heap tuple at all.
+
+    @Test
+    void testIndexOnlyScanReturnsCorrectValueAfterVacuum() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'Alice')");
+        database.execute("INSERT INTO t VALUES (2, 'Bob')");
+        database.execute("INSERT INTO t VALUES (3, 'Carol')");
+        database.execute("CREATE INDEX idx_id ON t (id) USING BTREE");
+
+        // Before vacuum, the page isn't yet confirmed all-visible - must still work correctly (falls back to a real heap fetch).
+        QueryResult beforeVacuum = database.execute("SELECT id FROM t WHERE id = 2");
+        assertTrue(beforeVacuum.isSuccess());
+        assertEquals(1, beforeVacuum.getRows().size());
+        assertEquals(2, beforeVacuum.getRows().get(0).getValue("id"));
+
+        database.execute("VACUUM t");
+
+        QueryResult afterVacuum = database.execute("SELECT id FROM t WHERE id = 2");
+        assertTrue(afterVacuum.isSuccess());
+        assertEquals(1, afterVacuum.getRows().size());
+        assertEquals(2, afterVacuum.getRows().get(0).getValue("id"));
+    }
+
+    @Test
+    void testIndexOnlyScanValueTypeMatchesNormalScanValueType() {
+        // A real bug found by testing, not inspection: the index-only path
+        // originally returned java.lang.Long for a plain INT column while
+        // the normal heap-fetch path returned java.lang.Integer for the
+        // identical value - two different Java types for the same logical
+        // value depending on which internal scan path happened to run.
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'Alice')");
+        database.execute("CREATE INDEX idx_id ON t (id) USING BTREE");
+        database.execute("VACUUM t");
+
+        Object indexOnlyValue = database.execute("SELECT id FROM t WHERE id = 1").getRows().get(0).getValue("id");
+        Object normalValue = database.execute("SELECT * FROM t WHERE id = 1").getRows().get(0).getValue("id");
+
+        assertEquals(normalValue.getClass(), indexOnlyValue.getClass(),
+            () -> "an INT column's value must be the same Java type regardless of which scan path produced it - got "
+                + indexOnlyValue.getClass() + " (index-only) vs " + normalValue.getClass() + " (normal)");
+        assertEquals(Integer.class, indexOnlyValue.getClass(), "an INT column should surface as Integer, not Long");
+    }
+
+    @Test
+    void testIndexOnlyScanNotUsedWhenOtherColumnsRequested() {
+        // SELECT * (or any column other than the indexed one) must never take the index-only path - the index has nothing else to offer.
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'Alice')");
+        database.execute("CREATE INDEX idx_id ON t (id) USING BTREE");
+        database.execute("VACUUM t");
+
+        QueryResult result = database.execute("SELECT name FROM t WHERE id = 1");
+        assertTrue(result.isSuccess());
+        assertEquals("Alice", result.getRows().get(0).getValue("name"));
+    }
+
+    @Test
+    void testIndexOnlyScanCorrectlyReturnsNoRowsForAMiss() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("CREATE INDEX idx_id ON t (id) USING BTREE");
+        database.execute("VACUUM t");
+
+        QueryResult result = database.execute("SELECT id FROM t WHERE id = 999");
+        assertTrue(result.isSuccess());
+        assertEquals(0, result.getRows().size());
+    }
+
     private Tuple qualifiedTuple(String table, String col1, Object val1, String col2, Object val2) {
         Tuple t = new Tuple();
         t.addValue(table + "." + col1, val1);
