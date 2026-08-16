@@ -59,6 +59,20 @@ SELECT * FROM users WHERE age >= 25;
 
 Or use StratosDB's own CLI and custom protocol — see [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for the full walkthrough, including authentication, TLS, and the benchmark suite.
 
+## Using StratosDB as a dependency
+
+**Not yet published to Maven Central** — the project is fully prepared for it (correct `groupId`, license, POM metadata, and dependency scoping so `stratosdb-jdbc` won't pollute a consumer's logging setup — see [`PUBLISHING.md`](./PUBLISHING.md) for the complete, honest account of what's ready and what still requires manual account/signing steps only a maintainer can do). Once published:
+
+```xml
+<dependency>
+    <groupId>io.github.firoze-hossain</groupId>
+    <artifactId>stratosdb-jdbc</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+Alternatively, any Spring Boot project can already connect to a running StratosDB server via the **real, standard PostgreSQL JDBC driver** (`org.postgresql:postgresql`, already on Maven Central) — no StratosDB-specific dependency needed — by starting the server with `--stdwire` and pointing a normal `org.postgresql.Driver` connection string at that port.
+
 ## Architecture
 
 A multi-module Maven build, each module doing one job:
@@ -83,4 +97,4 @@ Every significant fix in this project's history was found by *actually running t
 
 ## License
 
-Not yet specified — add a `LICENSE` file before treating this as open for reuse or contribution under any particular terms.
+[Apache License 2.0](./LICENSE).

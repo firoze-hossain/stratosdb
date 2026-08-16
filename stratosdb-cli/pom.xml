@@ -4,7 +4,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <groupId>com.stratosdb</groupId>
+        <groupId>io.github.firoze-hossain</groupId>
         <artifactId>stratosdb-parent</artifactId>
         <version>1.0.0-SNAPSHOT</version>
     </parent>
@@ -14,12 +14,12 @@
 
     <dependencies>
         <dependency>
-            <groupId>com.stratosdb</groupId>
+            <groupId>io.github.firoze-hossain</groupId>
             <artifactId>stratosdb-jdbc</artifactId>
             <version>1.0.0-SNAPSHOT</version>
         </dependency>
         <dependency>
-            <groupId>com.stratosdb</groupId>
+            <groupId>io.github.firoze-hossain</groupId>
             <artifactId>stratosdb-common</artifactId>
             <version>1.0.0-SNAPSHOT</version>
         </dependency>
@@ -30,6 +30,7 @@
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
+            <optional>true</optional>
         </dependency>
     </dependencies>
 
