@@ -37,9 +37,25 @@ public class HeapTable {
     }
     
     /**
-     * Insert a tuple
+     * Insert a tuple.
+     *
+     * Synchronized on this table instance for its entire body - a real,
+     * serious bug found while testing sequence-generated ids under
+     * concurrency (though not specific to sequences at all): lastPageId
+     * was read and written with no synchronization, and two threads could
+     * both read the same lastPageId, both decide to use/create the same
+     * page, and both call page.insertTuple() on the very same Page object
+     * with zero locking between them - a classic read-modify-write race
+     * on the page's slot directory that could silently lose one thread's
+     * insert entirely (not corrupt it visibly - it just never appears in
+     * later reads), reproduced directly: plain, fast, uniformly-timed
+     * concurrent inserts rarely hit the race window, but nextval()'s
+     * extra latency (regex matching, a synchronized watermark check) made
+     * the window far more likely to be hit, exposing what was already a
+     * real risk for ANY concurrent inserts into the same table, not a bug
+     * introduced by sequences themselves.
      */
-    public InsertResult insert(byte[] tupleData) {
+    public synchronized InsertResult insert(byte[] tupleData) {
         // Try existing pages first
         for (long pageId = 0; pageId <= lastPageId; pageId++) {
             SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);

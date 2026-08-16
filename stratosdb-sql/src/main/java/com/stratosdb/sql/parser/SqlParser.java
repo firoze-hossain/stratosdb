@@ -2,6 +2,7 @@ package com.stratosdb.sql.parser;
 
 import com.stratosdb.sql.ast.*;
 import org.antlr.v4.runtime.*;
+import org.antlr.v4.runtime.tree.TerminalNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -80,6 +81,28 @@ public class SqlParser {
             SelectStatement cteQuery = buildSelect(cteCtx.select(0));
             SelectStatement outerQuery = buildSelect(cteCtx.select(1));
             return new CteSelectStatement(cteName, cteQuery, outerQuery);
+        } else if (ctx.createSequence() != null) {
+            StratosSQLParser.CreateSequenceContext seqCtx = ctx.createSequence();
+            String name = seqCtx.sequenceName().getText();
+            List<TerminalNode> ints = seqCtx.INTEGER_LITERAL();
+            // START and INCREMENT are both optional and order-independent in
+            // input, but the grammar only records their integer literals in
+            // left-to-right appearance order - START's value (if given)
+            // always comes before INCREMENT's in that list, matching how a
+            // real "CREATE SEQUENCE x START WITH 100 INCREMENT BY 5" reads.
+            long startValue = 1;
+            long incrementBy = 1;
+            if (seqCtx.START() != null && seqCtx.INCREMENT() != null && ints.size() == 2) {
+                startValue = Long.parseLong(ints.get(0).getText());
+                incrementBy = Long.parseLong(ints.get(1).getText());
+            } else if (seqCtx.START() != null && ints.size() >= 1) {
+                startValue = Long.parseLong(ints.get(0).getText());
+            } else if (seqCtx.INCREMENT() != null && ints.size() >= 1) {
+                incrementBy = Long.parseLong(ints.get(0).getText());
+            }
+            return new CreateSequenceStatement(name, startValue, incrementBy);
+        } else if (ctx.dropSequence() != null) {
+            return new DropSequenceStatement(ctx.dropSequence().sequenceName().getText());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }
@@ -120,7 +143,14 @@ public class SqlParser {
         for (StratosSQLParser.ColumnDefContext colCtx : ctx.columnDef()) {
             String name = colCtx.columnName().getText();
             String type = colCtx.dataType().getText();
-            columns.add(new ColumnDefinition(name, type, false, null));
+            // A second real "parsed but discarded" bug found alongside
+            // INSERT's column-list one: NOT NULL and DEFAULT were both
+            // hardcoded away here (false / null) regardless of what the
+            // statement actually said, so neither ever reached the AST at
+            // all - not even a matter of the executor ignoring them.
+            boolean notNull = colCtx.NOT() != null;
+            String defaultValue = colCtx.defaultValue() != null ? colCtx.defaultValue().getText() : null;
+            columns.add(new ColumnDefinition(name, type, notNull, defaultValue));
         }
 
         return new CreateTableStatement(tableName, columns);
@@ -131,12 +161,35 @@ public class SqlParser {
         List<String> values = new ArrayList<>();
 
         if (ctx.valueList() != null) {
-            for (StratosSQLParser.LiteralContext litCtx : ctx.valueList().literal()) {
-                values.add(litCtx.getText());
+            for (StratosSQLParser.InsertValueContext valCtx : ctx.valueList().insertValue()) {
+                if (valCtx.literal() != null) {
+                    values.add(valCtx.literal().getText());
+                } else {
+                    // A nextval('seq') or currval('seq') call - stored as its
+                    // own raw text (e.g. "nextval('t_id_seq')") for the
+                    // executor to recognize and resolve at insert time,
+                    // rather than trying to parse it as a literal.
+                    values.add(valCtx.getText());
+                }
             }
         }
 
-        return new InsertStatement(tableName, values);
+        // The optional (col1, col2, ...) list right after the table name - a
+        // real, previously-silent bug this fixes: this was parsed by the
+        // grammar but never actually captured here, so every INSERT with an
+        // explicit column list silently mapped its values POSITIONALLY
+        // against the table's full schema instead of against the NAMED
+        // columns - e.g. INSERT INTO t (name, age) VALUES ('Alice', 30)
+        // would put 'Alice' into whatever the table's FIRST column happened
+        // to be, not into 'name'. Found while investigating SERIAL/sequence
+        // support, which fundamentally depends on this working correctly
+        // (SERIAL's entire point is letting a column be omitted).
+        List<String> columns = new ArrayList<>();
+        for (StratosSQLParser.ColumnNameContext colCtx : ctx.columnName()) {
+            columns.add(colCtx.getText());
+        }
+
+        return new InsertStatement(tableName, columns, values);
     }
 
     /**
@@ -242,8 +295,8 @@ public class SqlParser {
 
     private List<String> buildValueList(StratosSQLParser.ValueListContext ctx) {
         List<String> values = new ArrayList<>();
-        for (StratosSQLParser.LiteralContext lit : ctx.literal()) {
-            values.add(lit.getText());
+        for (StratosSQLParser.InsertValueContext val : ctx.insertValue()) {
+            values.add(val.getText());
         }
         return values;
     }

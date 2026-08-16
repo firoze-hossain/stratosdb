@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -14,6 +14,9 @@ dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
 showTables: SHOW TABLES SEMICOLON?;
 showStats: SHOW STATS SEMICOLON?;
+createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
+dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
+sequenceName: IDENTIFIER;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
@@ -92,10 +95,11 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           ;
 
 // Values
-valueList: literal (COMMA literal)*;
+valueList: insertValue (COMMA insertValue)*;
+insertValue: literal | NEXTVAL LPAREN STRING_LITERAL RPAREN | CURRVAL LPAREN STRING_LITERAL RPAREN;
 
 // Data types
-dataType: INT | INTEGER | BIGINT | SMALLINT | TINYINT
+dataType: INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | VARCHAR (LPAREN INTEGER_LITERAL RPAREN)?
         | TEXT | CHAR (LPAREN INTEGER_LITERAL RPAREN)?
         | BOOLEAN | BOOL
@@ -108,7 +112,7 @@ dataType: INT | INTEGER | BIGINT | SMALLINT | TINYINT
 
 // Literals
 literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | BOOLEAN_LITERAL | NULL;
-defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP;
+defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | NEXTVAL LPAREN STRING_LITERAL RPAREN;
 
 // Identifiers
 tableName: IDENTIFIER;
@@ -151,6 +155,12 @@ DEFAULT: D E F A U L T;
 SHOW: S H O W;
 TABLES: T A B L E S;
 STATS: S T A T S;
+SEQUENCE: S E Q U E N C E;
+INCREMENT: I N C R E M E N T;
+NEXTVAL: N E X T V A L;
+CURRVAL: C U R R V A L;
+SERIAL: S E R I A L;
+BIGSERIAL: B I G S E R I A L;
 INDEX: I N D E X;
 ON: O N;
 USING: U S I N G;

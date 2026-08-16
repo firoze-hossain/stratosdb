@@ -1445,6 +1445,143 @@ public class StratosDBTest {
         assertTrue(Long.parseLong(metrics.get("wal_current_lsn")) > 0, "WAL LSN must reflect real logged activity, not just a placeholder zero");
     }
 
+    // --- A real, severe pre-existing bug found while investigating
+    // sequences: INSERT's optional (col1, col2, ...) list was parsed by
+    // the grammar but completely discarded, so every value silently
+    // mapped POSITIONALLY against the table's full schema instead of
+    // against the actual named columns.
+
+    @Test
+    void testInsertWithExplicitColumnListMapsCorrectly() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR, age INT)");
+        QueryResult result = database.execute("INSERT INTO employees (name, age) VALUES ('Alice', 30)");
+        assertTrue(result.isSuccess(), () -> "insert with explicit column list must succeed: " + result.getError());
+
+        var row = database.execute("SELECT * FROM employees").getRows().get(0);
+        assertNull(row.getValue("id"), "id (omitted from the column list) must be NULL, not 'Alice'");
+        assertEquals("Alice", row.getValue("name"), "name must correctly hold 'Alice', not silently receive the wrong value");
+        assertEquals(30, row.getValue("age"));
+    }
+
+    @Test
+    void testInsertWithOutOfOrderColumnListMapsCorrectly() {
+        database.execute("CREATE TABLE t (a INT, b VARCHAR, c INT)");
+        database.execute("INSERT INTO t (c, a, b) VALUES (100, 1, 'x')");
+        var row = database.execute("SELECT * FROM t").getRows().get(0);
+        assertEquals(1, row.getValue("a"));
+        assertEquals("x", row.getValue("b"));
+        assertEquals(100, row.getValue("c"));
+    }
+
+    @Test
+    void testInsertColumnValueCountMismatchFailsCleanly() {
+        database.execute("CREATE TABLE t (a INT, b VARCHAR)");
+        QueryResult result = database.execute("INSERT INTO t (a, b) VALUES (1, 'x', 'extra')");
+        assertFalse(result.isSuccess(), "a mismatched column/value count must error, not silently truncate or misalign");
+    }
+
+    @Test
+    void testColumnDefaultActuallyApplies() {
+        database.execute("CREATE TABLE t (id INT, status VARCHAR DEFAULT 'pending')");
+        database.execute("INSERT INTO t (id) VALUES (1)");
+        var row = database.execute("SELECT * FROM t").getRows().get(0);
+        assertEquals("pending", row.getValue("status"), "a column's DEFAULT must actually apply when the column is omitted - previously parsed but never used anywhere");
+    }
+
+    // --- Sequences: a real, persisted CREATE SEQUENCE / nextval() /
+    // currval(), and SERIAL as sugar that auto-creates a backing sequence.
+
+    @Test
+    void testCreateSequenceAndNextvalCurrval() {
+        assertTrue(database.execute("CREATE SEQUENCE my_seq START WITH 100 INCREMENT BY 5").isSuccess());
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (nextval('my_seq'), 'first')");
+        database.execute("INSERT INTO t VALUES (nextval('my_seq'), 'second')");
+
+        var rows = database.execute("SELECT * FROM t").getRows();
+        assertEquals(100, ((Number) rows.get(0).getValue("id")).intValue(), "first nextval() must honor START WITH");
+        assertEquals(105, ((Number) rows.get(1).getValue("id")).intValue(), "second nextval() must honor INCREMENT BY");
+
+        QueryResult currvalInsert = database.execute("INSERT INTO t VALUES (currval('my_seq'), 'third')");
+        assertTrue(currvalInsert.isSuccess());
+        var thirdRow = database.execute("SELECT * FROM t").getRows().get(2);
+        assertEquals(105, ((Number) thirdRow.getValue("id")).intValue(), "currval() must return the last value nextval() produced IN THIS SESSION, matching real Postgres semantics");
+    }
+
+    @Test
+    void testCurrvalBeforeNextvalFailsCleanly() {
+        database.execute("CREATE SEQUENCE s");
+        database.execute("CREATE TABLE t (id INT)");
+        QueryResult result = database.execute("INSERT INTO t VALUES (currval('s'))");
+        assertFalse(result.isSuccess(), "currval() before any nextval() call in this session must fail cleanly, matching real Postgres");
+    }
+
+    @Test
+    void testSerialAutoCreatesSequenceAndAppliesAsDefault() {
+        database.execute("CREATE TABLE users (id SERIAL, name VARCHAR)");
+        database.execute("INSERT INTO users (name) VALUES ('Alice')");
+        database.execute("INSERT INTO users (name) VALUES ('Bob')");
+
+        var rows = database.execute("SELECT * FROM users").getRows();
+        assertEquals(2, rows.size());
+        Object id1 = rows.get(0).getValue("id"), id2 = rows.get(1).getValue("id");
+        assertNotNull(id1);
+        assertNotNull(id2);
+        assertNotEquals(id1, id2, "SERIAL must generate a different id for each row");
+    }
+
+    @Test
+    void testSequencePersistsAcrossARestart() {
+        database.execute("CREATE SEQUENCE s1");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (nextval('s1'))");
+        database.execute("INSERT INTO t VALUES (nextval('s1'))");
+        var beforeRows = database.execute("SELECT * FROM t").getRows();
+        long lastBeforeRestart = ((Number) beforeRows.get(beforeRows.size() - 1).getValue("id")).longValue();
+
+        database.shutdown();
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config);
+
+        database.execute("INSERT INTO t VALUES (nextval('s1'))");
+        var afterRows = database.execute("SELECT * FROM t").getRows();
+        long newValue = ((Number) afterRows.get(afterRows.size() - 1).getValue("id")).longValue();
+        assertTrue(newValue > lastBeforeRestart, () -> "a sequence value after a restart (" + newValue
+            + ") must be strictly greater than before it (" + lastBeforeRestart + ") - never repeating, matching the same persistence discipline already used for the transaction-id counter");
+    }
+
+    @Test
+    @Timeout(value = 15, unit = TimeUnit.SECONDS)
+    void testConcurrentNextvalCallsNeverProduceDuplicates() throws Exception {
+        database.execute("CREATE SEQUENCE concurrent_seq");
+        database.execute("CREATE TABLE t (id INT)");
+
+        int n = 30;
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(n);
+        java.util.concurrent.atomic.AtomicInteger errors = new java.util.concurrent.atomic.AtomicInteger(0);
+        for (int i = 0; i < n; i++) {
+            new Thread(() -> {
+                try {
+                    QueryResult r = database.execute("INSERT INTO t VALUES (nextval('concurrent_seq'))");
+                    if (!r.isSuccess()) errors.incrementAndGet();
+                } catch (Exception e) {
+                    errors.incrementAndGet();
+                } finally {
+                    latch.countDown();
+                }
+            }).start();
+        }
+        assertTrue(latch.await(10, TimeUnit.SECONDS));
+        assertEquals(0, errors.get());
+
+        var rows = database.execute("SELECT * FROM t").getRows();
+        assertEquals(n, rows.size(), "every concurrent nextval()-based insert must actually persist - this exact scenario (nextval()'s added latency widening the race window) is what originally exposed a real, separate HeapTable.insert() concurrency bug, now fixed - see HeapTableConcurrencyTest");
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        for (var row : rows) ids.add(((Number) row.getValue("id")).longValue());
+        assertEquals(n, ids.size(), "every concurrently-generated id must be unique");
+    }
+
     private void assertRowCount(String sql, int expected) {
         QueryResult result = database.execute(sql);
         assertTrue(result.isSuccess(), () -> sql + " failed: " + result.getError());

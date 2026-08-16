@@ -28,6 +28,9 @@ public class ExecutorEngine {
     private final TransactionManager transactionManager;
     // Store column names for each table
     private final Map<String, List<String>> tableColumns;
+    /** tableName -> columnName -> its raw default expression text (a literal, or once SERIAL/sequences exist, a "nextval('seqname')" marker) - null/absent means no default, so an omitted column gets SQL NULL. */
+    private final Map<String, Map<String, String>> tableColumnDefaults = new ConcurrentHashMap<>();
+    private final Map<String, Sequence> sequences = new ConcurrentHashMap<>();
 
     /**
      * CREATE VIEW just remembers the defining query - a view is never
@@ -130,6 +133,12 @@ public class ExecutorEngine {
             catalogLines.put("INDEX:" + s.indexName(),
                 "INDEX|" + s.indexName() + "|" + s.tableName() + "|" + s.columnName() + "|" + s.indexType());
             saveCatalog();
+        } else if (stmt instanceof CreateSequenceStatement s) {
+            catalogLines.put("SEQUENCE:" + s.name(), "SEQUENCE|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropSequenceStatement s) {
+            catalogLines.remove("SEQUENCE:" + s.name());
+            saveCatalog();
         }
         // No DropIndexStatement exists yet in this grammar - nothing to remove for that case.
     }
@@ -179,7 +188,11 @@ public class ExecutorEngine {
                     reconstructIndex(indexName, tableName, columnName, type);
                     catalogLines.put("INDEX:" + indexName, line);
                 } else {
-                    // TABLE or VIEW - parts[1] is the original raw SQL text.
+                    // TABLE, VIEW, or SEQUENCE - parts[1] is the original raw
+                    // SQL text. Safe to replay verbatim for all three: a
+                    // table/sequence's constructor already correctly resumes
+                    // from whatever persisted state (heap file, watermark
+                    // file) already exists rather than assuming it's fresh.
                     // execute() already records this back into catalogLines
                     // via recordCatalogChange on success, so nothing extra
                     // needed here beyond checking it actually worked.
@@ -233,6 +246,8 @@ public class ExecutorEngine {
          * removing the other's still-in-use entry mid-execution).
          */
         Map<String, SelectStatement> activeCtes = new java.util.HashMap<>();
+        /** sequenceName -> the last value nextval() returned FOR THIS SESSION - real Postgres's currval() is explicitly per-session, not "whatever the sequence's global value happens to be" (which could reflect a completely different connection's nextval() call). */
+        Map<String, Long> lastNextvalBySequence = new java.util.HashMap<>();
     }
 
     private static final class Savepoint {
@@ -597,6 +612,8 @@ public class ExecutorEngine {
         if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
         if (stmt instanceof DropViewStatement s) return executeDropView(s);
         if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
+        if (stmt instanceof CreateSequenceStatement s) return executeCreateSequence(s);
+        if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
         return QueryResult.error("Unsupported statement");
     }
 
@@ -627,6 +644,26 @@ public class ExecutorEngine {
         }
     }
 
+    private QueryResult executeCreateSequence(CreateSequenceStatement stmt) {
+        if (sequences.containsKey(stmt.name())) {
+            return QueryResult.error("Sequence already exists: " + stmt.name());
+        }
+        sequences.put(stmt.name(), new Sequence(stmt.name(), stmt.startValue(), stmt.incrementBy(), sequenceFile(stmt.name())));
+        return QueryResult.success("Sequence created: " + stmt.name());
+    }
+
+    private QueryResult executeDropSequence(DropSequenceStatement stmt) {
+        if (sequences.remove(stmt.name()) == null) {
+            return QueryResult.error("Sequence not found: " + stmt.name());
+        }
+        return QueryResult.success("Sequence dropped: " + stmt.name());
+    }
+
+    /** Where a sequence's persisted watermark lives - null (no persistence) when this engine wasn't given a data directory, matching the same pattern the schema catalog and commit-status log already use. */
+    private java.io.File sequenceFile(String sequenceName) {
+        return dataDirectory == null ? null : new java.io.File(dataDirectory, "sequences/" + sequenceName + ".seq");
+    }
+
     private QueryResult executeCreateTable(CreateTableStatement stmt) {
         if (tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table already exists: " + stmt.tableName());
@@ -635,16 +672,52 @@ public class ExecutorEngine {
             return QueryResult.error("A view already exists with that name: " + stmt.tableName());
         }
 
+        // SERIAL/BIGSERIAL sugar: each such column gets its own backing
+        // sequence, auto-named "{table}_{column}_seq" (matching real
+        // Postgres's own naming convention) and wired as that column's
+        // default. Checked and named up front, before creating anything,
+        // so a collision with an already-existing sequence of that name
+        // cleanly aborts the whole CREATE TABLE rather than leaving a
+        // half-created table with some sequences made and others not.
+        Map<String, String> autoSequenceNames = new java.util.HashMap<>(); // columnName -> its sequence's name
+        for (ColumnDefinition col : stmt.columns()) {
+            if (isSerialType(col.type())) {
+                String seqName = stmt.tableName() + "_" + col.name() + "_seq";
+                if (sequences.containsKey(seqName)) {
+                    return QueryResult.error("Cannot create SERIAL column " + col.name()
+                        + ": a sequence named " + seqName + " already exists");
+                }
+                autoSequenceNames.put(col.name(), seqName);
+            }
+        }
+
         HeapTable table = new HeapTable(stmt.tableName(), bufferPool);
         tables.put(stmt.tableName(), table);
 
         List<String> columns = new ArrayList<>();
+        Map<String, String> defaults = new java.util.HashMap<>();
         for (ColumnDefinition col : stmt.columns()) {
             columns.add(col.name());
+            String seqName = autoSequenceNames.get(col.name());
+            if (seqName != null) {
+                sequences.put(seqName, new Sequence(seqName, 1, 1, sequenceFile(seqName)));
+                catalogLines.put("SEQUENCE:" + seqName, "SEQUENCE|CREATE SEQUENCE " + seqName + ";");
+                defaults.put(col.name(), "nextval('" + seqName + "')");
+            } else if (col.defaultValue() != null) {
+                defaults.put(col.name(), col.defaultValue());
+            }
         }
         tableColumns.put(stmt.tableName(), columns);
+        tableColumnDefaults.put(stmt.tableName(), defaults);
+        if (!autoSequenceNames.isEmpty()) {
+            saveCatalog(); // one write covering every auto-created sequence's new catalog entry
+        }
 
         return QueryResult.success("Table created: " + stmt.tableName());
+    }
+
+    private boolean isSerialType(String type) {
+        return type.equalsIgnoreCase("SERIAL") || type.equalsIgnoreCase("BIGSERIAL");
     }
 
     /**
@@ -806,24 +879,61 @@ public class ExecutorEngine {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
-        List<Object> values = new ArrayList<>();
-        for (String valueStr : stmt.values()) {
-            values.add(parseLiteral(valueStr));
+        List<String> allColumns = tableColumns.get(stmt.tableName());
+        if (allColumns == null) {
+            // Defensive fallback for a table somehow missing its column list -
+            // shouldn't happen in practice, since executeCreateTable always
+            // populates it, but keep the old col0/col1 behavior rather than
+            // crashing if it ever does.
+            Tuple fallback = new Tuple();
+            for (int i = 0; i < stmt.values().size(); i++) {
+                fallback.addValue("col" + i, resolveValue(stmt.values().get(i)));
+            }
+            return finishInsert(stmt, txn, fallback);
         }
 
+        // The explicit (col1, col2, ...) list if the statement gave one;
+        // otherwise every column, in the table's own declared order - the
+        // two cases INSERT INTO t (a, b) VALUES (...) and INSERT INTO t
+        // VALUES (...) are handled correctly and distinctly, unlike before
+        // this fix (see buildInsert's javadoc for the bug this replaced).
+        List<String> targetColumns = stmt.columns().isEmpty() ? allColumns : stmt.columns();
+        if (targetColumns.size() != stmt.values().size()) {
+            return QueryResult.error("INSERT has " + stmt.values().size() + " value(s) but "
+                + targetColumns.size() + " column(s) were specified for table " + stmt.tableName());
+        }
+
+        Map<String, Object> givenValues = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < targetColumns.size(); i++) {
+            String colName = targetColumns.get(i);
+            if (!allColumns.contains(colName)) {
+                return QueryResult.error("Column not found: " + colName + " on table " + stmt.tableName());
+            }
+            givenValues.put(colName, resolveValue(stmt.values().get(i)));
+        }
+
+        // Build the tuple in the TABLE's OWN column order (not the statement's
+        // order - callers may list columns in any order), applying each
+        // column's default for anything the statement didn't explicitly
+        // provide, or SQL NULL if it has no default either.
+        Map<String, String> defaults = tableColumnDefaults.getOrDefault(stmt.tableName(), Map.of());
         Tuple tuple = new Tuple();
-        List<String> columns = tableColumns.get(stmt.tableName());
-        if (columns != null) {
-            for (int i = 0; i < values.size() && i < columns.size(); i++) {
-                tuple.addValue(columns.get(i), values.get(i));
-            }
-        } else {
-            for (int i = 0; i < values.size(); i++) {
-                tuple.addValue("col" + i, values.get(i));
+        for (String col : allColumns) {
+            if (givenValues.containsKey(col)) {
+                tuple.addValue(col, givenValues.get(col));
+            } else if (defaults.containsKey(col)) {
+                tuple.addValue(col, resolveValue(defaults.get(col)));
+            } else {
+                tuple.addValue(col, null);
             }
         }
 
+        return finishInsert(stmt, txn, tuple);
+    }
+
+    private QueryResult finishInsert(InsertStatement stmt, Transaction txn, Tuple tuple) {
         byte[] data = tuple.serialize();
+        HeapTable table = tables.get(stmt.tableName());
         HeapTable.InsertResult result = table.insertMvcc(data, txn.getXID());
 
         walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, data);
@@ -2093,6 +2203,40 @@ public class ExecutorEngine {
                 return;
             }
         }
+    }
+
+    private static final java.util.regex.Pattern NEXTVAL_PATTERN = java.util.regex.Pattern.compile("(?i)nextval\\('([^']+)'\\)");
+    private static final java.util.regex.Pattern CURRVAL_PATTERN = java.util.regex.Pattern.compile("(?i)currval\\('([^']+)'\\)");
+
+    /** Resolves a raw value string that might be a plain literal, or a nextval('seq')/currval('seq') call - used for both column defaults and explicit values in an INSERT's VALUES list, since both need the exact same resolution logic. */
+    private Object resolveValue(String raw) {
+        java.util.regex.Matcher nextvalMatch = NEXTVAL_PATTERN.matcher(raw);
+        if (nextvalMatch.matches()) {
+            return callNextval(nextvalMatch.group(1));
+        }
+        java.util.regex.Matcher currvalMatch = CURRVAL_PATTERN.matcher(raw);
+        if (currvalMatch.matches()) {
+            return callCurrval(currvalMatch.group(1));
+        }
+        return parseLiteral(raw);
+    }
+
+    private long callNextval(String sequenceName) {
+        Sequence seq = sequences.get(sequenceName);
+        if (seq == null) {
+            throw new IllegalStateException("Sequence not found: " + sequenceName);
+        }
+        long value = seq.nextValue();
+        session.get().lastNextvalBySequence.put(sequenceName, value);
+        return value;
+    }
+
+    private long callCurrval(String sequenceName) {
+        Long value = session.get().lastNextvalBySequence.get(sequenceName);
+        if (value == null) {
+            throw new IllegalStateException("currval(\"" + sequenceName + "\") called before nextval() was called for that sequence in this session");
+        }
+        return value;
     }
 
     private Object parseLiteral(String value) {
