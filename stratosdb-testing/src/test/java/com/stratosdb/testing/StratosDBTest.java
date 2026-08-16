@@ -1946,6 +1946,89 @@ public class StratosDBTest {
         assertEquals(0, result.getRows().size());
     }
 
+    // --- Array columns: real ARRAY[...] literals, the @> containment
+    // operator (deliberately scoped down from real Postgres's
+    // array-to-array containment to array-to-single-element), and GIN
+    // indexing extended to index array elements exactly rather than
+    // tokenizing them - closing the "GIN also indexes arrays" gap this
+    // project's own docs had named as not yet done.
+
+    @Test
+    void testArrayLiteralInsertAndSelect() {
+        database.execute("CREATE TABLE t (id INT, tags VARCHAR[])");
+        QueryResult insert = database.execute("INSERT INTO t VALUES (1, ARRAY['urgent', 'bug'])");
+        assertTrue(insert.isSuccess(), () -> "inserting an ARRAY literal must succeed: " + insert.getError());
+
+        QueryResult result = database.execute("SELECT * FROM t");
+        assertTrue(result.isSuccess());
+        Object tagsValue = result.getRows().get(0).getValue("tags");
+        assertInstanceOf(java.util.List.class, tagsValue, "an array column's value must come back as a List");
+        assertEquals(java.util.List.of("urgent", "bug"), tagsValue);
+    }
+
+    @Test
+    void testEmptyArrayLiteral() {
+        database.execute("CREATE TABLE t (id INT, tags VARCHAR[])");
+        QueryResult insert = database.execute("INSERT INTO t VALUES (1, ARRAY[])");
+        assertTrue(insert.isSuccess());
+
+        Object tagsValue = database.execute("SELECT * FROM t").getRows().get(0).getValue("tags");
+        assertInstanceOf(java.util.List.class, tagsValue);
+        assertTrue(((java.util.List<?>) tagsValue).isEmpty());
+    }
+
+    @Test
+    void testArrayContainsOperatorWithoutAnyIndex() {
+        database.execute("CREATE TABLE t (id INT, tags VARCHAR[])");
+        database.execute("INSERT INTO t VALUES (1, ARRAY['urgent', 'bug'])");
+        database.execute("INSERT INTO t VALUES (2, ARRAY['feature', 'low-priority'])");
+        database.execute("INSERT INTO t VALUES (3, ARRAY['urgent', 'security'])");
+
+        QueryResult matches = database.execute("SELECT id FROM t WHERE tags @> 'urgent'");
+        assertTrue(matches.isSuccess());
+        assertEquals(2, matches.getRows().size(), "rows 1 and 3 both contain 'urgent'");
+
+        QueryResult noMatches = database.execute("SELECT id FROM t WHERE tags @> 'nonexistent'");
+        assertEquals(0, noMatches.getRows().size());
+    }
+
+    @Test
+    void testGinIndexOnArrayColumnIndexesElementsExactly() {
+        database.execute("CREATE TABLE t (id INT, tags VARCHAR[])");
+        database.execute("INSERT INTO t VALUES (1, ARRAY['urgent', 'bug'])");
+        database.execute("INSERT INTO t VALUES (2, ARRAY['feature', 'low-priority'])");
+        database.execute("INSERT INTO t VALUES (3, ARRAY['urgent', 'security'])");
+
+        QueryResult createResult = database.execute("CREATE INDEX idx_tags ON t (tags) USING GIN");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX ... USING GIN on an array column must succeed: " + createResult.getError());
+
+        QueryResult withIndex = database.execute("SELECT id FROM t WHERE tags @> 'urgent'");
+        assertTrue(withIndex.isSuccess());
+        assertEquals(2, withIndex.getRows().size());
+
+        // Exact-element matching, not tokenized: 'low' must NOT match the element 'low-priority'.
+        // (GinIndex's own text-search tokenizer would incorrectly split 'low-priority' into two
+        // words; array elements are indexed with insertExact specifically to avoid that.)
+        QueryResult noPartialMatch = database.execute("SELECT id FROM t WHERE tags @> 'low'");
+        assertEquals(0, noPartialMatch.getRows().size(), "'low' must not match the array element 'low-priority' - array elements are indexed exactly, not tokenized");
+
+        QueryResult exactMatch = database.execute("SELECT id FROM t WHERE tags @> 'low-priority'");
+        assertEquals(1, exactMatch.getRows().size());
+    }
+
+    @Test
+    void testGinIndexOnArrayMaintainedOnNewInserts() {
+        // The same staleness bug class found and fixed for BRIN/bitmap/GIN two rounds ago,
+        // re-verified specifically for the new array-indexing path added this round.
+        database.execute("CREATE TABLE t (id INT, tags VARCHAR[])");
+        database.execute("INSERT INTO t VALUES (1, ARRAY['urgent'])");
+        database.execute("CREATE INDEX idx_tags ON t (tags) USING GIN");
+
+        database.execute("INSERT INTO t VALUES (2, ARRAY['urgent', 'new'])");
+        QueryResult result = database.execute("SELECT id FROM t WHERE tags @> 'urgent'");
+        assertEquals(2, result.getRows().size(), "a row inserted after GIN index creation on an array column must be reflected immediately");
+    }
+
     private Tuple qualifiedTuple(String table, String col1, Object val1, String col2, Object val2) {
         Tuple t = new Tuple();
         t.addValue(table + "." + col1, val1);

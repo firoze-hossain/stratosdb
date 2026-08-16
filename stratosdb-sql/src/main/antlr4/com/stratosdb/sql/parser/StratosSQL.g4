@@ -80,6 +80,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName NE literal                                  #NeCompare
           | columnName LIKE literal                                #LikeCompare
           | columnName CONTAINS literal                            #ContainsCompare
+          | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
           | columnName IN LPAREN valueList RPAREN                  #InListExpr
           | columnName NOT IN LPAREN valueList RPAREN               #NotInListExpr
           | columnName IN LPAREN select RPAREN                      #InSubqueryExpr
@@ -98,10 +99,11 @@ expression: LPAREN expression RPAREN                              #ParenExpr
 
 // Values
 valueList: insertValue (COMMA insertValue)*;
-insertValue: literal | NEXTVAL LPAREN STRING_LITERAL RPAREN | CURRVAL LPAREN STRING_LITERAL RPAREN;
+insertValue: literal | NEXTVAL LPAREN STRING_LITERAL RPAREN | CURRVAL LPAREN STRING_LITERAL RPAREN | arrayLiteral;
+arrayLiteral: ARRAY LBRACKET (literal (COMMA literal)*)? RBRACKET;
 
 // Data types
-dataType: INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
+dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | VARCHAR (LPAREN INTEGER_LITERAL RPAREN)?
         | TEXT | CHAR (LPAREN INTEGER_LITERAL RPAREN)?
         | BOOLEAN | BOOL
@@ -110,7 +112,7 @@ dataType: INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | DOUBLE | FLOAT
         | BYTEA | BLOB
         | UUID
-        | JSON | JSONB;
+        | JSON | JSONB) (LBRACKET RBRACKET)?;
 
 // Literals
 literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | BOOLEAN_LITERAL | NULL;
@@ -220,6 +222,9 @@ FLOAT: F L O A T;
 BYTEA: B Y T E A;
 BLOB: B L O B;
 UUID: U U I D;
+ARRAY: A R R A Y;
+LBRACKET: '[';
+RBRACKET: ']';
 JSON: J S O N;
 JSONB: J S O N B;
 
@@ -239,6 +244,7 @@ LT: '<';
 GE: '>=';
 LE: '<=';
 NE: '!=';
+ARRAY_CONTAINS: '@>';
 STAR: '*';
 
 // Literals

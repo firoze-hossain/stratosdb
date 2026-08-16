@@ -24,6 +24,9 @@ public sealed interface WhereExpr {
     /** column CONTAINS 'word' - GIN's real, primary use case (see GinIndex): a whole-word text-search predicate. Usable even without a GIN index on the column (falls back to a direct tokenize-and-check, same as LIKE working without any index), just faster with one. */
     record Contains(String column, String word) implements WhereExpr {}
 
+    /** column @> 'value' - checks whether an array column contains a given scalar element. A deliberately scoped-down version of real Postgres's @> (which compares two full arrays for set containment) - this compares an array column against a single element, the more common, simpler case. */
+    record ArrayContains(String column, String literalElement) implements WhereExpr {}
+
     record InList(String column, List<String> values, boolean negated) implements WhereExpr {}
 
     /** column IN (SELECT ...) / column NOT IN (SELECT ...) - the subquery must produce exactly one column. */

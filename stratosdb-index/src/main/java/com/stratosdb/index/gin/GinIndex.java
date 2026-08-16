@@ -47,6 +47,21 @@ public class GinIndex {
         }
     }
 
+    /**
+     * Indexes one exact key (no tokenization at all) against this row -
+     * what an array column's elements need, unlike full-text search:
+     * "low-priority" must be indexed and matched as the single value
+     * "low-priority", not tokenized into "low" and "priority" the way
+     * insert()'s text-search tokenizer would (which is exactly correct
+     * for its own purpose, just wrong for this one).
+     */
+    public void insertExact(String key, BTreePage.RID rid) {
+        if (key == null) {
+            return;
+        }
+        wordToRids.computeIfAbsent(normalize(key), w -> new HashSet<>()).add(rid);
+    }
+
     /** All RIDs whose indexed text contains this exact word (case-insensitive, matching how tokenize() normalizes on insert). */
     public List<BTreePage.RID> search(String word) {
         Set<BTreePage.RID> rids = wordToRids.get(normalize(word));

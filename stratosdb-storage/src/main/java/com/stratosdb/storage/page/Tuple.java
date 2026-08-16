@@ -1,6 +1,11 @@
 package com.stratosdb.storage.page;
 
-import java.nio.ByteBuffer;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -40,52 +45,81 @@ public class Tuple {
     public int size() { return values.size(); }
     
     /**
-     * Serialize tuple to byte array
+     * Serialize tuple to byte array.
+     *
+     * Uses a dynamically-growing buffer (ByteArrayOutputStream), not a
+     * fixed-size one - a real, separate pre-existing bug found while
+     * adding array support: the previous implementation allocated exactly
+     * 1024 bytes regardless of actual row size, throwing
+     * BufferOverflowException the moment any row's total serialized size
+     * exceeded that (a real risk this project's own larger test data -
+     * e.g. BRIN's 500-character padding strings - happened not to trigger
+     * only because those tests used few enough columns to stay under the
+     * limit by luck, not by design). Arrays specifically make this a
+     * near-certainty rather than an edge case: even a modestly-sized
+     * array column pushes a row over 1024 bytes easily.
      */
     public byte[] serialize() {
-        ByteBuffer buffer = ByteBuffer.allocate(1024);
-        
-        // Write number of columns
-        buffer.putInt(values.size());
-        
-        // Write column names
-        for (String name : columnNames) {
-            byte[] nameBytes = name.getBytes();
-            buffer.putInt(nameBytes.length);
-            buffer.put(nameBytes);
-        }
-        
-        // Write each value
-        for (Object value : values) {
-            if (value == null) {
-                buffer.putInt(-1);
-            } else if (value instanceof Integer) {
-                buffer.putInt(1); // type
-                buffer.putInt((Integer) value);
-            } else if (value instanceof String) {
-                String str = (String) value;
-                byte[] strBytes = str.getBytes();
-                buffer.putInt(2); // type
-                buffer.putInt(strBytes.length);
-                buffer.put(strBytes);
-            } else if (value instanceof Long) {
-                buffer.putInt(3); // type
-                buffer.putLong((Long) value);
-            } else if (value instanceof Boolean) {
-                buffer.putInt(4); // type
-                buffer.put((byte) ((Boolean) value ? 1 : 0));
-            } else if (value instanceof Double) {
-                buffer.putInt(5); // type
-                buffer.putDouble((Double) value);
-            } else {
-                throw new IllegalArgumentException("Unsupported type: " + value.getClass());
+        ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(byteStream);
+        try {
+            out.writeInt(values.size());
+
+            for (String name : columnNames) {
+                byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+                out.writeInt(nameBytes.length);
+                out.write(nameBytes);
             }
+
+            for (Object value : values) {
+                writeValue(out, value);
+            }
+        } catch (IOException e) {
+            // ByteArrayOutputStream/DataOutputStream never actually throw IOException
+            // in practice (no real I/O involved) - this exists only to satisfy the
+            // checked exception, not because it's expected to ever happen.
+            throw new UncheckedIOException(e);
         }
-        
-        byte[] result = new byte[buffer.position()];
-        buffer.position(0);
-        buffer.get(result);
-        return result;
+        return byteStream.toByteArray();
+    }
+
+    /**
+     * Writes one value's type tag and payload. Recursive for arrays (type
+     * tag 6), since an array's elements can themselves be any of the
+     * other supported scalar types - reusing this exact method for each
+     * element keeps a single, unified encoding rather than a special
+     * parallel one just for array contents.
+     */
+    private static void writeValue(DataOutputStream out, Object value) throws IOException {
+        if (value == null) {
+            out.writeInt(-1);
+        } else if (value instanceof Integer) {
+            out.writeInt(1);
+            out.writeInt((Integer) value);
+        } else if (value instanceof String) {
+            byte[] strBytes = ((String) value).getBytes(StandardCharsets.UTF_8);
+            out.writeInt(2);
+            out.writeInt(strBytes.length);
+            out.write(strBytes);
+        } else if (value instanceof Long) {
+            out.writeInt(3);
+            out.writeLong((Long) value);
+        } else if (value instanceof Boolean) {
+            out.writeInt(4);
+            out.writeByte((Boolean) value ? 1 : 0);
+        } else if (value instanceof Double) {
+            out.writeInt(5);
+            out.writeDouble((Double) value);
+        } else if (value instanceof List) {
+            List<?> list = (List<?>) value;
+            out.writeInt(6);
+            out.writeInt(list.size());
+            for (Object element : list) {
+                writeValue(out, element);
+            }
+        } else {
+            throw new IllegalArgumentException("Unsupported type: " + value.getClass());
+        }
     }
     
     /**
@@ -93,49 +127,59 @@ public class Tuple {
      */
     public static Tuple deserialize(byte[] data) {
         Tuple tuple = new Tuple();
-        ByteBuffer buffer = ByteBuffer.wrap(data);
-        
-        int count = buffer.getInt();
-        
-        // Read column names
-        for (int i = 0; i < count; i++) {
-            int nameLen = buffer.getInt();
-            byte[] nameBytes = new byte[nameLen];
-            buffer.get(nameBytes);
-            tuple.columnNames.add(new String(nameBytes));
-        }
-        
-        // Read values
-        for (int i = 0; i < count; i++) {
-            int type = buffer.getInt();
-            switch (type) {
-                case 1: // Integer
-                    tuple.values.add(buffer.getInt());
-                    break;
-                case 2: // String
-                    int len = buffer.getInt();
-                    byte[] strBytes = new byte[len];
-                    buffer.get(strBytes);
-                    tuple.values.add(new String(strBytes));
-                    break;
-                case 3: // Long
-                    tuple.values.add(buffer.getLong());
-                    break;
-                case 4: // Boolean
-                    tuple.values.add(buffer.get() == 1);
-                    break;
-                case 5: // Double
-                    tuple.values.add(buffer.getDouble());
-                    break;
-                case -1: // NULL
-                    tuple.values.add(null);
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unknown type: " + type);
+        try {
+            DataInputStream in = new DataInputStream(new java.io.ByteArrayInputStream(data));
+
+            int count = in.readInt();
+
+            for (int i = 0; i < count; i++) {
+                int nameLen = in.readInt();
+                byte[] nameBytes = new byte[nameLen];
+                in.readFully(nameBytes);
+                tuple.columnNames.add(new String(nameBytes, StandardCharsets.UTF_8));
             }
+
+            for (int i = 0; i < count; i++) {
+                tuple.values.add(readValue(in));
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
-        
+
         return tuple;
+    }
+
+    /** Reads one value's type tag and payload - the exact mirror of writeValue, including the recursive case for arrays. */
+    private static Object readValue(DataInputStream in) throws IOException {
+        int type = in.readInt();
+        switch (type) {
+            case 1:
+                return in.readInt();
+            case 2: {
+                int len = in.readInt();
+                byte[] strBytes = new byte[len];
+                in.readFully(strBytes);
+                return new String(strBytes, StandardCharsets.UTF_8);
+            }
+            case 3:
+                return in.readLong();
+            case 4:
+                return in.readByte() == 1;
+            case 5:
+                return in.readDouble();
+            case 6: {
+                int size = in.readInt();
+                List<Object> list = new ArrayList<>(size);
+                for (int i = 0; i < size; i++) {
+                    list.add(readValue(in));
+                }
+                return list;
+            }
+            case -1:
+                return null;
+            default:
+                throw new IllegalArgumentException("Unknown type: " + type);
+        }
     }
     
     @Override

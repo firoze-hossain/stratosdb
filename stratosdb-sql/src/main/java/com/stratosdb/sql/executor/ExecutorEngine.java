@@ -978,7 +978,7 @@ public class ExecutorEngine {
             Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
             Object value = findColumnValue(tuple, stmt.columnName());
             if (value != null) {
-                index.insert(value.toString(), new BTreePage.RID(row.pageId(), row.slot()));
+                indexGinValue(index, value, new BTreePage.RID(row.pageId(), row.slot()));
                 indexed++;
             }
         }
@@ -989,6 +989,29 @@ public class ExecutorEngine {
 
         return QueryResult.success("Index created: " + stmt.indexName() + " (GIN) on " + stmt.tableName()
             + "(" + stmt.columnName() + "), indexed " + indexed + " row(s), " + index.getDistinctWordCount() + " distinct word(s)");
+    }
+
+    /**
+     * Indexes one column value into a GIN index correctly based on its
+     * actual shape: an array value gets each element indexed EXACTLY (no
+     * tokenization - GinIndex.insertExact), since real Postgres's own GIN
+     * indexes an array's individual elements this way, enabling a fast
+     * @> lookup. A plain text value still gets tokenized for word search
+     * (GinIndex.insert), the original, separate use case this index type
+     * already supported. Shared by both the initial CREATE INDEX build
+     * and every subsequent INSERT's maintenance, so both paths can never
+     * disagree about how a given value gets indexed.
+     */
+    private void indexGinValue(com.stratosdb.index.gin.GinIndex index, Object value, BTreePage.RID rid) {
+        if (value instanceof List<?> array) {
+            for (Object element : array) {
+                if (element != null) {
+                    index.insertExact(element.toString(), rid);
+                }
+            }
+        } else {
+            index.insert(value.toString(), rid);
+        }
     }
 
     /**
@@ -1376,6 +1399,16 @@ public class ExecutorEngine {
                 return null;
             }
             candidateRids = ginEntry.index().search(stripQuotes(contains.word()));
+        } else if (stmt.where() instanceof WhereExpr.ArrayContains arrayContains) {
+            GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), arrayContains.column());
+            if (ginEntry == null) {
+                return null;
+            }
+            // Element values were indexed EXACTLY (insertExact, not tokenized -
+            // see indexGinValue), so the search key must be the exact literal
+            // text, not stripped/lowered the way word-search's Contains is.
+            Object targetElement = parseLiteral(arrayContains.literalElement());
+            candidateRids = ginEntry.index().search(targetElement.toString());
         } else if (stmt.where() instanceof WhereExpr.Comparison cmp && cmp.operator().equals("=")
             && findEqualityIndex(stmt.tableName(), cmp.column()) == null) {
             // Only used when no BTREE/HASH already covers this column - those are strictly
@@ -2366,7 +2399,7 @@ public class ExecutorEngine {
             for (GinIndexEntry idx : ginIndexes) {
                 Object value = findColumnValue(tuple, idx.columnName());
                 if (value != null) {
-                    idx.index().insert(value.toString(), new BTreePage.RID(pageId, slot));
+                    indexGinValue(idx.index(), value, new BTreePage.RID(pageId, slot));
                 }
             }
         }
@@ -2702,6 +2735,19 @@ public class ExecutorEngine {
             String word = stripQuotes(contains.word());
             return com.stratosdb.index.gin.GinIndex.tokenize(value.toString()).contains(word.toLowerCase());
         }
+        if (expr instanceof WhereExpr.ArrayContains arrayContains) {
+            Object value = resolveColumnValue(row, arrayContains.column(), outerRow);
+            if (!(value instanceof List)) {
+                return false; // not an array column at all, or NULL - @> is false either way
+            }
+            Object targetElement = parseLiteral(arrayContains.literalElement());
+            for (Object element : (List<?>) value) {
+                if (java.util.Objects.equals(normalizeJoinKey(element), normalizeJoinKey(targetElement))) {
+                    return true;
+                }
+            }
+            return false;
+        }
         if (expr instanceof WhereExpr.InList inList) {
             Object value = resolveColumnValue(row, inList.column(), outerRow);
             if (value == null) {
@@ -3000,8 +3046,9 @@ public class ExecutorEngine {
 
     private static final java.util.regex.Pattern NEXTVAL_PATTERN = java.util.regex.Pattern.compile("(?i)nextval\\('([^']+)'\\)");
     private static final java.util.regex.Pattern CURRVAL_PATTERN = java.util.regex.Pattern.compile("(?i)currval\\('([^']+)'\\)");
+    private static final java.util.regex.Pattern ARRAY_LITERAL_PATTERN = java.util.regex.Pattern.compile("(?is)ARRAY\\[(.*)\\]");
 
-    /** Resolves a raw value string that might be a plain literal, or a nextval('seq')/currval('seq') call - used for both column defaults and explicit values in an INSERT's VALUES list, since both need the exact same resolution logic. */
+    /** Resolves a raw value string that might be a plain literal, a nextval('seq')/currval('seq') call, or an ARRAY[...] literal - used for both column defaults and explicit values in an INSERT's VALUES list, since both need the exact same resolution logic. */
     private Object resolveValue(String raw) {
         java.util.regex.Matcher nextvalMatch = NEXTVAL_PATTERN.matcher(raw);
         if (nextvalMatch.matches()) {
@@ -3011,7 +3058,53 @@ public class ExecutorEngine {
         if (currvalMatch.matches()) {
             return callCurrval(currvalMatch.group(1));
         }
+        java.util.regex.Matcher arrayMatch = ARRAY_LITERAL_PATTERN.matcher(raw);
+        if (arrayMatch.matches()) {
+            return parseArrayLiteral(arrayMatch.group(1));
+        }
         return parseLiteral(raw);
+    }
+
+    /**
+     * Parses an ARRAY[...] literal's inner content (already stripped of the
+     * "ARRAY[" / "]" wrapper) into a real List<Object>, splitting elements
+     * on commas that are NOT inside a quoted string - a naive comma-split
+     * would incorrectly break an element like 'a,b' into two elements.
+     * Each element is then resolved through parseLiteral, the same
+     * literal-parsing logic every other value in this engine already uses.
+     */
+    private List<Object> parseArrayLiteral(String innerContent) {
+        List<Object> elements = new ArrayList<>();
+        String trimmed = innerContent.trim();
+        if (trimmed.isEmpty()) {
+            return elements; // ARRAY[] - a real, valid empty array
+        }
+
+        List<String> rawElements = splitRespectingQuotes(trimmed);
+        for (String rawElement : rawElements) {
+            elements.add(parseLiteral(rawElement.trim()));
+        }
+        return elements;
+    }
+
+    private List<String> splitRespectingQuotes(String text) {
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean insideQuotes = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\'') {
+                insideQuotes = !insideQuotes;
+                current.append(c);
+            } else if (c == ',' && !insideQuotes) {
+                parts.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        parts.add(current.toString());
+        return parts;
     }
 
     private long callNextval(String sequenceName) {
