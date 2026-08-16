@@ -5,7 +5,7 @@
          http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>io.github.firoze-hossain</groupId>
+    <groupId>com.stratosdb</groupId>
     <artifactId>stratosdb-parent</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
@@ -195,102 +195,5 @@
             </plugins>
         </pluginManagement>
     </build>
-
-    <!--
-        Activated explicitly with `mvn clean deploy -Prelease` - kept separate
-        from the normal build so `mvn clean install` for everyday development
-        never tries to GPG-sign anything or needs Central Portal credentials
-        that most contributors won't have. See RUNNING_LOCALLY.md for the
-        full, step-by-step publishing walkthrough (account setup, GPG key
-        generation, and the settings.xml credentials this profile expects).
-    -->
-    <profiles>
-        <profile>
-            <id>release</id>
-            <build>
-                <plugins>
-                    <!-- Maven Central requires a sources jar for every published artifact. -->
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-source-plugin</artifactId>
-                        <executions>
-                            <execution>
-                                <id>attach-sources</id>
-                                <goals>
-                                    <goal>jar-no-fork</goal>
-                                </goals>
-                            </execution>
-                        </executions>
-                    </plugin>
-
-                    <!-- Maven Central requires a javadoc jar for every published artifact. -->
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-javadoc-plugin</artifactId>
-                        <configuration>
-                            <!-- This codebase's javadoc comments are written as prose for
-                                 humans reading the source, not strict Javadoc HTML - don't
-                                 fail a release over doclint warnings about that. -->
-                            <doclint>none</doclint>
-                            <failOnError>false</failOnError>
-                        </configuration>
-                        <executions>
-                            <execution>
-                                <id>attach-javadocs</id>
-                                <goals>
-                                    <goal>jar</goal>
-                                </goals>
-                            </execution>
-                        </executions>
-                    </plugin>
-
-                    <!--
-                        Maven Central requires every file (jar, sources jar, javadoc
-                        jar, and the pom itself) to be GPG-signed. Needs a real GPG
-                        key generated and published to a keyserver first - see
-                        RUNNING_LOCALLY.md - and either gpg.passphrase in
-                        settings.xml or an interactive terminal (this plugin will
-                        prompt if neither is configured).
-                    -->
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-gpg-plugin</artifactId>
-                        <version>3.2.4</version>
-                        <executions>
-                            <execution>
-                                <id>sign-artifacts</id>
-                                <phase>verify</phase>
-                                <goals>
-                                    <goal>sign</goal>
-                                </goals>
-                            </execution>
-                        </executions>
-                    </plugin>
-
-                    <!--
-                        Sonatype's current (2024+) publishing plugin for the Central
-                        Portal - replaces the older OSSRH/nexus-staging-maven-plugin
-                        flow, which Sonatype is sunsetting. Needs a <server> entry
-                        with id "central" in ~/.m2/settings.xml holding a Central
-                        Portal user token (generated on central.sonatype.com, not
-                        your account password) - see RUNNING_LOCALLY.md.
-                        autoPublish=false deliberately: this uploads a reviewable
-                        bundle and stops there, so a mistake can be caught before
-                        anything goes permanently, irrevocably live.
-                    -->
-                    <plugin>
-                        <groupId>org.sonatype.central</groupId>
-                        <artifactId>central-publishing-maven-plugin</artifactId>
-                        <version>0.7.0</version>
-                        <extensions>true</extensions>
-                        <configuration>
-                            <publishingServerId>central</publishingServerId>
-                            <autoPublish>false</autoPublish>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-    </profiles>
 
 </project>

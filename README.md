@@ -59,19 +59,25 @@ SELECT * FROM users WHERE age >= 25;
 
 Or use StratosDB's own CLI and custom protocol — see [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for the full walkthrough, including authentication, TLS, and the benchmark suite.
 
-## Using StratosDB as a dependency
+## Connecting from a Java application
 
-**Not yet published to Maven Central** — the project is fully prepared for it (correct `groupId`, license, POM metadata, and dependency scoping so `stratosdb-jdbc` won't pollute a consumer's logging setup — see [`PUBLISHING.md`](./PUBLISHING.md) for the complete, honest account of what's ready and what still requires manual account/signing steps only a maintainer can do). Once published:
+**The easiest path today, no StratosDB-specific dependency required**: start a StratosDB server with `--stdwire`, then connect with the real, standard PostgreSQL JDBC driver (`org.postgresql:postgresql`, already on Maven Central) — this is exactly what real applications do with any Postgres-wire-compatible database:
 
 ```xml
 <dependency>
-    <groupId>io.github.firoze-hossain</groupId>
-    <artifactId>stratosdb-jdbc</artifactId>
-    <version>1.0.0</version>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <version>42.7.3</version>
 </dependency>
 ```
 
-Alternatively, any Spring Boot project can already connect to a running StratosDB server via the **real, standard PostgreSQL JDBC driver** (`org.postgresql:postgresql`, already on Maven Central) — no StratosDB-specific dependency needed — by starting the server with `--stdwire` and pointing a normal `org.postgresql.Driver` connection string at that port.
+```java
+Connection conn = DriverManager.getConnection("jdbc:postgresql://localhost:6583/anydb", "anyuser", "");
+```
+
+Works the same way with Spring Boot's `DataSource`/`JdbcTemplate` — just point the connection URL at the `--stdwire` port. Known limits from `PROGRESS.md` still apply (simple query protocol only, trust auth only).
+
+**A dedicated StratosDB connector/driver, published the way `mysql-connector-j` or `org.postgresql:postgresql` are** — a small, standalone client artifact (not the engine itself) that Java/Spring Boot projects could add as a single Maven dependency — is a real, deliberately deferred future item, not attempted yet.
 
 ## Architecture
 
