@@ -1758,6 +1758,120 @@ public class StratosDBTest {
         assertEquals(1, result.getRows().size());
     }
 
+    // --- BRIN, bitmap, and GIN indexes: three genuinely different index
+    // structures (block-range summaries, per-value bitmaps, and a text
+    // inverted index respectively), each built, WRITE-maintained, and
+    // actually consulted during a scan - not just created and forgotten.
+    // A real, silent staleness bug was found and fixed for all three
+    // while building this: index maintenance on new rows was missing
+    // entirely at first, verified by directly testing an INSERT after
+    // index creation (see PROGRESS.md).
+
+    @Test
+    void testBrinIndexBuildsAndAnswersRangeAndEqualityQueries() {
+        database.execute("CREATE TABLE t (id INT, payload VARCHAR)");
+        String padding = "x".repeat(500);
+        for (int i = 0; i < 200; i++) {
+            database.execute("INSERT INTO t VALUES (" + i + ", '" + padding + "')");
+        }
+        QueryResult createResult = database.execute("CREATE INDEX idx_id_brin ON t (id) USING BRIN");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX ... USING BRIN must succeed: " + createResult.getError());
+
+        QueryResult rangeResult = database.execute("SELECT id FROM t WHERE id >= 190");
+        assertTrue(rangeResult.isSuccess());
+        assertEquals(10, rangeResult.getRows().size(), "ids 190-199");
+
+        QueryResult equalityResult = database.execute("SELECT id FROM t WHERE id = 50");
+        assertTrue(equalityResult.isSuccess());
+        assertEquals(1, equalityResult.getRows().size());
+
+        QueryResult outOfRangeResult = database.execute("SELECT id FROM t WHERE id > 1000");
+        assertTrue(outOfRangeResult.isSuccess(), "a range entirely outside the data must return 0 rows, not error");
+        assertEquals(0, outOfRangeResult.getRows().size());
+    }
+
+    @Test
+    void testBrinIndexMaintainsRangeOnNewInserts() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("CREATE INDEX idx_id_brin ON t (id) USING BRIN");
+
+        database.execute("INSERT INTO t VALUES (999)");
+        QueryResult result = database.execute("SELECT * FROM t WHERE id = 999");
+        assertEquals(1, result.getRows().size(), "a row inserted after BRIN index creation must extend its range's summary, not be silently unreachable");
+    }
+
+    @Test
+    void testBitmapIndexEqualityLookupAndMaintenance() {
+        database.execute("CREATE TABLE t (id INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'active')");
+        database.execute("INSERT INTO t VALUES (2, 'inactive')");
+        database.execute("INSERT INTO t VALUES (3, 'active')");
+        QueryResult createResult = database.execute("CREATE INDEX idx_status ON t (status) USING BITMAP");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX ... USING BITMAP must succeed: " + createResult.getError());
+
+        QueryResult result = database.execute("SELECT * FROM t WHERE status = 'active'");
+        assertTrue(result.isSuccess());
+        assertEquals(2, result.getRows().size());
+
+        // The real staleness bug this guards against.
+        database.execute("INSERT INTO t VALUES (4, 'active')");
+        QueryResult afterInsert = database.execute("SELECT * FROM t WHERE status = 'active'");
+        assertEquals(3, afterInsert.getRows().size(), "a row inserted after BITMAP index creation must be reflected immediately, not silently missing");
+    }
+
+    @Test
+    void testBitmapIndexStaleEntryFromDeleteIsFilteredByMvccVisibility() {
+        // The bitmap index itself never removes a deleted row's bit (a real,
+        // named limitation - see BitmapIndex's own javadoc), but the query
+        // must still be CORRECT: the stale entry gets filtered by the same
+        // MVCC visibility check every other index scan path already uses.
+        database.execute("CREATE TABLE t (id INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'active')");
+        database.execute("INSERT INTO t VALUES (2, 'active')");
+        database.execute("CREATE INDEX idx_status ON t (status) USING BITMAP");
+
+        database.execute("DELETE FROM t WHERE id = 1");
+        QueryResult result = database.execute("SELECT * FROM t WHERE status = 'active'");
+        assertEquals(1, result.getRows().size(), "a deleted row's stale bitmap entry must never appear in results, even though it's never physically removed from the index");
+    }
+
+    @Test
+    void testGinIndexContainsSearchAndMaintenance() {
+        database.execute("CREATE TABLE t (id INT, description VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'the quick brown fox')");
+        database.execute("INSERT INTO t VALUES (2, 'jumps over the lazy dog')");
+        database.execute("INSERT INTO t VALUES (3, 'fox hunting in the forest')");
+        QueryResult createResult = database.execute("CREATE INDEX idx_desc ON t (description) USING GIN");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX ... USING GIN must succeed: " + createResult.getError());
+
+        QueryResult result = database.execute("SELECT id FROM t WHERE description CONTAINS 'fox'");
+        assertTrue(result.isSuccess());
+        assertEquals(2, result.getRows().size(), "rows 1 and 3 both contain 'fox'");
+
+        // Word-boundary matching, not substring: 'fox' must not match a row that only contains a longer word containing "fox" as a substring.
+        database.execute("INSERT INTO t VALUES (4, 'foxglove flowers')");
+        QueryResult stillTwo = database.execute("SELECT id FROM t WHERE description CONTAINS 'fox'");
+        assertEquals(2, stillTwo.getRows().size(), "'fox' must match whole words only, not as a substring of 'foxglove'");
+
+        // The real staleness bug this guards against.
+        database.execute("INSERT INTO t VALUES (5, 'another fox appears')");
+        QueryResult afterInsert = database.execute("SELECT id FROM t WHERE description CONTAINS 'fox'");
+        assertEquals(3, afterInsert.getRows().size(), "a row inserted after GIN index creation must be reflected immediately, not silently missing");
+    }
+
+    @Test
+    void testContainsWorksWithoutAnyGinIndexAtAll() {
+        // CONTAINS must work correctly even with no index present at all - the same relationship LIKE has with indexes.
+        database.execute("CREATE TABLE t (id INT, description VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'the quick brown fox')");
+        database.execute("INSERT INTO t VALUES (2, 'no matching word here')");
+
+        QueryResult result = database.execute("SELECT id FROM t WHERE description CONTAINS 'fox'");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+    }
+
     private Tuple qualifiedTuple(String table, String col1, Object val1, String col2, Object val2) {
         Tuple t = new Tuple();
         t.addValue(table + "." + col1, val1);

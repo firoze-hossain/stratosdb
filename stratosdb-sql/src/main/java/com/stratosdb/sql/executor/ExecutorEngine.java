@@ -7,6 +7,7 @@ import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.page.BTreePage;
+import com.stratosdb.storage.page.SlottedPage;
 import com.stratosdb.storage.page.Tuple;
 import com.stratosdb.storage.wal.WALManager;
 import com.stratosdb.transaction.Transaction;
@@ -45,6 +46,18 @@ public class ExecutorEngine {
 
     private final Map<String, IndexEntry> indexesByName;
     private final Map<String, List<IndexEntry>> indexesByTable;
+
+    /** BRIN, bitmap, and GIN indexes each have a different shape from KeyValueIndex (block-range summaries, per-value bitmaps, and per-word posting lists respectively - see each class's own javadoc), so each gets its own parallel entry/storage rather than being forced into the KeyValueIndex interface. Index NAME uniqueness is still checked across all of these together in executeCreateIndex - a name collision between, say, a BTREE index and a GIN index is still a real collision. */
+    private record BrinIndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.brin.BrinIndex index) {}
+    private record BitmapIndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.bitmap.BitmapIndex index) {}
+    private record GinIndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.gin.GinIndex index) {}
+
+    private final Map<String, BrinIndexEntry> brinIndexesByName = new ConcurrentHashMap<>();
+    private final Map<String, List<BrinIndexEntry>> brinIndexesByTable = new ConcurrentHashMap<>();
+    private final Map<String, BitmapIndexEntry> bitmapIndexesByName = new ConcurrentHashMap<>();
+    private final Map<String, List<BitmapIndexEntry>> bitmapIndexesByTable = new ConcurrentHashMap<>();
+    private final Map<String, GinIndexEntry> ginIndexesByName = new ConcurrentHashMap<>();
+    private final Map<String, List<GinIndexEntry>> ginIndexesByTable = new ConcurrentHashMap<>();
 
     /**
      * Per-column statistics: distinct-value count (for equality selectivity)
@@ -849,7 +862,8 @@ public class ExecutorEngine {
      * knowing before relying on it.
      */
     private QueryResult executeCreateIndex(CreateIndexStatement stmt, Transaction txn) {
-        if (indexesByName.containsKey(stmt.indexName())) {
+        if (indexesByName.containsKey(stmt.indexName()) || brinIndexesByName.containsKey(stmt.indexName())
+            || bitmapIndexesByName.containsKey(stmt.indexName()) || ginIndexesByName.containsKey(stmt.indexName())) {
             return QueryResult.error("Index already exists: " + stmt.indexName());
         }
         HeapTable table = tables.get(stmt.tableName());
@@ -862,6 +876,15 @@ public class ExecutorEngine {
             return QueryResult.error("Column not found: " + stmt.columnName() + " on table " + stmt.tableName());
         }
 
+        return switch (stmt.indexType()) {
+            case BRIN -> buildBrinIndex(stmt, table, txn);
+            case BITMAP -> buildBitmapIndex(stmt, table, txn);
+            case GIN -> buildGinIndex(stmt, table, txn);
+            case HASH, BTREE -> buildKeyValueIndex(stmt, table, txn);
+        };
+    }
+
+    private QueryResult buildKeyValueIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
         com.stratosdb.index.KeyValueIndex index = stmt.indexType() == CreateIndexStatement.IndexType.HASH
             ? new com.stratosdb.index.hash.HashIndex(stmt.indexName(), bufferPool)
             : new BTreeIndex(stmt.indexName(), bufferPool);
@@ -892,6 +915,80 @@ public class ExecutorEngine {
             message += " (" + skippedNonNumeric + " row(s) skipped: non-integer column value)";
         }
         return QueryResult.success(message);
+    }
+
+    private QueryResult buildBrinIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
+        com.stratosdb.index.brin.BrinIndex index = new com.stratosdb.index.brin.BrinIndex(stmt.indexName());
+        int indexed = 0;
+        int skippedNonNumeric = 0;
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Long key = toIndexKey(findColumnValue(tuple, stmt.columnName()));
+            if (key != null) {
+                index.observe(row.pageId(), key);
+                indexed++;
+            } else {
+                skippedNonNumeric++;
+            }
+        }
+
+        BrinIndexEntry entry = new BrinIndexEntry(stmt.indexName(), stmt.tableName(), stmt.columnName(), index);
+        brinIndexesByName.put(stmt.indexName(), entry);
+        brinIndexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
+
+        String message = "Index created: " + stmt.indexName() + " (BRIN) on " + stmt.tableName()
+            + "(" + stmt.columnName() + "), summarized " + indexed + " row(s) across " + index.getRangeCount() + " page range(s)";
+        if (skippedNonNumeric > 0) {
+            message += " (" + skippedNonNumeric + " row(s) skipped: non-integer column value)";
+        }
+        return QueryResult.success(message);
+    }
+
+    private QueryResult buildBitmapIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
+        com.stratosdb.index.bitmap.BitmapIndex index = new com.stratosdb.index.bitmap.BitmapIndex(stmt.indexName());
+        int indexed = 0;
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Object value = findColumnValue(tuple, stmt.columnName());
+            index.insert(value, new BTreePage.RID(row.pageId(), row.slot()));
+            indexed++;
+        }
+
+        BitmapIndexEntry entry = new BitmapIndexEntry(stmt.indexName(), stmt.tableName(), stmt.columnName(), index);
+        bitmapIndexesByName.put(stmt.indexName(), entry);
+        bitmapIndexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
+
+        return QueryResult.success("Index created: " + stmt.indexName() + " (BITMAP) on " + stmt.tableName()
+            + "(" + stmt.columnName() + "), indexed " + indexed + " row(s) across " + index.getDistinctValueCount() + " distinct value(s)");
+    }
+
+    private QueryResult buildGinIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
+        com.stratosdb.index.gin.GinIndex index = new com.stratosdb.index.gin.GinIndex(stmt.indexName());
+        int indexed = 0;
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Object value = findColumnValue(tuple, stmt.columnName());
+            if (value != null) {
+                index.insert(value.toString(), new BTreePage.RID(row.pageId(), row.slot()));
+                indexed++;
+            }
+        }
+
+        GinIndexEntry entry = new GinIndexEntry(stmt.indexName(), stmt.tableName(), stmt.columnName(), index);
+        ginIndexesByName.put(stmt.indexName(), entry);
+        ginIndexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
+
+        return QueryResult.success("Index created: " + stmt.indexName() + " (GIN) on " + stmt.tableName()
+            + "(" + stmt.columnName() + "), indexed " + indexed + " row(s), " + index.getDistinctWordCount() + " distinct word(s)");
     }
 
     /**
@@ -1132,6 +1229,15 @@ public class ExecutorEngine {
             return executeWindowFunctionSelect(stmt, txn, table);
         }
 
+        List<Tuple> ginOrBitmapResult = tryGinOrBitmapIndexScan(stmt, table, txn);
+        if (ginOrBitmapResult != null) {
+            return finishSimpleSelect(stmt, ginOrBitmapResult);
+        }
+        List<Tuple> brinResult = tryBrinIndexScan(stmt, table, txn);
+        if (brinResult != null) {
+            return finishSimpleSelect(stmt, brinResult);
+        }
+
         ScanPlan plan = planScan(stmt.tableName(), stmt.where());
         List<Tuple> tuples = new ArrayList<>();
 
@@ -1162,6 +1268,10 @@ public class ExecutorEngine {
             }
         }
 
+        return finishSimpleSelect(stmt, tuples);
+    }
+
+    private QueryResult finishSimpleSelect(SelectStatement stmt, List<Tuple> tuples) {
         if (stmt.limit() != null) {
             try {
                 int limit = Integer.parseInt(stmt.limit());
@@ -1174,6 +1284,176 @@ public class ExecutorEngine {
         }
 
         return QueryResult.success(tuples);
+    }
+
+    /**
+     * A targeted fast path, separate from planScan's cost-based B+Tree/hash
+     * logic: if the WHERE clause is exactly a single CONTAINS predicate
+     * with a GIN index on that column, or exactly a single equality
+     * predicate with a BITMAP index on that column (and no faster
+     * BTREE/HASH index already exists for it - planScan already prefers
+     * those when available), use the index directly instead of a full
+     * scan. Returns null (not an empty list - a real, empty result is a
+     * valid, different outcome) when neither applies, so the caller falls
+     * through to the existing scan-planning path unchanged.
+     *
+     * Reuses the exact same fetch-verify-recheck-project pattern the
+     * existing B+Tree/hash index path uses (see the caller): fetch the
+     * heap tuple for each candidate RID, confirm MVCC visibility (an
+     * index entry can be stale after an update/delete), defensively
+     * re-check the full WHERE clause (keeps results identical to what a
+     * full scan would produce even if a future WHERE clause combines
+     * CONTAINS/equality with something else this fast path doesn't fully
+     * understand), then project.
+     */
+    private List<Tuple> tryGinOrBitmapIndexScan(SelectStatement stmt, HeapTable table, Transaction txn) {
+        if (stmt.where() == null) {
+            return null;
+        }
+
+        List<BTreePage.RID> candidateRids;
+        if (stmt.where() instanceof WhereExpr.Contains contains) {
+            GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), contains.column());
+            if (ginEntry == null) {
+                return null;
+            }
+            candidateRids = ginEntry.index().search(stripQuotes(contains.word()));
+        } else if (stmt.where() instanceof WhereExpr.Comparison cmp && cmp.operator().equals("=")
+            && findEqualityIndex(stmt.tableName(), cmp.column()) == null) {
+            // Only used when no BTREE/HASH already covers this column - those are strictly
+            // faster for a plain equality lookup (direct key hashing/comparison, not a
+            // BitSet scan), so bitmap is specifically the fallback for a low-cardinality
+            // column that was ONLY ever given a BITMAP index.
+            BitmapIndexEntry bitmapEntry = findBitmapIndex(stmt.tableName(), cmp.column());
+            if (bitmapEntry == null) {
+                return null;
+            }
+            candidateRids = bitmapEntry.index().search(parseLiteral(cmp.literal()));
+        } else {
+            return null;
+        }
+
+        List<Tuple> tuples = new ArrayList<>();
+        for (BTreePage.RID rid : candidateRids) {
+            byte[] stored = table.readTuple(rid.pageId(), rid.slot());
+            if (stored == null || !MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+            if (!matchesWhere(tuple, stmt.where(), txn)) {
+                continue;
+            }
+            tuples.add(project(tuple, stmt.columns()));
+        }
+        return tuples;
+    }
+
+    private GinIndexEntry findGinIndex(String tableName, String columnName) {
+        List<GinIndexEntry> entries = ginIndexesByTable.get(tableName);
+        if (entries == null) {
+            return null;
+        }
+        for (GinIndexEntry e : entries) {
+            if (e.columnName().equalsIgnoreCase(columnName)) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private BitmapIndexEntry findBitmapIndex(String tableName, String columnName) {
+        List<BitmapIndexEntry> entries = bitmapIndexesByTable.get(tableName);
+        if (entries == null) {
+            return null;
+        }
+        for (BitmapIndexEntry e : entries) {
+            if (e.columnName().equalsIgnoreCase(columnName)) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private BrinIndexEntry findBrinIndex(String tableName, String columnName) {
+        List<BrinIndexEntry> entries = brinIndexesByTable.get(tableName);
+        if (entries == null) {
+            return null;
+        }
+        for (BrinIndexEntry e : entries) {
+            if (e.columnName().equalsIgnoreCase(columnName)) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * BRIN's fast path is shaped differently from GIN/bitmap's above: it
+     * never returns a set of matching RIDs directly (BRIN doesn't have
+     * per-row entries at all - see BrinIndex's own javadoc). Instead it
+     * narrows WHICH PAGES are worth scanning at all, then does a real
+     * scan - reading every tuple, checking MVCC visibility, and
+     * re-checking the full WHERE clause - restricted to just those pages.
+     * Only used when no faster BTREE/HASH index already covers this
+     * column (planScan already prefers those), and only for a simple,
+     * single-column comparison expressible as a contiguous bound - the
+     * same restriction planScan's own cost-based logic has for ranges.
+     */
+    private List<Tuple> tryBrinIndexScan(SelectStatement stmt, HeapTable table, Transaction txn) {
+        WhereExpr.Comparison cmp = extractSimpleComparison(stmt.where());
+        if (cmp == null) {
+            return null;
+        }
+        BrinIndexEntry brinEntry = findBrinIndex(stmt.tableName(), cmp.column());
+        if (brinEntry == null) {
+            return null;
+        }
+        if (findEqualityIndex(stmt.tableName(), cmp.column()) != null
+            || findRangeCapableIndex(stmt.tableName(), cmp.column()) != null) {
+            return null; // a real B+Tree/hash index already covers this column - strictly faster, let planScan use it
+        }
+
+        long value;
+        try {
+            value = Long.parseLong(cmp.literal());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+
+        Long lo = null, hi = null;
+        boolean loInclusive = true, hiInclusive = true;
+        switch (cmp.operator()) {
+            case "=" -> { lo = value; hi = value; }
+            case ">" -> { lo = value; loInclusive = false; }
+            case ">=" -> lo = value;
+            case "<" -> { hi = value; hiInclusive = false; }
+            case "<=" -> hi = value;
+            default -> { return null; } // "!=" isn't expressible as a contiguous bound
+        }
+
+        List<com.stratosdb.index.brin.BrinIndex.RangeSummary> candidateRanges =
+            brinEntry.index().candidateRanges(lo, loInclusive, hi, hiInclusive);
+
+        List<Tuple> tuples = new ArrayList<>();
+        for (com.stratosdb.index.brin.BrinIndex.RangeSummary range : candidateRanges) {
+            long lastPageInTable = table.getLastPageId();
+            for (long pageId = range.startPageId; pageId <= range.endPageId && pageId <= lastPageInTable; pageId++) {
+                SlottedPage page = (SlottedPage) bufferPool.getPage(stmt.tableName(), pageId);
+                for (int slot : page.getValidSlots()) {
+                    byte[] stored = page.readTuple(slot);
+                    if (stored == null || !MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
+                        continue;
+                    }
+                    Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+                    if (!matchesWhere(tuple, stmt.where(), txn)) {
+                        continue;
+                    }
+                    tuples.add(project(tuple, stmt.columns()));
+                }
+                bufferPool.unpinPage(stmt.tableName(), pageId);
+            }
+        }
+        return tuples;
     }
 
     /**
@@ -1986,15 +2266,50 @@ public class ExecutorEngine {
 
     private void maintainIndexesOnWrite(String tableName, Tuple tuple, long pageId, int slot) {
         List<IndexEntry> tableIndexes = indexesByTable.get(tableName);
-        if (tableIndexes == null) return;
-        for (IndexEntry idx : tableIndexes) {
-            Object value = findColumnValue(tuple, idx.columnName());
-            Long key = toIndexKey(value);
-            if (key != null) {
-                idx.index().insert(key, new BTreePage.RID(pageId, slot));
-            } else {
-                LOG.debug("Not indexing row in {} for index {}: column {} value {} isn't an integer key",
-                    tableName, idx.indexName(), idx.columnName(), value);
+        if (tableIndexes != null) {
+            for (IndexEntry idx : tableIndexes) {
+                Object value = findColumnValue(tuple, idx.columnName());
+                Long key = toIndexKey(value);
+                if (key != null) {
+                    idx.index().insert(key, new BTreePage.RID(pageId, slot));
+                } else {
+                    LOG.debug("Not indexing row in {} for index {}: column {} value {} isn't an integer key",
+                        tableName, idx.indexName(), idx.columnName(), value);
+                }
+            }
+        }
+
+        // BRIN, bitmap, and GIN indexes need the exact same "every new row
+        // must be reflected" maintenance as B+Tree/hash above - found
+        // missing entirely by directly testing an INSERT after index
+        // creation, which returned stale (missing) results instead of
+        // failing loudly. A silent staleness bug, not a crash, is exactly
+        // the kind of thing that's easy to ship unnoticed without testing
+        // the write path specifically, not just the initial index build.
+        List<BrinIndexEntry> brinIndexes = brinIndexesByTable.get(tableName);
+        if (brinIndexes != null) {
+            for (BrinIndexEntry idx : brinIndexes) {
+                Long key = toIndexKey(findColumnValue(tuple, idx.columnName()));
+                if (key != null) {
+                    idx.index().observe(pageId, key);
+                }
+            }
+        }
+
+        List<BitmapIndexEntry> bitmapIndexes = bitmapIndexesByTable.get(tableName);
+        if (bitmapIndexes != null) {
+            for (BitmapIndexEntry idx : bitmapIndexes) {
+                idx.index().insert(findColumnValue(tuple, idx.columnName()), new BTreePage.RID(pageId, slot));
+            }
+        }
+
+        List<GinIndexEntry> ginIndexes = ginIndexesByTable.get(tableName);
+        if (ginIndexes != null) {
+            for (GinIndexEntry idx : ginIndexes) {
+                Object value = findColumnValue(tuple, idx.columnName());
+                if (value != null) {
+                    idx.index().insert(value.toString(), new BTreePage.RID(pageId, slot));
+                }
             }
         }
     }
@@ -2320,6 +2635,14 @@ public class ExecutorEngine {
         if (expr instanceof WhereExpr.Like like) {
             Object value = resolveColumnValue(row, like.column(), outerRow);
             return value != null && matchesLikePattern(value.toString(), stripQuotes(like.pattern()));
+        }
+        if (expr instanceof WhereExpr.Contains contains) {
+            Object value = resolveColumnValue(row, contains.column(), outerRow);
+            if (value == null) {
+                return false;
+            }
+            String word = stripQuotes(contains.word());
+            return com.stratosdb.index.gin.GinIndex.tokenize(value.toString()).contains(word.toLowerCase());
         }
         if (expr instanceof WhereExpr.InList inList) {
             Object value = resolveColumnValue(row, inList.column(), outerRow);

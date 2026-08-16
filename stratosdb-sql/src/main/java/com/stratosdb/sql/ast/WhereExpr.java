@@ -21,6 +21,9 @@ public sealed interface WhereExpr {
 
     record Like(String column, String pattern) implements WhereExpr {}
 
+    /** column CONTAINS 'word' - GIN's real, primary use case (see GinIndex): a whole-word text-search predicate. Usable even without a GIN index on the column (falls back to a direct tokenize-and-check, same as LIKE working without any index), just faster with one. */
+    record Contains(String column, String word) implements WhereExpr {}
+
     record InList(String column, List<String> values, boolean negated) implements WhereExpr {}
 
     /** column IN (SELECT ...) / column NOT IN (SELECT ...) - the subquery must produce exactly one column. */

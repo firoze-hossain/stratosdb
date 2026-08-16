@@ -122,9 +122,12 @@ public class SqlParser {
         String indexName = ctx.indexName().getText();
         String tableName = ctx.tableName().getText();
         String columnName = ctx.columnName().getText();
-        CreateIndexStatement.IndexType indexType = ctx.HASH() != null
-            ? CreateIndexStatement.IndexType.HASH
-            : CreateIndexStatement.IndexType.BTREE; // default, matching Postgres's own convention
+        CreateIndexStatement.IndexType indexType;
+        if (ctx.HASH() != null) indexType = CreateIndexStatement.IndexType.HASH;
+        else if (ctx.BRIN() != null) indexType = CreateIndexStatement.IndexType.BRIN;
+        else if (ctx.GIN() != null) indexType = CreateIndexStatement.IndexType.GIN;
+        else if (ctx.BITMAP() != null) indexType = CreateIndexStatement.IndexType.BITMAP;
+        else indexType = CreateIndexStatement.IndexType.BTREE; // default, matching Postgres's own convention
         return new CreateIndexStatement(indexName, tableName, columnName, indexType);
     }
 
@@ -264,6 +267,9 @@ public class SqlParser {
         }
         if (ctx instanceof StratosSQLParser.LikeCompareContext c) {
             return new WhereExpr.Like(c.columnName().getText(), c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.ContainsCompareContext c) {
+            return new WhereExpr.Contains(c.columnName().getText(), c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.InListExprContext c) {
             return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), false);

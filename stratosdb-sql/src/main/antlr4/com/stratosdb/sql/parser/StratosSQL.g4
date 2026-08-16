@@ -7,7 +7,7 @@ sqlStatement: createTable | createIndex | insert | selectWithCte | select | upda
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
-createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN (USING (HASH | BTREE))? SEMICOLON?;
+createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
 createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
@@ -79,6 +79,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName LE literal                                  #LeCompare
           | columnName NE literal                                  #NeCompare
           | columnName LIKE literal                                #LikeCompare
+          | columnName CONTAINS literal                            #ContainsCompare
           | columnName IN LPAREN valueList RPAREN                  #InListExpr
           | columnName NOT IN LPAREN valueList RPAREN               #NotInListExpr
           | columnName IN LPAREN select RPAREN                      #InSubqueryExpr
@@ -175,6 +176,10 @@ ON: O N;
 USING: U S I N G;
 HASH: H A S H;
 BTREE: B T R E E;
+BRIN: B R I N;
+GIN: G I N;
+BITMAP: B I T M A P;
+CONTAINS: C O N T A I N S;
 JOIN: J O I N;
 INNER: I N N E R;
 EXPLAIN: E X P L A I N;
