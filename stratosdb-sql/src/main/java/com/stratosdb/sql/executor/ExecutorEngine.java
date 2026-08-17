@@ -411,6 +411,25 @@ public class ExecutorEngine {
             }
             LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
             return QueryResult.error("Deadlock detected, transaction aborted: " + e.getMessage());
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            // A known, expected validation/limitation failure - the
+            // established convention throughout this codebase for "this
+            // specific operation can't be done, here's why" (sequence not
+            // found, invalid JSON for a column, an unsupported subquery
+            // pattern like this one). The QueryResult.error(...) below is
+            // the real, intended way this surfaces to the caller - logging
+            // it is just for visibility, so a full ERROR-level stack trace
+            // here would be actively misleading: it looks like a crash in
+            // build/test output even though this is working exactly as
+            // designed. Real, unexpected errors are still caught (and
+            // logged in full) by the general Exception handler below.
+            if (explicit) {
+                state.poisoned = true;
+            } else {
+                transactionManager.abort(txn);
+            }
+            LOG.warn("Statement failed (a known, expected validation failure, not a bug): {} - {}", sql, e.getMessage());
+            return QueryResult.error(e.getMessage());
         } catch (Exception e) {
             if (explicit) {
                 state.poisoned = true;
