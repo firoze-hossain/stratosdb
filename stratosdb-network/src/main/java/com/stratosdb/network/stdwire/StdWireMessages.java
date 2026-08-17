@@ -12,13 +12,28 @@ import java.nio.charset.StandardCharsets;
  * `psql` client (see PROGRESS.md), not implemented from memory of the spec
  * alone.
  *
- * Scope, stated plainly: this implements the startup handshake (including
- * declining SSL, since psql tries SSL first by default) and the *simple*
- * query protocol (single 'Q' message in, a stream of result messages out) -
- * what every basic client uses for plain SQL statements. It does not
- * implement the *extended* query protocol (Parse/Bind/Execute, used for
- * real server-side prepared statements and binary parameter binding) - a
- * real, separate, further piece of work, not silently missing.
+ * Scope: the startup handshake (including declining SSL, since psql tries
+ * SSL first by default), the simple query protocol (single 'Q' message in,
+ * a stream of result messages out), and now the extended query protocol
+ * (Parse/Bind/Describe/Execute/Sync/Close) - real server-side prepared
+ * statements and portals, verified against this project's own native
+ * `stdsql` client (see stratosdb-cli's StdSql.java) rather than psql, since
+ * psql's own extended-protocol usage isn't easily driven from its
+ * interactive prompt the way a purpose-built test client can be.
+ *
+ * A real, named simplification for the extended protocol: parameter
+ * substitution happens by interpolating each bound value as a properly
+ * quoted/escaped SQL literal into the query text before handing it to the
+ * same executor every simple-query statement already goes through - not
+ * via a native parameterized-query path inside ExecutorEngine itself
+ * (which has no such concept). This is a real implementation of the wire
+ * PROTOCOL (real Parse/Bind/Describe/Execute/Sync/Close message handling,
+ * real prepared-statement and portal lifecycle, real parameter type
+ * inference from $1/$2 placeholders) - not a relabeled simple query - but
+ * it does not give a reusable, pre-planned query the way a real
+ * server-side prepared statement in Postgres itself does. Values are still
+ * escaped correctly before substitution, so this remains SQL-injection-safe
+ * despite not being a native parameterized path.
  *
  * Authentication is "trust" only right now (AuthenticationOk immediately,
  * no password required) - a deliberate, minimal first step matching this
@@ -56,6 +71,98 @@ public final class StdWireMessages {
             while (body[end] != 0) end++;
             return new String(body, offset, end - offset, StandardCharsets.UTF_8);
         }
+    }
+
+    // --- extended query protocol: client-to-server message parsing ---
+
+    /** Parse ('P'): a prepared-statement name (empty = unnamed), the query text (with $1/$2/... placeholders), and the parameter type OIDs the client chose to specify up front (any may be 0 = "let the server infer it", which this implementation always effectively does anyway, since it has no static type-checking phase separate from execution). */
+    public record ParseMessage(String statementName, String query, int[] paramTypeOids) {}
+
+    public static ParseMessage readParseMessage(TypedMessage msg) {
+        byte[] body = msg.body();
+        int pos = 0;
+        String statementName = msg.readCString(pos);
+        pos += statementName.length() + 1;
+        String query = msg.readCString(pos);
+        pos += query.length() + 1;
+        int paramCount = readShortAt(body, pos);
+        pos += 2;
+        int[] paramTypeOids = new int[paramCount];
+        for (int i = 0; i < paramCount; i++) {
+            paramTypeOids[i] = readIntAt(body, pos);
+            pos += 4;
+        }
+        return new ParseMessage(statementName, query, paramTypeOids);
+    }
+
+    /** Bind ('B'): binds a portal (destinationPortal, empty = unnamed) to a previously-Parsed statement, with concrete parameter values - paramValues entries are raw bytes as sent (null entry = SQL NULL), always interpreted as text format here (see the class javadoc: format codes are read and stored but this implementation only ever produces/consumes text). */
+    public record BindMessage(String portalName, String statementName, byte[][] paramValues) {}
+
+    public static BindMessage readBindMessage(TypedMessage msg) {
+        byte[] body = msg.body();
+        int pos = 0;
+        String portalName = msg.readCString(pos);
+        pos += portalName.length() + 1;
+        String statementName = msg.readCString(pos);
+        pos += statementName.length() + 1;
+
+        int paramFormatCodeCount = readShortAt(body, pos);
+        pos += 2;
+        pos += paramFormatCodeCount * 2; // format codes themselves are ignored - see class javadoc
+
+        int paramValueCount = readShortAt(body, pos);
+        pos += 2;
+        byte[][] paramValues = new byte[paramValueCount][];
+        for (int i = 0; i < paramValueCount; i++) {
+            int len = readIntAt(body, pos);
+            pos += 4;
+            if (len == -1) {
+                paramValues[i] = null; // SQL NULL
+            } else {
+                paramValues[i] = new byte[len];
+                System.arraycopy(body, pos, paramValues[i], 0, len);
+                pos += len;
+            }
+        }
+        // result format codes (trailing Int16 count + Int16[] codes) are intentionally
+        // not parsed - this implementation always responds in text format regardless.
+        return new BindMessage(portalName, statementName, paramValues);
+    }
+
+    /** Describe ('D'): 'S' for a prepared statement (client wants ParameterDescription + RowDescription/NoData) or 'P' for a portal (client wants RowDescription/NoData only). */
+    public record DescribeMessage(char targetType, String name) {}
+
+    public static DescribeMessage readDescribeMessage(TypedMessage msg) {
+        char targetType = (char) msg.body()[0];
+        String name = msg.readCString(1);
+        return new DescribeMessage(targetType, name);
+    }
+
+    /** Execute ('E'): runs a previously-Bound portal. maxRows (0 = unlimited) is read but not honored - see class javadoc: this engine has no partial/cursor-based execution to limit against. */
+    public record ExecuteMessage(String portalName, int maxRows) {}
+
+    public static ExecuteMessage readExecuteMessage(TypedMessage msg) {
+        String portalName = msg.readCString(0);
+        int maxRows = readIntAt(msg.body(), portalName.length() + 1);
+        return new ExecuteMessage(portalName, maxRows);
+    }
+
+    /** Close ('C'): 'S' or 'P', same shape as Describe. */
+    public record CloseMessage(char targetType, String name) {}
+
+    public static CloseMessage readCloseMessage(TypedMessage msg) {
+        char targetType = (char) msg.body()[0];
+        String name = msg.readCString(1);
+        return new CloseMessage(targetType, name);
+    }
+
+    private static int readShortAt(byte[] body, int offset) {
+        return ((body[offset] & 0xFF) << 8) | (body[offset + 1] & 0xFF);
+    }
+
+    private static int readIntAt(byte[] body, int offset) {
+        return ((body[offset] & 0xFF) << 24) | ((body[offset + 1] & 0xFF) << 16)
+            | ((body[offset + 2] & 0xFF) << 8) | (body[offset + 3] & 0xFF);
     }
 
     /** Parses a StartupMessage body (after the 4-byte length and 4-byte protocol version already consumed by the caller) into its key/value parameters. */
@@ -157,6 +264,35 @@ public final class StdWireMessages {
         });
     }
 
+    // --- extended query protocol: server-to-client responses ---
+
+    public static void writeParseComplete(DataOutputStream out) throws IOException {
+        writeMessage(out, '1', buf -> {});
+    }
+
+    public static void writeBindComplete(DataOutputStream out) throws IOException {
+        writeMessage(out, '2', buf -> {});
+    }
+
+    public static void writeCloseComplete(DataOutputStream out) throws IOException {
+        writeMessage(out, '3', buf -> {});
+    }
+
+    /** typeOids.size() must match the statement's actual parameter count - sent in response to Describe('S', ...), always ahead of that same statement's RowDescription/NoData. */
+    public static void writeParameterDescription(DataOutputStream out, java.util.List<Integer> typeOids) throws IOException {
+        writeMessage(out, 't', buf -> {
+            buf.putShort((short) typeOids.size());
+            for (int oid : typeOids) {
+                buf.putInt(oid);
+            }
+        });
+    }
+
+    /** Sent instead of RowDescription when a statement/portal produces no result columns at all (e.g. INSERT/UPDATE/DELETE/DDL) - a real, separate message type from an empty RowDescription (zero columns would be a different, wrong signal: "this returns rows, there just happen to be none described"). */
+    public static void writeNoData(DataOutputStream out) throws IOException {
+        writeMessage(out, 'n', buf -> {});
+    }
+
     // --- shared plumbing ---
 
     private interface BodyWriter {
@@ -177,5 +313,93 @@ public final class StdWireMessages {
     private static void putCString(java.nio.ByteBuffer buf, String s) {
         buf.put(s.getBytes(StandardCharsets.UTF_8));
         buf.put((byte) 0);
+    }
+
+    // --- client-side message writers (used by stdsql, a real native stdwire client) ---
+
+    /** The StartupMessage: untyped (no leading type byte, like SSLRequest), just protocol version + key/value params, ending with a final empty string. */
+    public static void writeStartupMessage(DataOutputStream out, String user, String database) throws IOException {
+        java.nio.ByteBuffer scratch = java.nio.ByteBuffer.allocate(65536);
+        scratch.putInt(PROTOCOL_VERSION_3);
+        putCString(scratch, "user");
+        putCString(scratch, user);
+        if (database != null) {
+            putCString(scratch, "database");
+            putCString(scratch, database);
+        }
+        scratch.put((byte) 0); // terminating empty string
+        int bodyLen = scratch.position();
+        out.writeInt(bodyLen + 4);
+        out.write(scratch.array(), 0, bodyLen);
+        out.flush();
+    }
+
+    /** Simple query protocol: one 'Q' message containing the whole SQL text. */
+    public static void writeQuery(DataOutputStream out, String sql) throws IOException {
+        writeMessage(out, 'Q', buf -> putCString(buf, sql));
+        out.flush();
+    }
+
+    public static void writeTerminate(DataOutputStream out) throws IOException {
+        writeMessage(out, 'X', buf -> {});
+        out.flush();
+    }
+
+    /** Parse: statementName empty = unnamed. paramTypeOids may be empty - 0 means "let the server infer it," which this project's own server always does anyway. */
+    public static void writeParse(DataOutputStream out, String statementName, String query, int[] paramTypeOids) throws IOException {
+        writeMessage(out, 'P', buf -> {
+            putCString(buf, statementName);
+            putCString(buf, query);
+            buf.putShort((short) paramTypeOids.length);
+            for (int oid : paramTypeOids) {
+                buf.putInt(oid);
+            }
+        });
+    }
+
+    /** Bind: always text format for both parameters and results (this project's own server, and this client, never produce or consume binary format) - paramValues entries are the parameter's literal text, UTF-8 encoded; a null entry means SQL NULL. */
+    public static void writeBind(DataOutputStream out, String portalName, String statementName, String[] paramValues) throws IOException {
+        writeMessage(out, 'B', buf -> {
+            putCString(buf, portalName);
+            putCString(buf, statementName);
+            buf.putShort((short) 0); // 0 parameter format codes = every parameter is text format, the protocol's own default
+            buf.putShort((short) paramValues.length);
+            for (String v : paramValues) {
+                if (v == null) {
+                    buf.putInt(-1);
+                } else {
+                    byte[] b = v.getBytes(StandardCharsets.UTF_8);
+                    buf.putInt(b.length);
+                    buf.put(b);
+                }
+            }
+            buf.putShort((short) 0); // 0 result format codes = text format for every result column
+        });
+    }
+
+    public static void writeDescribe(DataOutputStream out, char targetType, String name) throws IOException {
+        writeMessage(out, 'D', buf -> {
+            buf.put((byte) targetType);
+            putCString(buf, name);
+        });
+    }
+
+    public static void writeExecute(DataOutputStream out, String portalName, int maxRows) throws IOException {
+        writeMessage(out, 'E', buf -> {
+            putCString(buf, portalName);
+            buf.putInt(maxRows);
+        });
+    }
+
+    public static void writeClose(DataOutputStream out, char targetType, String name) throws IOException {
+        writeMessage(out, 'C', buf -> {
+            buf.put((byte) targetType);
+            putCString(buf, name);
+        });
+    }
+
+    public static void writeSync(DataOutputStream out) throws IOException {
+        writeMessage(out, 'S', buf -> {});
+        out.flush();
     }
 }

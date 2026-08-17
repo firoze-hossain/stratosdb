@@ -2816,7 +2816,7 @@ public class ExecutorEngine {
         String column = parts[0].trim();
         String value = parts[1].trim();
         if (value.startsWith("'") && value.endsWith("'")) {
-            value = value.substring(1, value.length() - 1);
+            value = unescapeStringLiteral(value);
         }
 
         boolean isNumeric;
@@ -3011,9 +3011,28 @@ public class ExecutorEngine {
 
     private String stripQuotes(String literalText) {
         if (literalText.startsWith("'") && literalText.endsWith("'")) {
-            return literalText.substring(1, literalText.length() - 1);
+            return unescapeStringLiteral(literalText);
         }
         return literalText;
+    }
+
+    /**
+     * Strips a STRING_LITERAL token's surrounding quotes AND un-escapes
+     * any doubled single quote ('') back into one literal quote - the
+     * standard SQL escaping convention. A real, previously-latent bug
+     * found by testing (not by inspection): the grammar's own
+     * STRING_LITERAL token didn't accept '' at all until this same round
+     * (see the .g4 file), so a value containing a literal quote - such as
+     * a parameter substituted through the wire protocol's extended query
+     * support - would either fail to parse or, if only the un-escaping
+     * half were fixed without the grammar half, parse as two adjacent
+     * string literals instead of one. Both halves needed fixing together;
+     * fixing just one would have left the other looking like it worked
+     * only for lucky inputs.
+     */
+    private String unescapeStringLiteral(String quotedText) {
+        String inner = quotedText.substring(1, quotedText.length() - 1);
+        return inner.replace("''", "'");
     }
 
     /** Numeric-aware equality/ordering between two already-resolved values (as opposed to evaluatePredicate, which compares a resolved value against raw literal text). */
@@ -3340,7 +3359,7 @@ public class ExecutorEngine {
 
     private Object parseLiteral(String value) {
         if (value.startsWith("'") && value.endsWith("'")) {
-            return value.substring(1, value.length() - 1);
+            return unescapeStringLiteral(value);
         }
         if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) {
             return Boolean.parseBoolean(value);

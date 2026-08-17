@@ -254,7 +254,7 @@ STAR: '*';
 
 // Literals
 IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
-STRING_LITERAL: '\'' (~['])* '\'';
+STRING_LITERAL: '\'' ('\'\'' | ~['])* '\'';
 INTEGER_LITERAL: [0-9]+;
 FLOAT_LITERAL: [0-9]+ '.' [0-9]+;
 BOOLEAN_LITERAL: TRUE | FALSE;

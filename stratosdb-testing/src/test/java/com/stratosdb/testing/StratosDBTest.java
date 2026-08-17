@@ -2187,6 +2187,44 @@ public class StratosDBTest {
         assertEquals(2, result.getRows().size(), "a row inserted after GIST index creation must be reflected immediately");
     }
 
+    // --- Quote escaping: a real, previously-latent bug found by testing the
+    // extended query protocol's parameter substitution, not by inspection -
+    // the grammar's STRING_LITERAL token never supported SQL's standard ''
+    // (doubled single quote) escaping convention at all, so any value
+    // containing a literal quote either failed to parse or, once the value
+    // extraction half was naively fixed without the grammar half, would
+    // have parsed as two adjacent string literals instead of one.
+
+    @Test
+    void testEscapedQuoteInStringLiteralInsertsAndReadsBackCorrectly() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        QueryResult insert = database.execute("INSERT INTO t VALUES (1, 'O''Brien')");
+        assertTrue(insert.isSuccess(), () -> "an embedded '' escaped quote must parse correctly: " + insert.getError());
+
+        Object value = database.execute("SELECT * FROM t").getRows().get(0).getValue("name");
+        assertEquals("O'Brien", value, "the escaped '' must un-escape to a single literal quote, not stay doubled or get dropped");
+    }
+
+    @Test
+    void testEscapedQuoteInWhereClauseComparison() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'O''Brien')");
+        database.execute("INSERT INTO t VALUES (2, 'Smith')");
+
+        QueryResult result = database.execute("SELECT id FROM t WHERE name = 'O''Brien'");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+        assertEquals(1, result.getRows().get(0).getValue("id"));
+    }
+
+    @Test
+    void testMultipleEscapedQuotesInOneLiteral() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        QueryResult insert = database.execute("INSERT INTO t VALUES (1, 'a''b''c')");
+        assertTrue(insert.isSuccess());
+        assertEquals("a'b'c", database.execute("SELECT * FROM t").getRows().get(0).getValue("name"));
+    }
+
     private Tuple qualifiedTuple(String table, String col1, Object val1, String col2, Object val2) {
         Tuple t = new Tuple();
         t.addValue(table + "." + col1, val1);

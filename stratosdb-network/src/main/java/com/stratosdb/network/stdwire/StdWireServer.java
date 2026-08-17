@@ -89,6 +89,12 @@ public class StdWireServer {
 
             db.closeSession(); // defensive: this thread is new per connection, but be explicit about starting clean
 
+            // Extended query protocol state - per connection, matching the protocol's own
+            // scoping (a prepared statement/portal only ever means something to the
+            // connection that created it). See ExtendedProtocolHandler's own javadoc for
+            // the real, named simplification in how these are executed.
+            ExtendedProtocolHandler extended = new ExtendedProtocolHandler(db, this);
+
             boolean inTransaction = false;
             while (running) {
                 StdWireMessages.TypedMessage msg;
@@ -101,10 +107,13 @@ public class StdWireServer {
                 if (msg.type() == 'X') {
                     break; // Terminate
                 }
+                if (msg.type() == 'P' || msg.type() == 'B' || msg.type() == 'D'
+                    || msg.type() == 'E' || msg.type() == 'C' || msg.type() == 'S') {
+                    inTransaction = extended.handle(msg, out, inTransaction);
+                    continue;
+                }
                 if (msg.type() != 'Q') {
-                    // Anything from the extended query protocol (Parse/Bind/Describe/Execute/
-                    // Sync/Close) lands here - not implemented yet (see StdWireMessages' javadoc).
-                    StdWireMessages.writeErrorResponse(out, "Only the simple query protocol is supported right now");
+                    StdWireMessages.writeErrorResponse(out, "Unsupported message type: " + msg.type());
                     out.flush();
                     continue;
                 }
@@ -271,14 +280,14 @@ public class StdWireServer {
      * a real client to receive from what's supposed to be a JSON column.
      * Converted back to real JSON text here instead.
      */
-    private String formatValueForWire(Object value) {
+    String formatValueForWire(Object value) {
         if (value instanceof java.util.Map) {
             return com.stratosdb.sql.executor.JsonParser.toJsonText(value);
         }
         return value.toString();
     }
 
-    private List<StdWireMessages.Column> describeColumns(List<Tuple> rows) {
+    List<StdWireMessages.Column> describeColumns(List<Tuple> rows) {
         List<StdWireMessages.Column> columns = new ArrayList<>();
         if (rows.isEmpty()) {
             return columns; // no rows at all means no way to know column names from this result alone - a real, minor limitation of the simple query protocol without a schema catalog behind it
@@ -311,7 +320,7 @@ public class StdWireServer {
     private static final Pattern UPDATED_PATTERN = Pattern.compile("Updated (\\d+) row");
     private static final Pattern DELETED_PATTERN = Pattern.compile("Deleted (\\d+) row");
 
-    private int extractAffectedCount(String message) {
+    int extractAffectedCount(String message) {
         if (message == null) return 0;
         Matcher u = UPDATED_PATTERN.matcher(message);
         if (u.find()) return Integer.parseInt(u.group(1));
@@ -326,7 +335,7 @@ public class StdWireServer {
      * etc. - real Postgres clients depend on this exact shape for some
      * interactive behavior (row-count reporting), not just cosmetics.
      */
-    private String buildCommandTag(String sql, int count) {
+    String buildCommandTag(String sql, int count) {
         String upper = sql.trim().toUpperCase();
         if (upper.startsWith("SELECT") || upper.startsWith("EXPLAIN")) return "SELECT " + count;
         if (upper.startsWith("INSERT")) return "INSERT 0 " + count;
@@ -345,12 +354,12 @@ public class StdWireServer {
         return "OK";
     }
 
-    private boolean isTransactionControl(String sql) {
+    boolean isTransactionControl(String sql) {
         String upper = sql.trim().toUpperCase();
         return upper.startsWith("BEGIN") || upper.startsWith("START");
     }
 
-    private boolean updateTransactionState(String sql, boolean currentlyInTransaction) {
+    boolean updateTransactionState(String sql, boolean currentlyInTransaction) {
         String upper = sql.trim().toUpperCase();
         if (upper.startsWith("BEGIN") || upper.startsWith("START")) return true;
         if (upper.startsWith("COMMIT") || upper.startsWith("ROLLBACK")) return false;
