@@ -121,14 +121,16 @@ public class SqlParser {
     private CreateIndexStatement buildCreateIndex(StratosSQLParser.CreateIndexContext ctx) {
         String indexName = ctx.indexName().getText();
         String tableName = ctx.tableName().getText();
-        String columnName = ctx.columnName().getText();
+        String columnName = ctx.columnName(0).getText();
+        String columnName2 = ctx.columnName().size() > 1 ? ctx.columnName(1).getText() : null;
         CreateIndexStatement.IndexType indexType;
         if (ctx.HASH() != null) indexType = CreateIndexStatement.IndexType.HASH;
         else if (ctx.BRIN() != null) indexType = CreateIndexStatement.IndexType.BRIN;
         else if (ctx.GIN() != null) indexType = CreateIndexStatement.IndexType.GIN;
         else if (ctx.BITMAP() != null) indexType = CreateIndexStatement.IndexType.BITMAP;
+        else if (ctx.GIST() != null) indexType = CreateIndexStatement.IndexType.GIST;
         else indexType = CreateIndexStatement.IndexType.BTREE; // default, matching Postgres's own convention
-        return new CreateIndexStatement(indexName, tableName, columnName, indexType);
+        return new CreateIndexStatement(indexName, tableName, columnName, columnName2, indexType);
     }
 
     /**
@@ -276,6 +278,9 @@ public class SqlParser {
         }
         if (ctx instanceof StratosSQLParser.JsonExtractTextEqCompareContext c) {
             return new WhereExpr.JsonExtractTextEquals(c.columnName().getText(), c.literal(0).getText(), c.literal(1).getText());
+        }
+        if (ctx instanceof StratosSQLParser.RangeOverlapsCompareContext c) {
+            return new WhereExpr.RangeOverlaps(c.columnName(0).getText(), c.columnName(1).getText(), c.literal(0).getText(), c.literal(1).getText());
         }
         if (ctx instanceof StratosSQLParser.InListExprContext c) {
             return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), false);

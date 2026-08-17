@@ -30,6 +30,9 @@ public sealed interface WhereExpr {
     /** column ->> 'key' = 'value' - extracts a top-level JSON key as text and compares it for equality. Deliberately scoped to top-level keys and equality only - real Postgres's ->> also supports array-index extraction and #>>'{path,to,key}' for nested paths, real further work not attempted here. */
     record JsonExtractTextEquals(String column, String key, String value) implements WhereExpr {}
 
+    /** (startColumn, endColumn) OVERLAPS (queryStart, queryEnd) - real interval/range overlap, GiST's own classic real-world use case. Two intervals [a,b] and [c,d] overlap iff a <= d AND c <= b - the standard interval overlap test, used both here (for the no-index fallback) and by GistIntervalIndex's own search/pruning. */
+    record RangeOverlaps(String startColumn, String endColumn, String queryStartLiteral, String queryEndLiteral) implements WhereExpr {}
+
     record InList(String column, List<String> values, boolean negated) implements WhereExpr {}
 
     /** column IN (SELECT ...) / column NOT IN (SELECT ...) - the subquery must produce exactly one column. */

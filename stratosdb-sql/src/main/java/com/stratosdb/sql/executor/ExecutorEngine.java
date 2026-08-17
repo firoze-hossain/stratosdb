@@ -53,6 +53,8 @@ public class ExecutorEngine {
     private record BrinIndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.brin.BrinIndex index) {}
     private record BitmapIndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.bitmap.BitmapIndex index) {}
     private record GinIndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.gin.GinIndex index) {}
+    /** GIST is the only index type needing two column names - the (start, end) pair an interval-overlap predicate needs to mean anything. */
+    private record GistIndexEntry(String indexName, String tableName, String startColumn, String endColumn, com.stratosdb.index.gist.GistIntervalIndex index) {}
 
     private final Map<String, BrinIndexEntry> brinIndexesByName = new ConcurrentHashMap<>();
     private final Map<String, List<BrinIndexEntry>> brinIndexesByTable = new ConcurrentHashMap<>();
@@ -60,6 +62,8 @@ public class ExecutorEngine {
     private final Map<String, List<BitmapIndexEntry>> bitmapIndexesByTable = new ConcurrentHashMap<>();
     private final Map<String, GinIndexEntry> ginIndexesByName = new ConcurrentHashMap<>();
     private final Map<String, List<GinIndexEntry>> ginIndexesByTable = new ConcurrentHashMap<>();
+    private final Map<String, GistIndexEntry> gistIndexesByName = new ConcurrentHashMap<>();
+    private final Map<String, List<GistIndexEntry>> gistIndexesByTable = new ConcurrentHashMap<>();
 
     /**
      * Per-column statistics: distinct-value count (for equality selectivity)
@@ -887,7 +891,8 @@ public class ExecutorEngine {
      */
     private QueryResult executeCreateIndex(CreateIndexStatement stmt, Transaction txn) {
         if (indexesByName.containsKey(stmt.indexName()) || brinIndexesByName.containsKey(stmt.indexName())
-            || bitmapIndexesByName.containsKey(stmt.indexName()) || ginIndexesByName.containsKey(stmt.indexName())) {
+            || bitmapIndexesByName.containsKey(stmt.indexName()) || ginIndexesByName.containsKey(stmt.indexName())
+            || gistIndexesByName.containsKey(stmt.indexName())) {
             return QueryResult.error("Index already exists: " + stmt.indexName());
         }
         HeapTable table = tables.get(stmt.tableName());
@@ -900,10 +905,23 @@ public class ExecutorEngine {
             return QueryResult.error("Column not found: " + stmt.columnName() + " on table " + stmt.tableName());
         }
 
+        if (stmt.indexType() == CreateIndexStatement.IndexType.GIST) {
+            if (stmt.columnName2() == null) {
+                return QueryResult.error("GIST requires a (start, end) column pair - e.g. CREATE INDEX ... ON t (start_col, end_col) USING GIST");
+            }
+            boolean secondColumnExists = columns.stream().anyMatch(c -> c.equalsIgnoreCase(stmt.columnName2()));
+            if (!secondColumnExists) {
+                return QueryResult.error("Column not found: " + stmt.columnName2() + " on table " + stmt.tableName());
+            }
+        } else if (stmt.columnName2() != null) {
+            return QueryResult.error(stmt.indexType() + " only supports a single column - only GIST uses a (start, end) pair");
+        }
+
         return switch (stmt.indexType()) {
             case BRIN -> buildBrinIndex(stmt, table, txn);
             case BITMAP -> buildBitmapIndex(stmt, table, txn);
             case GIN -> buildGinIndex(stmt, table, txn);
+            case GIST -> buildGistIndex(stmt, table, txn);
             case HASH, BTREE -> buildKeyValueIndex(stmt, table, txn);
         };
     }
@@ -1013,6 +1031,37 @@ public class ExecutorEngine {
 
         return QueryResult.success("Index created: " + stmt.indexName() + " (GIN) on " + stmt.tableName()
             + "(" + stmt.columnName() + "), indexed " + indexed + " row(s), " + index.getDistinctWordCount() + " distinct word(s)");
+    }
+
+    private QueryResult buildGistIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
+        com.stratosdb.index.gist.GistIntervalIndex index = new com.stratosdb.index.gist.GistIntervalIndex(stmt.indexName());
+        int indexed = 0;
+        int skippedNonNumeric = 0;
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Long start = toIndexKey(findColumnValue(tuple, stmt.columnName()));
+            Long end = toIndexKey(findColumnValue(tuple, stmt.columnName2()));
+            if (start != null && end != null) {
+                index.insert(start, end, new BTreePage.RID(row.pageId(), row.slot()));
+                indexed++;
+            } else {
+                skippedNonNumeric++;
+            }
+        }
+
+        GistIndexEntry entry = new GistIndexEntry(stmt.indexName(), stmt.tableName(), stmt.columnName(), stmt.columnName2(), index);
+        gistIndexesByName.put(stmt.indexName(), entry);
+        gistIndexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
+
+        String message = "Index created: " + stmt.indexName() + " (GIST) on " + stmt.tableName()
+            + "(" + stmt.columnName() + ", " + stmt.columnName2() + "), indexed " + indexed + " row(s)";
+        if (skippedNonNumeric > 0) {
+            message += " (" + skippedNonNumeric + " row(s) skipped: non-integer start/end value)";
+        }
+        return QueryResult.success(message);
     }
 
     /**
@@ -1473,6 +1522,14 @@ public class ExecutorEngine {
                 return null;
             }
             candidateRids = bitmapEntry.index().search(parseLiteral(cmp.literal()));
+        } else if (stmt.where() instanceof WhereExpr.RangeOverlaps rangeOverlaps) {
+            GistIndexEntry gistEntry = findGistIndex(stmt.tableName(), rangeOverlaps.startColumn(), rangeOverlaps.endColumn());
+            if (gistEntry == null) {
+                return null;
+            }
+            long queryStart = ((Number) parseLiteral(rangeOverlaps.queryStartLiteral())).longValue();
+            long queryEnd = ((Number) parseLiteral(rangeOverlaps.queryEndLiteral())).longValue();
+            candidateRids = gistEntry.index().searchOverlapping(queryStart, queryEnd);
         } else {
             return null;
         }
@@ -1499,6 +1556,20 @@ public class ExecutorEngine {
         }
         for (GinIndexEntry e : entries) {
             if (e.columnName().equalsIgnoreCase(columnName)) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    /** Matches on BOTH columns, in order - a GIST index over (a, b) is not the same index as one over (b, a), just as it wouldn't be for a real multi-column B-Tree. */
+    private GistIndexEntry findGistIndex(String tableName, String startColumn, String endColumn) {
+        List<GistIndexEntry> entries = gistIndexesByTable.get(tableName);
+        if (entries == null) {
+            return null;
+        }
+        for (GistIndexEntry e : entries) {
+            if (e.startColumn().equalsIgnoreCase(startColumn) && e.endColumn().equalsIgnoreCase(endColumn)) {
                 return e;
             }
         }
@@ -2475,6 +2546,17 @@ public class ExecutorEngine {
                 }
             }
         }
+
+        List<GistIndexEntry> gistIndexes = gistIndexesByTable.get(tableName);
+        if (gistIndexes != null) {
+            for (GistIndexEntry idx : gistIndexes) {
+                Long start = toIndexKey(findColumnValue(tuple, idx.startColumn()));
+                Long end = toIndexKey(findColumnValue(tuple, idx.endColumn()));
+                if (start != null && end != null) {
+                    idx.index().insert(start, end, new BTreePage.RID(pageId, slot));
+                }
+            }
+        }
     }
 
     /**
@@ -2836,6 +2918,19 @@ public class ExecutorEngine {
             // (the "text" extraction operator, as opposed to -> which preserves
             // the JSON type).
             return jsonScalarAsText(extracted).equals(targetText);
+        }
+        if (expr instanceof WhereExpr.RangeOverlaps rangeOverlaps) {
+            Object startValue = resolveColumnValue(row, rangeOverlaps.startColumn(), outerRow);
+            Object endValue = resolveColumnValue(row, rangeOverlaps.endColumn(), outerRow);
+            if (startValue == null || endValue == null) {
+                return false;
+            }
+            long rowStart = ((Number) startValue).longValue();
+            long rowEnd = ((Number) endValue).longValue();
+            long queryStart = ((Number) parseLiteral(rangeOverlaps.queryStartLiteral())).longValue();
+            long queryEnd = ((Number) parseLiteral(rangeOverlaps.queryEndLiteral())).longValue();
+            // Standard interval overlap test: [a,b] and [c,d] overlap iff a <= d AND c <= b.
+            return rowStart <= queryEnd && queryStart <= rowEnd;
         }
         if (expr instanceof WhereExpr.InList inList) {
             Object value = resolveColumnValue(row, inList.column(), outerRow);

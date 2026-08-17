@@ -2115,6 +2115,78 @@ public class StratosDBTest {
         assertEquals(1, result.getRows().size());
     }
 
+    // --- GiST: closing out the last named gap in this project's indexing
+    // scorecard, scoped honestly to GiST's own classic real-world
+    // application - interval/range overlap over a (start, end) column
+    // pair - rather than a hollow relabeling of B+Tree. Needed real
+    // multi-column index support first (CREATE INDEX ... (col1, col2)),
+    // which didn't exist before this either.
+
+    @Test
+    void testRangeOverlapsWithoutAnyIndex() {
+        database.execute("CREATE TABLE bookings (id INT, start_day INT, end_day INT)");
+        database.execute("INSERT INTO bookings VALUES (1, 1, 5)");
+        database.execute("INSERT INTO bookings VALUES (2, 10, 15)");
+        database.execute("INSERT INTO bookings VALUES (3, 4, 8)");
+
+        QueryResult result = database.execute("SELECT id FROM bookings WHERE (start_day, end_day) OVERLAPS (3, 6)");
+        assertTrue(result.isSuccess(), () -> "OVERLAPS must work correctly with no index at all: " + result.getError());
+        assertEquals(2, result.getRows().size(), "rows 1 [1,5] and 3 [4,8] both overlap the query range [3,6]");
+    }
+
+    @Test
+    void testRangeOverlapsBoundaryAndGapCases() {
+        database.execute("CREATE TABLE bookings (id INT, start_day INT, end_day INT)");
+        database.execute("INSERT INTO bookings VALUES (1, 10, 15)");
+        database.execute("INSERT INTO bookings VALUES (2, 20, 25)");
+
+        QueryResult gap = database.execute("SELECT id FROM bookings WHERE (start_day, end_day) OVERLAPS (16, 19)");
+        assertEquals(0, gap.getRows().size(), "a genuine gap between stored intervals must match nothing");
+
+        QueryResult boundaryTouch = database.execute("SELECT id FROM bookings WHERE (start_day, end_day) OVERLAPS (15, 20)");
+        assertEquals(2, boundaryTouch.getRows().size(), "touching a boundary point on both sides must count as overlapping - inclusive intervals");
+    }
+
+    @Test
+    void testCreateGistIndexRequiresExactlyTwoColumns() {
+        database.execute("CREATE TABLE bookings (id INT, start_day INT, end_day INT)");
+
+        QueryResult missingSecond = database.execute("CREATE INDEX idx1 ON bookings (start_day) USING GIST");
+        assertFalse(missingSecond.isSuccess(), "GIST with only one column must be rejected - an interval-overlap predicate needs both start and end");
+
+        QueryResult otherTypeWithTwo = database.execute("CREATE INDEX idx2 ON bookings (start_day, end_day) USING BTREE");
+        assertFalse(otherTypeWithTwo.isSuccess(), "a non-GIST index type must reject two columns - only GIST's interval-overlap use case needs the pair");
+    }
+
+    @Test
+    void testGistIndexReturnsSameResultsAsNoIndex() {
+        database.execute("CREATE TABLE bookings (id INT, start_day INT, end_day INT)");
+        database.execute("INSERT INTO bookings VALUES (1, 1, 5)");
+        database.execute("INSERT INTO bookings VALUES (2, 10, 15)");
+        database.execute("INSERT INTO bookings VALUES (3, 4, 8)");
+        database.execute("INSERT INTO bookings VALUES (4, 20, 25)");
+
+        QueryResult createResult = database.execute("CREATE INDEX idx_bookings ON bookings (start_day, end_day) USING GIST");
+        assertTrue(createResult.isSuccess(), () -> "CREATE INDEX ... USING GIST must succeed: " + createResult.getError());
+
+        QueryResult withIndex = database.execute("SELECT id FROM bookings WHERE (start_day, end_day) OVERLAPS (3, 6)");
+        assertTrue(withIndex.isSuccess());
+        assertEquals(2, withIndex.getRows().size(), "the GIST-accelerated path must return the exact same rows as the no-index path did");
+    }
+
+    @Test
+    void testGistIndexMaintainedOnNewInserts() {
+        // The same staleness-bug class found and fixed for BRIN/bitmap/GIN, and
+        // re-verified for array and JSON indexing - re-verified again for GIST.
+        database.execute("CREATE TABLE bookings (id INT, start_day INT, end_day INT)");
+        database.execute("INSERT INTO bookings VALUES (1, 1, 5)");
+        database.execute("CREATE INDEX idx_bookings ON bookings (start_day, end_day) USING GIST");
+
+        database.execute("INSERT INTO bookings VALUES (2, 3, 4)");
+        QueryResult result = database.execute("SELECT id FROM bookings WHERE (start_day, end_day) OVERLAPS (3, 6)");
+        assertEquals(2, result.getRows().size(), "a row inserted after GIST index creation must be reflected immediately");
+    }
+
     private Tuple qualifiedTuple(String table, String col1, Object val1, String col2, Object val2) {
         Tuple t = new Tuple();
         t.addValue(table + "." + col1, val1);

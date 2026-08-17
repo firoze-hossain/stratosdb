@@ -7,7 +7,7 @@ sqlStatement: createTable | createIndex | insert | selectWithCte | select | upda
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
-createIndex: CREATE INDEX indexName ON tableName LPAREN columnName RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP))? SEMICOLON?;
+createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
 createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
@@ -82,6 +82,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName CONTAINS literal                            #ContainsCompare
           | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
           | columnName JSON_EXTRACT_TEXT literal ASSIGN literal    #JsonExtractTextEqCompare
+          | LPAREN columnName COMMA columnName RPAREN OVERLAPS LPAREN literal COMMA literal RPAREN #RangeOverlapsCompare
           | columnName IN LPAREN valueList RPAREN                  #InListExpr
           | columnName NOT IN LPAREN valueList RPAREN               #NotInListExpr
           | columnName IN LPAREN select RPAREN                      #InSubqueryExpr
@@ -182,6 +183,8 @@ BTREE: B T R E E;
 BRIN: B R I N;
 GIN: G I N;
 BITMAP: B I T M A P;
+GIST: G I S T;
+OVERLAPS: O V E R L A P S;
 CONTAINS: C O N T A I N S;
 JOIN: J O I N;
 INNER: I N N E R;
