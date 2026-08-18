@@ -48,6 +48,23 @@ final class ExtendedProtocolHandler {
     private final Map<String, PreparedStatement> preparedStatements = new HashMap<>();
     private final Map<String, Portal> portals = new HashMap<>();
 
+    /**
+     * Set the moment any extended-protocol message fails - references a
+     * prepared statement/portal that doesn't exist, or a Bind whose
+     * substituted query itself fails at execution. Real Postgres's own
+     * behavior, and the reason this exists: once one message in a
+     * pipelined Parse/Bind/.../Sync batch fails, every later message
+     * before the next Sync is skipped rather than acted on, so a stale
+     * portal or statement from an earlier, unrelated part of the session
+     * can never be silently picked up and executed in its place just
+     * because a later message happened to reuse the same name. A real,
+     * previously-latent gap found by testing this exact sequence - Bind
+     * fails, then Execute against a portal name that still had a valid,
+     * unrelated entry from earlier in the session - and returned that
+     * stale row instead of correctly doing nothing until Sync.
+     */
+    private boolean inErrorState = false;
+
     ExtendedProtocolHandler(StratosDB db, StdWireServer server) {
         this.db = db;
         this.server = server;
@@ -55,6 +72,9 @@ final class ExtendedProtocolHandler {
 
     /** Dispatches one extended-protocol message and returns the (possibly updated) inTransaction state - the same state threaded through the simple query path, since a Bind/Execute can just as easily run inside an explicit transaction as a simple 'Q' statement can. */
     boolean handle(StdWireMessages.TypedMessage msg, DataOutputStream out, boolean inTransaction) throws IOException {
+        if (inErrorState && msg.type() != 'S') {
+            return inTransaction; // silently skipped - see inErrorState's own javadoc
+        }
         switch (msg.type()) {
             case 'P' -> {
                 handleParse(msg, out);
@@ -75,6 +95,7 @@ final class ExtendedProtocolHandler {
                 return inTransaction;
             }
             case 'S' -> {
+                inErrorState = false; // Sync always clears it, whether or not an error actually happened this round
                 StdWireMessages.writeReadyForQuery(out, inTransaction ? 'T' : 'I');
                 out.flush();
                 return inTransaction;
@@ -95,6 +116,7 @@ final class ExtendedProtocolHandler {
         StdWireMessages.BindMessage bind = StdWireMessages.readBindMessage(msg);
         PreparedStatement stmt = preparedStatements.get(bind.statementName());
         if (stmt == null) {
+            inErrorState = true;
             StdWireMessages.writeErrorResponse(out, "Prepared statement does not exist: \"" + bind.statementName() + "\"");
             out.flush();
             return inTransaction;
@@ -111,6 +133,17 @@ final class ExtendedProtocolHandler {
         StdWireMessages.writeBindComplete(out);
         out.flush();
 
+        // No inErrorState=true here even when result failed: BindComplete was
+        // just sent, meaning Bind itself succeeded as a protocol operation - the
+        // eagerly-executed query's failure is stored on the portal and gets
+        // reported to the client later, via Describe (NoData) or Execute (the
+        // real ErrorResponse) - see this class's own javadoc on why execution
+        // happens this early. Marking the connection as errored before the
+        // client has even been told there's a problem would cause the message
+        // that's actually supposed to report it (Execute) to be silently
+        // skipped instead - a real regression caught by testing this exact
+        // "Bind succeeds, later Execute reports the real failure" sequence,
+        // not by inspection.
         if (result.isSuccess()) {
             return server.updateTransactionState(substituted, inTransaction);
         }
@@ -122,6 +155,7 @@ final class ExtendedProtocolHandler {
         if (describe.targetType() == 'S') {
             PreparedStatement stmt = preparedStatements.get(describe.name());
             if (stmt == null) {
+                inErrorState = true;
                 StdWireMessages.writeErrorResponse(out, "Prepared statement does not exist: \"" + describe.name() + "\"");
                 out.flush();
                 return;
@@ -137,6 +171,7 @@ final class ExtendedProtocolHandler {
         } else {
             Portal portal = portals.get(describe.name());
             if (portal == null) {
+                inErrorState = true;
                 StdWireMessages.writeErrorResponse(out, "Portal does not exist: \"" + describe.name() + "\"");
                 out.flush();
                 return;
@@ -158,6 +193,7 @@ final class ExtendedProtocolHandler {
         // and the portal's result was already fully computed at Bind time.
         Portal portal = portals.get(execute.portalName());
         if (portal == null) {
+            inErrorState = true;
             StdWireMessages.writeErrorResponse(out, "Portal does not exist: \"" + execute.portalName() + "\"");
             out.flush();
             return inTransaction;
@@ -165,6 +201,7 @@ final class ExtendedProtocolHandler {
 
         QueryResult result = portal.result();
         if (!result.isSuccess()) {
+            inErrorState = true;
             StdWireMessages.writeErrorResponse(out, result.getError());
             out.flush();
             return inTransaction;

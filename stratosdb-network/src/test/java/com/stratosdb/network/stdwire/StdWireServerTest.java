@@ -202,6 +202,116 @@ class StdWireServerTest {
     }
 
     @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void namedPreparedStatementCanBeReusedAcrossMultipleBindExecuteCalls() throws Exception {
+        // The actual point of a prepared statement: Parse ONCE, then Bind+Execute
+        // repeatedly with different parameter values, rather than a fresh
+        // Parse+Bind+Execute+Sync cycle per call (which is all extendedQuery's
+        // all-in-one helper, and every prior test using it, ever exercised).
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE t (id INT, name VARCHAR)");
+            conn.query("INSERT INTO t VALUES (1, 'Alice')");
+            conn.query("INSERT INTO t VALUES (2, 'Bob')");
+            conn.query("INSERT INTO t VALUES (3, 'Carol')");
+
+            conn.parse("myquery", "SELECT * FROM t WHERE id = $1");
+
+            assertTrue(conn.bind("", "myquery", "1"));
+            QueryOutcome first = conn.executePortal("");
+            conn.sync();
+            assertEquals(1, first.rowCount);
+            assertEquals("Alice", first.rows.get(0).get(1));
+
+            assertTrue(conn.bind("", "myquery", "2"));
+            QueryOutcome second = conn.executePortal("");
+            conn.sync();
+            assertEquals(1, second.rowCount);
+            assertEquals("Bob", second.rows.get(0).get(1));
+
+            assertTrue(conn.bind("", "myquery", "3"));
+            QueryOutcome third = conn.executePortal("");
+            conn.sync();
+            assertEquals(1, third.rowCount);
+            assertEquals("Carol", third.rows.get(0).get(1));
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void multiplePortalsFromOneStatementExecuteIndependently() throws Exception {
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE t (id INT, name VARCHAR)");
+            conn.query("INSERT INTO t VALUES (1, 'Alice')");
+            conn.query("INSERT INTO t VALUES (2, 'Bob')");
+
+            conn.parse("myquery", "SELECT * FROM t WHERE id = $1");
+            assertTrue(conn.bind("portalA", "myquery", "1"));
+            assertTrue(conn.bind("portalB", "myquery", "2"));
+
+            // Deliberately interleaved out of bind order - each portal must
+            // independently remember its own bound parameter value.
+            QueryOutcome resultB = conn.executePortal("portalB");
+            QueryOutcome resultA = conn.executePortal("portalA");
+            conn.sync();
+
+            assertEquals("Bob", resultB.rows.get(0).get(1));
+            assertEquals("Alice", resultA.rows.get(0).get(1));
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void closeRemovesTheStatementAndSubsequentBindCorrectlyErrors() throws Exception {
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE t (id INT)");
+            conn.parse("myquery", "SELECT * FROM t WHERE id = $1");
+            conn.closeStatement("myquery");
+
+            boolean bindSucceeded = conn.bind("", "myquery", "1");
+            conn.sync();
+            assertFalse(bindSucceeded, "binding against a closed statement must fail with an error, not silently succeed");
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void failedBindPutsConnectionInErrorStateUntilSync() throws Exception {
+        // A real, previously-latent bug found by testing this exact sequence: a
+        // failed Bind must cause every subsequent extended-protocol message to be
+        // skipped until the next Sync (matching real Postgres's own pipelined
+        // error-recovery semantics) - not silently fall through to whatever
+        // stale portal/statement of the same name happens to still exist from
+        // earlier, unrelated activity on the same connection.
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE t (id INT, name VARCHAR)");
+            conn.query("INSERT INTO t VALUES (1, 'Alice')");
+
+            // Leave a valid, real unnamed portal in place first.
+            conn.parse("myquery", "SELECT * FROM t WHERE id = $1");
+            assertTrue(conn.bind("", "myquery", "1"));
+            QueryOutcome beforeError = conn.executePortal("");
+            conn.sync();
+            assertEquals("Alice", beforeError.rows.get(0).get(1));
+
+            // Now: Bind against a nonexistent statement (fails), then Execute the
+            // SAME unnamed portal name that still holds the earlier, valid result.
+            conn.closeStatement("myquery"); // so the next Bind against "myquery" genuinely fails
+            boolean bindSucceeded = conn.bind("", "myquery", "1");
+            assertFalse(bindSucceeded);
+
+            // sendExecute+sendSync (not executePortal+sync): after a failed Bind, the
+            // server correctly sends ZERO response bytes for the skipped Execute -
+            // reading immediately, as executePortal would, deadlocks waiting for a
+            // response that (correctly) never comes until Sync's own ReadyForQuery.
+            conn.sendExecute("");
+            conn.sendSync();
+            QueryOutcome afterFailedBind = conn.readAllUntilReadyForQuery();
+            assertEquals(0, afterFailedBind.rowCount,
+                "after a failed Bind, the skipped Execute must return zero rows - specifically, it must NOT silently return the earlier, unrelated portal's stale 'Alice' row");
+        }
+    }
+
+    @Test
     @Timeout(value = 15, unit = TimeUnit.SECONDS)
     void realPsycopg2ClientUsesExtendedProtocolForParameterizedQueries() throws Exception {
         // The strongest possible verification: a real, unmodified, independent
@@ -518,6 +628,138 @@ class StdWireServerTest {
             out.writeByte(type);
             out.writeInt(body.length + 4);
             out.write(body);
+        }
+
+        /** Parse a NAMED statement (unlike extendedQuery, always unnamed) - reads and discards ParseComplete. */
+        void parse(String statementName, String sqlWithPlaceholders) throws IOException {
+            byte[] queryBytes = sqlWithPlaceholders.getBytes(StandardCharsets.UTF_8);
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            body.write(statementName.getBytes(StandardCharsets.UTF_8)); body.write(0);
+            body.write(queryBytes); body.write(0);
+            body.write(0); body.write(0); // 0 parameter type OIDs
+            writeTypedMessage(out, 'P', body.toByteArray());
+            out.flush();
+            char type = (char) in.readUnsignedByte();
+            int len = in.readInt();
+            in.readFully(new byte[len - 4]);
+            if (type != '1') throw new IOException("expected ParseComplete, got: " + type);
+        }
+
+        /** Bind a (possibly named) portal to a (possibly named) statement - reads and returns whether BindComplete ('2', true) or ErrorResponse ('E', false) came back, without assuming which. */
+        boolean bind(String portalName, String statementName, String... paramValues) throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            body.write(portalName.getBytes(StandardCharsets.UTF_8)); body.write(0);
+            body.write(statementName.getBytes(StandardCharsets.UTF_8)); body.write(0);
+            body.write(0); body.write(0); // 0 parameter format codes (all text)
+            body.write(0); body.write(paramValues.length);
+            for (String v : paramValues) {
+                if (v == null) {
+                    body.write(-1); body.write(-1); body.write(-1); body.write(-1);
+                } else {
+                    byte[] vb = v.getBytes(StandardCharsets.UTF_8);
+                    body.write((vb.length >> 24) & 0xFF); body.write((vb.length >> 16) & 0xFF);
+                    body.write((vb.length >> 8) & 0xFF); body.write(vb.length & 0xFF);
+                    body.write(vb);
+                }
+            }
+            body.write(0); body.write(0); // 0 result format codes (all text)
+            writeTypedMessage(out, 'B', body.toByteArray());
+            out.flush();
+            char type = (char) in.readUnsignedByte();
+            int len = in.readInt();
+            byte[] respBody = new byte[len - 4];
+            in.readFully(respBody);
+            if (type == 'E') return false;
+            if (type != '2') throw new IOException("expected BindComplete or ErrorResponse, got: " + type);
+            return true;
+        }
+
+        /** Execute a (possibly named) portal and read its full response (rows, command tag, or error) - does NOT send Sync; caller composes sync() separately so multiple Executes can be issued before one Sync, exactly matching real pipelining. */
+        QueryOutcome executePortal(String portalName) throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            body.write(portalName.getBytes(StandardCharsets.UTF_8)); body.write(0);
+            body.write(0); body.write(0); body.write(0); body.write(0); // maxRows = 0
+            writeTypedMessage(out, 'E', body.toByteArray());
+            out.flush();
+
+            List<String> columnNames = new java.util.ArrayList<>();
+            List<List<String>> rows = new java.util.ArrayList<>();
+            String commandTag = null;
+            String error = null;
+            // Execute's own response is exactly one of: a run of DataRows then CommandComplete, or a single ErrorResponse.
+            while (commandTag == null && error == null) {
+                int type = in.readUnsignedByte();
+                int len = in.readInt();
+                byte[] body2 = new byte[len - 4];
+                in.readFully(body2);
+                if (type == 'D') rows.add(parseDataRowValues(body2));
+                else if (type == 'C') commandTag = new String(body2, 0, body2.length - 1, StandardCharsets.UTF_8);
+                else if (type == 'E') error = extractErrorMessage(body2);
+            }
+            return new QueryOutcome(rows.size(), columnNames, rows, commandTag, error);
+        }
+
+        /** Sends Execute WITHOUT reading any response - for scenarios where the server may legitimately send zero bytes back (a skipped message after an error), where reading immediately would deadlock. Pair with a follow-up read (see readUntilReadyForQuery) after also sending Sync. */
+        void sendExecute(String portalName) throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            body.write(portalName.getBytes(StandardCharsets.UTF_8)); body.write(0);
+            body.write(0); body.write(0); body.write(0); body.write(0); // maxRows = 0
+            writeTypedMessage(out, 'E', body.toByteArray());
+        }
+
+        void sendSync() throws IOException {
+            writeTypedMessage(out, 'S', new byte[0]);
+            out.flush();
+        }
+
+        /** Reads every response message up through and including ReadyForQuery, tolerating zero response messages for a skipped command (see class javadoc on error-state handling) - the correct way to read back a batch of messages sent without reading in between (sendExecute, sendSync), as any real pipelining client would. */
+        QueryOutcome readAllUntilReadyForQuery() throws IOException {
+            List<String> columnNames = new java.util.ArrayList<>();
+            List<List<String>> rows = new java.util.ArrayList<>();
+            String commandTag = null;
+            String error = null;
+            while (true) {
+                int type = in.readUnsignedByte();
+                int len = in.readInt();
+                byte[] body = new byte[len - 4];
+                in.readFully(body);
+                if (type == 'Z') break;
+                if (type == 'T') columnNames.addAll(parseRowDescriptionNames(body));
+                if (type == 'D') rows.add(parseDataRowValues(body));
+                if (type == 'C') commandTag = new String(body, 0, body.length - 1, StandardCharsets.UTF_8);
+                if (type == 'E') error = extractErrorMessage(body);
+            }
+            return new QueryOutcome(rows.size(), columnNames, rows, commandTag, error);
+        }
+
+        void closeStatement(String name) throws IOException {
+            closeTarget('S', name);
+        }
+
+        void closePortal(String name) throws IOException {
+            closeTarget('P', name);
+        }
+
+        private void closeTarget(char targetType, String name) throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            body.write(targetType);
+            body.write(name.getBytes(StandardCharsets.UTF_8)); body.write(0);
+            writeTypedMessage(out, 'C', body.toByteArray());
+            out.flush();
+            char type = (char) in.readUnsignedByte();
+            int len = in.readInt();
+            in.readFully(new byte[len - 4]);
+            if (type != '3') throw new IOException("expected CloseComplete, got: " + type);
+        }
+
+        /** Sends Sync and reads ReadyForQuery - must be called to end an extended-protocol exchange built from the composable methods above. */
+        void sync() throws IOException {
+            writeTypedMessage(out, 'S', new byte[0]);
+            out.flush();
+            char type = (char) in.readUnsignedByte();
+            int len = in.readInt();
+            in.readFully(new byte[len - 4]);
+            if (type != 'Z') throw new IOException("expected ReadyForQuery after Sync, got: " + type);
         }
 
         @Override
