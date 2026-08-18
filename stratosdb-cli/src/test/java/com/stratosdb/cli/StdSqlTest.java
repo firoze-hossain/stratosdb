@@ -68,7 +68,7 @@ class StdSqlTest {
         try {
             System.setIn(new ByteArrayInputStream(scriptedInput.getBytes(StandardCharsets.UTF_8)));
             System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
-            new StdSql("localhost", port, "testuser", "testdb").start();
+            new StdSql("localhost", port, "testuser", "testdb", null).start();
         } finally {
             System.setIn(originalIn);
             System.setOut(originalOut);
@@ -133,5 +133,93 @@ class StdSqlTest {
         );
 
         assertTrue(output.contains("NULL"), () -> "expected the NULL parameter to display as NULL in the subsequent SELECT, got:\n" + output);
+    }
+
+    // --- SCRAM-SHA-256: stdsql must complete the real handshake against a
+    // UserStore-protected server, not hang or silently ignore the challenge
+    // (a real, previously-latent bug: this client used to ignore any 'R'
+    // message without checking its auth code, so it would have hung
+    // forever against a server offering SCRAM, waiting for a
+    // SASLInitialResponse it never sent).
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void authenticatesAgainstAScramProtectedServerWithCorrectPassword() throws Exception {
+        com.stratosdb.network.auth.UserStore userStore = new com.stratosdb.network.auth.UserStore();
+        userStore.addUser("scramuser", "correct-password");
+        int scramPort = findFreePort();
+        StdWireServer scramServer = new StdWireServer(scramPort, db, userStore);
+        scramServer.start();
+        Thread.sleep(200);
+        try {
+            InputStream originalIn = System.in;
+            PrintStream originalOut = System.out;
+            ByteArrayOutputStream captured = new ByteArrayOutputStream();
+            try {
+                System.setIn(new ByteArrayInputStream("CREATE TABLE t (id INT)\nINSERT INTO t VALUES (7)\nSELECT * FROM t\n\\q\n".getBytes(StandardCharsets.UTF_8)));
+                System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+                new StdSql("localhost", scramPort, "scramuser", "testdb", "correct-password").start();
+            } finally {
+                System.setIn(originalIn);
+                System.setOut(originalOut);
+            }
+            String output = captured.toString(StandardCharsets.UTF_8);
+            assertTrue(output.contains("CREATE TABLE"), () -> "SCRAM handshake must complete and allow real SQL to execute, got:\n" + output);
+            assertTrue(output.contains("7"), () -> "expected the inserted row's data, got:\n" + output);
+        } finally {
+            scramServer.stop();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void rejectsWrongPasswordAgainstAScramProtectedServer() throws Exception {
+        com.stratosdb.network.auth.UserStore userStore = new com.stratosdb.network.auth.UserStore();
+        userStore.addUser("scramuser2", "the-real-password");
+        int scramPort = findFreePort();
+        StdWireServer scramServer = new StdWireServer(scramPort, db, userStore);
+        scramServer.start();
+        Thread.sleep(200);
+        try {
+            assertThrows(java.io.IOException.class,
+                () -> new StdSql("localhost", scramPort, "scramuser2", "testdb", "wrong-password"),
+                "a wrong password must fail the handshake, not silently connect");
+        } finally {
+            scramServer.stop();
+        }
+    }
+
+    // --- main()'s psql-style CLI flag parsing: -h/-p/-U/-d, plus the
+    // trailing-positional-argument-as-database convention psql itself uses.
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void mainAcceptsPsqlStyleFlagsInAnyOrder() throws Exception {
+        String output = runMainWithArgs("-p", String.valueOf(port), "-U", "testuser", "-h", "localhost", "-d", "testdb");
+        assertTrue(output.contains("connected to localhost:" + port + " as testuser/testdb"),
+            () -> "expected a successful connection using flag-based arguments, got:\n" + output);
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void mainAcceptsATrailingPositionalDatabaseNameLikePsqlDoes() throws Exception {
+        String output = runMainWithArgs("-h", "localhost", "-p", String.valueOf(port), "-U", "testuser", "mydb");
+        assertTrue(output.contains("connected to localhost:" + port + " as testuser/mydb"),
+            () -> "expected the trailing positional argument to be treated as the database name, got:\n" + output);
+    }
+
+    private String runMainWithArgs(String... args) throws Exception {
+        InputStream originalIn = System.in;
+        PrintStream originalOut = System.out;
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        try {
+            System.setIn(new ByteArrayInputStream("\\q\n".getBytes(StandardCharsets.UTF_8)));
+            System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+            StdSql.main(args);
+        } finally {
+            System.setIn(originalIn);
+            System.setOut(originalOut);
+        }
+        return captured.toString(StandardCharsets.UTF_8);
     }
 }

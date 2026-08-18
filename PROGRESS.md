@@ -9,8 +9,8 @@
 | Commits | 9 |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
-| Tests passing | **245 / 245** |
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. This round: real SCRAM-SHA-256 authentication (RFC 5802) - a genuine cryptographic challenge-response handshake, not a password sent in the clear, verified against real, unmodified `psql` and `psycopg2` (both negotiate it automatically) plus an independently hand-rolled client sharing no code with the server implementation |
+| Tests passing | **249 / 249** |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. This round: `stdsql` gained real SCRAM-SHA-256 client support (a real, previously-latent bug: it used to silently ignore the server's SASL challenge, which would have hung forever against a SCRAM-protected server) and psql-style `-h`/`-p`/`-U`/`-d` command-line flags, replacing positional arguments |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -421,6 +421,17 @@ Closes one of the two remaining named wire-protocol gaps. Not a simplified stand
 - Verified with `ScramSha256Test` (5 tests, using an independent, from-scratch CLIENT-side SCRAM implementation written separately and sharing no helper code with the server implementation under test - a passing test proves genuine interoperability against the spec, not just that the server agrees with its own internal logic) and `ScramWireProtocolTest` (4 tests: a second independent client speaking the real wire bytes directly over a socket, trust auth's continued correctness, and the real `psycopg2` check).
 - 9 new tests (`ScramSha256Test`, `ScramWireProtocolTest`).
 - **Known, honestly-stated limitation**: channel binding (`SCRAM-SHA-256-PLUS`, the TLS-bound variant of this mechanism) is not implemented - this handshake accepts a client's "no channel binding" GS2 header at face value, matching plain `SCRAM-SHA-256` (what real Postgres also offers by default over a non-channel-bound connection), not the stronger, TLS-integrated variant.
+
+## `stdsql` gains real SCRAM support and psql-style flags
+
+A real, previously-latent bug found while extending `stdsql` (not by inspection): the client's own startup-response loop treated every `'R'` (Authentication*) message type identically, never checking the actual auth code inside it. Against a trust-auth server this happened to work by accident (`AuthenticationOk` needs no response). Against a server configured with real SCRAM-SHA-256 (added earlier this round - see above), `stdsql` would have hung forever: the server sends `AuthenticationSASL` and waits for a `SASLInitialResponse` that this client would never have sent.
+
+- ✅ **`ScramClient`**: a real, from-scratch CLIENT-side SCRAM-SHA-256 implementation (`stratosdb-network`'s auth package, alongside the server-side `ScramSha256` and `ScramSha256Test`'s own independent test-only client) - a genuinely different role in the handshake from the server side (derives SaltedPassword from a real plaintext password via PBKDF2, builds the proof, independently verifies the server's own signature back). Reusable by any future client work, not `stdsql`-specific.
+- ✅ **`stdsql` now completes the real handshake**: checks the actual auth code in every `AuthenticationOk`/`AuthenticationSASL` message, performs the full `SASLInitialResponse` → read `AuthenticationSASLContinue` → `SASLResponse` → read `AuthenticationSASLFinal` exchange when the server demands it, and verifies the server's own signature (aborting on a mismatch - real mutual-authentication defense, not just checking its own login succeeded).
+- ✅ **Password handling matches psql's own conventions**: read from a `STDSQL_PASSWORD` environment variable (mirroring `PGPASSWORD`) if set, otherwise prompted for interactively (masked via `Console.readPassword` when a real terminal is attached, falling back to a visible stdin prompt otherwise) - never accepted as a plain command-line argument, since that would leak into shell history and process listings.
+- ✅ **Real psql-style CLI flags**: `stdsql -h host -p port -U user -d database`, in any order, plus psql's own trailing-positional-argument-as-database-name convention (`stdsql -U user dbname`) - replacing the previous positional-only `stdsql host port user database` form entirely.
+- Verified end to end against a real, running SCRAM-protected server: correct password authenticates and executes real SQL, wrong password is cleanly rejected with a clear error (not a hang or a stack trace), and flag parsing is tested in multiple orders plus the trailing-positional-database case.
+- 4 new tests in `StdSqlTest`.
 
 ## What to do next
 

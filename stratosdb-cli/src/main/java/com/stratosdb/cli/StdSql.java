@@ -1,6 +1,7 @@
 package com.stratosdb.cli;
 
 import com.stratosdb.common.constants.ProtocolConstants;
+import com.stratosdb.network.auth.ScramClient;
 import com.stratosdb.network.stdwire.StdWireMessages;
 
 import java.io.BufferedOutputStream;
@@ -8,7 +9,9 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.io.Console;
 import java.util.List;
 import java.util.Scanner;
 
@@ -26,7 +29,15 @@ import java.util.Scanner;
  * explicitly via the \bind command below, since psql's own interactive
  * prompt doesn't expose a simple way to trigger that path on demand.
  *
- * Two input forms:
+ * Command-line usage matches psql's own flag conventions:
+ * {@code stdsql -h host -p port -U user -d database}, with a password
+ * read from the STDSQL_PASSWORD environment variable if set (matching
+ * psql's own PGPASSWORD), or prompted for interactively if the server
+ * demands one and none was supplied - never accepted as a plain
+ * command-line argument, since that would leak it into shell history
+ * and process listings.
+ *
+ * Two input forms once connected:
  *   - A plain SQL statement -> sent as a single simple-query ('Q') message.
  *   - "\bind SQL_WITH_$N_PLACEHOLDERS | value1 | value2 | ..." -> drives
  *     the full extended protocol: Parse (unnamed statement) -> Bind
@@ -40,21 +51,28 @@ public class StdSql {
     private final String connectionDescription;
     private boolean running = true;
 
-    public StdSql(String host, int port, String user, String database) throws IOException {
+    public StdSql(String host, int port, String user, String database, String password) throws IOException {
         this.socket = new Socket(host, port);
         this.in = new DataInputStream(new java.io.BufferedInputStream(socket.getInputStream()));
         this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         this.connectionDescription = host + ":" + port + " as " + user + (database != null ? "/" + database : "");
 
         StdWireMessages.writeStartupMessage(out, user, database);
-        readStartupResponses();
+        readStartupResponses(user, password);
     }
 
-    private void readStartupResponses() throws IOException {
+    private void readStartupResponses(String user, String password) throws IOException {
         while (true) {
             StdWireMessages.TypedMessage msg = StdWireMessages.readTypedMessage(in);
             switch (msg.type()) {
-                case 'R' -> { /* AuthenticationOk (or a real auth challenge, not yet sent by this server - see StdWireMessages' javadoc) */ }
+                case 'R' -> {
+                    int authCode = readAuthCode(msg);
+                    if (authCode == 10) {
+                        performScramHandshake(user, password);
+                    }
+                    // authCode 0 (AuthenticationOk) needs no action - just keep reading
+                    // toward ReadyForQuery, same as every other case here.
+                }
                 case 'S', 'K' -> { /* ParameterStatus / BackendKeyData - informational, not needed for this simple client */ }
                 case 'Z' -> {
                     return; // ReadyForQuery - startup is complete
@@ -63,6 +81,83 @@ public class StdSql {
                 default -> { /* ignore anything else during startup */ }
             }
         }
+    }
+
+    /**
+     * Real SCRAM-SHA-256 (RFC 5802) - the actual mechanism this server
+     * offers, not a stand-in. If no password was supplied on the command
+     * line or via STDSQL_PASSWORD, prompts for one interactively
+     * (matching psql's own behavior for exactly this situation), rather
+     * than failing outright or silently sending an empty password.
+     */
+    private void performScramHandshake(String username, String password) throws IOException {
+        if (password == null) {
+            password = promptForPassword(username);
+        }
+
+        ScramClient scram = new ScramClient(username, password);
+        String clientFirstMessage = scram.buildClientFirstMessage();
+        writeSaslInitialResponse(clientFirstMessage);
+
+        StdWireMessages.TypedMessage continueMsg = StdWireMessages.readTypedMessage(in);
+        if (continueMsg.type() != 'R' || readAuthCode(continueMsg) != 11) {
+            throw new IOException("Expected AuthenticationSASLContinue during SCRAM handshake");
+        }
+        String serverFirstMessage = new String(continueMsg.body(), 4, continueMsg.body().length - 4, StandardCharsets.UTF_8);
+
+        String clientFinalMessage = scram.buildClientFinalMessage(serverFirstMessage);
+        byte[] cfBytes = clientFinalMessage.getBytes(StandardCharsets.UTF_8);
+        out.writeByte('p');
+        out.writeInt(cfBytes.length + 4);
+        out.write(cfBytes);
+        out.flush();
+
+        StdWireMessages.TypedMessage finalMsg = StdWireMessages.readTypedMessage(in);
+        if (finalMsg.type() == 'E') {
+            throw new IOException("Authentication failed: " + extractErrorMessage(finalMsg));
+        }
+        if (finalMsg.type() != 'R' || readAuthCode(finalMsg) != 12) {
+            throw new IOException("Expected AuthenticationSASLFinal during SCRAM handshake");
+        }
+        String serverFinalMessage = new String(finalMsg.body(), 4, finalMsg.body().length - 4, StandardCharsets.UTF_8);
+        if (!scram.verifyServerFinalMessage(serverFinalMessage)) {
+            throw new IOException("Server's SCRAM signature did not verify - possible impersonation, aborting");
+        }
+        // The server sends a normal AuthenticationOk right after AuthenticationSASLFinal -
+        // readStartupResponses' own loop will read and correctly ignore it (authCode 0).
+    }
+
+    private void writeSaslInitialResponse(String clientFirstMessage) throws IOException {
+        byte[] mechanismBytes = com.stratosdb.network.auth.ScramSha256.MECHANISM_NAME.getBytes(StandardCharsets.UTF_8);
+        byte[] dataBytes = clientFirstMessage.getBytes(StandardCharsets.UTF_8);
+        int bodyLen = mechanismBytes.length + 1 + 4 + dataBytes.length;
+        out.writeByte('p');
+        out.writeInt(bodyLen + 4);
+        out.write(mechanismBytes);
+        out.writeByte(0);
+        out.writeInt(dataBytes.length);
+        out.write(dataBytes);
+        out.flush();
+    }
+
+    private String promptForPassword(String username) throws IOException {
+        Console console = System.console();
+        String promptText = "Password for user " + username + ": ";
+        if (console != null) {
+            char[] chars = console.readPassword(promptText);
+            return chars == null ? "" : new String(chars);
+        }
+        // No real console attached (e.g. input piped in) - fall back to a visible
+        // prompt on stdin, matching what psql itself does in the same situation.
+        System.out.print(promptText);
+        System.out.flush();
+        Scanner scanner = new Scanner(System.in);
+        return scanner.hasNextLine() ? scanner.nextLine() : "";
+    }
+
+    private static int readAuthCode(StdWireMessages.TypedMessage msg) {
+        byte[] body = msg.body();
+        return ((body[0] & 0xFF) << 24) | ((body[1] & 0xFF) << 16) | ((body[2] & 0xFF) << 8) | (body[3] & 0xFF);
     }
 
     public void start() {
@@ -212,17 +307,48 @@ public class StdSql {
     }
 
     public static void main(String[] args) throws Exception {
-        String host = args.length > 0 ? args[0] : "localhost";
-        int port = args.length > 1 ? Integer.parseInt(args[1]) : ProtocolConstants.DEFAULT_STDWIRE_PORT;
-        String user = args.length > 2 ? args[2] : "stratos";
-        String database = args.length > 3 ? args[3] : "stratosdb";
+        String host = "localhost";
+        int port = ProtocolConstants.DEFAULT_STDWIRE_PORT;
+        String user = System.getProperty("user.name", "stratos");
+        String database = null;
+
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "-h" -> host = requireArg(args, ++i, "-h");
+                case "-p" -> port = Integer.parseInt(requireArg(args, ++i, "-p"));
+                case "-U" -> user = requireArg(args, ++i, "-U");
+                case "-d" -> database = requireArg(args, ++i, "-d");
+                default -> {
+                    if (database == null && !args[i].startsWith("-")) {
+                        // A trailing positional argument with no -d given is the database
+                        // name - matches psql's own convention exactly (`psql -U user dbname`).
+                        database = args[i];
+                    } else {
+                        System.out.println("Unrecognized argument: " + args[i]);
+                        System.out.println("Usage: stdsql -h host -p port -U user -d database");
+                        return;
+                    }
+                }
+            }
+        }
+        if (database == null) {
+            database = user;
+        }
+        String password = System.getenv("STDSQL_PASSWORD");
 
         try {
-            StdSql client = new StdSql(host, port, user, database);
+            StdSql client = new StdSql(host, port, user, database, password);
             client.start();
         } catch (IOException e) {
             System.out.println("Could not connect to StratosDB stdwire server at " + host + ":" + port + " - " + e.getMessage());
             System.out.println("Is the server running? Start it with stratosdb-network's StdWireServerMain first.");
         }
+    }
+
+    private static String requireArg(String[] args, int index, String flag) {
+        if (index >= args.length) {
+            throw new IllegalArgumentException(flag + " requires a value");
+        }
+        return args[index];
     }
 }
