@@ -1,6 +1,8 @@
 package com.stratosdb.network.stdwire;
 
 import com.stratosdb.core.StratosDB;
+import com.stratosdb.network.auth.ScramSha256;
+import com.stratosdb.network.auth.UserStore;
 import com.stratosdb.sql.executor.QueryResult;
 import com.stratosdb.storage.page.Tuple;
 import org.slf4j.Logger;
@@ -29,22 +31,30 @@ import java.util.regex.Pattern;
  * underlying StratosDB instance, on different ports, since neither owns
  * the database, they just speak different protocols to reach it.
  *
- * Scope: the startup handshake and the simple query protocol (see
- * StdWireMessages' javadoc for exactly what that does and doesn't cover).
+ * Scope: the startup handshake, the simple query protocol, the extended
+ * query protocol, and now real SCRAM-SHA-256 authentication when a
+ * UserStore is supplied (see StdWireMessages' javadoc for exactly what
+ * else this does and doesn't cover).
  */
 public class StdWireServer {
     private static final Logger LOG = LoggerFactory.getLogger(StdWireServer.class);
 
     private final int port;
     private final StratosDB db;
+    private final UserStore userStore; // null = trust auth, matching StratosServer's own established convention for this project
     private volatile boolean running = false;
     private ServerSocket serverSocket;
     private ExecutorService connectionExecutor;
     private final AtomicInteger nextPid = new AtomicInteger(1000);
 
     public StdWireServer(int port, StratosDB db) {
+        this(port, db, null);
+    }
+
+    public StdWireServer(int port, StratosDB db, UserStore userStore) {
         this.port = port;
         this.db = db;
+        this.userStore = userStore;
     }
 
     public void start() throws IOException {
@@ -164,9 +174,16 @@ public class StdWireServer {
         LOG.info("pg-wire startup: user={} database={} application_name={}",
             params.get("user"), params.get("database"), params.get("application_name"));
 
-        // Trust auth: no password required. A real, stated scope limit - see
-        // StdWireMessages' javadoc for why (SCRAM is a separate, later item).
-        StdWireMessages.writeAuthenticationOk(out);
+        if (userStore != null) {
+            if (!performScramAuthentication(params.get("user"), in, out)) {
+                return false; // performScramAuthentication already sent the ErrorResponse
+            }
+        } else {
+            // Trust auth: no password required - the unchanged default when no
+            // UserStore is supplied, matching StratosServer's own established
+            // convention for this project.
+            StdWireMessages.writeAuthenticationOk(out);
+        }
         StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB pg-wire compatibility layer)");
         StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
         StdWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");
@@ -175,6 +192,65 @@ public class StdWireServer {
         StdWireMessages.writeBackendKeyData(out, nextPid.getAndIncrement(), 12345);
         StdWireMessages.writeReadyForQuery(out, 'I');
         out.flush();
+        return true;
+    }
+
+    /**
+     * The real SCRAM-SHA-256 handshake (RFC 5802) - see ScramSha256's own
+     * javadoc for the cryptographic details. Only ever reached when a
+     * UserStore was supplied to this server; trust auth (the unchanged
+     * default) never calls this at all.
+     */
+    private boolean performScramAuthentication(String username, DataInputStream in, DataOutputStream out) throws IOException {
+        StdWireMessages.writeAuthenticationSasl(out, ScramSha256.MECHANISM_NAME);
+        out.flush();
+
+        StdWireMessages.TypedMessage initialMsg = StdWireMessages.readTypedMessage(in);
+        if (initialMsg.type() != 'p') {
+            StdWireMessages.writeErrorResponse(out, "Expected SASLInitialResponse");
+            out.flush();
+            return false;
+        }
+        StdWireMessages.SaslInitialResponse initial = StdWireMessages.readSaslInitialResponse(initialMsg);
+        if (!ScramSha256.MECHANISM_NAME.equals(initial.mechanism())) {
+            StdWireMessages.writeErrorResponse(out, "Unsupported SASL mechanism: " + initial.mechanism());
+            out.flush();
+            return false;
+        }
+
+        UserStore.ScramCredential credential = userStore.getScramCredential(username);
+        ScramSha256.Handshake handshake = new ScramSha256.Handshake(username, credential);
+
+        String serverFirstMessage;
+        try {
+            serverFirstMessage = handshake.clientFirst(initial.initialResponseData());
+        } catch (ScramSha256.ScramAuthenticationException e) {
+            StdWireMessages.writeErrorResponse(out, "Authentication failed: " + e.getMessage());
+            out.flush();
+            return false;
+        }
+        StdWireMessages.writeAuthenticationSaslContinue(out, serverFirstMessage);
+        out.flush();
+
+        StdWireMessages.TypedMessage finalMsg = StdWireMessages.readTypedMessage(in);
+        if (finalMsg.type() != 'p') {
+            StdWireMessages.writeErrorResponse(out, "Expected SASLResponse");
+            out.flush();
+            return false;
+        }
+        String clientFinalMessage = StdWireMessages.readSaslResponse(finalMsg);
+
+        String serverFinalMessage;
+        try {
+            serverFinalMessage = handshake.clientFinal(clientFinalMessage);
+        } catch (ScramSha256.ScramAuthenticationException e) {
+            LOG.warn("SCRAM authentication failed for user {}: {}", username, e.getMessage());
+            StdWireMessages.writeErrorResponse(out, "password authentication failed for user \"" + username + "\"");
+            out.flush();
+            return false;
+        }
+        StdWireMessages.writeAuthenticationSaslFinal(out, serverFinalMessage);
+        StdWireMessages.writeAuthenticationOk(out);
         return true;
     }
 

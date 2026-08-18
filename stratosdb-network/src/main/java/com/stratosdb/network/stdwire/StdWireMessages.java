@@ -194,6 +194,53 @@ public final class StdWireMessages {
         writeMessage(out, 'R', buf -> buf.putInt(0));
     }
 
+    // --- SCRAM-SHA-256 authentication (AuthenticationSASL family) ---
+
+    /** AuthenticationSASL (auth code 10): lists the mechanism names the server supports, each null-terminated, ending with one additional empty string - a real client picks one and responds with SASLInitialResponse. */
+    public static void writeAuthenticationSasl(DataOutputStream out, String... mechanisms) throws IOException {
+        writeMessage(out, 'R', buf -> {
+            buf.putInt(10);
+            for (String mechanism : mechanisms) {
+                putCString(buf, mechanism);
+            }
+            buf.put((byte) 0); // final empty string terminates the mechanism list
+        });
+    }
+
+    /** SASLInitialResponse ('p'): the client's chosen mechanism name plus its initial response data (client-first-message for SCRAM) - the ONE 'p' message shaped differently from a plain PasswordMessage, since it's prefixed with the mechanism name and an explicit data length rather than being just a bare, null-terminated string. */
+    public record SaslInitialResponse(String mechanism, String initialResponseData) {}
+
+    public static SaslInitialResponse readSaslInitialResponse(TypedMessage msg) {
+        byte[] body = msg.body();
+        String mechanism = msg.readCString(0);
+        int pos = mechanism.length() + 1;
+        int dataLen = readIntAt(body, pos);
+        pos += 4;
+        String data = dataLen < 0 ? "" : new String(body, pos, dataLen, StandardCharsets.UTF_8);
+        return new SaslInitialResponse(mechanism, data);
+    }
+
+    /** AuthenticationSASLContinue (auth code 11): carries the server-first-message - unlike AuthenticationSASL's list of C-strings, this is raw bytes filling the rest of the message (no length prefix or terminator of its own; the outer message length IS the boundary). */
+    public static void writeAuthenticationSaslContinue(DataOutputStream out, String data) throws IOException {
+        writeMessage(out, 'R', buf -> {
+            buf.putInt(11);
+            buf.put(data.getBytes(StandardCharsets.UTF_8));
+        });
+    }
+
+    /** SASLResponse ('p'): raw SASL data (client-final-message for SCRAM) filling the whole message body - no mechanism name or length prefix this time, unlike SASLInitialResponse, since the server already knows which mechanism and handshake step this belongs to from context. */
+    public static String readSaslResponse(TypedMessage msg) {
+        return new String(msg.body(), StandardCharsets.UTF_8);
+    }
+
+    /** AuthenticationSASLFinal (auth code 12): carries the server-final-message - sent once verification succeeds, immediately followed by a normal AuthenticationOk. */
+    public static void writeAuthenticationSaslFinal(DataOutputStream out, String data) throws IOException {
+        writeMessage(out, 'R', buf -> {
+            buf.putInt(12);
+            buf.put(data.getBytes(StandardCharsets.UTF_8));
+        });
+    }
+
     public static void writeParameterStatus(DataOutputStream out, String name, String value) throws IOException {
         writeMessage(out, 'S', buf -> {
             putCString(buf, name);

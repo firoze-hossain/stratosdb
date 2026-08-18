@@ -66,6 +66,27 @@ public class UserStore {
         return !users.isEmpty();
     }
 
+    /**
+     * SCRAM-SHA-256's own three ingredients for a given user: the random
+     * salt, SaltedPassword (SCRAM's own name for exactly the PBKDF2 value
+     * this class already computes and stores as its "hash" - the same
+     * derivation, just under SCRAM's terminology), and the iteration
+     * count used to produce it (SCRAM communicates this to the client as
+     * part of the handshake, so the client can redo the same derivation).
+     * Returns null for an unknown user - the caller (ScramSha256) is
+     * responsible for its own username-enumeration-resistant handling of
+     * that case, mirroring what verify() already does for password auth.
+     */
+    public record ScramCredential(byte[] salt, byte[] saltedPassword, int iterations) {}
+
+    public ScramCredential getScramCredential(String username) {
+        StoredCredential cred = users.get(username);
+        if (cred == null) {
+            return null;
+        }
+        return new ScramCredential(cred.salt(), cred.hash(), PBKDF2_ITERATIONS);
+    }
+
     private static final byte[] DUMMY_SALT = new byte[SALT_LENGTH_BYTES];
 
     private byte[] hash(String password, byte[] salt) {
