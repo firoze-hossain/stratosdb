@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -17,6 +17,12 @@ showStats: SHOW STATS SEMICOLON?;
 createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
 dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
 sequenceName: IDENTIFIER;
+createFunction: CREATE (OR REPLACE)? FUNCTION functionName LPAREN (functionParam (COMMA functionParam)*)? RPAREN RETURNS dataType AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
+dropFunction: DROP FUNCTION functionName SEMICOLON?;
+functionName: IDENTIFIER;
+functionParam: IDENTIFIER dataType;
+functionCall: functionName LPAREN (functionArg (COMMA functionArg)*)? RPAREN;
+functionArg: literal | columnName;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
@@ -54,7 +60,7 @@ indexName: IDENTIFIER;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
-selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
+selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | functionCall (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
 windowFunction: (ROW_NUMBER | RANK | DENSE_RANK) LPAREN RPAREN OVER LPAREN (PARTITION BY groupByList)? (ORDER BY orderList)? RPAREN;
 
 // Expressions
@@ -165,6 +171,11 @@ SHOW: S H O W;
 TABLES: T A B L E S;
 STATS: S T A T S;
 SEQUENCE: S E Q U E N C E;
+FUNCTION: F U N C T I O N;
+RETURNS: R E T U R N S;
+LANGUAGE: L A N G U A G E;
+REPLACE: R E P L A C E;
+SQL_LANG: S Q L;
 ROW_NUMBER: R O W '_' N U M B E R;
 RANK: R A N K;
 DENSE_RANK: D E N S E '_' R A N K;
@@ -255,6 +266,8 @@ STAR: '*';
 // Literals
 IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
 STRING_LITERAL: '\'' ('\'\'' | ~['])* '\'';
+/** Postgres's own $$ ... $$ delimiter for a function body - lets the body contain semicolons, quotes, or anything else without conflicting with the surrounding statement's own delimiters. Non-greedy (.*?) so the FIRST closing $$ ends the body, not the last one in the whole remaining input. */
+DOLLAR_QUOTED_STRING: '$$' .*? '$$';
 INTEGER_LITERAL: [0-9]+;
 FLOAT_LITERAL: [0-9]+ '.' [0-9]+;
 BOOLEAN_LITERAL: TRUE | FALSE;

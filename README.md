@@ -43,12 +43,12 @@ mvn clean install -DskipTests
 mvn test
 ```
 
-Start a server and connect with a real PostgreSQL client:
+Start a server and connect with StratosDB's own native client:
 
 ```bash
 java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./data 6582 --stdwire
 # custom protocol on 6582, PostgreSQL-wire-compatible protocol on 6583 (port + 1 by default)
-psql -h localhost -p 6583 -U anyuser -d anydb
+java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar -h localhost -p 6583 -U anyuser -d anydb
 ```
 
 ```sql
@@ -57,7 +57,15 @@ INSERT INTO users VALUES (1, 'Alice', 30);
 SELECT * FROM users WHERE age >= 25;
 ```
 
-Or use StratosDB's own CLI and custom protocol — see [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for the full walkthrough, including authentication, TLS, and the benchmark suite.
+Port 6583 speaks real PostgreSQL wire protocol v3, so any actual PostgreSQL client also connects unmodified — no StratosDB-specific driver needed:
+
+```bash
+psql -h localhost -p 6583 -U anyuser -d anydb
+```
+
+Verified against real `psql`, `psycopg2`, and JDBC drivers, including SCRAM-SHA-256 authentication and parameterized queries via the extended query protocol — see [`PROGRESS.md`](./PROGRESS.md) for the specifics.
+
+See [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for the full walkthrough, including `StratosShell` (StratosDB's JDBC-based client, a separate tool from `stdsql` above), TLS, and the benchmark suite.
 
 ## Connecting from a Java application
 

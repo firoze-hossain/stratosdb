@@ -114,8 +114,29 @@ public class SqlParser {
             return new CreateSequenceStatement(name, startValue, incrementBy);
         } else if (ctx.dropSequence() != null) {
             return new DropSequenceStatement(ctx.dropSequence().sequenceName().getText());
+        } else if (ctx.createFunction() != null) {
+            return buildCreateFunction(ctx.createFunction());
+        } else if (ctx.dropFunction() != null) {
+            return new DropFunctionStatement(ctx.dropFunction().functionName().getText());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
+    }
+
+    private CreateFunctionStatement buildCreateFunction(StratosSQLParser.CreateFunctionContext ctx) {
+        String name = ctx.functionName().getText();
+        List<FunctionParam> params = new ArrayList<>();
+        for (StratosSQLParser.FunctionParamContext paramCtx : ctx.functionParam()) {
+            params.add(new FunctionParam(paramCtx.IDENTIFIER().getText(), paramCtx.dataType().getText()));
+        }
+        String returnType = ctx.dataType().getText();
+        // Strip the $$ ... $$ delimiters - DOLLAR_QUOTED_STRING's own raw text
+        // includes them (ANTLR gives back the exact matched text for a token),
+        // but the stored body should be just the SQL inside.
+        String rawDollarQuoted = ctx.DOLLAR_QUOTED_STRING().getText();
+        String body = rawDollarQuoted.substring(2, rawDollarQuoted.length() - 2).trim();
+        String language = ctx.SQL_LANG() != null ? "SQL" : ctx.IDENTIFIER().getText();
+        boolean orReplace = ctx.REPLACE() != null;
+        return new CreateFunctionStatement(name, params, returnType, body, language, orReplace);
     }
 
     private CreateIndexStatement buildCreateIndex(StratosSQLParser.CreateIndexContext ctx) {
@@ -334,6 +355,7 @@ public class SqlParser {
         List<String> columns = new ArrayList<>();
         List<AggregateCall> aggregates = new ArrayList<>();
         List<WindowFunctionCall> windowFunctions = new ArrayList<>();
+        List<FunctionCallItem> functionCalls = new ArrayList<>();
 
         if (ctx.selectList().STAR() != null) {
             columns.add("*");
@@ -344,6 +366,8 @@ public class SqlParser {
                     windowFunctions.add(buildWindowFunctionCall(itemCtx.windowFunction(), alias));
                 } else if (itemCtx.aggregateFunction() != null) {
                     aggregates.add(buildAggregateCall(itemCtx.aggregateFunction(), alias));
+                } else if (itemCtx.functionCall() != null) {
+                    functionCalls.add(buildFunctionCallItem(itemCtx.functionCall(), alias));
                 } else if (itemCtx.columnName() != null) {
                     // No alias support for plain columns yet (a separate, smaller gap than
                     // aggregate aliasing) - the requested column text is used as-is, same as before.
@@ -374,8 +398,18 @@ public class SqlParser {
         WhereExpr where = buildWhereExpr(ctx.expression());
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause, windowFunctions);
+        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls);
     }
+
+    private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {
+        String functionName = ctx.functionName().getText();
+        List<String> args = new ArrayList<>();
+        for (StratosSQLParser.FunctionArgContext argCtx : ctx.functionArg()) {
+            args.add(argCtx.getText());
+        }
+        return new FunctionCallItem(functionName, args, alias);
+    }
+
 
     private WindowFunctionCall buildWindowFunctionCall(StratosSQLParser.WindowFunctionContext ctx, String alias) {
         String functionName;

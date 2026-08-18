@@ -43,8 +43,10 @@ java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar [dataDir
 Defaults to `./stratosdb_data` and port 6582.
 
 ```bash
-# Terminal 2: the CLI
-java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar [host] [port] [username] [password] [--ssl]
+# Terminal 2: the CLI (StratosShell, StratosDB's JDBC-based client for this custom
+# protocol - a separate tool from stdsql, which speaks stdwire instead; since the
+# shaded jar's default main class is stdsql, StratosShell needs -cp, not -jar)
+java -cp stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar com.stratosdb.cli.StratosShell [host] [port] [username] [password] [--ssl]
 ```
 
 Defaults to `localhost` and `6582`, no credentials, no TLS. All args are optional and positional except `--ssl`, which can appear anywhere.
@@ -99,10 +101,16 @@ java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./strato
 ```
 
 ```bash
+java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar -h localhost -p 6583 -U anyuser -d anydb
+```
+
+Any real PostgreSQL client also works here unmodified, not just this project's own `stdsql` - this was verified against real `psql` and Python's `psycopg2` independently (see `PROGRESS.md`):
+
+```bash
 psql -h localhost -p 6583 -U anyuser -d anydb
 ```
 
-Any real PostgreSQL client works here, not just `psql` — this was verified against `psql` and Python's `psycopg2` independently (see `PROGRESS.md`). Known limits: only the simple query protocol (no server-side prepared statements yet), trust auth only (no password over this path yet), and `psql`'s `\dt`/`\d`/`\l`/tab-completion don't work (they query real Postgres system catalog tables StratosDB doesn't emulate yet) — plain SQL statements work regardless.
+Both the simple and extended query protocols work (parameterized queries via `Parse`/`Bind`/`Execute` - `psycopg2`'s own default `cur.execute("... WHERE id = %s", (1,))` API uses this automatically), and real SCRAM-SHA-256 authentication is available (see section 4 below to turn it on - trust auth, unauthenticated, remains the default). Known limits: `psql`'s `\d`/`\l`/tab-completion don't work yet (they query real Postgres system catalog tables StratosDB doesn't emulate beyond `\dt`), and SCRAM channel binding (`SCRAM-SHA-256-PLUS`) isn't implemented - plain SQL statements, parameterized queries, and password authentication all work regardless.
 
 ## 4. Try authentication and TLS
 
@@ -126,10 +134,10 @@ keytool -genkeypair -alias stratosdb -keyalg RSA -keysize 2048 -validity 365 \
   -dname "CN=localhost, OU=StratosDB, O=StratosDB, L=Test, ST=Test, C=US"
 ```
 
-Then connect the CLI with credentials and TLS:
+Then connect with `StratosShell` (StratosDB's JDBC-based client for this custom protocol - a separate tool from `stdsql`, which speaks `stdwire` instead and takes `psql`-style `-h`/`-p`/`-U`/`-d` flags; since the shaded jar's default main class is `stdsql`, `StratosShell` needs to be invoked explicitly):
 
 ```bash
-java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar localhost 6582 alice correct-horse-battery-staple --ssl
+java -cp stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar com.stratosdb.cli.StratosShell localhost 6582 alice correct-horse-battery-staple --ssl
 ```
 
 Or via raw JDBC:
