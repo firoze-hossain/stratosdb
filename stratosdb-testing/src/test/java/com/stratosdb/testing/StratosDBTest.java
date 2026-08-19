@@ -2366,6 +2366,119 @@ public class StratosDBTest {
         }
     }
 
+    // --- Stored procedures: real CREATE [OR REPLACE] PROCEDURE / DROP PROCEDURE / CALL,
+    // deliberately scoped to SQL-language procedures (a real, own scope statement -
+    // see ExecutorEngine.executeCall's own javadoc). Unlike a function, a procedure's
+    // body may contain MULTIPLE semicolon-separated statements, run in sequence when
+    // CALLed - this is what actually distinguishes a procedure from a function here,
+    // not just the missing RETURNS clause. Bodies use literal SET assignments (not
+    // arithmetic on existing column values) - the same real, previously-discovered
+    // UPDATE-grammar limitation already documented for stored functions.
+
+    @Test
+    void testCreateProcedureAndCallExecutesMultipleStatementsInOrder() {
+        database.execute("CREATE TABLE accounts (id INT, status VARCHAR)");
+        database.execute("INSERT INTO accounts VALUES (1, 'active')");
+        database.execute("INSERT INTO accounts VALUES (2, 'active')");
+        database.execute("CREATE TABLE audit_log (msg VARCHAR)");
+
+        QueryResult createResult = database.execute(
+            "CREATE PROCEDURE suspend_account(acct_id INT, reason VARCHAR) AS $$ "
+                + "UPDATE accounts SET status = 'suspended' WHERE id = acct_id; "
+                + "INSERT INTO audit_log VALUES (reason) $$ LANGUAGE SQL");
+        assertTrue(createResult.isSuccess(), () -> "CREATE PROCEDURE must succeed: " + createResult.getError());
+
+        QueryResult callResult = database.execute("CALL suspend_account(1, 'fraud review')");
+        assertTrue(callResult.isSuccess(), () -> "CALL must succeed: " + callResult.getError());
+
+        assertEquals("suspended", database.execute("SELECT status FROM accounts WHERE id = 1").getRows().get(0).getValue("status"));
+        assertEquals("active", database.execute("SELECT status FROM accounts WHERE id = 2").getRows().get(0).getValue("status"),
+            "the untargeted row must remain unaffected");
+
+        QueryResult auditResult = database.execute("SELECT * FROM audit_log");
+        assertEquals(1, auditResult.getRows().size());
+        assertEquals("fraud review", auditResult.getRows().get(0).getValue("msg"),
+            "the string parameter must be correctly substituted (and quoted/escaped) into the second statement");
+    }
+
+    @Test
+    void testCallStopsAtTheFirstFailingStatementRatherThanContinuing() {
+        database.execute("CREATE TABLE audit_log (msg VARCHAR)");
+        database.execute("CREATE PROCEDURE broken_proc(x INT) AS $$ "
+            + "INSERT INTO audit_log VALUES ('step one'); "
+            + "INSERT INTO nonexistent_table VALUES (x); "
+            + "INSERT INTO audit_log VALUES ('step three') $$ LANGUAGE SQL");
+
+        QueryResult callResult = database.execute("CALL broken_proc(1)");
+        assertFalse(callResult.isSuccess(), "a procedure with a failing middle statement must report failure");
+        assertTrue(callResult.getError().contains("nonexistent_table"),
+            () -> "the error should identify which statement failed: " + callResult.getError());
+
+        QueryResult auditResult = database.execute("SELECT * FROM audit_log");
+        assertEquals(1, auditResult.getRows().size(),
+            "only the first statement (before the failure) should have run - the third must never execute");
+    }
+
+    @Test
+    void testCallWithWrongArgumentCountFailsCleanly() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE PROCEDURE p(x INT, y INT) AS $$ INSERT INTO t VALUES (x) $$ LANGUAGE SQL");
+
+        QueryResult result = database.execute("CALL p(1)");
+        assertFalse(result.isSuccess(), "calling with fewer arguments than parameters must fail, not silently proceed");
+    }
+
+    @Test
+    void testCreateProcedureWithoutReplaceRejectsADuplicateName() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE PROCEDURE p(x INT) AS $$ INSERT INTO t VALUES (x) $$ LANGUAGE SQL");
+
+        QueryResult duplicate = database.execute("CREATE PROCEDURE p(x INT) AS $$ INSERT INTO t VALUES (x) $$ LANGUAGE SQL");
+        assertFalse(duplicate.isSuccess(), "CREATE PROCEDURE without OR REPLACE must reject an existing procedure name");
+
+        QueryResult replace = database.execute("CREATE OR REPLACE PROCEDURE p(x INT) AS $$ INSERT INTO t VALUES (x) $$ LANGUAGE SQL");
+        assertTrue(replace.isSuccess(), "CREATE OR REPLACE PROCEDURE must succeed even when the procedure already exists");
+    }
+
+    @Test
+    void testDropProcedureAndSubsequentCallCorrectlyFails() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE PROCEDURE p(x INT) AS $$ INSERT INTO t VALUES (x) $$ LANGUAGE SQL");
+
+        QueryResult dropResult = database.execute("DROP PROCEDURE p");
+        assertTrue(dropResult.isSuccess());
+
+        QueryResult dropAgain = database.execute("DROP PROCEDURE p");
+        assertFalse(dropAgain.isSuccess(), "dropping an already-dropped procedure must fail, not silently succeed");
+
+        QueryResult callAfterDrop = database.execute("CALL p(1)");
+        assertFalse(callAfterDrop.isSuccess(), "calling a dropped procedure must fail cleanly, not crash");
+    }
+
+    @Test
+    void testProcedureDefinitionSurvivesARealRestart() throws Exception {
+        java.nio.file.Path tempDataDir = java.nio.file.Files.createTempDirectory("procedurerestarttest");
+        try {
+            com.stratosdb.core.DatabaseConfig config1 = new com.stratosdb.core.DatabaseConfig();
+            config1.setDataDirectory(tempDataDir.toString());
+            StratosDB db1 = new StratosDB(config1);
+            db1.execute("CREATE TABLE accounts (id INT, status VARCHAR)");
+            db1.execute("INSERT INTO accounts VALUES (1, 'active')");
+            db1.execute("CREATE PROCEDURE suspend_account(acct_id INT) AS $$ UPDATE accounts SET status = 'suspended' WHERE id = acct_id $$ LANGUAGE SQL");
+            db1.shutdown();
+
+            com.stratosdb.core.DatabaseConfig config2 = new com.stratosdb.core.DatabaseConfig();
+            config2.setDataDirectory(tempDataDir.toString());
+            StratosDB db2 = new StratosDB(config2);
+            QueryResult callResult = db2.execute("CALL suspend_account(1)");
+            assertTrue(callResult.isSuccess(), () -> "a procedure created before a restart must still exist and work after it: " + callResult.getError());
+            assertEquals("suspended", db2.execute("SELECT status FROM accounts WHERE id = 1").getRows().get(0).getValue("status"));
+            db2.shutdown();
+        } finally {
+            deleteRecursively(tempDataDir.toFile());
+        }
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

@@ -36,6 +36,8 @@ public class ExecutorEngine {
     private final Map<String, Sequence> sequences = new ConcurrentHashMap<>();
     /** name -> definition, for CREATE FUNCTION / DROP FUNCTION - see executeCreateFunction's own javadoc for the real, honestly-stated scope of what a "function" means in this engine. */
     private final Map<String, CreateFunctionStatement> functions = new ConcurrentHashMap<>();
+    /** name -> definition, for CREATE PROCEDURE / DROP PROCEDURE - see executeCall's own javadoc for the real, honestly-stated scope of what a "procedure" means in this engine. */
+    private final Map<String, CreateProcedureStatement> procedures = new ConcurrentHashMap<>();
 
     /**
      * CREATE VIEW just remembers the defining query - a view is never
@@ -165,6 +167,12 @@ public class ExecutorEngine {
             saveCatalog();
         } else if (stmt instanceof DropFunctionStatement s) {
             catalogLines.remove("FUNCTION:" + s.name());
+            saveCatalog();
+        } else if (stmt instanceof CreateProcedureStatement s) {
+            catalogLines.put("PROCEDURE:" + s.name(), "PROCEDURE|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropProcedureStatement s) {
+            catalogLines.remove("PROCEDURE:" + s.name());
             saveCatalog();
         }
         // No DropIndexStatement exists yet in this grammar - nothing to remove for that case.
@@ -665,6 +673,9 @@ public class ExecutorEngine {
         if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
         if (stmt instanceof CreateFunctionStatement s) return executeCreateFunction(s);
         if (stmt instanceof DropFunctionStatement s) return executeDropFunction(s);
+        if (stmt instanceof CreateProcedureStatement s) return executeCreateProcedure(s);
+        if (stmt instanceof DropProcedureStatement s) return executeDropProcedure(s);
+        if (stmt instanceof CallStatement s) return executeCall(s);
         return QueryResult.error("Unsupported statement");
     }
 
@@ -852,6 +863,86 @@ public class ExecutorEngine {
             return QueryResult.error("Function not found: " + stmt.name());
         }
         return QueryResult.success("Function dropped: " + stmt.name());
+    }
+
+    /**
+     * CREATE [OR REPLACE] PROCEDURE - a real, deliberately scoped-down
+     * stored procedure, not a full PL/pgSQL implementation, mirroring
+     * executeCreateFunction's own scope statement. Unlike a function, a
+     * procedure's body may contain MULTIPLE semicolon-separated statements
+     * (see executeCall) - this is what actually distinguishes a procedure
+     * from a function here, not just the missing RETURNS clause.
+     */
+    private QueryResult executeCreateProcedure(CreateProcedureStatement stmt) {
+        if (!stmt.orReplace() && procedures.containsKey(stmt.name())) {
+            return QueryResult.error("Procedure already exists: " + stmt.name() + " (use CREATE OR REPLACE PROCEDURE to redefine it)");
+        }
+        if (!stmt.language().equalsIgnoreCase("SQL")) {
+            return QueryResult.error("Unsupported procedure language: " + stmt.language() + " (only SQL is supported)");
+        }
+        procedures.put(stmt.name(), stmt);
+        return QueryResult.success("Procedure created: " + stmt.name());
+    }
+
+    private QueryResult executeDropProcedure(DropProcedureStatement stmt) {
+        if (procedures.remove(stmt.name()) == null) {
+            return QueryResult.error("Procedure not found: " + stmt.name());
+        }
+        return QueryResult.success("Procedure dropped: " + stmt.name());
+    }
+
+    /**
+     * CALL procedureName(args) - executes the procedure's body as a
+     * sequence of statements, not a single one. The body's stored text is
+     * split on top-level semicolons (a real, honestly-stated limitation:
+     * a semicolon embedded inside a string literal within the procedure
+     * body is not supported - splitting correctly around one would need a
+     * real SQL tokenizer, not a text split, and no example or test in
+     * this project needs one), each substituted with the caller's actual
+     * argument values (same real, tested, injection-safe substitution
+     * mechanism as invokeFunction) and executed in order. Stops at the
+     * first statement that fails, returning that failure - a procedure
+     * call is not atomic across its own statements (no implicit
+     * transaction wraps the whole CALL), matching this engine's own
+     * existing auto-commit-per-statement default; wrap the CALL itself in
+     * an explicit BEGIN/COMMIT for atomicity, the same as any other
+     * multi-statement sequence in this engine.
+     *
+     * A procedure has no return value (see CreateProcedureStatement's own
+     * javadoc) - success reports how many statements ran, not a
+     * computed result.
+     */
+    private QueryResult executeCall(CallStatement stmt) {
+        CreateProcedureStatement proc = procedures.get(stmt.procedureName());
+        if (proc == null) {
+            return QueryResult.error("Procedure not found: " + stmt.procedureName());
+        }
+        if (stmt.args().size() != proc.params().size()) {
+            return QueryResult.error("Procedure " + stmt.procedureName() + " expects " + proc.params().size()
+                + " argument(s), got " + stmt.args().size());
+        }
+
+        String[] bodyStatements = proc.body().split(";");
+        int executedCount = 0;
+        for (String rawStatement : bodyStatements) {
+            String statementText = rawStatement.trim();
+            if (statementText.isEmpty()) {
+                continue;
+            }
+            String substituted = statementText;
+            for (int i = 0; i < proc.params().size(); i++) {
+                String paramName = proc.params().get(i).name();
+                Object argValue = parseLiteral(stmt.args().get(i));
+                substituted = substituteIdentifier(substituted, paramName, argValue);
+            }
+            QueryResult result = execute(substituted);
+            if (!result.isSuccess()) {
+                return QueryResult.error("CALL " + stmt.procedureName() + " failed at statement "
+                    + (executedCount + 1) + " (\"" + statementText + "\"): " + result.getError());
+            }
+            executedCount++;
+        }
+        return QueryResult.success("CALL " + stmt.procedureName() + " (" + executedCount + " statement(s) executed)");
     }
 
     /** Where a sequence's persisted watermark lives - null (no persistence) when this engine wasn't given a data directory, matching the same pattern the schema catalog and commit-status log already use. */

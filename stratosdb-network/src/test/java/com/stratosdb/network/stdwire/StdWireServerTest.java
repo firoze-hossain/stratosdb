@@ -183,6 +183,30 @@ class StdWireServerTest {
 
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void storedProcedureWorksEndToEndOverTheRealWireProtocol() throws Exception {
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE accounts (id INT, status VARCHAR)");
+            conn.query("INSERT INTO accounts VALUES (1, 'active')");
+
+            QueryOutcome createProc = conn.query(
+                "CREATE PROCEDURE suspend_account(acct_id INT) AS $$ UPDATE accounts SET status = 'suspended' WHERE id = acct_id $$ LANGUAGE SQL");
+            assertTrue(createProc.error == null, () -> "CREATE PROCEDURE must succeed: " + createProc.error);
+            assertEquals("CREATE PROCEDURE", createProc.commandTag);
+
+            QueryOutcome callResult = conn.query("CALL suspend_account(1)");
+            assertTrue(callResult.error == null, () -> "CALL must succeed: " + callResult.error);
+            assertEquals("CALL", callResult.commandTag);
+
+            QueryOutcome checkResult = conn.query("SELECT status FROM accounts WHERE id = 1");
+            assertEquals(List.of("suspended"), checkResult.rows.get(0));
+
+            QueryOutcome dropProc = conn.query("DROP PROCEDURE suspend_account");
+            assertEquals("DROP PROCEDURE", dropProc.commandTag);
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
     void extendedProtocolNullParameterEncodesAsRealNull() throws Exception {
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE t (id INT, val VARCHAR)");

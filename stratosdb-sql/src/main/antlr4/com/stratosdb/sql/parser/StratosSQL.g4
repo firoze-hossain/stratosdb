@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -23,6 +23,10 @@ functionName: IDENTIFIER;
 functionParam: IDENTIFIER dataType;
 functionCall: functionName LPAREN (functionArg (COMMA functionArg)*)? RPAREN;
 functionArg: literal | columnName;
+createProcedure: CREATE (OR REPLACE)? PROCEDURE procedureName LPAREN (functionParam (COMMA functionParam)*)? RPAREN AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
+dropProcedure: DROP PROCEDURE procedureName SEMICOLON?;
+procedureName: IDENTIFIER;
+callStatement: CALL procedureName LPAREN (functionArg (COMMA functionArg)*)? RPAREN SEMICOLON?;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
@@ -172,6 +176,8 @@ TABLES: T A B L E S;
 STATS: S T A T S;
 SEQUENCE: S E Q U E N C E;
 FUNCTION: F U N C T I O N;
+PROCEDURE: P R O C E D U R E;
+CALL: C A L L;
 RETURNS: R E T U R N S;
 LANGUAGE: L A N G U A G E;
 REPLACE: R E P L A C E;

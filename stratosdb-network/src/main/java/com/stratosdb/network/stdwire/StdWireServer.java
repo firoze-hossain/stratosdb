@@ -431,6 +431,9 @@ public class StdWireServer {
         if (upper.startsWith("DROP FUNCTION")) return "DROP FUNCTION";
         if (upper.startsWith("CREATE SEQUENCE")) return "CREATE SEQUENCE";
         if (upper.startsWith("DROP SEQUENCE")) return "DROP SEQUENCE";
+        if (upper.startsWith("CREATE OR REPLACE PROCEDURE") || upper.startsWith("CREATE PROCEDURE")) return "CREATE PROCEDURE";
+        if (upper.startsWith("DROP PROCEDURE")) return "DROP PROCEDURE";
+        if (upper.startsWith("CALL")) return "CALL";
         return "OK";
     }
 

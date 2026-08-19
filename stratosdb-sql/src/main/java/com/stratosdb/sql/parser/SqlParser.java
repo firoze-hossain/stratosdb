@@ -118,6 +118,12 @@ public class SqlParser {
             return buildCreateFunction(ctx.createFunction());
         } else if (ctx.dropFunction() != null) {
             return new DropFunctionStatement(ctx.dropFunction().functionName().getText());
+        } else if (ctx.createProcedure() != null) {
+            return buildCreateProcedure(ctx.createProcedure());
+        } else if (ctx.dropProcedure() != null) {
+            return new DropProcedureStatement(ctx.dropProcedure().procedureName().getText());
+        } else if (ctx.callStatement() != null) {
+            return buildCallStatement(ctx.callStatement());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }
@@ -137,6 +143,28 @@ public class SqlParser {
         String language = ctx.SQL_LANG() != null ? "SQL" : ctx.IDENTIFIER().getText();
         boolean orReplace = ctx.REPLACE() != null;
         return new CreateFunctionStatement(name, params, returnType, body, language, orReplace);
+    }
+
+    private CreateProcedureStatement buildCreateProcedure(StratosSQLParser.CreateProcedureContext ctx) {
+        String name = ctx.procedureName().getText();
+        List<FunctionParam> params = new ArrayList<>();
+        for (StratosSQLParser.FunctionParamContext paramCtx : ctx.functionParam()) {
+            params.add(new FunctionParam(paramCtx.IDENTIFIER().getText(), paramCtx.dataType().getText()));
+        }
+        String rawDollarQuoted = ctx.DOLLAR_QUOTED_STRING().getText();
+        String body = rawDollarQuoted.substring(2, rawDollarQuoted.length() - 2).trim();
+        String language = ctx.SQL_LANG() != null ? "SQL" : ctx.IDENTIFIER().getText();
+        boolean orReplace = ctx.REPLACE() != null;
+        return new CreateProcedureStatement(name, params, body, language, orReplace);
+    }
+
+    private CallStatement buildCallStatement(StratosSQLParser.CallStatementContext ctx) {
+        String name = ctx.procedureName().getText();
+        List<String> args = new ArrayList<>();
+        for (StratosSQLParser.FunctionArgContext argCtx : ctx.functionArg()) {
+            args.add(argCtx.getText());
+        }
+        return new CallStatement(name, args);
     }
 
     private CreateIndexStatement buildCreateIndex(StratosSQLParser.CreateIndexContext ctx) {
