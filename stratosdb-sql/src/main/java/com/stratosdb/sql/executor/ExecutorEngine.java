@@ -38,6 +38,8 @@ public class ExecutorEngine {
     private final Map<String, CreateFunctionStatement> functions = new ConcurrentHashMap<>();
     /** name -> definition, for CREATE PROCEDURE / DROP PROCEDURE - see executeCall's own javadoc for the real, honestly-stated scope of what a "procedure" means in this engine. */
     private final Map<String, CreateProcedureStatement> procedures = new ConcurrentHashMap<>();
+    /** name -> definition, for CREATE TRIGGER / DROP TRIGGER - see fireTriggers' own javadoc for the real, honestly-stated scope of what a "trigger" means in this engine. Keyed by trigger name alone (assumed globally unique, a real simplification vs real Postgres's per-table trigger-name scoping). */
+    private final Map<String, CreateTriggerStatement> triggers = new ConcurrentHashMap<>();
 
     /**
      * CREATE VIEW just remembers the defining query - a view is never
@@ -173,6 +175,12 @@ public class ExecutorEngine {
             saveCatalog();
         } else if (stmt instanceof DropProcedureStatement s) {
             catalogLines.remove("PROCEDURE:" + s.name());
+            saveCatalog();
+        } else if (stmt instanceof CreateTriggerStatement s) {
+            catalogLines.put("TRIGGER:" + s.name(), "TRIGGER|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropTriggerStatement s) {
+            catalogLines.remove("TRIGGER:" + s.name());
             saveCatalog();
         }
         // No DropIndexStatement exists yet in this grammar - nothing to remove for that case.
@@ -675,7 +683,9 @@ public class ExecutorEngine {
         if (stmt instanceof DropFunctionStatement s) return executeDropFunction(s);
         if (stmt instanceof CreateProcedureStatement s) return executeCreateProcedure(s);
         if (stmt instanceof DropProcedureStatement s) return executeDropProcedure(s);
-        if (stmt instanceof CallStatement s) return executeCall(s);
+        if (stmt instanceof CallStatement s) return executeCall(s, txn);
+        if (stmt instanceof CreateTriggerStatement s) return executeCreateTrigger(s);
+        if (stmt instanceof DropTriggerStatement s) return executeDropTrigger(s);
         return QueryResult.error("Unsupported statement");
     }
 
@@ -912,7 +922,7 @@ public class ExecutorEngine {
      * javadoc) - success reports how many statements ran, not a
      * computed result.
      */
-    private QueryResult executeCall(CallStatement stmt) {
+    private QueryResult executeCall(CallStatement stmt, Transaction txn) throws DeadlockException {
         CreateProcedureStatement proc = procedures.get(stmt.procedureName());
         if (proc == null) {
             return QueryResult.error("Procedure not found: " + stmt.procedureName());
@@ -921,7 +931,34 @@ public class ExecutorEngine {
             return QueryResult.error("Procedure " + stmt.procedureName() + " expects " + proc.params().size()
                 + " argument(s), got " + stmt.args().size());
         }
+        List<Object> argValues = new ArrayList<>();
+        for (String rawArg : stmt.args()) {
+            argValues.add(parseLiteral(rawArg));
+        }
+        return runProcedure(proc, argValues, txn);
+    }
 
+    /**
+     * The actual "run a procedure's body against these argument values"
+     * logic, factored out of executeCall so a trigger (see fireTriggers)
+     * can invoke a procedure too, with argument values it already
+     * resolved from an affected row's columns - not raw literal text
+     * needing parseLiteral, unlike a real CALL statement's own arguments.
+     * Runs every statement in the body WITHIN the given transaction (via
+     * executeWithinTransaction, not the public execute(String), which
+     * always starts its own, separately-committed transaction) - a real,
+     * previously-latent bug found by testing: a trigger's own procedure
+     * used to commit independently of the statement that fired it, so a
+     * later trigger failing (and the triggering statement rolling back)
+     * left the earlier trigger's own effects permanently, incorrectly
+     * committed anyway. This also genuinely improves CALL's own behavior
+     * as a top-level statement, not just triggers: its own statements now
+     * share CALL's own transaction rather than each auto-committing
+     * independently, though the known, documented limitation stands that
+     * CALL's overall statement is still not wrapped in an implicit
+     * transaction of its own by default.
+     */
+    private QueryResult runProcedure(CreateProcedureStatement proc, List<Object> argValues, Transaction txn) throws DeadlockException {
         String[] bodyStatements = proc.body().split(";");
         int executedCount = 0;
         for (String rawStatement : bodyStatements) {
@@ -932,17 +969,138 @@ public class ExecutorEngine {
             String substituted = statementText;
             for (int i = 0; i < proc.params().size(); i++) {
                 String paramName = proc.params().get(i).name();
-                Object argValue = parseLiteral(stmt.args().get(i));
-                substituted = substituteIdentifier(substituted, paramName, argValue);
+                substituted = substituteIdentifier(substituted, paramName, argValues.get(i));
             }
-            QueryResult result = execute(substituted);
+            QueryResult result = executeWithinTransaction(substituted, txn);
             if (!result.isSuccess()) {
-                return QueryResult.error("CALL " + stmt.procedureName() + " failed at statement "
+                return QueryResult.error("CALL " + proc.name() + " failed at statement "
                     + (executedCount + 1) + " (\"" + statementText + "\"): " + result.getError());
             }
             executedCount++;
         }
-        return QueryResult.success("CALL " + stmt.procedureName() + " (" + executedCount + " statement(s) executed)");
+        return QueryResult.success("CALL " + proc.name() + " (" + executedCount + " statement(s) executed)");
+    }
+
+    /**
+     * CREATE TRIGGER - a real, deliberately scoped-down implementation.
+     * Real, honestly-stated differences from Postgres's own trigger
+     * model:
+     *   - EXECUTE PROCEDURE is allowed here (not just EXECUTE FUNCTION),
+     *     since this engine's stored procedures - real side effects,
+     *     no return value needed - are actually a more natural fit for a
+     *     trigger's own purpose than a scalar-returning function is; real
+     *     Postgres requires a special RETURNS TRIGGER function instead.
+     *   - A BEFORE trigger here cannot modify the affected row or cancel
+     *     the operation the way real Postgres's own BEFORE triggers can -
+     *     this engine's stored functions/procedures have no return-value
+     *     mechanism a trigger could use for that. A BEFORE trigger here
+     *     can still run real side effects (logging, validation-style
+     *     checks that fail the statement by erroring - see
+     *     invokeTriggerHandler), just not alter or veto the row itself.
+     *   - The handler's parameters are bound to the affected row's
+     *     columns by NAME match (see fireTriggers) - not by an explicit
+     *     argument list the way CALL takes one, since a trigger's whole
+     *     point is running automatically off the row itself, with no
+     *     call site to supply arguments from.
+     *   - Trigger names are assumed globally unique (this engine's own
+     *     registry is keyed by name alone), not scoped per-table the way
+     *     real Postgres allows the same trigger name on different tables.
+     */
+    private QueryResult executeCreateTrigger(CreateTriggerStatement stmt) {
+        if (triggers.containsKey(stmt.name())) {
+            return QueryResult.error("Trigger already exists: " + stmt.name());
+        }
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        if (stmt.isFunction()) {
+            if (!functions.containsKey(stmt.handlerName())) {
+                return QueryResult.error("Function not found: " + stmt.handlerName());
+            }
+        } else {
+            if (!procedures.containsKey(stmt.handlerName())) {
+                return QueryResult.error("Procedure not found: " + stmt.handlerName());
+            }
+        }
+        triggers.put(stmt.name(), stmt);
+        return QueryResult.success("Trigger created: " + stmt.name());
+    }
+
+    private QueryResult executeDropTrigger(DropTriggerStatement stmt) {
+        CreateTriggerStatement removed = triggers.remove(stmt.name());
+        if (removed == null) {
+            return QueryResult.error("Trigger not found: " + stmt.name());
+        }
+        if (!removed.tableName().equals(stmt.tableName())) {
+            // Put it back - this DROP TRIGGER named a different table than the
+            // one this trigger was actually created on, matching real Postgres's
+            // own validation that DROP TRIGGER name ON table must agree.
+            triggers.put(stmt.name(), removed);
+            return QueryResult.error("Trigger " + stmt.name() + " does not exist on table " + stmt.tableName());
+        }
+        return QueryResult.success("Trigger dropped: " + stmt.name());
+    }
+
+    /**
+     * Fires every trigger matching (tableName, timing, event) against one
+     * affected row. Returns null on success, or an error message if any
+     * matching trigger failed - the caller (finishInsert/executeUpdate/
+     * executeDelete) must treat a non-null return as a failure of the
+     * whole triggering statement, matching real Postgres's own behavior:
+     * a failing trigger fails the statement that fired it, not a logged
+     * warning nobody sees. Triggers run in no particular guaranteed order
+     * (a real, honestly-stated simplification - real Postgres orders same-
+     * event triggers alphabetically by name; this engine does not).
+     */
+    private String fireTriggers(String tableName, String timing, String event, Tuple row, Transaction txn) throws DeadlockException {
+        for (CreateTriggerStatement trigger : triggers.values()) {
+            if (!trigger.tableName().equals(tableName) || !trigger.timing().equals(timing) || !trigger.event().equals(event)) {
+                continue;
+            }
+            String error = invokeTriggerHandler(trigger, row, txn);
+            if (error != null) {
+                return "Trigger " + trigger.name() + " failed: " + error;
+            }
+        }
+        return null;
+    }
+
+    /** Binds the handler's own parameters to the affected row's columns by exact name match, then invokes it - a genuinely different argument-resolution path from both invokeFunction's own SELECT-list column/literal resolution and CALL's own literal-argument-list resolution, since a trigger has neither a surrounding row-projection context nor an explicit call-site argument list, only the one affected row itself. Returns null on success, or a real error message on any failure (handler not found, a parameter with no matching column, or the handler's own execution failing). */
+    private String invokeTriggerHandler(CreateTriggerStatement trigger, Tuple row, Transaction txn) throws DeadlockException {
+        List<FunctionParam> params;
+        if (trigger.isFunction()) {
+            CreateFunctionStatement func = functions.get(trigger.handlerName());
+            if (func == null) {
+                return "referenced function not found: " + trigger.handlerName();
+            }
+            params = func.params();
+        } else {
+            CreateProcedureStatement proc = procedures.get(trigger.handlerName());
+            if (proc == null) {
+                return "referenced procedure not found: " + trigger.handlerName();
+            }
+            params = proc.params();
+        }
+
+        List<Object> argValues = new ArrayList<>();
+        for (FunctionParam param : params) {
+            if (!row.getColumnNames().contains(param.name())) {
+                return "handler parameter \"" + param.name() + "\" does not match any column on the affected row";
+            }
+            argValues.add(row.getValue(param.name()));
+        }
+
+        if (trigger.isFunction()) {
+            try {
+                invokeFunction(trigger.handlerName(), argValues, txn); // return value discarded - a trigger has no use for one
+                return null;
+            } catch (Exception e) {
+                return e.getMessage();
+            }
+        } else {
+            QueryResult result = runProcedure(procedures.get(trigger.handlerName()), argValues, txn);
+            return result.isSuccess() ? null : result.getError();
+        }
     }
 
     /** Where a sequence's persisted watermark lives - null (no persistence) when this engine wasn't given a data directory, matching the same pattern the schema catalog and commit-status log already use. */
@@ -1391,6 +1549,11 @@ public class ExecutorEngine {
     }
 
     private QueryResult finishInsert(InsertStatement stmt, Transaction txn, Tuple tuple) {
+        String beforeError = fireTriggers(stmt.tableName(), "BEFORE", "INSERT", tuple, txn);
+        if (beforeError != null) {
+            return QueryResult.error(beforeError);
+        }
+
         byte[] data = tuple.serialize();
         HeapTable table = tables.get(stmt.tableName());
         HeapTable.InsertResult result = table.insertMvcc(data, txn.getXID());
@@ -1398,6 +1561,11 @@ public class ExecutorEngine {
         walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, data);
         maintainIndexesOnWrite(stmt.tableName(), tuple, result.pageId, result.slot);
         recordUndo(new UndoAction.UndoInsert(stmt.tableName(), result.pageId, result.slot));
+
+        String afterError = fireTriggers(stmt.tableName(), "AFTER", "INSERT", tuple, txn);
+        if (afterError != null) {
+            return QueryResult.error(afterError);
+        }
 
         return QueryResult.success("Inserted row at " + result.pageId + "/" + result.slot);
     }
@@ -2753,6 +2921,12 @@ public class ExecutorEngine {
             for (Assignment assignment : stmt.assignments()) {
                 setColumnValue(tuple, assignment.column(), parseLiteral(assignment.value()));
             }
+
+            String beforeError = fireTriggers(stmt.tableName(), "BEFORE", "UPDATE", tuple, txn);
+            if (beforeError != null) {
+                return QueryResult.error(beforeError);
+            }
+
             byte[] newPayload = tuple.serialize();
 
             HeapTable.InsertResult newVersion = table.updateMvcc(row.pageId(), row.slot(), newPayload, txn.getXID(),
@@ -2761,6 +2935,12 @@ public class ExecutorEngine {
             maintainIndexesOnDelete(stmt.tableName(), oldTuple, row.pageId(), row.slot());
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
             recordUndo(new UndoAction.UndoUpdate(stmt.tableName(), row.pageId(), row.slot(), newVersion.pageId, newVersion.slot));
+
+            String afterError = fireTriggers(stmt.tableName(), "AFTER", "UPDATE", tuple, txn);
+            if (afterError != null) {
+                return QueryResult.error(afterError);
+            }
+
             updated++;
         }
 
@@ -2789,12 +2969,23 @@ public class ExecutorEngine {
                 continue;
             }
 
+            String beforeError = fireTriggers(stmt.tableName(), "BEFORE", "DELETE", tuple, txn);
+            if (beforeError != null) {
+                return QueryResult.error(beforeError);
+            }
+
             boolean removed = table.deleteMvcc(row.pageId(), row.slot(), txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
             if (removed) {
                 walManager.logDelete(stmt.tableName(), txn.getXID(), row.pageId(), row.slot());
                 maintainIndexesOnDelete(stmt.tableName(), tuple, row.pageId(), row.slot());
                 recordUndo(new UndoAction.UndoDelete(stmt.tableName(), row.pageId(), row.slot()));
+
+                String afterError = fireTriggers(stmt.tableName(), "AFTER", "DELETE", tuple, txn);
+                if (afterError != null) {
+                    return QueryResult.error(afterError);
+                }
+
                 deleted++;
             }
         }
@@ -2993,6 +3184,76 @@ public class ExecutorEngine {
             return null;
         }
         return rows.get(0).getValue(0);
+    }
+
+    /**
+     * Same substitution logic as the no-txn overload above, but executes
+     * the substituted body WITHIN the given transaction (via dispatch,
+     * not the public execute(String), which always starts its own,
+     * separately-committed transaction) - needed specifically for a
+     * function invoked as a trigger handler (see invokeTriggerHandler),
+     * so its own effects share the exact same atomic unit as the
+     * INSERT/UPDATE/DELETE that fired it: if that statement's overall
+     * transaction later aborts (a different trigger failing, for
+     * instance), this function's own effects must roll back with it,
+     * not remain independently, permanently committed. A real,
+     * previously-latent bug found by testing exactly that scenario - see
+     * PROGRESS.md. The pre-existing SELECT-list function-call path
+     * (project/resolveFunctionArgs) intentionally still uses the no-txn
+     * overload above; unlike a trigger's own writes, extending
+     * transaction-sharing to that separate, already-shipped, read-only-
+     * by-convention path is real, further work, not attempted here.
+     */
+    private Object invokeFunction(String functionName, List<Object> argValues, Transaction txn) throws DeadlockException {
+        CreateFunctionStatement func = functions.get(functionName);
+        if (func == null) {
+            throw new IllegalArgumentException("Function not found: " + functionName);
+        }
+        if (argValues.size() != func.params().size()) {
+            throw new IllegalArgumentException("Function " + functionName + " expects " + func.params().size()
+                + " argument(s), got " + argValues.size());
+        }
+
+        String substituted = func.body();
+        for (int i = 0; i < func.params().size(); i++) {
+            String paramName = func.params().get(i).name();
+            substituted = substituteIdentifier(substituted, paramName, argValues.get(i));
+        }
+
+        QueryResult result = executeWithinTransaction(substituted, txn);
+        if (!result.isSuccess()) {
+            throw new IllegalStateException("Function " + functionName + " failed: " + result.getError());
+        }
+        List<Tuple> rows = result.getRows();
+        if (rows == null || rows.isEmpty()) {
+            return null;
+        }
+        return rows.get(0).getValue(0);
+    }
+
+    /**
+     * Parses and dispatches sql against the GIVEN transaction, rather
+     * than starting (and separately committing) a new one the way the
+     * public execute(String) always does - the actual fix behind
+     * runProcedure/invokeFunction's own transaction-sharing overloads
+     * (see their own javadoc). BEGIN/COMMIT/ROLLBACK/SAVEPOINT are
+     * deliberately rejected here (real errors, not silently ignored):
+     * a procedure or function body managing its own transaction
+     * boundaries while already running inside one doesn't have a
+     * sensible meaning in this engine.
+     */
+    private QueryResult executeWithinTransaction(String sql, Transaction txn) throws DeadlockException {
+        Statement stmt;
+        try {
+            stmt = parser.parse(sql);
+        } catch (Exception e) {
+            return QueryResult.error(e.getMessage());
+        }
+        if (stmt instanceof BeginStatement || stmt instanceof CommitStatement || stmt instanceof RollbackStatement
+            || stmt instanceof SavepointStatement || stmt instanceof ReleaseSavepointStatement || stmt instanceof RollbackToSavepointStatement) {
+            return QueryResult.error("Transaction control statements are not allowed inside a function/procedure/trigger body");
+        }
+        return dispatch(stmt, txn);
     }
 
     /** Replaces every whole-word occurrence of identifierName in sql with value's SQL-literal text (quoted/escaped for a string, bare for a number/boolean) - a word-boundary-aware substitution so a parameter named "x" doesn't also match inside "max" or "xyz". */

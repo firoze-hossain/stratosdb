@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -27,6 +27,10 @@ createProcedure: CREATE (OR REPLACE)? PROCEDURE procedureName LPAREN (functionPa
 dropProcedure: DROP PROCEDURE procedureName SEMICOLON?;
 procedureName: IDENTIFIER;
 callStatement: CALL procedureName LPAREN (functionArg (COMMA functionArg)*)? RPAREN SEMICOLON?;
+createTrigger: CREATE TRIGGER triggerName (BEFORE | AFTER) (INSERT | UPDATE | DELETE) ON tableName FOR EACH ROW EXECUTE (FUNCTION | PROCEDURE) triggerHandlerName LPAREN RPAREN SEMICOLON?;
+dropTrigger: DROP TRIGGER triggerName ON tableName SEMICOLON?;
+triggerName: IDENTIFIER;
+triggerHandlerName: IDENTIFIER;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
@@ -178,6 +182,13 @@ SEQUENCE: S E Q U E N C E;
 FUNCTION: F U N C T I O N;
 PROCEDURE: P R O C E D U R E;
 CALL: C A L L;
+TRIGGER: T R I G G E R;
+BEFORE: B E F O R E;
+AFTER: A F T E R;
+FOR: F O R;
+EACH: E A C H;
+ROW: R O W;
+EXECUTE: E X E C U T E;
 RETURNS: R E T U R N S;
 LANGUAGE: L A N G U A G E;
 REPLACE: R E P L A C E;

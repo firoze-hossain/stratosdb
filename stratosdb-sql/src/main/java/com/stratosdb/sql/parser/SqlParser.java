@@ -124,6 +124,10 @@ public class SqlParser {
             return new DropProcedureStatement(ctx.dropProcedure().procedureName().getText());
         } else if (ctx.callStatement() != null) {
             return buildCallStatement(ctx.callStatement());
+        } else if (ctx.createTrigger() != null) {
+            return buildCreateTrigger(ctx.createTrigger());
+        } else if (ctx.dropTrigger() != null) {
+            return new DropTriggerStatement(ctx.dropTrigger().triggerName().getText(), ctx.dropTrigger().tableName().getText());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }
@@ -165,6 +169,16 @@ public class SqlParser {
             args.add(argCtx.getText());
         }
         return new CallStatement(name, args);
+    }
+
+    private CreateTriggerStatement buildCreateTrigger(StratosSQLParser.CreateTriggerContext ctx) {
+        String name = ctx.triggerName().getText();
+        String timing = ctx.BEFORE() != null ? "BEFORE" : "AFTER";
+        String event = ctx.INSERT() != null ? "INSERT" : ctx.UPDATE() != null ? "UPDATE" : "DELETE";
+        String tableName = ctx.tableName().getText();
+        String handlerName = ctx.triggerHandlerName().getText();
+        boolean isFunction = ctx.FUNCTION() != null;
+        return new CreateTriggerStatement(name, timing, event, tableName, handlerName, isFunction);
     }
 
     private CreateIndexStatement buildCreateIndex(StratosSQLParser.CreateIndexContext ctx) {

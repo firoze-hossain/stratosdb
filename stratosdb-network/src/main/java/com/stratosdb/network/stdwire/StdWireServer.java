@@ -434,6 +434,8 @@ public class StdWireServer {
         if (upper.startsWith("CREATE OR REPLACE PROCEDURE") || upper.startsWith("CREATE PROCEDURE")) return "CREATE PROCEDURE";
         if (upper.startsWith("DROP PROCEDURE")) return "DROP PROCEDURE";
         if (upper.startsWith("CALL")) return "CALL";
+        if (upper.startsWith("CREATE TRIGGER")) return "CREATE TRIGGER";
+        if (upper.startsWith("DROP TRIGGER")) return "DROP TRIGGER";
         return "OK";
     }
 

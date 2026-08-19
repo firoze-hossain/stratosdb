@@ -207,6 +207,30 @@ class StdWireServerTest {
 
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void triggerWorksEndToEndOverTheRealWireProtocol() throws Exception {
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE employees (id INT, name VARCHAR)");
+            conn.query("CREATE TABLE audit_log (emp_id INT, emp_name VARCHAR)");
+            conn.query("CREATE PROCEDURE log_new_employee(id INT, name VARCHAR) AS $$ INSERT INTO audit_log VALUES (id, name) $$ LANGUAGE SQL");
+
+            QueryOutcome createTrigger = conn.query(
+                "CREATE TRIGGER trg_log_insert AFTER INSERT ON employees FOR EACH ROW EXECUTE PROCEDURE log_new_employee()");
+            assertTrue(createTrigger.error == null, () -> "CREATE TRIGGER must succeed: " + createTrigger.error);
+            assertEquals("CREATE TRIGGER", createTrigger.commandTag);
+
+            QueryOutcome insertResult = conn.query("INSERT INTO employees VALUES (1, 'Alice')");
+            assertTrue(insertResult.error == null, () -> "INSERT must succeed: " + insertResult.error);
+
+            QueryOutcome auditResult = conn.query("SELECT * FROM audit_log");
+            assertEquals(List.of("1", "Alice"), auditResult.rows.get(0), "the trigger must have fired and logged the new row");
+
+            QueryOutcome dropTrigger = conn.query("DROP TRIGGER trg_log_insert ON employees");
+            assertEquals("DROP TRIGGER", dropTrigger.commandTag);
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
     void extendedProtocolNullParameterEncodesAsRealNull() throws Exception {
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE t (id INT, val VARCHAR)");

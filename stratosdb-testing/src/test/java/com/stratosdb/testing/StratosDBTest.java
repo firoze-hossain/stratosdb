@@ -2402,7 +2402,13 @@ public class StratosDBTest {
     }
 
     @Test
-    void testCallStopsAtTheFirstFailingStatementRatherThanContinuing() {
+    void testCallIsAtomicAcrossItsOwnStatementsAndStopsAtTheFirstFailure() {
+        // A real, positive side effect of fixing a genuine trigger bug this same round
+        // (see PROGRESS.md): CALL's own statements now share one real transaction
+        // instead of each auto-committing independently, so a failing statement rolls
+        // back every earlier statement in the same CALL too, not just preventing the
+        // ones after it from running - a stronger, more correct guarantee than this
+        // project's own earlier, honestly-stated "no atomicity across CALL" limitation.
         database.execute("CREATE TABLE audit_log (msg VARCHAR)");
         database.execute("CREATE PROCEDURE broken_proc(x INT) AS $$ "
             + "INSERT INTO audit_log VALUES ('step one'); "
@@ -2415,8 +2421,8 @@ public class StratosDBTest {
             () -> "the error should identify which statement failed: " + callResult.getError());
 
         QueryResult auditResult = database.execute("SELECT * FROM audit_log");
-        assertEquals(1, auditResult.getRows().size(),
-            "only the first statement (before the failure) should have run - the third must never execute");
+        assertEquals(0, auditResult.getRows().size(),
+            "the whole CALL is now atomic: even the first statement (which ran successfully before the failure) must roll back with it");
     }
 
     @Test
@@ -2473,6 +2479,140 @@ public class StratosDBTest {
             QueryResult callResult = db2.execute("CALL suspend_account(1)");
             assertTrue(callResult.isSuccess(), () -> "a procedure created before a restart must still exist and work after it: " + callResult.getError());
             assertEquals("suspended", db2.execute("SELECT status FROM accounts WHERE id = 1").getRows().get(0).getValue("status"));
+            db2.shutdown();
+        } finally {
+            deleteRecursively(tempDataDir.toFile());
+        }
+    }
+
+    // --- Triggers: real CREATE TRIGGER / DROP TRIGGER, deliberately scoped-down
+    // (see ExecutorEngine.executeCreateTrigger's own javadoc). Real, honest
+    // differences from Postgres's own trigger model: EXECUTE PROCEDURE is
+    // allowed (not just EXECUTE FUNCTION, real Postgres's own requirement),
+    // a BEFORE trigger can't modify the row or cancel the operation (no
+    // return-value mechanism for that here), and a handler's parameters are
+    // bound to the affected row's columns by exact name match.
+
+    @Test
+    void testAfterInsertTriggerFiresAndBindsRowColumnsToTheHandlersParameters() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE audit_log (emp_id INT, emp_name VARCHAR)");
+        database.execute("CREATE PROCEDURE log_new_employee(id INT, name VARCHAR) AS $$ "
+            + "INSERT INTO audit_log VALUES (id, name) $$ LANGUAGE SQL");
+
+        QueryResult createTrigger = database.execute(
+            "CREATE TRIGGER trg_log_insert AFTER INSERT ON employees FOR EACH ROW EXECUTE PROCEDURE log_new_employee()");
+        assertTrue(createTrigger.isSuccess(), () -> "CREATE TRIGGER must succeed: " + createTrigger.getError());
+
+        QueryResult insertResult = database.execute("INSERT INTO employees VALUES (1, 'Alice')");
+        assertTrue(insertResult.isSuccess(), () -> "the INSERT itself must still succeed: " + insertResult.getError());
+
+        QueryResult auditResult = database.execute("SELECT * FROM audit_log");
+        assertEquals(1, auditResult.getRows().size(), "the trigger must have fired exactly once");
+        assertEquals(1, auditResult.getRows().get(0).getValue("emp_id"));
+        assertEquals("Alice", auditResult.getRows().get(0).getValue("emp_name"));
+
+        database.execute("INSERT INTO employees VALUES (2, 'Bob')");
+        assertEquals(2, database.execute("SELECT * FROM audit_log").getRows().size(),
+            "the trigger must fire again, independently, for a second insert");
+    }
+
+    @Test
+    void testBeforeDeleteTriggerFiresWithTheRowAboutToBeDeleted() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice')");
+        database.execute("CREATE TABLE status_log (msg VARCHAR)");
+        database.execute("CREATE PROCEDURE log_before_delete(id INT, name VARCHAR) AS $$ "
+            + "INSERT INTO status_log VALUES (name) $$ LANGUAGE SQL");
+        database.execute("CREATE TRIGGER trg_before_delete BEFORE DELETE ON employees FOR EACH ROW EXECUTE PROCEDURE log_before_delete()");
+
+        QueryResult deleteResult = database.execute("DELETE FROM employees WHERE id = 1");
+        assertTrue(deleteResult.isSuccess(), () -> "the DELETE itself must still succeed: " + deleteResult.getError());
+
+        QueryResult statusResult = database.execute("SELECT * FROM status_log");
+        assertEquals(1, statusResult.getRows().size());
+        assertEquals("Alice", statusResult.getRows().get(0).getValue("msg"),
+            "the BEFORE trigger must see the row that's about to be deleted");
+    }
+
+    @Test
+    void testAFailingTriggerRollsBackTheWholeTriggeringStatementIncludingEarlierTriggerEffects() {
+        // A real, previously-latent bug this project found and fixed by testing exactly
+        // this scenario (see PROGRESS.md): a trigger handler's own effects used to commit
+        // independently of the statement that fired it, so an earlier-firing trigger's
+        // effects survived even when a later trigger failed and the triggering INSERT
+        // itself correctly rolled back. Fixed by sharing the same transaction throughout.
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE audit_log (emp_id INT, emp_name VARCHAR)");
+        database.execute("CREATE PROCEDURE log_new_employee(id INT, name VARCHAR) AS $$ "
+            + "INSERT INTO audit_log VALUES (id, name) $$ LANGUAGE SQL");
+        database.execute("CREATE TRIGGER trg_log_insert AFTER INSERT ON employees FOR EACH ROW EXECUTE PROCEDURE log_new_employee()");
+
+        // A second trigger whose handler references a parameter with no matching column -
+        // guaranteed to fail at trigger-invocation time.
+        database.execute("CREATE PROCEDURE bad_handler(nonexistent_col INT) AS $$ INSERT INTO audit_log VALUES (1, 'x') $$ LANGUAGE SQL");
+        database.execute("CREATE TRIGGER trg_bad AFTER INSERT ON employees FOR EACH ROW EXECUTE PROCEDURE bad_handler()");
+
+        QueryResult insertResult = database.execute("INSERT INTO employees VALUES (1, 'Alice')");
+        assertFalse(insertResult.isSuccess(), "the INSERT must fail since one of its AFTER triggers fails");
+        assertTrue(insertResult.getError().contains("trg_bad"),
+            () -> "the error should identify which trigger failed: " + insertResult.getError());
+
+        assertEquals(0, database.execute("SELECT * FROM employees").getRows().size(),
+            "the employee row itself must be rolled back");
+        assertEquals(0, database.execute("SELECT * FROM audit_log").getRows().size(),
+            "trg_log_insert's own audit row must ALSO be rolled back, even though that trigger itself succeeded - "
+                + "the whole statement (including every trigger it fired) is one atomic unit");
+    }
+
+    @Test
+    void testCreateTriggerRejectsAMissingHandler() {
+        database.execute("CREATE TABLE t (id INT)");
+        QueryResult result = database.execute(
+            "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE nonexistent_procedure()");
+        assertFalse(result.isSuccess(), "CREATE TRIGGER must validate its handler exists, not defer the failure to first use");
+    }
+
+    @Test
+    void testDropTriggerAndSubsequentInsertNoLongerFiresIt() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("CREATE TABLE audit_log (emp_id INT, emp_name VARCHAR)");
+        database.execute("CREATE PROCEDURE log_new_employee(id INT, name VARCHAR) AS $$ "
+            + "INSERT INTO audit_log VALUES (id, name) $$ LANGUAGE SQL");
+        database.execute("CREATE TRIGGER trg_log_insert AFTER INSERT ON employees FOR EACH ROW EXECUTE PROCEDURE log_new_employee()");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice')");
+
+        QueryResult dropResult = database.execute("DROP TRIGGER trg_log_insert ON employees");
+        assertTrue(dropResult.isSuccess());
+
+        QueryResult dropAgain = database.execute("DROP TRIGGER trg_log_insert ON employees");
+        assertFalse(dropAgain.isSuccess(), "dropping an already-dropped trigger must fail, not silently succeed");
+
+        database.execute("INSERT INTO employees VALUES (2, 'Bob')");
+        assertEquals(1, database.execute("SELECT * FROM audit_log").getRows().size(),
+            "after dropping the trigger, a new insert must not fire it again");
+    }
+
+    @Test
+    void testTriggerDefinitionSurvivesARealRestart() throws Exception {
+        java.nio.file.Path tempDataDir = java.nio.file.Files.createTempDirectory("triggerrestarttest");
+        try {
+            com.stratosdb.core.DatabaseConfig config1 = new com.stratosdb.core.DatabaseConfig();
+            config1.setDataDirectory(tempDataDir.toString());
+            StratosDB db1 = new StratosDB(config1);
+            db1.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+            db1.execute("CREATE TABLE audit_log (emp_id INT, emp_name VARCHAR)");
+            db1.execute("CREATE PROCEDURE log_new_employee(id INT, name VARCHAR) AS $$ INSERT INTO audit_log VALUES (id, name) $$ LANGUAGE SQL");
+            db1.execute("CREATE TRIGGER trg_log_insert AFTER INSERT ON employees FOR EACH ROW EXECUTE PROCEDURE log_new_employee()");
+            db1.shutdown();
+
+            com.stratosdb.core.DatabaseConfig config2 = new com.stratosdb.core.DatabaseConfig();
+            config2.setDataDirectory(tempDataDir.toString());
+            StratosDB db2 = new StratosDB(config2);
+            QueryResult insertResult = db2.execute("INSERT INTO employees VALUES (1, 'Alice')");
+            assertTrue(insertResult.isSuccess(), () -> "insert after restart must succeed: " + insertResult.getError());
+            assertEquals(1, db2.execute("SELECT * FROM audit_log").getRows().size(),
+                "a trigger created before a restart must still fire correctly after it");
             db2.shutdown();
         } finally {
             deleteRecursively(tempDataDir.toFile());
