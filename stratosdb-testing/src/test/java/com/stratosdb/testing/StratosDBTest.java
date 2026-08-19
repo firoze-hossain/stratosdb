@@ -377,12 +377,23 @@ public class StratosDBTest {
         database.execute("CREATE TABLE users (id INT, name VARCHAR)");
         database.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
 
+        // A single transaction, not 3000 individual auto-commits: this test measures
+        // the hash join's own performance, not WAL fsync latency. Auto-committing each
+        // insert separately would fsync up to 6000 times (2 WAL writes per insert,
+        // each durably flushed) before ever reaching the join being tested - real disk
+        // fsync latency (a few to several ms is normal on real, non-virtualized hardware)
+        // multiplied across that many round trips can genuinely exceed this test's own
+        // 60-second safety-net timeout on real disks, even though the join itself (what's
+        // actually asserted below) takes well under a second - a real, previously-latent
+        // bug found on real hardware, not a flaw in the hash join or WAL correctness itself.
+        database.execute("BEGIN");
         for (int i = 0; i < userCount; i++) {
             database.execute("INSERT INTO users VALUES (" + i + ", 'user" + i + "')");
             // Two orders per user - real fan-out, not a trivial 1:1 join.
             database.execute("INSERT INTO orders VALUES (" + (i * 2) + ", " + i + ", 10)");
             database.execute("INSERT INTO orders VALUES (" + (i * 2 + 1) + ", " + i + ", 20)");
         }
+        database.execute("COMMIT");
 
         // 1,000 x 2,000 = 2,000,000 comparisons for a nested loop; hash join is O(n+m) = 3,000.
         long start = System.currentTimeMillis();
@@ -430,10 +441,12 @@ public class StratosDBTest {
     @Test
     void testCostBasedOptimizerRejectsIndexForLowSelectivityPredicate() {
         database.execute("CREATE TABLE t (id INT, category INT)");
+        database.execute("BEGIN");
         for (int i = 0; i < 1000; i++) {
             // Only 2 distinct values, each matching half the table - genuinely low selectivity.
             database.execute("INSERT INTO t VALUES (" + i + ", " + (i % 2) + ")");
         }
+        database.execute("COMMIT");
         database.execute("CREATE INDEX idx_category ON t (category)");
         database.execute("ANALYZE t");
 
@@ -450,10 +463,12 @@ public class StratosDBTest {
     @Test
     void testCostBasedOptimizerKeepsIndexForHighSelectivityPredicate() {
         database.execute("CREATE TABLE t (id INT, unique_id INT)");
+        database.execute("BEGIN");
         for (int i = 0; i < 1000; i++) {
             // 1000 distinct values - genuinely high selectivity for equality.
             database.execute("INSERT INTO t VALUES (" + i + ", " + i + ")");
         }
+        database.execute("COMMIT");
         database.execute("CREATE INDEX idx_unique ON t (unique_id)");
         database.execute("ANALYZE t");
 

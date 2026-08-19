@@ -154,6 +154,79 @@ class CrashRecoveryTest {
     }
 
     /**
+     * Group commit: unlike the test above (one commit per row), this logs
+     * MANY inserts under a single shared transaction id with NO commit in
+     * between, then ONE logCommit at the very end - the real shape of a
+     * multi-statement transaction, and the exact property
+     * WALManager.writeBuffer's own force-only-on-commit behavior depends
+     * on for correctness (see its own javadoc): an individual insert/
+     * update/delete record is never itself fsynced, only written to the
+     * same file the eventual commit record also lands in - a single
+     * fsync() flushes a file's entire pending write queue, not just its
+     * most recent write, so the commit's own force is what makes every
+     * earlier, unforced record in this same transaction durable too.
+     * If that reasoning were wrong, this test would show missing rows
+     * after a real, ungraceful process end.
+     */
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void groupCommittedRowsAllSurviveRestartEvenThoughOnlyTheFinalCommitWasForced() {
+        int totalRows = 500;
+        long sharedXid = 999;
+        Set<Integer> insertedIds = new HashSet<>();
+
+        {
+            DiskManager diskManager = new DiskManager(dataDir);
+            BufferPoolManager bufferPool = track(new BufferPoolManager(64, diskManager));
+            WALManager walManager = track(new WALManager(dataDir));
+            HeapTable table = new HeapTable("crash_test", bufferPool);
+
+            for (int i = 0; i < totalRows; i++) {
+                Tuple tuple = new Tuple();
+                tuple.addValue("id", i);
+                tuple.addValue("payload", "row-" + i + "-payload-padding-to-look-like-a-real-column");
+                byte[] data = tuple.serialize();
+
+                HeapTable.InsertResult result = table.insert(data);
+                walManager.logInsert("crash_test", sharedXid, result.pageId, result.slot, data);
+                // Deliberately NO logCommit here - all 500 inserts share one transaction,
+                // committed exactly once, below, after every row has been logged.
+                insertedIds.add(i);
+            }
+            walManager.logCommit(sharedXid);
+            // Deliberately no bufferPool.flushAll(), no walManager.checkpoint()/close():
+            // this is what "the process ended" looks like without a graceful shutdown path.
+        }
+
+        DiskManager diskManager2 = new DiskManager(dataDir);
+        BufferPoolManager bufferPool2 = track(new BufferPoolManager(64, diskManager2));
+        WALManager walManager2 = track(new WALManager(dataDir));
+        walManager2.recover(diskManager2);
+        HeapTable table2 = new HeapTable("crash_test", bufferPool2);
+
+        Set<Integer> recoveredIds = new HashSet<>();
+        List<byte[]> rows = table2.scan(totalRows * 2);
+        for (byte[] raw : rows) {
+            Tuple t = Tuple.deserialize(raw);
+            recoveredIds.add((Integer) t.getValue("id"));
+        }
+
+        Set<Integer> missing = new HashSet<>(insertedIds);
+        missing.removeAll(recoveredIds);
+
+        assertEquals(
+            insertedIds.size(),
+            recoveredIds.size(),
+            () -> "Expected all " + insertedIds.size() + " group-committed rows to survive a restart "
+                + "even though only the final commit record was individually fsynced, but only "
+                + recoveredIds.size() + " were recovered. Missing " + missing.size()
+                + " row ids, e.g. " + sample(missing, 5) + ". "
+                + "This would mean a single fsync() does NOT flush a file's entire prior write queue "
+                + "on this platform, invalidating WALManager's own force-only-on-commit optimization."
+        );
+    }
+
+    /**
      * Real crash: a second JVM inserts rows and WAL-commits them one at a time, marking
      * each row as committed (fsynced) only after the WAL commit call returns. The test
      * sends SIGKILL partway through, then verifies that every row the child claimed as

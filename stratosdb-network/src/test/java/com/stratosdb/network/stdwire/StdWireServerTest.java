@@ -160,6 +160,29 @@ class StdWireServerTest {
 
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void createAndDropFunctionAndSequenceReturnTheirOwnCommandTagsNotAGenericOk() throws Exception {
+        // A real, previously-latent gap found by testing stdsql end to end: these four
+        // statement types all fell through buildCommandTag's generic "OK" fallback
+        // instead of their own specific tag, unlike every other DDL type already handled.
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE t (id INT)");
+
+            QueryOutcome createFunc = conn.query("CREATE FUNCTION f(x INT) RETURNS INT AS $$ SELECT COUNT(*) FROM t $$ LANGUAGE SQL");
+            assertEquals("CREATE FUNCTION", createFunc.commandTag);
+
+            QueryOutcome dropFunc = conn.query("DROP FUNCTION f");
+            assertEquals("DROP FUNCTION", dropFunc.commandTag);
+
+            QueryOutcome createSeq = conn.query("CREATE SEQUENCE s START WITH 1 INCREMENT BY 1");
+            assertEquals("CREATE SEQUENCE", createSeq.commandTag);
+
+            QueryOutcome dropSeq = conn.query("DROP SEQUENCE s");
+            assertEquals("DROP SEQUENCE", dropSeq.commandTag);
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
     void extendedProtocolNullParameterEncodesAsRealNull() throws Exception {
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE t (id INT, val VARCHAR)");

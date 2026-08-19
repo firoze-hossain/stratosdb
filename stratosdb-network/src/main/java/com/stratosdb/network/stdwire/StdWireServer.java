@@ -427,6 +427,10 @@ public class StdWireServer {
         if (upper.startsWith("ROLLBACK")) return "ROLLBACK";
         if (upper.startsWith("VACUUM")) return "VACUUM";
         if (upper.startsWith("ANALYZE")) return "ANALYZE";
+        if (upper.startsWith("CREATE OR REPLACE FUNCTION") || upper.startsWith("CREATE FUNCTION")) return "CREATE FUNCTION";
+        if (upper.startsWith("DROP FUNCTION")) return "DROP FUNCTION";
+        if (upper.startsWith("CREATE SEQUENCE")) return "CREATE SEQUENCE";
+        if (upper.startsWith("DROP SEQUENCE")) return "DROP SEQUENCE";
         return "OK";
     }
 

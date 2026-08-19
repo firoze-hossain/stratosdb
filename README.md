@@ -69,7 +69,9 @@ See [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for the full walkthrough, inclu
 
 ## Connecting from a Java application
 
-**The easiest path today, no StratosDB-specific dependency required**: start a StratosDB server with `--stdwire`, then connect with the real, standard PostgreSQL JDBC driver (`org.postgresql:postgresql`, already on Maven Central) — this is exactly what real applications do with any Postgres-wire-compatible database:
+**StratosDB's own JDBC driver, `StratosDriver`** — no PostgreSQL dependency of any kind, speaking this project's own custom wire protocol end to end. Not yet published as a standalone Maven artifact (see below), so today this means building from source and depending on the `stratosdb-jdbc` module directly; see [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for `StratosShell`, the reference client built on it.
+
+**Separately, and entirely optionally**: the `--stdwire` port speaks real PostgreSQL wire protocol v3, so the standard, real PostgreSQL JDBC driver (`org.postgresql:postgresql`) also happens to work against it unmodified — this is an ecosystem-*compatibility* feature (any tool built for Postgres wire protocol works here too), not something StratosDB itself needs or depends on:
 
 ```xml
 <dependency>
@@ -83,9 +85,9 @@ See [`RUNNING_LOCALLY.md`](./RUNNING_LOCALLY.md) for the full walkthrough, inclu
 Connection conn = DriverManager.getConnection("jdbc:postgresql://localhost:6583/anydb", "anyuser", "");
 ```
 
-Works the same way with Spring Boot's `DataSource`/`JdbcTemplate` — just point the connection URL at the `--stdwire` port. Known limits from `PROGRESS.md` still apply (simple query protocol only, trust auth only).
+Works the same way with Spring Boot's `DataSource`/`JdbcTemplate` — just point the connection URL at the `--stdwire` port. Both the simple and extended query protocols work here (parameterized queries via `PreparedStatement` use the extended protocol automatically), and real SCRAM-SHA-256 authentication is available — see `PROGRESS.md` for specifics.
 
-**A dedicated StratosDB connector/driver, published the way `mysql-connector-j` or `org.postgresql:postgresql` are** — a small, standalone client artifact (not the engine itself) that Java/Spring Boot projects could add as a single Maven dependency — is a real, deliberately deferred future item, not attempted yet.
+**A dedicated, standalone `StratosDriver` connector artifact**, published the way `mysql-connector-j` or `org.postgresql:postgresql` are — a small, self-contained client jar (not the engine itself) that any Java/Spring Boot project could add as a single Maven dependency without cloning this whole repo — is a real, deliberately deferred future item, not attempted yet.
 
 ## Architecture
 

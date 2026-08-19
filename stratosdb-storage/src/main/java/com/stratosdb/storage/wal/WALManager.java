@@ -82,7 +82,7 @@ public class WALManager {
             buffer.putInt(tupleData.length);
             buffer.put(tupleData);
             
-            writeBuffer(buffer);
+            writeBuffer(buffer, false);
         } catch (Exception e) {
             LOG.error("Failed to log insert", e);
         }
@@ -104,7 +104,7 @@ public class WALManager {
             buffer.putLong(pageId);
             buffer.putInt(slot);
             
-            writeBuffer(buffer);
+            writeBuffer(buffer, false);
         } catch (Exception e) {
             LOG.error("Failed to log delete", e);
         }
@@ -132,7 +132,7 @@ public class WALManager {
             buffer.putInt(newData.length);
             buffer.put(newData);
             
-            writeBuffer(buffer);
+            writeBuffer(buffer, false);
         } catch (Exception e) {
             LOG.error("Failed to log update", e);
         }
@@ -146,7 +146,7 @@ public class WALManager {
             ByteBuffer buffer = ByteBuffer.allocate(16);
             buffer.putInt(OP_COMMIT);
             buffer.putLong(transactionId);
-            writeBuffer(buffer);
+            writeBuffer(buffer, true);
         } catch (Exception e) {
             LOG.error("Failed to log commit", e);
         }
@@ -168,7 +168,7 @@ public class WALManager {
             ByteBuffer buffer = ByteBuffer.allocate(12);
             buffer.putInt(OP_CHECKPOINT);
             buffer.putLong(System.currentTimeMillis());
-            writeBuffer(buffer);
+            writeBuffer(buffer, true);
             LOG.info("Checkpoint written at LSN: {}", currentLSN.get());
         } catch (Exception e) {
             LOG.error("Failed to write checkpoint", e);
@@ -178,14 +178,25 @@ public class WALManager {
     /**
      * Write buffer to WAL
      */
-    private void writeBuffer(ByteBuffer buffer) {
+    private void writeBuffer(ByteBuffer buffer, boolean force) {
+        if (walChannel == null || !walChannel.isOpen()) {
+            // Already known to be closed - fail fast rather than attempting the write and
+            // logging a full stack trace, which would repeat on every subsequent call once
+            // the WAL is in this state (a real, previously-latent issue: once the channel
+            // closes for any reason mid-session - including a JVM-level ClosedByInterruptException
+            // if the thread performing a slow fsync is interrupted, e.g. by a test timeout on a real,
+            // slower disk - every later write silently degraded into repeated, expensive
+            // full-stack-trace logging instead of failing quietly).
+            LOG.warn("WAL write skipped - channel is already closed");
+            return;
+        }
         try {
             buffer.flip();
             long position = currentLSN.getAndAdd(buffer.limit());
             walChannel.position(position);
             walChannel.write(buffer);
             
-            if (sync) {
+            if (sync && force) {
                 walChannel.force(false);
             }
         } catch (Exception e) {
