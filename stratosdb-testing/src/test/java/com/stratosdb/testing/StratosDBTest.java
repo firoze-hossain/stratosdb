@@ -2666,6 +2666,127 @@ public class StratosDBTest {
         }
     }
 
+    // --- Extensions: real CREATE EXTENSION / DROP EXTENSION / CREATE FUNCTION ...
+    // LANGUAGE C, backed by NativeExtensionBridge's own real dlopen()/dlsym() calls -
+    // see its own javadoc (stratosdb-sql module, com.stratosdb.sql.extension package)
+    // for the full design and honestly-stated scope. These tests build a real native
+    // bridge library and a real sample extension library from C source, at test time,
+    // via gcc - skipped entirely (not failed) if gcc or the JDK's own jni.h aren't
+    // available, since that's a real, environment-dependent prerequisite for this
+    // feature, not something every machine running this test suite is guaranteed to
+    // have - StratosDB itself runs completely fine without ever needing either.
+
+    private static boolean nativeExtensionsBuildable() {
+        try {
+            Process gccCheck = new ProcessBuilder("gcc", "--version").redirectErrorStream(true).start();
+            if (gccCheck.waitFor() != 0) return false;
+            String javaHome = System.getProperty("java.home");
+            return new java.io.File(javaHome, "include/jni.h").exists();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Builds libstratosbridge.so into ./native/ (relative to the current working directory - matching exactly what NativeExtensionBridge.findBridgeLibrary itself checks, with no environment-variable trickery needed) and a small sample extension .so into workDir, using the project's own real NativeExtensionBridge.java source - not a hand-copied duplicate that could silently drift out of sync with it. */
+    private static void buildNativeTestFixtures(java.io.File workDir) throws Exception {
+        java.io.File nativeDir = new java.io.File("native");
+        nativeDir.mkdirs();
+        String javaHome = System.getProperty("java.home");
+
+        // Find the real NativeExtensionBridge.java source by walking up from the
+        // working directory - robust to Maven running this test from either the
+        // repo root or the stratosdb-testing module directory.
+        java.io.File bridgeSource = findFileUpward("stratosdb-sql/src/main/java/com/stratosdb/sql/extension/NativeExtensionBridge.java");
+        assertNotNull(bridgeSource, "Could not locate NativeExtensionBridge.java by walking up from the working directory");
+
+        String slf4jJar = findJarOnClasspath("slf4j-api");
+        runAndCheck(new String[]{"javac", "-cp", slf4jJar, "-d", workDir.getPath(), "-h", nativeDir.getPath(), bridgeSource.getPath()});
+
+        java.io.File bridgeHeader = new java.io.File(nativeDir, "com_stratosdb_sql_extension_NativeExtensionBridge.h");
+        java.io.File bridgeSourceC = findFileUpward("native/stratosbridge.c");
+        assertNotNull(bridgeSourceC, "Could not locate native/stratosbridge.c by walking up from the working directory");
+
+        runAndCheck(new String[]{"gcc", "-shared", "-fPIC",
+            "-I" + javaHome + "/include", "-I" + javaHome + "/include/linux", "-I" + nativeDir.getPath(),
+            bridgeSourceC.getPath(), "-o", new java.io.File(nativeDir, "libstratosbridge.so").getPath(), "-ldl"});
+
+        java.io.File sampleExtC = new java.io.File(workDir, "sample_ext.c");
+        java.nio.file.Files.writeString(sampleExtC.toPath(),
+            "#include <stdint.h>\n" +
+            "int64_t stratos_ext_add(int64_t *args, int32_t argc) { return argc == 2 ? args[0] + args[1] : -1; }\n");
+        runAndCheck(new String[]{"gcc", "-shared", "-fPIC", sampleExtC.getPath(),
+            "-o", new java.io.File(workDir, "libsampleext.so").getPath()});
+    }
+
+    private static java.io.File findFileUpward(String relativePath) {
+        java.io.File dir = new java.io.File(".").getAbsoluteFile();
+        for (int i = 0; i < 6 && dir != null; i++, dir = dir.getParentFile()) {
+            java.io.File candidate = new java.io.File(dir, relativePath);
+            if (candidate.exists()) return candidate;
+        }
+        return null;
+    }
+
+    private static String findJarOnClasspath(String jarNameFragment) {
+        for (String entry : System.getProperty("java.class.path").split(java.io.File.pathSeparator)) {
+            if (entry.contains(jarNameFragment)) return entry;
+        }
+        return "";
+    }
+
+    private static void runAndCheck(String[] command) throws Exception {
+        Process p = new ProcessBuilder(command).redirectErrorStream(true).start();
+        String output = new String(p.getInputStream().readAllBytes());
+        int exit = p.waitFor();
+        assertEquals(0, exit, () -> "Command failed: " + String.join(" ", command) + "\nOutput: " + output);
+    }
+
+    @Test
+    void testCreateExtensionAndNativeFunctionCallReturnsRealNativeResult() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(nativeExtensionsBuildable(), "gcc or the JDK's jni.h is not available on this machine - skipping native extension tests");
+
+        java.io.File workDir = java.nio.file.Files.createTempDirectory("nativeexttest").toFile();
+        try {
+            buildNativeTestFixtures(workDir);
+            String extPath = new java.io.File(workDir, "libsampleext.so").getAbsolutePath();
+
+            QueryResult createExt = database.execute("CREATE EXTENSION sampleext AS '" + extPath + "'");
+            assertTrue(createExt.isSuccess(), () -> "CREATE EXTENSION must succeed: " + createExt.getError());
+
+            QueryResult createFunc = database.execute(
+                "CREATE FUNCTION fast_add(a INT, b INT) RETURNS INT AS sampleext, 'stratos_ext_add' LANGUAGE C");
+            assertTrue(createFunc.isSuccess(), () -> "CREATE FUNCTION LANGUAGE C must succeed: " + createFunc.getError());
+
+            database.execute("CREATE TABLE t (id INT)");
+            database.execute("INSERT INTO t VALUES (1)");
+
+            QueryResult selectResult = database.execute("SELECT fast_add(15, 27) FROM t");
+            assertTrue(selectResult.isSuccess(), () -> "SELECT calling the native function must succeed: " + selectResult.getError());
+            assertEquals(42, selectResult.getRows().get(0).getValue(0),
+                "the native C function's own real, computed result (15+27) must come back correctly, not a stub or placeholder");
+
+            QueryResult dropExt = database.execute("DROP EXTENSION sampleext");
+            assertTrue(dropExt.isSuccess());
+            QueryResult afterDrop = database.execute("SELECT fast_add(1, 2) FROM t");
+            assertFalse(afterDrop.isSuccess(), "calling a native function after its extension is dropped must fail cleanly, not crash or return a stale result");
+        } finally {
+            deleteRecursively(workDir);
+        }
+    }
+
+    @Test
+    void testCreateExtensionRejectsANonexistentLibraryPath() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(nativeExtensionsBuildable(), "gcc or the JDK's jni.h is not available on this machine - skipping native extension tests");
+        java.io.File workDir = java.nio.file.Files.createTempDirectory("nativeexttest2").toFile();
+        try {
+            buildNativeTestFixtures(workDir); // needed so the bridge itself is buildable/loadable before this CREATE EXTENSION attempt
+            QueryResult result = database.execute("CREATE EXTENSION badext AS '/nonexistent/path/libfake.so'");
+            assertFalse(result.isSuccess(), "CREATE EXTENSION must fail cleanly for a library that doesn't exist, not crash the process");
+        } finally {
+            deleteRecursively(workDir);
+        }
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

@@ -128,6 +128,15 @@ public class SqlParser {
             return buildCreateTrigger(ctx.createTrigger());
         } else if (ctx.dropTrigger() != null) {
             return new DropTriggerStatement(ctx.dropTrigger().triggerName().getText(), ctx.dropTrigger().tableName().getText());
+        } else if (ctx.createExtension() != null) {
+            StratosSQLParser.CreateExtensionContext extCtx = ctx.createExtension();
+            String name = extCtx.extensionName().getText();
+            String rawPath = extCtx.STRING_LITERAL().getText();
+            return new CreateExtensionStatement(name, rawPath);
+        } else if (ctx.dropExtension() != null) {
+            return new DropExtensionStatement(ctx.dropExtension().extensionName().getText());
+        } else if (ctx.createNativeFunction() != null) {
+            return buildCreateNativeFunction(ctx.createNativeFunction());
         }
         throw new IllegalArgumentException("Unsupported SQL statement");
     }
@@ -147,6 +156,20 @@ public class SqlParser {
         String language = ctx.SQL_LANG() != null ? "SQL" : ctx.IDENTIFIER().getText();
         boolean orReplace = ctx.REPLACE() != null;
         return new CreateFunctionStatement(name, params, returnType, body, language, orReplace);
+    }
+
+    /** extensionName is a bare identifier looked up in ExecutorEngine's own extension registry (see CreateNativeFunctionStatement's own javadoc for why this differs from real Postgres's own two-string-literal 'obj_file', 'symbol' convention). nativeSymbol's raw STRING_LITERAL text is kept quoted, unquoted later by the executor's own parseLiteral, matching this project's established convention. */
+    private CreateNativeFunctionStatement buildCreateNativeFunction(StratosSQLParser.CreateNativeFunctionContext ctx) {
+        String name = ctx.functionName().getText();
+        List<FunctionParam> params = new ArrayList<>();
+        for (StratosSQLParser.FunctionParamContext paramCtx : ctx.functionParam()) {
+            params.add(new FunctionParam(paramCtx.IDENTIFIER().getText(), paramCtx.dataType().getText()));
+        }
+        String returnType = ctx.dataType().getText();
+        String extensionName = ctx.extensionName().getText();
+        String rawSymbol = ctx.STRING_LITERAL().getText();
+        boolean orReplace = ctx.REPLACE() != null;
+        return new CreateNativeFunctionStatement(name, params, returnType, extensionName, rawSymbol, orReplace);
     }
 
     private CreateProcedureStatement buildCreateProcedure(StratosSQLParser.CreateProcedureContext ctx) {

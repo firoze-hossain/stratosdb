@@ -436,6 +436,8 @@ public class StdWireServer {
         if (upper.startsWith("CALL")) return "CALL";
         if (upper.startsWith("CREATE TRIGGER")) return "CREATE TRIGGER";
         if (upper.startsWith("DROP TRIGGER")) return "DROP TRIGGER";
+        if (upper.startsWith("CREATE EXTENSION")) return "CREATE EXTENSION";
+        if (upper.startsWith("DROP EXTENSION")) return "DROP EXTENSION";
         return "OK";
     }
 

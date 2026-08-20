@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -20,6 +20,10 @@ sequenceName: IDENTIFIER;
 createFunction: CREATE (OR REPLACE)? FUNCTION functionName LPAREN (functionParam (COMMA functionParam)*)? RPAREN RETURNS dataType AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
 dropFunction: DROP FUNCTION functionName SEMICOLON?;
 functionName: IDENTIFIER;
+createExtension: CREATE EXTENSION extensionName AS STRING_LITERAL SEMICOLON?;
+dropExtension: DROP EXTENSION extensionName SEMICOLON?;
+extensionName: IDENTIFIER;
+createNativeFunction: CREATE (OR REPLACE)? FUNCTION functionName LPAREN (functionParam (COMMA functionParam)*)? RPAREN RETURNS dataType AS extensionName COMMA STRING_LITERAL LANGUAGE IDENTIFIER SEMICOLON?;
 functionParam: IDENTIFIER dataType;
 functionCall: functionName LPAREN (functionArg (COMMA functionArg)*)? RPAREN;
 functionArg: literal | columnName;
@@ -189,6 +193,7 @@ FOR: F O R;
 EACH: E A C H;
 ROW: R O W;
 EXECUTE: E X E C U T E;
+EXTENSION: E X T E N S I O N;
 RETURNS: R E T U R N S;
 LANGUAGE: L A N G U A G E;
 REPLACE: R E P L A C E;
