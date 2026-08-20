@@ -167,6 +167,7 @@ public class StratosDB {
 
     // Getters
     public DatabaseConfig getConfig() { return config; }
+    public DiskManager getDiskManager() { return diskManager; }
     public BufferPoolManager getBufferPool() { return bufferPool; }
     public WALManager getWalManager() { return walManager; }
     public TransactionManager getTransactionManager() { return transactionManager; }

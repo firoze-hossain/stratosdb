@@ -1558,7 +1558,23 @@ public class ExecutorEngine {
         HeapTable table = tables.get(stmt.tableName());
         HeapTable.InsertResult result = table.insertMvcc(data, txn.getXID());
 
-        walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, data);
+        // A real, previously-latent bug: insertMvcc wraps data with MVCC
+        // metadata (xmin/xmax) internally before storing it on the page,
+        // but this logInsert call used to log the raw, UNWRAPPED data
+        // instead - not what was actually stored. WALManager.recover()'s
+        // own redo (page.insertTuple(tupleData) with tupleData taken
+        // directly from this WAL record) would then insert a tuple with
+        // no MVCC wrapper at all into the recovered page - readable
+        // neither as a valid MVCC-wrapped row nor matching what the
+        // primary's own page actually had before a crash. Found while
+        // building real replication (a replica applying this same,
+        // wrong bytes produced a page scan() couldn't read back
+        // correctly), but this affects this engine's own local crash
+        // recovery too, not just replication - fixed by logging the
+        // exact same wrapped bytes insertMvcc already computed and
+        // stored, not a second, divergent computation of them.
+        byte[] storedBytes = MVCCVisibility.wrap(data, txn.getXID(), MVCCVisibility.NO_XMAX);
+        walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, storedBytes);
         maintainIndexesOnWrite(stmt.tableName(), tuple, result.pageId, result.slot);
         recordUndo(new UndoAction.UndoInsert(stmt.tableName(), result.pageId, result.slot));
 
@@ -2931,7 +2947,11 @@ public class ExecutorEngine {
 
             HeapTable.InsertResult newVersion = table.updateMvcc(row.pageId(), row.slot(), newPayload, txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
-            walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, newPayload);
+            // Same real, previously-latent bug as finishInsert's own logInsert call (see its
+            // javadoc): updateMvcc's own insertMvcc call wraps newPayload with MVCC metadata
+            // before actually storing it; log that same wrapped form, not the raw payload.
+            byte[] storedNewBytes = MVCCVisibility.wrap(newPayload, txn.getXID(), MVCCVisibility.NO_XMAX);
+            walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, storedNewBytes);
             maintainIndexesOnDelete(stmt.tableName(), oldTuple, row.pageId(), row.slot());
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
             recordUndo(new UndoAction.UndoUpdate(stmt.tableName(), row.pageId(), row.slot(), newVersion.pageId, newVersion.slot));

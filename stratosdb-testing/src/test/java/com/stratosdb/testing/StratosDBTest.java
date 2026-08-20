@@ -2619,6 +2619,53 @@ public class StratosDBTest {
         }
     }
 
+    @Test
+    void testRecoveredInsertIsCorrectlyMvccWrappedNotRawUnwrappedBytes() throws Exception {
+        // A real, previously-latent bug found while building real replication (see
+        // PROGRESS.md): ExecutorEngine.finishInsert used to log the RAW, unwrapped tuple
+        // payload to the WAL, but HeapTable.insertMvcc wraps that same payload with real
+        // MVCC metadata (xmin/xmax) internally before actually storing it on the page - so
+        // a row recovered purely from the WAL (never flushed to its page before a crash)
+        // would come back with no MVCC wrapper at all, not matching what the page would
+        // have had if it had been flushed normally. Proven here directly: insert a row,
+        // deliberately never flush or gracefully shut down (simulating a crash before any
+        // background flush), then recover from a completely fresh WALManager/DiskManager
+        // pair and verify the recovered bytes are genuinely MVCC-wrapped - readable via
+        // MVCCVisibility and deserializing back to the exact original values, not garbage.
+        java.nio.file.Path tempDataDir = java.nio.file.Files.createTempDirectory("mvccwraptest");
+        try {
+            com.stratosdb.core.DatabaseConfig config = new com.stratosdb.core.DatabaseConfig();
+            config.setDataDirectory(tempDataDir.toString());
+            StratosDB db = new StratosDB(config);
+            db.execute("CREATE TABLE t (id INT, name VARCHAR)");
+            db.execute("INSERT INTO t VALUES (42, 'Alice')");
+            // Deliberately no db.shutdown() and no explicit flush - the row must still only
+            // exist via the WAL record finishInsert wrote, not yet written to its own page.
+
+            com.stratosdb.storage.disk.DiskManager diskManager = new com.stratosdb.storage.disk.DiskManager(tempDataDir.toString());
+            com.stratosdb.storage.buffer.BufferPoolManager bufferPool = new com.stratosdb.storage.buffer.BufferPoolManager(64, diskManager);
+            com.stratosdb.storage.wal.WALManager walManager = new com.stratosdb.storage.wal.WALManager(tempDataDir.toString());
+            walManager.recover(diskManager);
+
+            com.stratosdb.storage.heap.HeapTable table = new com.stratosdb.storage.heap.HeapTable("t", bufferPool);
+            java.util.List<byte[]> rawRows = table.scan(10);
+            assertEquals(1, rawRows.size(), "exactly one row should have been recovered purely from the WAL");
+
+            byte[] raw = rawRows.get(0);
+            assertTrue(com.stratosdb.transaction.mvcc.MVCCVisibility.readXmin(raw) > 0,
+                "the recovered row must have a real, positive MVCC xmin - not garbage bytes misread as one");
+            byte[] payload = com.stratosdb.transaction.mvcc.MVCCVisibility.readPayload(raw);
+            com.stratosdb.storage.page.Tuple recovered = com.stratosdb.storage.page.Tuple.deserialize(payload);
+            assertEquals(42, recovered.getValue("id"));
+            assertEquals("Alice", recovered.getValue("name"));
+
+            walManager.close();
+            bufferPool.close();
+        } finally {
+            deleteRecursively(tempDataDir.toFile());
+        }
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

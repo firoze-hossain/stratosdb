@@ -495,7 +495,36 @@ public class WALManager {
     public long getCurrentLSN() {
         return currentLSN.get();
     }
-    
+
+    /**
+     * Reads raw WAL bytes from fromOffset up to the current LSN, for
+     * streaming to a connected replica (see ReplicationServer) - the
+     * primary side's own counterpart to StreamingWalApplier's replica-
+     * side apply logic. Uses a completely separate FileChannel opened
+     * read-only against the same underlying file, rather than the
+     * shared walChannel every write already uses, so a concurrent
+     * replication read can never race with (or be blocked by) an
+     * in-progress write's own position()/write() pair on that shared
+     * channel - two independent file descriptors reading/writing the
+     * same file concurrently is a standard, safe OS-level guarantee.
+     */
+    public synchronized byte[] readBytesFrom(long fromOffset) {
+        long upToLsn = currentLSN.get();
+        if (fromOffset >= upToLsn) {
+            return new byte[0];
+        }
+        try (RandomAccessFile raf = new RandomAccessFile(new File(walDirectory, "wal.log"), "r")) {
+            int length = (int) (upToLsn - fromOffset);
+            byte[] data = new byte[length];
+            raf.seek(fromOffset);
+            raf.readFully(data);
+            return data;
+        } catch (Exception e) {
+            LOG.error("Failed to read WAL bytes for replication from offset {}", fromOffset, e);
+            return new byte[0];
+        }
+    }
+
     public void close() {
         if (walChannel == null || !walChannel.isOpen()) {
             return; // already closed - makes close() safe to call more than once
