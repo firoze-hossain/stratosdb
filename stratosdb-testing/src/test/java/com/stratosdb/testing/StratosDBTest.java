@@ -2787,6 +2787,22 @@ public class StratosDBTest {
         }
     }
 
+    @Test
+    void testLineAndBlockCommentsAreCorrectlyIgnoredNotTreatedAsSyntaxErrors() {
+        // A real, separate fix from stratosdump itself: this engine's own grammar had no
+        // comment support at all before this round - found while testing stratosdump's own
+        // generated dump output, which starts with real SQL comment lines.
+        database.execute("-- this whole line is a comment and must not error");
+        QueryResult createResult = database.execute("CREATE TABLE t (id INT) -- trailing comment on a real statement");
+        assertTrue(createResult.isSuccess(), () -> "a trailing line comment must not break an otherwise-valid statement: " + createResult.getError());
+
+        QueryResult insertResult = database.execute("INSERT /* a block comment mid-statement */ INTO t VALUES (1)");
+        assertTrue(insertResult.isSuccess(), () -> "a block comment must not break an otherwise-valid statement: " + insertResult.getError());
+
+        QueryResult selectResult = database.execute("SELECT * FROM t");
+        assertEquals(1, selectResult.getRows().size(), "the actual statement content around the comments must still execute correctly");
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

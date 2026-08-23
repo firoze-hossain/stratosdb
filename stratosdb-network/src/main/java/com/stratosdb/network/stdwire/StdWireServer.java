@@ -4,6 +4,7 @@ import com.stratosdb.core.StratosDB;
 import com.stratosdb.network.auth.ScramSha256;
 import com.stratosdb.network.auth.UserStore;
 import com.stratosdb.sql.executor.QueryResult;
+import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.storage.page.Tuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +43,8 @@ public class StdWireServer {
     private final int port;
     private final StratosDB db;
     private final UserStore userStore; // null = trust auth, matching StratosServer's own established convention for this project
+    /** Stateless - safe to keep one, reused only for isEffectivelyEmpty's own real lexer check below (real SQL parsing itself still goes through StratosDB.execute's own internal parser, not this instance). */
+    private final SqlParser sqlParser = new SqlParser();
     private volatile boolean running = false;
     private ServerSocket serverSocket;
     private ExecutorService connectionExecutor;
@@ -134,7 +137,7 @@ public class StdWireServer {
                 // per-line behavior sends one at a time, but scripts/tools may not) - handle
                 // each one in order, same as a real server would.
                 for (String statement : splitStatements(sql)) {
-                    if (statement.isBlank()) {
+                    if (statement.isBlank() || sqlParser.isEffectivelyEmpty(statement)) {
                         StdWireMessages.writeEmptyQueryResponse(out);
                         continue;
                     }

@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -14,6 +14,7 @@ dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
 showTables: SHOW TABLES SEMICOLON?;
 showStats: SHOW STATS SEMICOLON?;
+showCatalog: SHOW CATALOG SEMICOLON?;
 createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
 dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
 sequenceName: IDENTIFIER;
@@ -182,6 +183,7 @@ DEFAULT: D E F A U L T;
 SHOW: S H O W;
 TABLES: T A B L E S;
 STATS: S T A T S;
+CATALOG: C A T A L O G;
 SEQUENCE: S E Q U E N C E;
 FUNCTION: F U N C T I O N;
 PROCEDURE: P R O C E D U R E;
@@ -328,3 +330,5 @@ fragment Z: [zZ];
 
 // Skip whitespace
 WS: [ \t\r\n]+ -> skip;
+LINE_COMMENT: '--' ~[\r\n]* -> skip;
+BLOCK_COMMENT: '/*' .*? '*/' -> skip;

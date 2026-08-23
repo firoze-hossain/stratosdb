@@ -163,7 +163,8 @@ public class ExecutorEngine {
             saveCatalog();
         } else if (stmt instanceof CreateIndexStatement s) {
             catalogLines.put("INDEX:" + s.indexName(),
-                "INDEX|" + s.indexName() + "|" + s.tableName() + "|" + s.columnName() + "|" + s.indexType());
+                "INDEX|" + s.indexName() + "|" + s.tableName() + "|" + s.columnName() + "|" + s.indexType()
+                    + "|" + (s.columnName2() == null ? "" : s.columnName2()));
             saveCatalog();
         } else if (stmt instanceof CreateSequenceStatement s) {
             catalogLines.put("SEQUENCE:" + s.name(), "SEQUENCE|" + sql);
@@ -242,8 +243,13 @@ public class ExecutorEngine {
                 String[] parts = line.split("\\|", 2);
                 String kind = parts[0];
                 if (kind.equals("INDEX")) {
-                    String[] indexParts = parts[1].split("\\|");
+                    String[] indexParts = parts[1].split("\\|", -1);
                     String indexName = indexParts[0], tableName = indexParts[1], columnName = indexParts[2], type = indexParts[3];
+                    // A 6th field (columnName2, for multi-column GiST indexes) is a real,
+                    // separate fix from a later round - older, already-persisted catalog
+                    // files won't have it, so this stays backward compatible rather than
+                    // breaking on a shorter, pre-existing line.
+                    String columnName2 = indexParts.length > 4 && !indexParts[4].isEmpty() ? indexParts[4] : null;
                     reconstructIndex(indexName, tableName, columnName, type);
                     catalogLines.put("INDEX:" + indexName, line);
                 } else {
@@ -398,6 +404,16 @@ public class ExecutorEngine {
     }
 
     private QueryResult executeInternal(String sql) {
+        if (parser.isEffectivelyEmpty(sql)) {
+            // A comment-only or all-whitespace query is a real, valid no-op - the same
+            // way real Postgres treats it - not a syntax error. Found while testing
+            // stratosdump's own generated dump output, which starts with real SQL
+            // comment lines; fixed here at the core level so any caller of execute()
+            // gets this right, not just the wire-protocol path (see StdWireServer's
+            // own, separate isEffectivelyEmpty check for its own EmptyQueryResponse
+            // message type specifically).
+            return QueryResult.success("OK");
+        }
         Statement stmt;
         try {
             stmt = parser.parse(sql);
@@ -686,6 +702,7 @@ public class ExecutorEngine {
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ShowStatsStatement) return executeShowStats();
+        if (stmt instanceof ShowCatalogStatement) return executeShowCatalog();
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
@@ -3171,6 +3188,56 @@ public class ExecutorEngine {
         for (String tableName : tables.keySet()) {
             Tuple row = new Tuple();
             row.addValue("table_name", tableName);
+            rows.add(row);
+        }
+        return QueryResult.success(rows);
+    }
+
+    /**
+     * SHOW CATALOG - see ShowCatalogStatement's own javadoc for the real
+     * design principle: expose exactly the same original CREATE
+     * statement text this engine already persists for its own restart
+     * survival, verbatim, rather than re-serializing each object type's
+     * AST back into SQL text separately (a real, separate source of
+     * drift from what the object actually is).
+     *
+     * INDEX is the one real exception: unlike every other object type,
+     * an index's own catalogLines entry does not store its original
+     * CREATE INDEX text verbatim - only its structured fields (name,
+     * table, column(s), type) - so this method reconstructs a real,
+     * valid, re-executable CREATE INDEX statement from those fields
+     * instead of just passing something through.
+     */
+    private QueryResult executeShowCatalog() {
+        List<Tuple> rows = new ArrayList<>();
+        for (Map.Entry<String, String> entry : catalogLines.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+            int colonIdx = key.indexOf(':');
+            String objectType = colonIdx >= 0 ? key.substring(0, colonIdx) : key;
+            String objectName = colonIdx >= 0 ? key.substring(colonIdx + 1) : "";
+
+            String ddlSql;
+            if (objectType.equals("INDEX")) {
+                String[] parts = value.split("\\|", -1);
+                // INDEX|indexName|tableName|columnName|indexType[|columnName2]
+                String indexName = parts.length > 1 ? parts[1] : objectName;
+                String tableName = parts.length > 2 ? parts[2] : "";
+                String columnName = parts.length > 3 ? parts[3] : "";
+                String indexType = parts.length > 4 ? parts[4] : "BTREE";
+                String columnName2 = parts.length > 5 && !parts[5].isEmpty() ? parts[5] : null;
+                String columns = columnName2 != null ? columnName + ", " + columnName2 : columnName;
+                String usingClause = indexType.equalsIgnoreCase("BTREE") ? "" : " USING " + indexType;
+                ddlSql = "CREATE INDEX " + indexName + " ON " + tableName + " (" + columns + ")" + usingClause + ";";
+            } else {
+                int pipeIdx = value.indexOf('|');
+                ddlSql = pipeIdx >= 0 ? value.substring(pipeIdx + 1) : value;
+            }
+
+            Tuple row = new Tuple();
+            row.addValue("object_type", objectType);
+            row.addValue("object_name", objectName);
+            row.addValue("ddl_sql", ddlSql);
             rows.add(row);
         }
         return QueryResult.success(rows);

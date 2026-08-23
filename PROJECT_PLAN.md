@@ -58,6 +58,8 @@ PostgreSQL is the product of roughly 30 years and thousands of contributors, wit
 
 And where StratosDB is honestly not going to be "better" any time soon, stated as plainly as the rest of this plan: query optimizer sophistication (decades of tuning against real workloads), the extension ecosystem (PostGIS, `pg_vector`, hundreds of others), replication and HA maturity, raw throughput at scale, and — perhaps most importantly — the sheer volume of production battle-testing that surfaces edge cases no test suite invents on its own.
 
+One real, deliberately narrow step taken within that gap rather than an attempt to close it: `stratosdump`, a real backup/restore tool (see `PROGRESS.md`) — the single piece of tooling every real Postgres deployment has always had that this engine genuinely could not do without. It doesn't change the scale of the gap above; it's proof that picking one real, extremely-needed thing and building it properly is the right way to make progress against a "different scale of thing" problem, rather than a token gesture across many fronts at once.
+
 Given that, the real goal for Part 2 is: close the feature gaps that matter most for actual usage, in priority order, each backed by a real test — the exact standard Part 1 was held to throughout. "Better than PostgreSQL" is realistically an aspiration for a narrow, specific set of properties (embeddability, portability, code legibility), not a blanket claim, and everything below is honest about that split.
 
 ### Feature-parity scorecard (checked against the actual repo, not aspirational)

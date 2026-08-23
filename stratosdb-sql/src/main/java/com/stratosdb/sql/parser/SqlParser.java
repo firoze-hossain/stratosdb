@@ -12,6 +12,31 @@ import java.util.List;
 public class SqlParser {
     private static final Logger LOG = LoggerFactory.getLogger(SqlParser.class);
 
+    /**
+     * True if sql has no real tokens once whitespace and comments are
+     * stripped - e.g. a line that's entirely a `--` comment, or a
+     * `/* *\/`-only block, or pure whitespace. Uses the real lexer
+     * (not a separate, potentially-diverging regex) specifically so a
+     * string literal that happens to contain "--" or "/*" is never
+     * mistaken for an actual comment the way a naive text-based check
+     * could be - the lexer already knows the difference correctly.
+     *
+     * Exists for exactly one real reason: a comment-only line (like the
+     * header lines stratosdump's own generated output starts with) is
+     * not a syntax error to report - it's an empty query, the same as
+     * real Postgres treats it, and StdWireServer uses this to decide
+     * that rather than attempting to parse it and surfacing a confusing
+     * "mismatched input EOF" error for what is, in fact, valid SQL.
+     */
+    public boolean isEffectivelyEmpty(String sql) {
+        CharStream charStream = CharStreams.fromString(sql);
+        StratosSQLLexer lexer = new StratosSQLLexer(charStream);
+        lexer.removeErrorListeners(); // a lexer error here (e.g. an unterminated string) means real content exists - not this method's job to report
+        CommonTokenStream tokens = new CommonTokenStream(lexer);
+        tokens.fill();
+        return tokens.size() == 1 && tokens.get(0).getType() == Token.EOF;
+    }
+
     public Statement parse(String sql) {
         LOG.debug("Parsing: {}", sql);
 
@@ -53,6 +78,8 @@ public class SqlParser {
             return new ShowTablesStatement();
         } else if (ctx.showStats() != null) {
             return new ShowStatsStatement();
+        } else if (ctx.showCatalog() != null) {
+            return new ShowCatalogStatement();
         } else if (ctx.explain() != null) {
             return new ExplainStatement(buildSelect(ctx.explain().select()));
         } else if (ctx.analyze() != null) {
