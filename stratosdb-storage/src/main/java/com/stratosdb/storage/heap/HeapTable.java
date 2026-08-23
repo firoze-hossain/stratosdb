@@ -23,7 +23,16 @@ public class HeapTable {
     
     private final String name;
     private final BufferPool bufferPool;
-    private long lastPageId;
+    /**
+     * Atomic, not a plain long: now that insert() uses fine-grained,
+     * per-page latches instead of one coarse table-wide synchronized
+     * lock (see insert()'s own javadoc), multiple threads can genuinely
+     * read and race to advance this field concurrently while deciding
+     * whether to extend the table with a new page - a plain long here
+     * would risk a stale, un-published read across threads with no
+     * happens-before relationship at all.
+     */
+    private final java.util.concurrent.atomic.AtomicLong lastPageId;
 
     /**
      * The visibility map: bit i set means page i is currently "all
@@ -57,7 +66,7 @@ public class HeapTable {
         // many pages the table really had. scan()/insert() silently ignored every
         // page beyond the first for any table that survived a restart.
         long existingPages = bufferPool.getTablePageCount(name);
-        this.lastPageId = existingPages > 0 ? existingPages - 1 : 0;
+        this.lastPageId = new java.util.concurrent.atomic.AtomicLong(existingPages > 0 ? existingPages - 1 : 0);
     }
 
     /** Whether pageId is currently known to be "all visible" - see visibilityMap's own javadoc for the exact guarantee this means. Conservatively false (never crashes) for a pageId never observed. */
@@ -68,79 +77,103 @@ public class HeapTable {
     /**
      * Insert a tuple.
      *
-     * Synchronized on this table instance for its entire body - a real,
-     * serious bug found while testing sequence-generated ids under
-     * concurrency (though not specific to sequences at all): lastPageId
-     * was read and written with no synchronization, and two threads could
-     * both read the same lastPageId, both decide to use/create the same
-     * page, and both call page.insertTuple() on the very same Page object
-     * with zero locking between them - a classic read-modify-write race
-     * on the page's slot directory that could silently lose one thread's
-     * insert entirely (not corrupt it visibly - it just never appears in
-     * later reads), reproduced directly: plain, fast, uniformly-timed
-     * concurrent inserts rarely hit the race window, but nextval()'s
-     * extra latency (regex matching, a synchronized watermark check) made
-     * the window far more likely to be hit, exposing what was already a
-     * real risk for ANY concurrent inserts into the same table, not a bug
-     * introduced by sequences themselves.
+     * Real, fine-grained page latching, not one coarse table-wide lock:
+     * each existing page is tried under its OWN write latch, held only
+     * for that page's own insert attempt - concurrent inserts landing on
+     * different pages of the same table now genuinely proceed in
+     * parallel, rather than serializing through one lock regardless of
+     * which page each one actually targets.
+     *
+     * The real, separate risk this replaces a coarse lock's brute-force
+     * fix for (a real, serious bug found while testing sequence-generated
+     * ids under concurrency, though not specific to sequences at all):
+     * two threads both deciding to extend the table with a new page could
+     * race on lastPageId itself - not a page's own contents, but the
+     * decision of which page id even IS the new one. Solved here with a
+     * real compareAndSet retry loop: a thread that loses the race to
+     * publish its own candidate new page id (because a concurrent thread
+     * already advanced lastPageId past it) doesn't silently double-use a
+     * page id or corrupt anything - it simply retries with a fresh
+     * candidate. The same loop also handles the rarer case where a "new"
+     * page is found already full by the time this thread's own write
+     * latch on it is granted (another thread got there first and filled
+     * it) - retried, not assumed to succeed.
      */
-    public synchronized InsertResult insert(byte[] tupleData) {
-        // Try existing pages first
-        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+    public InsertResult insert(byte[] tupleData) {
+        // Fast path: try every existing page under its own write latch, held only
+        // for this one insert attempt on that specific page.
+        long snapshotLast = lastPageId.get();
+        for (long pageId = 0; pageId <= snapshotLast; pageId++) {
             SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-            
-            // Check if we have space for this tuple
-            if (page.hasSpace(tupleData)) {
-                int slot = page.insertTuple(tupleData);
-                if (slot != -1) {
-                    bufferPool.markDirty(name, pageId);
-                    bufferPool.unpinPage(name, pageId);
-                    visibilityMap.clear((int) pageId); // a new (possibly uncommitted) tuple just landed here
-                    LOG.debug("Inserted at {}/{}", pageId, slot);
-                    return new InsertResult(pageId, slot);
+            page.getLatch().writeLock().lock();
+            try {
+                if (page.hasSpace(tupleData)) {
+                    int slot = page.insertTuple(tupleData);
+                    if (slot != -1) {
+                        bufferPool.markDirty(name, pageId);
+                        visibilityMap.clear((int) pageId); // a new (possibly uncommitted) tuple just landed here
+                        LOG.debug("Inserted at {}/{}", pageId, slot);
+                        return new InsertResult(pageId, slot);
+                    }
                 }
+            } finally {
+                page.getLatch().writeLock().unlock();
+                bufferPool.unpinPage(name, pageId);
             }
-            bufferPool.unpinPage(name, pageId);
         }
-        
-        // Need new page. This MUST go through the buffer pool (getPage), the same
-        // as every existing page above - otherwise the page only exists in this
-        // local variable, is never registered in the pool's cache, and is silently
-        // dropped on the floor: flushAll()/eviction can only persist pages they know
-        // about. (Previously this called `new SlottedPage(newPageId)` directly,
-        // which is exactly why data on any page past the first was lost.)
-        long newPageId = lastPageId + 1;
-        SlottedPage newPage = (SlottedPage) bufferPool.getPage(name, newPageId);
-        int slot = newPage.insertTuple(tupleData);
-        
-        bufferPool.markDirty(name, newPageId);
-        bufferPool.unpinPage(name, newPageId);
-        visibilityMap.clear((int) newPageId); // a brand new page always starts NOT all-visible
-        
-        lastPageId = newPageId;
-        LOG.debug("Created new page {} for insertion", newPageId);
-        
-        return new InsertResult(newPageId, slot);
+
+        // No existing page had space - extend the table. This MUST go through the
+        // buffer pool (getPage), the same as every existing page above - otherwise
+        // the page only exists in a local variable, is never registered in the
+        // pool's cache, and is silently dropped on the floor: flushAll()/eviction
+        // can only persist pages they know about.
+        while (true) {
+            long observedLast = lastPageId.get();
+            long candidatePageId = observedLast + 1;
+            SlottedPage newPage = (SlottedPage) bufferPool.getPage(name, candidatePageId);
+            newPage.getLatch().writeLock().lock();
+            try {
+                int slot = newPage.insertTuple(tupleData);
+                if (slot == -1) {
+                    // A concurrent thread already claimed and filled this exact candidate
+                    // page before we got its write latch - retry with a fresh candidate
+                    // rather than assuming this attempt succeeded.
+                    lastPageId.compareAndSet(observedLast, candidatePageId);
+                    continue;
+                }
+                bufferPool.markDirty(name, candidatePageId);
+                visibilityMap.clear((int) candidatePageId); // a brand new page always starts NOT all-visible
+                lastPageId.compareAndSet(observedLast, candidatePageId);
+                LOG.debug("Created new page {} for insertion", candidatePageId);
+                return new InsertResult(candidatePageId, slot);
+            } finally {
+                newPage.getLatch().writeLock().unlock();
+                bufferPool.unpinPage(name, candidatePageId);
+            }
+        }
     }
-    
+
     /**
      * Scan all tuples
      */
     public List<byte[]> scan() {
         List<byte[]> results = new ArrayList<>();
         
-        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+        for (long pageId = 0; pageId <= lastPageId.get(); pageId++) {
             SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-            
-            List<Integer> slots = page.getValidSlots();
-            for (int slot : slots) {
-                byte[] tuple = page.readTuple(slot);
-                if (tuple != null) {
-                    results.add(tuple);
+            page.getLatch().readLock().lock();
+            try {
+                List<Integer> slots = page.getValidSlots();
+                for (int slot : slots) {
+                    byte[] tuple = page.readTuple(slot);
+                    if (tuple != null) {
+                        results.add(tuple);
+                    }
                 }
+            } finally {
+                page.getLatch().readLock().unlock();
+                bufferPool.unpinPage(name, pageId);
             }
-            
-            bufferPool.unpinPage(name, pageId);
         }
         
         LOG.debug("Scanned {} tuples from table {}", results.size(), name);
@@ -154,20 +187,23 @@ public class HeapTable {
         List<byte[]> results = new ArrayList<>();
         int count = 0;
         
-        for (long pageId = 0; pageId <= lastPageId && count < limit; pageId++) {
+        for (long pageId = 0; pageId <= lastPageId.get() && count < limit; pageId++) {
             SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-            
-            List<Integer> slots = page.getValidSlots();
-            for (int slot : slots) {
-                if (count >= limit) break;
-                byte[] tuple = page.readTuple(slot);
-                if (tuple != null) {
-                    results.add(tuple);
-                    count++;
+            page.getLatch().readLock().lock();
+            try {
+                List<Integer> slots = page.getValidSlots();
+                for (int slot : slots) {
+                    if (count >= limit) break;
+                    byte[] tuple = page.readTuple(slot);
+                    if (tuple != null) {
+                        results.add(tuple);
+                        count++;
+                    }
                 }
+            } finally {
+                page.getLatch().readLock().unlock();
+                bufferPool.unpinPage(name, pageId);
             }
-            
-            bufferPool.unpinPage(name, pageId);
         }
         
         return results;
@@ -178,9 +214,14 @@ public class HeapTable {
      */
     public boolean delete(long pageId, int slot) {
         SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-        page.deleteTuple(slot);
-        bufferPool.markDirty(name, pageId);
-        bufferPool.unpinPage(name, pageId);
+        page.getLatch().writeLock().lock();
+        try {
+            page.deleteTuple(slot);
+            bufferPool.markDirty(name, pageId);
+        } finally {
+            page.getLatch().writeLock().unlock();
+            bufferPool.unpinPage(name, pageId);
+        }
         LOG.debug("Deleted {}/{}", pageId, slot);
         return true;
     }
@@ -190,12 +231,18 @@ public class HeapTable {
      */
     public boolean update(long pageId, int slot, byte[] newData) {
         SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-        boolean result = page.updateTuple(slot, newData);
-        if (result) {
-            bufferPool.markDirty(name, pageId);
-            visibilityMap.clear((int) pageId); // e.g. an xmax was just set (deleteMvcc's tombstone) - visibility on this page is now snapshot-dependent
+        boolean result;
+        page.getLatch().writeLock().lock();
+        try {
+            result = page.updateTuple(slot, newData);
+            if (result) {
+                bufferPool.markDirty(name, pageId);
+                visibilityMap.clear((int) pageId); // e.g. an xmax was just set (deleteMvcc's tombstone) - visibility on this page is now snapshot-dependent
+            }
+        } finally {
+            page.getLatch().writeLock().unlock();
+            bufferPool.unpinPage(name, pageId);
         }
-        bufferPool.unpinPage(name, pageId);
         return result;
     }
     
@@ -204,13 +251,17 @@ public class HeapTable {
      */
     public byte[] readTuple(long pageId, int slot) {
         SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-        byte[] data = page.readTuple(slot);
-        bufferPool.unpinPage(name, pageId);
-        return data;
+        page.getLatch().readLock().lock();
+        try {
+            return page.readTuple(slot);
+        } finally {
+            page.getLatch().readLock().unlock();
+            bufferPool.unpinPage(name, pageId);
+        }
     }
     
     public String getName() { return name; }
-    public long getLastPageId() { return lastPageId; }
+    public long getLastPageId() { return lastPageId.get(); }
 
     // --- MVCC-aware API ---
     // These sit on top of the raw methods above rather than replacing them:
@@ -225,15 +276,20 @@ public class HeapTable {
     /** Like scan(), but keeps (pageId, slot) around instead of returning bare payload bytes. */
     public List<PositionedRow> scanPositioned() {
         List<PositionedRow> results = new ArrayList<>();
-        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+        for (long pageId = 0; pageId <= lastPageId.get(); pageId++) {
             SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-            for (int slot : page.getValidSlots()) {
-                byte[] stored = page.readTuple(slot);
-                if (stored != null) {
-                    results.add(new PositionedRow(pageId, slot, stored));
+            page.getLatch().readLock().lock();
+            try {
+                for (int slot : page.getValidSlots()) {
+                    byte[] stored = page.readTuple(slot);
+                    if (stored != null) {
+                        results.add(new PositionedRow(pageId, slot, stored));
+                    }
                 }
+            } finally {
+                page.getLatch().readLock().unlock();
+                bufferPool.unpinPage(name, pageId);
             }
-            bufferPool.unpinPage(name, pageId);
         }
         return results;
     }
@@ -293,56 +349,60 @@ public class HeapTable {
         // scan zero pages. lastPageId is this table's own in-memory record of
         // every page it has ever allocated, which is exactly what insert()
         // and scan() already rely on for the same reason.
-        for (long pageId = 0; pageId <= lastPageId; pageId++) {
+        for (long pageId = 0; pageId <= lastPageId.get(); pageId++) {
             SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-            boolean anyReclaimed = false;
-            for (int slot : page.getValidSlots()) {
-                byte[] stored = page.readTuple(slot);
-                if (stored == null) {
-                    continue;
+            page.getLatch().writeLock().lock();
+            try {
+                boolean anyReclaimed = false;
+                for (int slot : page.getValidSlots()) {
+                    byte[] stored = page.readTuple(slot);
+                    if (stored == null) {
+                        continue;
+                    }
+                    long xmax = MVCCVisibility.readXmax(stored);
+                    if (xmax != MVCCVisibility.NO_XMAX
+                            && txnManager.isCommitted(xmax)
+                            && xmax < horizonXid) {
+                        page.deleteTuple(slot);
+                        reclaimedVersions++;
+                        anyReclaimed = true;
+                    }
                 }
-                long xmax = MVCCVisibility.readXmax(stored);
-                if (xmax != MVCCVisibility.NO_XMAX
-                        && txnManager.isCommitted(xmax)
-                        && xmax < horizonXid) {
-                    page.deleteTuple(slot);
-                    reclaimedVersions++;
-                    anyReclaimed = true;
+                if (anyReclaimed) {
+                    page.defragment();
+                    bufferPool.markDirty(name, pageId);
+                    pagesCompacted++;
                 }
-            }
-            if (anyReclaimed) {
-                page.defragment();
-                bufferPool.markDirty(name, pageId);
-                pagesCompacted++;
-            }
 
-            // Visibility map: after reclaiming whatever was safe to reclaim,
-            // this page qualifies as "all visible" only if EVERY remaining
-            // tuple has a committed xmin and NO xmax at all - not merely "no
-            // xmax below the horizon." A tuple with any xmax set (even one
-            // not yet old enough to reclaim) has visibility that genuinely
-            // differs between snapshots, which disqualifies the whole page
-            // regardless of how much dead space vacuum just cleaned up.
-            boolean allVisible = true;
-            for (int slot : page.getValidSlots()) {
-                byte[] stored = page.readTuple(slot);
-                if (stored == null) {
-                    continue;
+                // Visibility map: after reclaiming whatever was safe to reclaim,
+                // this page qualifies as "all visible" only if EVERY remaining
+                // tuple has a committed xmin and NO xmax at all - not merely "no
+                // xmax below the horizon." A tuple with any xmax set (even one
+                // not yet old enough to reclaim) has visibility that genuinely
+                // differs between snapshots, which disqualifies the whole page
+                // regardless of how much dead space vacuum just cleaned up.
+                boolean allVisible = true;
+                for (int slot : page.getValidSlots()) {
+                    byte[] stored = page.readTuple(slot);
+                    if (stored == null) {
+                        continue;
+                    }
+                    long xmin = MVCCVisibility.readXmin(stored);
+                    long xmax = MVCCVisibility.readXmax(stored);
+                    if (!txnManager.isCommitted(xmin) || xmax != MVCCVisibility.NO_XMAX) {
+                        allVisible = false;
+                        break;
+                    }
                 }
-                long xmin = MVCCVisibility.readXmin(stored);
-                long xmax = MVCCVisibility.readXmax(stored);
-                if (!txnManager.isCommitted(xmin) || xmax != MVCCVisibility.NO_XMAX) {
-                    allVisible = false;
-                    break;
+                if (allVisible) {
+                    visibilityMap.set((int) pageId);
+                } else {
+                    visibilityMap.clear((int) pageId);
                 }
+            } finally {
+                page.getLatch().writeLock().unlock();
+                bufferPool.unpinPage(name, pageId);
             }
-            if (allVisible) {
-                visibilityMap.set((int) pageId);
-            } else {
-                visibilityMap.clear((int) pageId);
-            }
-
-            bufferPool.unpinPage(name, pageId);
         }
 
         LOG.debug("Vacuumed {}: reclaimed {} dead row version(s) across {} page(s)", name, reclaimedVersions, pagesCompacted);

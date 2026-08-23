@@ -28,7 +28,29 @@ public class Page {
     private long pageId;
     private boolean dirty = false;
     private int pinCount = 0;
-    
+
+    /**
+     * The real, fine-grained physical latch protecting THIS page's own
+     * bytes from concurrent corruption - a genuinely different, lower-
+     * level concern from MVCC's own row-level locks (LockManager), which
+     * only protect against LOGICAL write-write conflicts between
+     * transactions on the SAME row, held for a transaction's whole
+     * lifetime. Two transactions modifying two DIFFERENT rows on the
+     * SAME page each acquire their own, distinct row lock and can both
+     * proceed concurrently as far as MVCC is concerned - but they are
+     * both about to mutate this exact page's own slot directory and free-
+     * space pointer, which is a real, physical data race without a latch
+     * protecting the page itself, regardless of how correct the row-level
+     * locking above it is. A latch is held only for the actual duration
+     * of the physical page operation (a single insert/update/delete/scan
+     * call), never for a transaction's whole lifetime, and carries none
+     * of MVCC's own deadlock-detection machinery - by design, latches are
+     * meant to be held briefly enough that real deadlock risk between two
+     * latches doesn't arise the way it can between two long-held row
+     * locks.
+     */
+    private final java.util.concurrent.locks.ReentrantReadWriteLock latch = new java.util.concurrent.locks.ReentrantReadWriteLock();
+
     public Page(long pageId) {
         this.pageId = pageId;
         this.buffer = ByteBuffer.allocateDirect(PageConstants.PAGE_SIZE);
@@ -67,6 +89,9 @@ public class Page {
     public int getPinCount() { return pinCount; }
     public void pin() { pinCount++; }
     public void unpin() { if (pinCount > 0) pinCount--; }
+
+    /** This page's own physical latch - see the field's own javadoc for why this is a real, separate concern from MVCC's row-level locks. */
+    public java.util.concurrent.locks.ReentrantReadWriteLock getLatch() { return latch; }
     
     public int getFreeSpace() {
         int lower = buffer.getShort(12);
