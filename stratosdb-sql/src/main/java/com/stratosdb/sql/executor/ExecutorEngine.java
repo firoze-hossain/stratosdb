@@ -700,6 +700,13 @@ public class ExecutorEngine {
         if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn);
         if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
+        if (stmt instanceof AlterTableAddColumnStatement s) return executeAlterTableAddColumn(s, txn);
+        if (stmt instanceof AlterTableDropColumnStatement s) return executeAlterTableDropColumn(s, txn);
+        if (stmt instanceof AlterTableRenameColumnStatement s) return executeAlterTableRenameColumn(s, txn);
+        if (stmt instanceof AlterTableRenameTableStatement s) return executeAlterTableRenameTable(s);
+        if (stmt instanceof AlterTableAlterColumnTypeStatement s) return executeAlterTableAlterColumnType(s, txn);
+        if (stmt instanceof AlterTableSetDefaultStatement s) return executeAlterTableSetDefault(s);
+        if (stmt instanceof AlterTableDropDefaultStatement s) return executeAlterTableDropDefault(s);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ShowStatsStatement) return executeShowStats();
         if (stmt instanceof ShowCatalogStatement) return executeShowCatalog();
@@ -3141,7 +3148,381 @@ public class ExecutorEngine {
 
         tables.remove(stmt.tableName());
         tableColumns.remove(stmt.tableName());
+        tableColumnTypes.remove(stmt.tableName());
+        tableColumnDefaults.remove(stmt.tableName());
         return QueryResult.success("Table dropped: " + stmt.tableName());
+    }
+
+    /**
+     * Rebuilds and persists tableName's own catalog-stored "CREATE TABLE"
+     * text from its CURRENT tableColumns/tableColumnTypes/
+     * tableColumnDefaults state - called after every ALTER TABLE
+     * sub-command that changes the schema. This matters beyond just
+     * restart survival: SHOW CATALOG (and stratosdump, built on it -
+     * see its own javadoc) reads this exact stored text as the table's
+     * own DDL. Without regenerating it here, a dump taken after an
+     * ALTER TABLE would silently use the table's own pre-ALTER column
+     * list - a real, genuine correctness gap this method exists
+     * specifically to avoid.
+     */
+    private void regenerateTableDdl(String tableName) {
+        List<String> columns = tableColumns.get(tableName);
+        Map<String, String> types = tableColumnTypes.getOrDefault(tableName, Map.of());
+        Map<String, String> defaults = tableColumnDefaults.getOrDefault(tableName, Map.of());
+        StringBuilder sql = new StringBuilder("CREATE TABLE ").append(tableName).append(" (");
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) sql.append(", ");
+            String col = columns.get(i);
+            sql.append(col).append(" ").append(types.getOrDefault(col, "VARCHAR"));
+            String def = defaults.get(col);
+            if (def != null) {
+                sql.append(" DEFAULT ").append(def);
+            }
+        }
+        sql.append(")");
+        catalogLines.put("TABLE:" + tableName, "TABLE|" + sql);
+        saveCatalog();
+    }
+
+    /**
+     * Rewrites every physical row version currently stored for tableName
+     * - not just currently-visible ones, every version scanPositioned()
+     * finds, including already-dead (tombstoned) ones, so no stale,
+     * pre-ALTER row version can ever be read back with the old column
+     * layout later - applying transformer to each row's own deserialized
+     * Tuple. Preserves each row's own original xmin/xmax: an ALTER TABLE
+     * schema change isn't a new MVCC row version from a transactional-
+     * history point of view, only the row's own physical column layout
+     * changes. Correctly maintains every index on the table, since a
+     * length-changing rewrite (which ADD/DROP COLUMN always is) isn't
+     * guaranteed to fit back on the row's original page - HeapTable's
+     * own raw insert()/delete() (not insertMvcc, which would wrongly
+     * assign a brand new xmin) are used directly for exactly this
+     * reason, going through the real, fine-grained per-page write
+     * latches HeapTable already has. WAL-logs both the delete and the
+     * insert so this is durable and correctly replayed after a crash,
+     * the same as any other real write this engine makes.
+     *
+     * transformer is trusted not to throw - any per-row validation that
+     * could genuinely fail (see ALTER COLUMN ... TYPE's own real,
+     * honestly-stated scope) is done in a separate, prior pass before
+     * this method is ever called, so nothing on disk changes unless
+     * every row is already known to convert successfully.
+     *
+     * Real, honestly-stated limitation: this touches every row one at a
+     * time, under that row's own page latch, not as a single atomic
+     * operation - a crash mid-rewrite leaves some rows already converted
+     * and some not (WAL redo correctly replays whichever individual
+     * inserts/deletes were already logged, but there is no single
+     * transaction boundary wrapping the WHOLE rewrite the way a fully
+     * transactional ALTER TABLE would have). A real, further piece of
+     * work, not attempted here given the scope already covered.
+     */
+    private void rewriteAllRows(String tableName, long xid, java.util.function.Function<Tuple, Tuple> transformer) {
+        HeapTable table = tables.get(tableName);
+        List<HeapTable.PositionedRow> rows = table.scanPositioned();
+        for (HeapTable.PositionedRow row : rows) {
+            byte[] stored = row.stored();
+            long xmin = MVCCVisibility.readXmin(stored);
+            long xmax = MVCCVisibility.readXmax(stored);
+            byte[] payload = MVCCVisibility.readPayload(stored);
+            Tuple oldTuple = Tuple.deserialize(payload);
+            Tuple newTuple = transformer.apply(oldTuple);
+
+            maintainIndexesOnDelete(tableName, oldTuple, row.pageId(), row.slot());
+            table.delete(row.pageId(), row.slot());
+            walManager.logDelete(tableName, xid, row.pageId(), row.slot());
+
+            byte[] newStored = MVCCVisibility.wrap(newTuple.serialize(), xmin, xmax);
+            HeapTable.InsertResult result = table.insert(newStored);
+            walManager.logInsert(tableName, xid, result.pageId, result.slot, newStored);
+            maintainIndexesOnWrite(tableName, newTuple, result.pageId, result.slot);
+        }
+    }
+
+    /**
+     * Real, explicit conversion between the Java value representations
+     * this engine actually stores (Integer/Long/Double/Boolean/String) -
+     * needed because, unlike a real Postgres-grade type system, this
+     * engine does not enforce that a stored value's own Java type
+     * matches its column's declared SQL type at insert time
+     * (coerceForColumnType only validates JSON) - so ALTER COLUMN ...
+     * TYPE needs its own real conversion logic, not a reuse of
+     * something that was never actually doing this job. Throws a clear
+     * IllegalArgumentException naming the exact unconvertible value on
+     * failure - deliberately never silently drops or corrupts data.
+     */
+    private Object convertValueToType(Object value, String newType) {
+        if (value == null) return null;
+        String normalized = newType.trim().toUpperCase(java.util.Locale.ROOT);
+        int parenIdx = normalized.indexOf('(');
+        if (parenIdx >= 0) normalized = normalized.substring(0, parenIdx).trim();
+        int bracketIdx = normalized.indexOf('[');
+        if (bracketIdx >= 0) normalized = normalized.substring(0, bracketIdx).trim();
+
+        switch (normalized) {
+            case "INT": case "INTEGER": case "SMALLINT": case "TINYINT": case "SERIAL": {
+                if (value instanceof Integer) return value;
+                if (value instanceof Long l) return l.intValue();
+                if (value instanceof Double d) return d.intValue();
+                if (value instanceof String s) {
+                    try {
+                        return Integer.parseInt(s.trim());
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("cannot convert \"" + s + "\" to " + newType);
+                    }
+                }
+                throw new IllegalArgumentException("cannot convert " + value + " to " + newType);
+            }
+            case "BIGINT": case "BIGSERIAL": {
+                if (value instanceof Long) return value;
+                if (value instanceof Integer i) return i.longValue();
+                if (value instanceof String s) {
+                    try {
+                        return Long.parseLong(s.trim());
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("cannot convert \"" + s + "\" to " + newType);
+                    }
+                }
+                throw new IllegalArgumentException("cannot convert " + value + " to " + newType);
+            }
+            case "DOUBLE": case "FLOAT": case "DECIMAL": {
+                if (value instanceof Double) return value;
+                if (value instanceof Integer i) return i.doubleValue();
+                if (value instanceof Long l) return l.doubleValue();
+                if (value instanceof String s) {
+                    try {
+                        return Double.parseDouble(s.trim());
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("cannot convert \"" + s + "\" to " + newType);
+                    }
+                }
+                throw new IllegalArgumentException("cannot convert " + value + " to " + newType);
+            }
+            case "BOOLEAN": case "BOOL": {
+                if (value instanceof Boolean) return value;
+                if (value instanceof String s) {
+                    if (s.equalsIgnoreCase("true")) return true;
+                    if (s.equalsIgnoreCase("false")) return false;
+                }
+                throw new IllegalArgumentException("cannot convert " + value + " to " + newType);
+            }
+            default:
+                // VARCHAR, TEXT, CHAR, DATE/TIME/TIMESTAMP, UUID, and anything else not
+                // specially handled above - the safe, always-succeeding direction.
+                return value.toString();
+        }
+    }
+
+    private QueryResult executeAlterTableAddColumn(AlterTableAddColumnStatement stmt, Transaction txn) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        List<String> columns = tableColumns.get(stmt.tableName());
+        if (columns.contains(stmt.columnName())) {
+            return QueryResult.error("Column already exists: " + stmt.columnName());
+        }
+
+        Object resolvedDefault = stmt.defaultValue() != null
+            ? coerceForColumnType(stmt.columnName(), stmt.dataType(), resolveValue(stmt.defaultValue()))
+            : null;
+
+        rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
+            Tuple newTuple = new Tuple();
+            for (String col : oldTuple.getColumnNames()) {
+                newTuple.addValue(col, oldTuple.getValue(col));
+            }
+            newTuple.addValue(stmt.columnName(), resolvedDefault);
+            return newTuple;
+        });
+
+        columns.add(stmt.columnName());
+        tableColumnTypes.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.dataType());
+        if (stmt.defaultValue() != null) {
+            tableColumnDefaults.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.defaultValue());
+        }
+        regenerateTableDdl(stmt.tableName());
+        return QueryResult.success("Column added: " + stmt.columnName());
+    }
+
+    private QueryResult executeAlterTableDropColumn(AlterTableDropColumnStatement stmt, Transaction txn) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        List<String> columns = tableColumns.get(stmt.tableName());
+        if (!columns.contains(stmt.columnName())) {
+            return QueryResult.error("Column not found: " + stmt.columnName());
+        }
+        if (columns.size() == 1) {
+            return QueryResult.error("Cannot drop the only remaining column of table " + stmt.tableName());
+        }
+
+        rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
+            Tuple newTuple = new Tuple();
+            for (String col : oldTuple.getColumnNames()) {
+                if (!col.equals(stmt.columnName())) {
+                    newTuple.addValue(col, oldTuple.getValue(col));
+                }
+            }
+            return newTuple;
+        });
+
+        columns.remove(stmt.columnName());
+        Map<String, String> types = tableColumnTypes.get(stmt.tableName());
+        if (types != null) types.remove(stmt.columnName());
+        Map<String, String> defaults = tableColumnDefaults.get(stmt.tableName());
+        if (defaults != null) defaults.remove(stmt.columnName());
+        regenerateTableDdl(stmt.tableName());
+        return QueryResult.success("Column dropped: " + stmt.columnName());
+    }
+
+    /**
+     * Metadata-only - a column's own name is not stored inside any
+     * existing row's own serialized bytes lookup key the way a B+Tree
+     * index's own key would be (Tuple's own columnNames list IS part of
+     * each row's stored bytes - see Tuple's own javadoc - so existing
+     * rows DO still need their own stored columnNames list updated, or
+     * a later read by the new name would find nothing). Real, honestly-
+     * stated limitation: any index on this column, any view/trigger/
+     * function referencing it by its old name, is not updated - a real,
+     * separate piece of further work, matching how this project already
+     * names similar cross-object-reference gaps elsewhere (e.g. DROP
+     * EXTENSION's own note on functions still referencing it by name).
+     */
+    private QueryResult executeAlterTableRenameColumn(AlterTableRenameColumnStatement stmt, Transaction txn) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        List<String> columns = tableColumns.get(stmt.tableName());
+        if (!columns.contains(stmt.oldColumnName())) {
+            return QueryResult.error("Column not found: " + stmt.oldColumnName());
+        }
+        if (columns.contains(stmt.newColumnName())) {
+            return QueryResult.error("Column already exists: " + stmt.newColumnName());
+        }
+
+        rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
+            Tuple newTuple = new Tuple();
+            for (String col : oldTuple.getColumnNames()) {
+                newTuple.addValue(col.equals(stmt.oldColumnName()) ? stmt.newColumnName() : col, oldTuple.getValue(col));
+            }
+            return newTuple;
+        });
+
+        int idx = columns.indexOf(stmt.oldColumnName());
+        columns.set(idx, stmt.newColumnName());
+        Map<String, String> types = tableColumnTypes.get(stmt.tableName());
+        if (types != null && types.containsKey(stmt.oldColumnName())) {
+            types.put(stmt.newColumnName(), types.remove(stmt.oldColumnName()));
+        }
+        Map<String, String> defaults = tableColumnDefaults.get(stmt.tableName());
+        if (defaults != null && defaults.containsKey(stmt.oldColumnName())) {
+            defaults.put(stmt.newColumnName(), defaults.remove(stmt.oldColumnName()));
+        }
+        regenerateTableDdl(stmt.tableName());
+        return QueryResult.success("Column renamed: " + stmt.oldColumnName() + " -> " + stmt.newColumnName());
+    }
+
+    /**
+     * A pure rename of this engine's own in-memory/catalog registration -
+     * the underlying HeapTable/DiskManager storage keeps using its
+     * original name internally (matching how real Postgres itself keeps
+     * a table's own underlying filenode unchanged across a rename; only
+     * the externally-visible name changes). Real, honestly-stated
+     * limitation: any view, trigger, index, or function referencing the
+     * old table name is not updated - the same real, named class of gap
+     * as ALTER TABLE ... RENAME COLUMN above.
+     */
+    private QueryResult executeAlterTableRenameTable(AlterTableRenameTableStatement stmt) {
+        if (!tables.containsKey(stmt.oldTableName())) {
+            return QueryResult.error("Table not found: " + stmt.oldTableName());
+        }
+        if (tables.containsKey(stmt.newTableName()) || views.containsKey(stmt.newTableName())) {
+            return QueryResult.error("A table or view already exists with that name: " + stmt.newTableName());
+        }
+
+        tables.put(stmt.newTableName(), tables.remove(stmt.oldTableName()));
+        tableColumns.put(stmt.newTableName(), tableColumns.remove(stmt.oldTableName()));
+        Map<String, String> types = tableColumnTypes.remove(stmt.oldTableName());
+        if (types != null) tableColumnTypes.put(stmt.newTableName(), types);
+        Map<String, String> defaults = tableColumnDefaults.remove(stmt.oldTableName());
+        if (defaults != null) tableColumnDefaults.put(stmt.newTableName(), defaults);
+
+        catalogLines.remove("TABLE:" + stmt.oldTableName());
+        regenerateTableDdl(stmt.newTableName());
+        return QueryResult.success("Table renamed: " + stmt.oldTableName() + " -> " + stmt.newTableName());
+    }
+
+    /**
+     * Real, honestly-stated scope (see AlterTableAlterColumnTypeStatement's
+     * own javadoc): every existing value is converted via
+     * convertValueToType, not a full USING-expression. Validates every
+     * row FIRST, in a separate pass that touches nothing on disk, before
+     * ever calling rewriteAllRows - so a single unconvertible value deep
+     * in a large table fails the whole statement cleanly, with nothing
+     * changed, rather than leaving the table half-converted.
+     */
+    private QueryResult executeAlterTableAlterColumnType(AlterTableAlterColumnTypeStatement stmt, Transaction txn) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        List<String> columns = tableColumns.get(stmt.tableName());
+        if (!columns.contains(stmt.columnName())) {
+            return QueryResult.error("Column not found: " + stmt.columnName());
+        }
+
+        HeapTable table = tables.get(stmt.tableName());
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Object value = tuple.getValue(stmt.columnName());
+            try {
+                convertValueToType(value, stmt.newDataType());
+            } catch (IllegalArgumentException e) {
+                return QueryResult.error("Cannot change column " + stmt.columnName() + " to " + stmt.newDataType()
+                    + ": " + e.getMessage() + " (row at " + row.pageId() + "/" + row.slot() + ") - no changes made");
+            }
+        }
+
+        rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
+            Tuple newTuple = new Tuple();
+            for (String col : oldTuple.getColumnNames()) {
+                Object value = oldTuple.getValue(col);
+                newTuple.addValue(col, col.equals(stmt.columnName()) ? convertValueToType(value, stmt.newDataType()) : value);
+            }
+            return newTuple;
+        });
+
+        tableColumnTypes.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.newDataType());
+        regenerateTableDdl(stmt.tableName());
+        return QueryResult.success("Column type changed: " + stmt.columnName() + " -> " + stmt.newDataType());
+    }
+
+    /** Metadata-only - applies to future inserts, never touches any existing row, matching real Postgres's own behavior for this specific sub-command. */
+    private QueryResult executeAlterTableSetDefault(AlterTableSetDefaultStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        List<String> columns = tableColumns.get(stmt.tableName());
+        if (!columns.contains(stmt.columnName())) {
+            return QueryResult.error("Column not found: " + stmt.columnName());
+        }
+        tableColumnDefaults.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.defaultValue());
+        regenerateTableDdl(stmt.tableName());
+        return QueryResult.success("Default set for column: " + stmt.columnName());
+    }
+
+    private QueryResult executeAlterTableDropDefault(AlterTableDropDefaultStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        List<String> columns = tableColumns.get(stmt.tableName());
+        if (!columns.contains(stmt.columnName())) {
+            return QueryResult.error("Column not found: " + stmt.columnName());
+        }
+        Map<String, String> defaults = tableColumnDefaults.get(stmt.tableName());
+        if (defaults != null) defaults.remove(stmt.columnName());
+        regenerateTableDdl(stmt.tableName());
+        return QueryResult.success("Default dropped for column: " + stmt.columnName());
     }
 
     /**

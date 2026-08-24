@@ -2803,6 +2803,239 @@ public class StratosDBTest {
         assertEquals(1, selectResult.getRows().size(), "the actual statement content around the comments must still execute correctly");
     }
 
+    // --- ALTER TABLE: real schema migration - the single biggest, most honestly-named
+    // gap this project had (see PROGRESS.md). Every sub-command below actually rewrites
+    // every existing physical row on disk where the row's own column layout changes
+    // (ADD/DROP COLUMN, ALTER COLUMN TYPE), not just a metadata-only pretence - see
+    // ExecutorEngine.rewriteAllRows's own javadoc for the real mechanics and honest
+    // limitations.
+
+    @Test
+    void testAddColumnGivesExistingRowsTheDefaultValue() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice')");
+        database.execute("INSERT INTO employees VALUES (2, 'Bob')");
+
+        QueryResult addCol = database.execute("ALTER TABLE employees ADD COLUMN department VARCHAR DEFAULT 'Unassigned'");
+        assertTrue(addCol.isSuccess(), () -> "ADD COLUMN with a default must succeed: " + addCol.getError());
+
+        QueryResult rows = database.execute("SELECT id, name, department FROM employees");
+        assertEquals(2, rows.getRows().size(), "ADD COLUMN must not change the row count");
+        for (Tuple row : rows.getRows()) {
+            assertEquals("Unassigned", row.getValue("department"),
+                () -> "every existing row must get the new column's default value: " + row);
+        }
+    }
+
+    @Test
+    void testAddColumnWithoutDefaultGivesExistingRowsNull() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("ALTER TABLE t ADD COLUMN note VARCHAR");
+
+        QueryResult result = database.execute("SELECT note FROM t WHERE id = 1");
+        assertTrue(result.isSuccess());
+        assertNull(result.getRows().get(0).getValue("note"), "ADD COLUMN with no default must give existing rows NULL, not fail or leave it missing");
+    }
+
+    @Test
+    void testAddColumnRejectsADuplicateColumnName() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        QueryResult result = database.execute("ALTER TABLE t ADD COLUMN name VARCHAR");
+        assertFalse(result.isSuccess(), "ADD COLUMN with an already-existing name must fail cleanly");
+    }
+
+    @Test
+    void testNewInsertsAfterAddColumnUseTheNewSchemaAndItsDefault() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("ALTER TABLE employees ADD COLUMN department VARCHAR DEFAULT 'Unassigned'");
+
+        database.execute("INSERT INTO employees VALUES (1, 'Carol', 'Engineering')");
+        assertEquals("Engineering", database.execute("SELECT department FROM employees WHERE id = 1").getRows().get(0).getValue("department"));
+
+        database.execute("INSERT INTO employees (id, name) VALUES (2, 'Dave')");
+        assertEquals("Unassigned", database.execute("SELECT department FROM employees WHERE id = 2").getRows().get(0).getValue("department"),
+            "an insert omitting the new column must fall back to its default, the same as any other column would");
+    }
+
+    @Test
+    void testDropColumnRemovesItFromExistingRowsEntirely() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR, junk VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'Alice', 'garbage')");
+
+        QueryResult dropResult = database.execute("ALTER TABLE t DROP COLUMN junk");
+        assertTrue(dropResult.isSuccess(), () -> "DROP COLUMN must succeed: " + dropResult.getError());
+
+        QueryResult rows = database.execute("SELECT * FROM t");
+        Tuple row = rows.getRows().get(0);
+        assertFalse(row.getColumnNames().contains("junk"), "the dropped column must be genuinely gone from the row's own stored columns, not merely null: " + row);
+    }
+
+    @Test
+    void testDropColumnRejectsANonexistentColumn() {
+        database.execute("CREATE TABLE t (id INT)");
+        QueryResult result = database.execute("ALTER TABLE t DROP COLUMN nonexistent");
+        assertFalse(result.isSuccess());
+    }
+
+    @Test
+    void testDropColumnRejectsDroppingTheLastRemainingColumn() {
+        database.execute("CREATE TABLE t (id INT)");
+        QueryResult result = database.execute("ALTER TABLE t DROP COLUMN id");
+        assertFalse(result.isSuccess(), "a table must always have at least one column - DROP COLUMN on the last one must fail cleanly");
+    }
+
+    @Test
+    void testRenameColumnPreservesEachRowsValueUnderTheNewName() {
+        database.execute("CREATE TABLE employees (id INT, department VARCHAR)");
+        database.execute("INSERT INTO employees VALUES (1, 'Engineering')");
+
+        QueryResult renameResult = database.execute("ALTER TABLE employees RENAME COLUMN department TO dept");
+        assertTrue(renameResult.isSuccess(), () -> "RENAME COLUMN must succeed: " + renameResult.getError());
+
+        assertEquals("Engineering", database.execute("SELECT dept FROM employees WHERE id = 1").getRows().get(0).getValue("dept"),
+            "the row's original value must survive intact under the column's new name");
+
+        // This engine returns NULL for any unknown column name rather than erroring - a
+        // real, separate, pre-existing behavior verified directly against a wholly
+        // unrelated table, not something this feature changes. The real, correct
+        // assertion is that the OLD name no longer resolves to the actual data.
+        QueryResult oldName = database.execute("SELECT department FROM employees WHERE id = 1");
+        assertTrue(oldName.isSuccess());
+        assertNull(oldName.getRows().get(0).getValue("department"), "the old column name must no longer resolve to real data");
+    }
+
+    @Test
+    void testRenameColumnRejectsANameCollision() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        QueryResult result = database.execute("ALTER TABLE t RENAME COLUMN id TO name");
+        assertFalse(result.isSuccess(), "renaming a column to an already-existing name must fail cleanly");
+    }
+
+    @Test
+    void testRenameTablePreservesAllDataUnderTheNewName() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+        database.execute("INSERT INTO employees VALUES (1, 'Alice')");
+        database.execute("INSERT INTO employees VALUES (2, 'Bob')");
+
+        QueryResult renameResult = database.execute("ALTER TABLE employees RENAME TO staff");
+        assertTrue(renameResult.isSuccess(), () -> "RENAME TO must succeed: " + renameResult.getError());
+
+        QueryResult newTable = database.execute("SELECT * FROM staff");
+        assertTrue(newTable.isSuccess());
+        assertEquals(2, newTable.getRows().size(), "every row must survive the rename intact");
+
+        QueryResult oldTable = database.execute("SELECT * FROM employees");
+        assertFalse(oldTable.isSuccess(), "the old table name must no longer resolve to anything after RENAME TO");
+    }
+
+    @Test
+    void testAlterColumnTypeConvertsEveryExistingValue() {
+        database.execute("CREATE TABLE items (id INT, code INT)");
+        database.execute("INSERT INTO items VALUES (1, 42)");
+
+        QueryResult typeChange = database.execute("ALTER TABLE items ALTER COLUMN code TYPE VARCHAR");
+        assertTrue(typeChange.isSuccess(), () -> "ALTER COLUMN TYPE must succeed for a convertible value: " + typeChange.getError());
+
+        Object value = database.execute("SELECT code FROM items WHERE id = 1").getRows().get(0).getValue("code");
+        assertInstanceOf(String.class, value, "the converted value must genuinely be a String now, not still an Integer wearing a new declared type");
+        assertEquals("42", value);
+    }
+
+    @Test
+    void testAlterColumnTypeFailsCleanlyLeavingEveryRowUntouched() {
+        database.execute("CREATE TABLE mixed (id INT, val VARCHAR)");
+        database.execute("INSERT INTO mixed VALUES (1, '123')");
+        database.execute("INSERT INTO mixed VALUES (2, 'not-a-number')");
+
+        QueryResult failedChange = database.execute("ALTER TABLE mixed ALTER COLUMN val TYPE INT");
+        assertFalse(failedChange.isSuccess(), "a type change must fail when any row's value can't convert");
+
+        // Both rows - not just the one that failed to convert - must be completely
+        // untouched, proving this validates every row BEFORE changing anything, not
+        // partway through a rewrite that then aborts.
+        Object row1Value = database.execute("SELECT val FROM mixed WHERE id = 1").getRows().get(0).getValue("val");
+        assertInstanceOf(String.class, row1Value, "after a failed type change, an otherwise-convertible row must still be untouched, still its original String");
+        assertEquals("123", row1Value);
+        assertEquals("not-a-number", database.execute("SELECT val FROM mixed WHERE id = 2").getRows().get(0).getValue("val"));
+    }
+
+    @Test
+    void testSetAndDropDefaultOnlyAffectFutureInserts() {
+        database.execute("CREATE TABLE t (id INT, status VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, NULL)");
+
+        database.execute("ALTER TABLE t ALTER COLUMN status SET DEFAULT 'active'");
+        assertNull(database.execute("SELECT status FROM t WHERE id = 1").getRows().get(0).getValue("status"),
+            "SET DEFAULT must not retroactively change any existing row");
+
+        database.execute("INSERT INTO t (id) VALUES (2)");
+        assertEquals("active", database.execute("SELECT status FROM t WHERE id = 2").getRows().get(0).getValue("status"),
+            "SET DEFAULT must apply to a subsequent insert that omits the column");
+
+        database.execute("ALTER TABLE t ALTER COLUMN status DROP DEFAULT");
+        database.execute("INSERT INTO t (id) VALUES (3)");
+        assertNull(database.execute("SELECT status FROM t WHERE id = 3").getRows().get(0).getValue("status"),
+            "DROP DEFAULT must make a further insert fall back to NULL again");
+    }
+
+    @Test
+    void testAlterTableOnANonexistentTableFailsCleanly() {
+        QueryResult result = database.execute("ALTER TABLE nonexistent_table ADD COLUMN x INT");
+        assertFalse(result.isSuccess());
+    }
+
+    @Test
+    void testShowCatalogReflectsTheCurrentPostAlterSchemaNotTheOriginal() {
+        // A real, separate correctness concern found and fixed while building this
+        // feature: SHOW CATALOG (and stratosdump, built on it) reads a table's own
+        // catalog-stored DDL text - if ALTER TABLE didn't regenerate it, a dump taken
+        // afterward would silently use the table's stale, pre-ALTER column list.
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("ALTER TABLE t ADD COLUMN name VARCHAR DEFAULT 'unknown'");
+
+        QueryResult catalog = database.execute("SHOW CATALOG");
+        assertTrue(catalog.isSuccess());
+        Tuple tableEntry = catalog.getRows().stream()
+            .filter(r -> "TABLE".equals(r.getValue("object_type")) && "t".equals(r.getValue("object_name")))
+            .findFirst().orElseThrow();
+        String ddl = (String) tableEntry.getValue("ddl_sql");
+        assertTrue(ddl.contains("name") && ddl.contains("VARCHAR"), () -> "SHOW CATALOG's own DDL text must reflect the post-ALTER schema: " + ddl);
+    }
+
+    @Test
+    void testAlterTableDefinitionsAndRewrittenDataSurviveARealRestart() throws Exception {
+        java.nio.file.Path tempDataDir = java.nio.file.Files.createTempDirectory("altertablerestarttest");
+        try {
+            com.stratosdb.core.DatabaseConfig config1 = new com.stratosdb.core.DatabaseConfig();
+            config1.setDataDirectory(tempDataDir.toString());
+            StratosDB db1 = new StratosDB(config1);
+            db1.execute("CREATE TABLE employees (id INT, name VARCHAR)");
+            db1.execute("INSERT INTO employees VALUES (1, 'Alice')");
+            db1.execute("ALTER TABLE employees ADD COLUMN department VARCHAR DEFAULT 'Unassigned'");
+            db1.execute("INSERT INTO employees VALUES (2, 'Bob', 'Engineering')");
+            db1.execute("ALTER TABLE employees RENAME COLUMN department TO dept");
+            db1.shutdown();
+
+            com.stratosdb.core.DatabaseConfig config2 = new com.stratosdb.core.DatabaseConfig();
+            config2.setDataDirectory(tempDataDir.toString());
+            StratosDB db2 = new StratosDB(config2);
+            QueryResult result = db2.execute("SELECT id, name, dept FROM employees");
+            assertTrue(result.isSuccess(), () -> "querying the altered table after a real restart must succeed: " + result.getError());
+            assertEquals(2, result.getRows().size());
+            assertEquals("Unassigned", result.getRows().stream().filter(r -> r.getValue("id").equals(1)).findFirst().orElseThrow().getValue("dept"),
+                "a row that existed before the ALTER must still have its rewritten value after a real restart");
+            assertEquals("Engineering", result.getRows().stream().filter(r -> r.getValue("id").equals(2)).findFirst().orElseThrow().getValue("dept"));
+
+            // A fresh insert after restart must also correctly use the post-ALTER schema.
+            db2.execute("INSERT INTO employees (id, name) VALUES (3, 'Carol')");
+            assertEquals("Unassigned", db2.execute("SELECT dept FROM employees WHERE id = 3").getRows().get(0).getValue("dept"));
+            db2.shutdown();
+        } finally {
+            deleteRecursively(tempDataDir.toFile());
+        }
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

@@ -74,6 +74,28 @@ public class SqlParser {
             return buildDelete(ctx.delete());
         } else if (ctx.dropTable() != null) {
             return buildDropTable(ctx.dropTable());
+        } else if (ctx.alterTableAddColumn() != null) {
+            StratosSQLParser.AlterTableAddColumnContext actx = ctx.alterTableAddColumn();
+            String defaultVal = actx.defaultValue() != null ? actx.defaultValue().getText() : null;
+            return new AlterTableAddColumnStatement(actx.tableName().getText(), actx.columnName().getText(), actx.dataType().getText(), defaultVal);
+        } else if (ctx.alterTableDropColumn() != null) {
+            StratosSQLParser.AlterTableDropColumnContext actx = ctx.alterTableDropColumn();
+            return new AlterTableDropColumnStatement(actx.tableName().getText(), actx.columnName().getText());
+        } else if (ctx.alterTableRenameColumn() != null) {
+            StratosSQLParser.AlterTableRenameColumnContext actx = ctx.alterTableRenameColumn();
+            return new AlterTableRenameColumnStatement(actx.tableName().getText(), actx.columnName(0).getText(), actx.columnName(1).getText());
+        } else if (ctx.alterTableRenameTable() != null) {
+            StratosSQLParser.AlterTableRenameTableContext actx = ctx.alterTableRenameTable();
+            return new AlterTableRenameTableStatement(actx.tableName(0).getText(), actx.tableName(1).getText());
+        } else if (ctx.alterTableAlterColumnType() != null) {
+            StratosSQLParser.AlterTableAlterColumnTypeContext actx = ctx.alterTableAlterColumnType();
+            return new AlterTableAlterColumnTypeStatement(actx.tableName().getText(), actx.columnName().getText(), actx.dataType().getText());
+        } else if (ctx.alterTableSetDefault() != null) {
+            StratosSQLParser.AlterTableSetDefaultContext actx = ctx.alterTableSetDefault();
+            return new AlterTableSetDefaultStatement(actx.tableName().getText(), actx.columnName().getText(), actx.defaultValue().getText());
+        } else if (ctx.alterTableDropDefault() != null) {
+            StratosSQLParser.AlterTableDropDefaultContext actx = ctx.alterTableDropDefault();
+            return new AlterTableDropDefaultStatement(actx.tableName().getText(), actx.columnName().getText());
         } else if (ctx.showTables() != null) {
             return new ShowTablesStatement();
         } else if (ctx.showStats() != null) {

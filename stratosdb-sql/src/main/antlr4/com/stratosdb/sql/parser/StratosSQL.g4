@@ -3,12 +3,19 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
+alterTableAddColumn: ALTER TABLE tableName ADD COLUMN? columnName dataType (DEFAULT defaultValue)? SEMICOLON?;
+alterTableDropColumn: ALTER TABLE tableName DROP COLUMN? columnName SEMICOLON?;
+alterTableRenameColumn: ALTER TABLE tableName RENAME COLUMN columnName TO columnName SEMICOLON?;
+alterTableRenameTable: ALTER TABLE tableName RENAME TO tableName SEMICOLON?;
+alterTableAlterColumnType: ALTER TABLE tableName ALTER COLUMN? columnName TYPE dataType SEMICOLON?;
+alterTableSetDefault: ALTER TABLE tableName ALTER COLUMN? columnName SET DEFAULT defaultValue SEMICOLON?;
+alterTableDropDefault: ALTER TABLE tableName ALTER COLUMN? columnName DROP DEFAULT SEMICOLON?;
 createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
@@ -155,6 +162,11 @@ UNION: U N I O N;
 ALL: A L L;
 RECURSIVE: R E C U R S I V E;
 DROP: D R O P;
+ALTER: A L T E R;
+ADD: A D D;
+COLUMN: C O L U M N;
+RENAME: R E N A M E;
+TYPE: T Y P E;
 INSERT: I N S E R T;
 INTO: I N T O;
 VALUES: V A L U E S;
