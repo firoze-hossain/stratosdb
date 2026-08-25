@@ -186,6 +186,19 @@ public class StratosDump {
         boolean isSuccess() { return error == null; }
     }
 
+    /**
+     * A small, public wrapper around the private runQuery below - added so
+     * this class's own already-working, real SCRAM-authenticated
+     * connection logic can be reused directly by tests that need a real
+     * wire-protocol client (see GrantPrivilegeEndToEndTest), rather than
+     * a third, separate, duplicate SCRAM client implementation existing
+     * purely for test purposes.
+     */
+    public String executeSql(String sql) throws IOException {
+        QueryResult result = runQuery(sql);
+        return result.isSuccess() ? null : result.error();
+    }
+
     private QueryResult runQuery(String sql) throws IOException {
         StdWireMessages.writeQuery(out, sql);
         List<String> columnNames = new ArrayList<>();
@@ -240,7 +253,7 @@ public class StratosDump {
         return values;
     }
 
-    private void close() {
+    public void close() {
         try {
             StdWireMessages.writeTerminate(out);
         } catch (IOException ignored) {

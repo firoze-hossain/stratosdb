@@ -57,6 +57,21 @@ public class StratosDB {
     }
 
     /**
+     * Call once per connection, right after real authentication succeeds -
+     * see ExecutorEngine.setCurrentUser's own javadoc for the real
+     * backward-compatibility guarantee this gives every existing caller
+     * that never calls this at all.
+     */
+    public void setCurrentUser(String username) {
+        executor.setCurrentUser(username);
+    }
+
+    /** See ExecutorEngine.RoleCredentialSink's own javadoc for why this bridge exists and what it's for. */
+    public void setRoleCredentialSink(ExecutorEngine.RoleCredentialSink sink) {
+        executor.setRoleCredentialSink(sink);
+    }
+
+    /**
      * Call when a connection/session ends (not between individual
      * statements) - see ExecutorEngine.closeSession's javadoc for why this
      * matters: a client that sends BEGIN and then just disconnects,

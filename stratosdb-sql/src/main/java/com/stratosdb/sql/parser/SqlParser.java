@@ -74,6 +74,18 @@ public class SqlParser {
             return buildDelete(ctx.delete());
         } else if (ctx.dropTable() != null) {
             return buildDropTable(ctx.dropTable());
+        } else if (ctx.createRole() != null) {
+            return buildCreateRole(ctx.createRole());
+        } else if (ctx.dropRole() != null) {
+            return new DropRoleStatement(ctx.dropRole().roleName().getText());
+        } else if (ctx.grantStatement() != null) {
+            StratosSQLParser.GrantStatementContext gctx = ctx.grantStatement();
+            List<String> privileges = buildPrivilegeList(gctx.privilegeList());
+            return new GrantStatement(privileges, gctx.tableName().getText(), gctx.roleName().getText());
+        } else if (ctx.revokeStatement() != null) {
+            StratosSQLParser.RevokeStatementContext rctx = ctx.revokeStatement();
+            List<String> privileges = buildPrivilegeList(rctx.privilegeList());
+            return new RevokeStatement(privileges, rctx.tableName().getText(), rctx.roleName().getText());
         } else if (ctx.alterTableAddColumn() != null) {
             StratosSQLParser.AlterTableAddColumnContext actx = ctx.alterTableAddColumn();
             String defaultVal = actx.defaultValue() != null ? actx.defaultValue().getText() : null;
@@ -578,5 +590,35 @@ public class SqlParser {
     private DropTableStatement buildDropTable(StratosSQLParser.DropTableContext ctx) {
         String tableName = ctx.tableName().getText();
         return new DropTableStatement(tableName);
+    }
+
+    private CreateRoleStatement buildCreateRole(StratosSQLParser.CreateRoleContext ctx) {
+        String roleName = ctx.roleName().getText();
+        boolean login = false;
+        boolean superuser = false;
+        String password = null;
+        for (StratosSQLParser.RoleOptionContext opt : ctx.roleOption()) {
+            if (opt.LOGIN() != null) login = true;
+            else if (opt.NOLOGIN() != null) login = false;
+            else if (opt.SUPERUSER() != null) superuser = true;
+            else if (opt.NOSUPERUSER() != null) superuser = false;
+            else if (opt.PASSWORD() != null) password = opt.STRING_LITERAL().getText();
+        }
+        return new CreateRoleStatement(roleName, login, superuser, password);
+    }
+
+    private List<String> buildPrivilegeList(StratosSQLParser.PrivilegeListContext ctx) {
+        List<String> privileges = new ArrayList<>();
+        for (StratosSQLParser.PrivilegeNameContext p : ctx.privilegeName()) {
+            if (p.ALL() != null) {
+                privileges.add("SELECT");
+                privileges.add("INSERT");
+                privileges.add("UPDATE");
+                privileges.add("DELETE");
+            } else {
+                privileges.add(p.getText().toUpperCase(java.util.Locale.ROOT));
+            }
+        }
+        return privileges;
     }
 }

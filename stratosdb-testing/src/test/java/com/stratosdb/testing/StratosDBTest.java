@@ -3036,6 +3036,203 @@ public class StratosDBTest {
         }
     }
 
+    // --- GRANT/REVOKE + CREATE ROLE: real privilege enforcement - this project's own
+    // honestly-named "no notion of a role, a privilege, or a restriction" gap. See
+    // ExecutorEngine.hasPrivilege's own javadoc for the real, deliberate backward-
+    // compatibility design (no current user set, or an unknown username never
+    // CREATE ROLE'd, both stay fully unrestricted - real access control begins the
+    // moment a role is actually created).
+
+    @Test
+    void testNoCurrentUserSetIsFullyUnrestricted() {
+        // Every pre-existing test in this whole file (and every internal tool) relies
+        // on exactly this: db.execute() with no setCurrentUser call at all must behave
+        // completely unrestricted, unchanged by this feature existing.
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        QueryResult result = database.execute("SELECT * FROM t");
+        assertTrue(result.isSuccess());
+        assertEquals(1, result.getRows().size());
+    }
+
+    @Test
+    void testTableOwnerAlwaysHasFullPrivileges() {
+        database.setCurrentUser("alice");
+        database.execute("CREATE TABLE t (id INT)");
+        assertTrue(database.execute("INSERT INTO t VALUES (1)").isSuccess(), "the creator of a table must always be able to INSERT into it");
+        assertTrue(database.execute("SELECT * FROM t").isSuccess());
+        assertTrue(database.execute("UPDATE t SET id = 2 WHERE id = 1").isSuccess());
+        assertTrue(database.execute("DELETE FROM t WHERE id = 2").isSuccess());
+        assertTrue(database.execute("ALTER TABLE t ADD COLUMN name VARCHAR").isSuccess());
+        assertTrue(database.execute("DROP TABLE t").isSuccess());
+    }
+
+    @Test
+    void testGrantSelectAllowsSelectButDeniesOtherOperations() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE accounts (id INT, balance INT)");
+        database.execute("INSERT INTO accounts VALUES (1, 1000)");
+        database.execute("CREATE ROLE reporting_user WITH LOGIN PASSWORD 'x'");
+        QueryResult grant = database.execute("GRANT SELECT ON accounts TO reporting_user");
+        assertTrue(grant.isSuccess(), () -> "GRANT must succeed for the table's own owner: " + grant.getError());
+
+        database.setCurrentUser("reporting_user");
+        assertTrue(database.execute("SELECT * FROM accounts").isSuccess(), "a role with GRANTed SELECT must be able to SELECT");
+        assertFalse(database.execute("INSERT INTO accounts VALUES (2, 500)").isSuccess(), "a role without GRANTed INSERT must be denied");
+        assertFalse(database.execute("UPDATE accounts SET balance = 0 WHERE id = 1").isSuccess(), "a role without GRANTed UPDATE must be denied");
+        assertFalse(database.execute("DELETE FROM accounts WHERE id = 1").isSuccess(), "a role without GRANTed DELETE must be denied");
+
+        database.setCurrentUser("owner");
+        QueryResult stillIntact = database.execute("SELECT * FROM accounts");
+        assertEquals(1, stillIntact.getRows().size());
+        assertEquals(1000, stillIntact.getRows().get(0).getValue("balance"), "every denied write attempt must have changed genuinely nothing");
+    }
+
+    @Test
+    void testGrantAndRevokeChangePrivilegesImmediately() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE ROLE r WITH LOGIN");
+
+        database.setCurrentUser("r");
+        assertFalse(database.execute("INSERT INTO t VALUES (1)").isSuccess(), "no privilege yet - must be denied");
+
+        database.setCurrentUser("owner");
+        database.execute("GRANT INSERT ON t TO r");
+        database.setCurrentUser("r");
+        assertTrue(database.execute("INSERT INTO t VALUES (1)").isSuccess(), "after GRANT INSERT, the same role must now be allowed");
+
+        database.setCurrentUser("owner");
+        database.execute("REVOKE INSERT ON t FROM r");
+        database.setCurrentUser("r");
+        assertFalse(database.execute("INSERT INTO t VALUES (2)").isSuccess(), "after REVOKE INSERT, the same role must be denied again");
+    }
+
+    @Test
+    void testGrantAllPrivilegesGrantsAllFourDmlOperations() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("CREATE ROLE r WITH LOGIN");
+        database.execute("GRANT ALL PRIVILEGES ON t TO r");
+
+        database.setCurrentUser("r");
+        assertTrue(database.execute("SELECT * FROM t").isSuccess());
+        assertTrue(database.execute("INSERT INTO t VALUES (2)").isSuccess());
+        assertTrue(database.execute("UPDATE t SET id = 3 WHERE id = 2").isSuccess());
+        assertTrue(database.execute("DELETE FROM t WHERE id = 3").isSuccess());
+    }
+
+    @Test
+    void testSuperuserBypassesAllPrivilegeChecks() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("CREATE ROLE dba WITH LOGIN SUPERUSER");
+
+        database.setCurrentUser("dba");
+        // No GRANT of any kind was ever made to dba - superuser must bypass entirely.
+        assertTrue(database.execute("SELECT * FROM t").isSuccess());
+        assertTrue(database.execute("DELETE FROM t WHERE id = 1").isSuccess());
+        assertTrue(database.execute("DROP TABLE t").isSuccess());
+    }
+
+    @Test
+    void testUnknownUsernameNeverCreateRoledIsUnrestricted() {
+        // A real, deliberate backward-compatibility choice - see hasPrivilege's own
+        // javadoc: trust auth already has no real identity guarantee, so an unknown
+        // username stays exactly as unrestricted as this permission system not
+        // existing at all. Real access control begins only once a role is created.
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+
+        database.setCurrentUser("someone_never_created_as_a_role");
+        assertTrue(database.execute("INSERT INTO t VALUES (1)").isSuccess());
+    }
+
+    @Test
+    void testNonOwnerNonSuperuserDeniedDropAndAlterTable() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE ROLE r WITH LOGIN");
+        database.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON t TO r"); // every DML privilege, deliberately, still not ownership
+
+        database.setCurrentUser("r");
+        assertFalse(database.execute("DROP TABLE t").isSuccess(), "DML privileges alone must never imply the right to DROP the table");
+        assertFalse(database.execute("ALTER TABLE t ADD COLUMN name VARCHAR").isSuccess(), "DML privileges alone must never imply the right to ALTER the table");
+    }
+
+    @Test
+    void testDropRoleRemovesItsPrivileges() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE ROLE r WITH LOGIN");
+        database.execute("GRANT SELECT ON t TO r");
+        database.setCurrentUser("r");
+        assertTrue(database.execute("SELECT * FROM t").isSuccess());
+
+        database.setCurrentUser("owner");
+        QueryResult dropRole = database.execute("DROP ROLE r");
+        assertTrue(dropRole.isSuccess());
+
+        // r is now an unknown username again - and per this engine's own deliberate
+        // design, an unknown username is unrestricted, not "denied everything." The
+        // real, meaningful check is that re-creating the SAME name starts genuinely
+        // fresh, with no leftover privilege from before.
+        database.execute("CREATE ROLE r WITH LOGIN");
+        database.setCurrentUser("r");
+        assertFalse(database.execute("SELECT * FROM t").isSuccess(), "a re-created role of the same name must start with no privileges at all, not inherit the dropped role's own old grants");
+    }
+
+    @Test
+    void testCreateRoleRejectsADuplicateName() {
+        database.execute("CREATE ROLE r WITH LOGIN");
+        QueryResult duplicate = database.execute("CREATE ROLE r WITH LOGIN");
+        assertFalse(duplicate.isSuccess());
+    }
+
+    @Test
+    void testGrantOnANonexistentTableOrRoleFailsCleanly() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("CREATE ROLE r WITH LOGIN");
+        assertFalse(database.execute("GRANT SELECT ON nonexistent_table TO r").isSuccess());
+        assertFalse(database.execute("GRANT SELECT ON t TO nonexistent_role").isSuccess());
+    }
+
+    @Test
+    void testRolesGrantsAndOwnershipSurviveARealRestart() throws Exception {
+        java.nio.file.Path tempDataDir = java.nio.file.Files.createTempDirectory("grantrestarttest");
+        try {
+            com.stratosdb.core.DatabaseConfig config1 = new com.stratosdb.core.DatabaseConfig();
+            config1.setDataDirectory(tempDataDir.toString());
+            StratosDB db1 = new StratosDB(config1);
+            db1.setCurrentUser("admin");
+            db1.execute("CREATE TABLE accounts (id INT, balance INT)");
+            db1.execute("INSERT INTO accounts VALUES (1, 1000)");
+            db1.execute("CREATE ROLE reporting_user WITH LOGIN PASSWORD 'secret'");
+            db1.execute("GRANT SELECT ON accounts TO reporting_user");
+            db1.shutdown();
+
+            com.stratosdb.core.DatabaseConfig config2 = new com.stratosdb.core.DatabaseConfig();
+            config2.setDataDirectory(tempDataDir.toString());
+            StratosDB db2 = new StratosDB(config2);
+
+            db2.setCurrentUser("reporting_user");
+            QueryResult afterRestartSelect = db2.execute("SELECT * FROM accounts");
+            assertTrue(afterRestartSelect.isSuccess(), () -> "a role's own GRANTed privilege must survive a real restart: " + afterRestartSelect.getError());
+            assertFalse(db2.execute("INSERT INTO accounts VALUES (2, 500)").isSuccess(), "a privilege that was never granted must still be denied after a real restart");
+            assertFalse(db2.execute("ALTER TABLE accounts ADD COLUMN note VARCHAR").isSuccess(), "table ownership (a non-owner denied ALTER) must survive a real restart too");
+
+            db2.setCurrentUser("admin");
+            QueryResult ownerStillWorks = db2.execute("ALTER TABLE accounts ADD COLUMN note VARCHAR");
+            assertTrue(ownerStillWorks.isSuccess(), () -> "the real owner must still be able to ALTER after a real restart: " + ownerStillWorks.getError());
+            db2.shutdown();
+        } finally {
+            deleteRecursively(tempDataDir.toFile());
+        }
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

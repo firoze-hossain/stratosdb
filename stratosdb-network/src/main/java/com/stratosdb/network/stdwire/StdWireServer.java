@@ -58,6 +58,23 @@ public class StdWireServer {
         this.port = port;
         this.db = db;
         this.userStore = userStore;
+        if (userStore != null) {
+            // The real bridge - see ExecutorEngine.RoleCredentialSink's own javadoc for
+            // why this can't be a direct dependency instead: CREATE ROLE ... LOGIN
+            // PASSWORD 'x' becomes a genuine, SCRAM-authenticatable credential in this
+            // server's own UserStore, not just privilege bookkeeping.
+            db.setRoleCredentialSink(new com.stratosdb.sql.executor.ExecutorEngine.RoleCredentialSink() {
+                @Override
+                public void onRoleCredential(String username, String plaintextPassword) {
+                    userStore.addUser(username, plaintextPassword);
+                }
+
+                @Override
+                public void onRoleDropped(String username) {
+                    userStore.removeUser(username);
+                }
+            });
+        }
     }
 
     public void start() throws IOException {
@@ -96,11 +113,22 @@ public class StdWireServer {
              DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
 
+            // Defensive: this thread is new per connection from the pool's own point of
+            // view, but a pooled thread may be reused across connections - MUST run
+            // before performStartup(), not after: performStartup() now calls
+            // db.setCurrentUser() as part of authentication (see its own comment below),
+            // and closeSession()'s own session.remove() would otherwise immediately wipe
+            // that back out again on the very next line, silently leaving every
+            // connection's own session with no current user at all - a real bug found
+            // and fixed while testing this real, end to end: a role's own GRANTed
+            // privileges appeared to do nothing at all over a real connection, because
+            // by the time a query actually ran, currentUser had already been reset to
+            // null right after being correctly set.
+            db.closeSession();
+
             if (!performStartup(in, out)) {
                 return;
             }
-
-            db.closeSession(); // defensive: this thread is new per connection, but be explicit about starting clean
 
             // Extended query protocol state - per connection, matching the protocol's own
             // scoping (a prepared statement/portal only ever means something to the
@@ -187,6 +215,13 @@ public class StdWireServer {
             // convention for this project.
             StdWireMessages.writeAuthenticationOk(out);
         }
+        // Real permission enforcement begins here, regardless of auth mode - see
+        // ExecutorEngine.hasPrivilege's own javadoc for why an unknown username (one
+        // never explicitly CREATE ROLE'd) stays fully unrestricted either way: trust
+        // auth already has no real identity guarantee, so this call is what actually
+        // makes GRANT/REVOKE mean anything once a role IS created, not a promise that
+        // every connection is now locked down by default.
+        db.setCurrentUser(params.get("user"));
         StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB pg-wire compatibility layer)");
         StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
         StdWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");

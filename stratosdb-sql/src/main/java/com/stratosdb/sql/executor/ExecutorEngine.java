@@ -27,6 +27,61 @@ public class ExecutorEngine {
     private final BufferPool bufferPool;
     private final WALManager walManager;
     private final TransactionManager transactionManager;
+    /**
+     * name -> a role's own attributes (login/superuser). Password itself
+     * is deliberately NOT stored here - see RoleCredentialSink's own
+     * javadoc for why authentication and privilege-tracking are kept as
+     * two genuinely separate concerns, bridged rather than merged.
+     */
+    private final Map<String, Role> roles = new ConcurrentHashMap<>();
+    /** tableName -> roleName -> the set of privileges ("SELECT"/"INSERT"/"UPDATE"/"DELETE") that role has been GRANTed on that table. */
+    private final Map<String, Map<String, Set<String>>> tablePrivileges = new ConcurrentHashMap<>();
+    /** tableName -> the username that ran CREATE TABLE - an owner implicitly has every privilege on their own table, the same as real Postgres. */
+    private final Map<String, String> tableOwners = new ConcurrentHashMap<>();
+    private RoleCredentialSink roleCredentialSink;
+
+    public record Role(String name, boolean login, boolean superuser) {}
+
+    /**
+     * The real bridge between this engine's own, self-contained role/
+     * privilege bookkeeping (stratosdb-sql, which cannot depend on
+     * stratosdb-network's UserStore - that would be a backward module
+     * dependency) and REAL, working password authentication for a role
+     * created via CREATE ROLE ... LOGIN PASSWORD 'x'. Deliberately a
+     * small, dependency-free interface defined here rather than a
+     * direct UserStore reference: StdWireServer (which already depends
+     * on stratosdb-sql, and already owns a real UserStore) implements
+     * this and wires it in, so CREATE ROLE's own password genuinely
+     * becomes a real, SCRAM-authenticatable credential, not just a
+     * value tracked for show. Left unset (null), CREATE ROLE ... LOGIN
+     * PASSWORD still fully tracks the role's own attributes/privileges
+     * correctly - only the actual wire-protocol authentication bridge
+     * is skipped, which matters for e.g. tests that call execute()
+     * directly with no real server/UserStore involved at all.
+     */
+    public interface RoleCredentialSink {
+        void onRoleCredential(String username, String plaintextPassword);
+        void onRoleDropped(String username);
+    }
+
+    public void setRoleCredentialSink(RoleCredentialSink sink) {
+        this.roleCredentialSink = sink;
+    }
+
+    /**
+     * Called once per connection, right after real authentication
+     * succeeds (see StdWireServer's own startup flow) - NOT called at
+     * all by any caller using execute() directly (every existing test
+     * and internal tool), which is the deliberate, real backward-
+     * compatibility mechanism: a session with no explicitly-set current
+     * user is treated as unrestricted (see checkPrivilege's own
+     * javadoc), exactly matching this engine's behavior before this
+     * round existed at all.
+     */
+    public void setCurrentUser(String username) {
+        session.get().currentUser = username;
+    }
+
     // Store column names for each table
     private final Map<String, List<String>> tableColumns;
     /** tableName -> columnName -> its raw default expression text (a literal, or once SERIAL/sequences exist, a "nextval('seqname')" marker) - null/absent means no default, so an omitted column gets SQL NULL. */
@@ -252,6 +307,18 @@ public class ExecutorEngine {
                     String columnName2 = indexParts.length > 4 && !indexParts[4].isEmpty() ? indexParts[4] : null;
                     reconstructIndex(indexName, tableName, columnName, type);
                     catalogLines.put("INDEX:" + indexName, line);
+                } else if (kind.equals("OWNER")) {
+                    // Pure metadata, not a real SQL statement - restored directly rather
+                    // than through execute(), the same way INDEX bypasses it above. Must
+                    // replay AFTER the table itself already exists (see this format's own
+                    // ordering guarantee: catalogLines is a LinkedHashMap and the catalog
+                    // file preserves insertion order, so OWNER always appears after its
+                    // own TABLE line, since executeCreateTable only ever writes both
+                    // together, in that order, in the same call).
+                    String[] ownerParts = parts[1].split("\\|", -1);
+                    String tableName = ownerParts[0], owner = ownerParts[1];
+                    tableOwners.put(tableName, owner);
+                    catalogLines.put("OWNER:" + tableName, line);
                 } else {
                     // TABLE, VIEW, or SEQUENCE - parts[1] is the original raw
                     // SQL text. Safe to replay verbatim for all three: a
@@ -301,6 +368,8 @@ public class ExecutorEngine {
         Transaction transaction;
         boolean poisoned;
         List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
+        /** The real, authenticated username for this session, set once via setCurrentUser() right after login - see its own javadoc. Null (the default for every session that never calls setCurrentUser, i.e. every caller using execute() directly) means unrestricted, matching this engine's own pre-existing behavior. */
+        String currentUser;
         /**
          * CTE name -> its query, active only while executing the one
          * statement that defined it. Session-local (ThreadLocal-backed,
@@ -700,6 +769,10 @@ public class ExecutorEngine {
         if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn);
         if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
+        if (stmt instanceof CreateRoleStatement s) return executeCreateRole(s);
+        if (stmt instanceof DropRoleStatement s) return executeDropRole(s);
+        if (stmt instanceof GrantStatement s) return executeGrant(s);
+        if (stmt instanceof RevokeStatement s) return executeRevoke(s);
         if (stmt instanceof AlterTableAddColumnStatement s) return executeAlterTableAddColumn(s, txn);
         if (stmt instanceof AlterTableDropColumnStatement s) return executeAlterTableDropColumn(s, txn);
         if (stmt instanceof AlterTableRenameColumnStatement s) return executeAlterTableRenameColumn(s, txn);
@@ -1265,6 +1338,18 @@ public class ExecutorEngine {
 
         HeapTable table = new HeapTable(stmt.tableName(), bufferPool);
         tables.put(stmt.tableName(), table);
+        // The creating session's own current user becomes this table's owner - an
+        // owner implicitly has every privilege on their own table (see
+        // hasPrivilege's own javadoc). null (no current user set - every
+        // pre-existing caller, and any connection this engine's own permission
+        // system treats as unrestricted) means the table simply has no real
+        // owner recorded, which is fine: hasPrivilege's own null/unknown-user
+        // fast path already grants full access before ownership is even checked.
+        String creatingUser = session.get().currentUser;
+        if (creatingUser != null) {
+            tableOwners.put(stmt.tableName(), creatingUser);
+            catalogLines.put("OWNER:" + stmt.tableName(), "OWNER|" + stmt.tableName() + "|" + creatingUser);
+        }
 
         List<String> columns = new ArrayList<>();
         Map<String, String> defaults = new java.util.HashMap<>();
@@ -1621,6 +1706,8 @@ public class ExecutorEngine {
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requirePrivilege(stmt.tableName(), "INSERT");
+        if (denied != null) return denied;
 
         List<String> allColumns = tableColumns.get(stmt.tableName());
         if (allColumns == null) {
@@ -1767,6 +1854,15 @@ public class ExecutorEngine {
                 return executeSelectOverView(stmt, viewQuery, txn);
             }
             return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+
+        QueryResult denied = requirePrivilege(stmt.tableName(), "SELECT");
+        if (denied != null) return denied;
+        if (stmt.joins() != null) {
+            for (JoinClause join : stmt.joins()) {
+                QueryResult joinDenied = requirePrivilege(join.tableName(), "SELECT");
+                if (joinDenied != null) return joinDenied;
+            }
         }
 
         if (stmt.joins() != null && !stmt.joins().isEmpty()) {
@@ -3045,6 +3141,8 @@ public class ExecutorEngine {
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requirePrivilege(stmt.tableName(), "UPDATE");
+        if (denied != null) return denied;
 
         int updated = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -3106,6 +3204,8 @@ public class ExecutorEngine {
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requirePrivilege(stmt.tableName(), "DELETE");
+        if (denied != null) return denied;
 
         int deleted = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -3145,12 +3245,173 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
 
         tables.remove(stmt.tableName());
         tableColumns.remove(stmt.tableName());
         tableColumnTypes.remove(stmt.tableName());
         tableColumnDefaults.remove(stmt.tableName());
+        tableOwners.remove(stmt.tableName());
+        tablePrivileges.remove(stmt.tableName());
         return QueryResult.success("Table dropped: " + stmt.tableName());
+    }
+
+    /**
+     * True if the current session may do something requiring privilege
+     * on tableName. Deliberately permissive in two real, named cases
+     * beyond the obvious ones (superuser, the table's own owner, or an
+     * actual matching GRANT):
+     *
+     *   1. No current user was ever set for this session at all (see
+     *      setCurrentUser's own javadoc) - every pre-existing caller
+     *      using execute() directly, including every test and internal
+     *      tool this engine already had before this round, which never
+     *      touches the role system and must keep working completely
+     *      unrestricted, exactly as before.
+     *   2. currentUser was set (a real wire-protocol connection
+     *      authenticated as this username) but no CREATE ROLE of that
+     *      exact name was ever run - a deliberate, honestly-stated
+     *      backward-compatibility choice, not an oversight: this
+     *      engine's own trust-auth mode already accepts any username
+     *      with no real identity guarantee at all, so enforcing
+     *      privileges on top of an unverified identity would be a false
+     *      sense of security, not real access control. Real access
+     *      control begins the moment a role is actually created - an
+     *      unknown username stays exactly as unrestricted as this
+     *      engine's whole permission system not existing at all.
+     */
+    private boolean hasPrivilege(String tableName, String privilege) {
+        String currentUser = session.get().currentUser;
+        if (currentUser == null) return true;
+        Role role = roles.get(currentUser);
+        if (role == null) return true;
+        if (role.superuser()) return true;
+        if (currentUser.equals(tableOwners.get(tableName))) return true;
+        Map<String, Set<String>> byTable = tablePrivileges.get(tableName);
+        if (byTable == null) return false;
+        Set<String> granted = byTable.get(currentUser);
+        return granted != null && granted.contains(privilege);
+    }
+
+    /** Returns an error QueryResult if the current session lacks privilege, null (meaning "proceed") otherwise - callers do `QueryResult denied = requirePrivilege(...); if (denied != null) return denied;`. */
+    private QueryResult requirePrivilege(String tableName, String privilege) {
+        if (!hasPrivilege(tableName, privilege)) {
+            return QueryResult.error("permission denied for table " + tableName + " (missing " + privilege + " privilege)");
+        }
+        return null;
+    }
+
+    /** DDL that changes or removes a table's own structure (DROP TABLE, every ALTER TABLE sub-command) requires real ownership or superuser - GRANT/REVOKE's own SELECT/INSERT/UPDATE/DELETE privileges deliberately do not extend to this, matching real Postgres's own separation between data privileges and schema/ownership rights. */
+    private QueryResult requireOwnerOrSuperuser(String tableName) {
+        String currentUser = session.get().currentUser;
+        if (currentUser == null) return null;
+        Role role = roles.get(currentUser);
+        if (role == null) return null; // see hasPrivilege's own javadoc for this same, deliberate backward-compatibility choice
+        if (role.superuser()) return null;
+        if (currentUser.equals(tableOwners.get(tableName))) return null;
+        return QueryResult.error("permission denied: must be owner or superuser to alter table " + tableName);
+    }
+
+    private QueryResult executeCreateRole(CreateRoleStatement stmt) {
+        if (roles.containsKey(stmt.roleName())) {
+            return QueryResult.error("Role already exists: " + stmt.roleName());
+        }
+        roles.put(stmt.roleName(), new Role(stmt.roleName(), stmt.login(), stmt.superuser()));
+        if (stmt.login() && stmt.password() != null && roleCredentialSink != null) {
+            String plaintextPassword = (String) parseLiteral(stmt.password());
+            roleCredentialSink.onRoleCredential(stmt.roleName(), plaintextPassword);
+        }
+        // Deliberately does NOT include the password in the persisted text - a
+        // plaintext credential sitting in a catalog file on disk would be a real
+        // security exposure. A role's own LOGIN/SUPERUSER attributes and every
+        // privilege it's been GRANTed correctly survive a restart; its password
+        // does not, the same real, already-documented limitation UserStore
+        // itself already has for every credential (see its own javadoc) - not a
+        // new gap this round introduces.
+        String sql = "CREATE ROLE " + stmt.roleName() + " WITH "
+            + (stmt.login() ? "LOGIN " : "NOLOGIN ")
+            + (stmt.superuser() ? "SUPERUSER" : "NOSUPERUSER");
+        catalogLines.put("ROLE:" + stmt.roleName(), "ROLE|" + sql);
+        saveCatalog();
+        return QueryResult.success("Role created: " + stmt.roleName());
+    }
+
+    private QueryResult executeDropRole(DropRoleStatement stmt) {
+        if (!roles.containsKey(stmt.roleName())) {
+            return QueryResult.error("Role not found: " + stmt.roleName());
+        }
+        roles.remove(stmt.roleName());
+        for (Map<String, Set<String>> byTable : tablePrivileges.values()) {
+            byTable.remove(stmt.roleName());
+        }
+        if (roleCredentialSink != null) {
+            roleCredentialSink.onRoleDropped(stmt.roleName());
+        }
+        catalogLines.remove("ROLE:" + stmt.roleName());
+        saveCatalog();
+        return QueryResult.success("Role dropped: " + stmt.roleName());
+    }
+
+    private QueryResult executeGrant(GrantStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        if (!roles.containsKey(stmt.roleName())) {
+            return QueryResult.error("Role not found: " + stmt.roleName());
+        }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
+
+        tablePrivileges.computeIfAbsent(stmt.tableName(), k -> new ConcurrentHashMap<>())
+            .computeIfAbsent(stmt.roleName(), k -> ConcurrentHashMap.newKeySet())
+            .addAll(stmt.privileges());
+        persistGrants(stmt.tableName(), stmt.roleName());
+        return QueryResult.success("Privileges granted");
+    }
+
+    private QueryResult executeRevoke(RevokeStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        if (!roles.containsKey(stmt.roleName())) {
+            return QueryResult.error("Role not found: " + stmt.roleName());
+        }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
+
+        Map<String, Set<String>> byTable = tablePrivileges.get(stmt.tableName());
+        if (byTable != null) {
+            Set<String> granted = byTable.get(stmt.roleName());
+            if (granted != null) {
+                granted.removeAll(stmt.privileges());
+            }
+        }
+        persistGrants(stmt.tableName(), stmt.roleName());
+        return QueryResult.success("Privileges revoked");
+    }
+
+    /**
+     * Persists (tableName, roleName)'s own current privilege set as one
+     * catalog line, keyed by that exact pair - matching this engine's
+     * own established catalog pattern (verbatim, re-executable SQL text
+     * replayed directly by loadCatalog, no bespoke parsing format
+     * needed the way a single "all grants for this table" encoding
+     * would have required). An empty privilege set removes the entry
+     * entirely, rather than persisting a meaningless "GRANT ON ... TO
+     * ..." with nothing after it.
+     */
+    private void persistGrants(String tableName, String roleName) {
+        String key = "GRANT:" + tableName + ":" + roleName;
+        Map<String, Set<String>> byTable = tablePrivileges.get(tableName);
+        Set<String> granted = byTable != null ? byTable.get(roleName) : null;
+        if (granted == null || granted.isEmpty()) {
+            catalogLines.remove(key);
+        } else {
+            String sql = "GRANT " + String.join(", ", granted) + " ON " + tableName + " TO " + roleName;
+            catalogLines.put(key, "GRANT|" + sql);
+        }
+        saveCatalog();
     }
 
     /**
@@ -3318,6 +3579,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
         if (columns.contains(stmt.columnName())) {
             return QueryResult.error("Column already exists: " + stmt.columnName());
@@ -3349,6 +3612,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());
@@ -3393,6 +3658,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
         if (!columns.contains(stmt.oldColumnName())) {
             return QueryResult.error("Column not found: " + stmt.oldColumnName());
@@ -3437,6 +3704,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.oldTableName())) {
             return QueryResult.error("Table not found: " + stmt.oldTableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.oldTableName());
+        if (denied != null) return denied;
         if (tables.containsKey(stmt.newTableName()) || views.containsKey(stmt.newTableName())) {
             return QueryResult.error("A table or view already exists with that name: " + stmt.newTableName());
         }
@@ -3447,6 +3716,24 @@ public class ExecutorEngine {
         if (types != null) tableColumnTypes.put(stmt.newTableName(), types);
         Map<String, String> defaults = tableColumnDefaults.remove(stmt.oldTableName());
         if (defaults != null) tableColumnDefaults.put(stmt.newTableName(), defaults);
+
+        // Ownership and privileges are keyed by table name too - without migrating
+        // them here, they'd become orphaned under the old name (and the renamed
+        // table would silently, incorrectly appear to have no owner at all).
+        String owner = tableOwners.remove(stmt.oldTableName());
+        catalogLines.remove("OWNER:" + stmt.oldTableName());
+        if (owner != null) {
+            tableOwners.put(stmt.newTableName(), owner);
+            catalogLines.put("OWNER:" + stmt.newTableName(), "OWNER|" + stmt.newTableName() + "|" + owner);
+        }
+        Map<String, Set<String>> privileges = tablePrivileges.remove(stmt.oldTableName());
+        if (privileges != null) {
+            tablePrivileges.put(stmt.newTableName(), privileges);
+            for (String roleName : privileges.keySet()) {
+                catalogLines.remove("GRANT:" + stmt.oldTableName() + ":" + roleName);
+                persistGrants(stmt.newTableName(), roleName);
+            }
+        }
 
         catalogLines.remove("TABLE:" + stmt.oldTableName());
         regenerateTableDdl(stmt.newTableName());
@@ -3466,6 +3753,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());
@@ -3502,6 +3791,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());
@@ -3515,6 +3806,8 @@ public class ExecutorEngine {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());

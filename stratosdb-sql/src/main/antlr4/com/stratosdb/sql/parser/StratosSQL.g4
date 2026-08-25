@@ -3,12 +3,20 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
+createRole: CREATE ROLE roleName (WITH)? roleOption* SEMICOLON?;
+roleOption: LOGIN | NOLOGIN | SUPERUSER | NOSUPERUSER | PASSWORD STRING_LITERAL;
+dropRole: DROP ROLE roleName SEMICOLON?;
+grantStatement: GRANT privilegeList ON TABLE? tableName TO roleName SEMICOLON?;
+revokeStatement: REVOKE privilegeList ON TABLE? tableName FROM roleName SEMICOLON?;
+privilegeList: privilegeName (COMMA privilegeName)*;
+privilegeName: SELECT | INSERT | UPDATE | DELETE | ALL PRIVILEGES?;
+roleName: IDENTIFIER;
 alterTableAddColumn: ALTER TABLE tableName ADD COLUMN? columnName dataType (DEFAULT defaultValue)? SEMICOLON?;
 alterTableDropColumn: ALTER TABLE tableName DROP COLUMN? columnName SEMICOLON?;
 alterTableRenameColumn: ALTER TABLE tableName RENAME COLUMN columnName TO columnName SEMICOLON?;
@@ -162,6 +170,15 @@ UNION: U N I O N;
 ALL: A L L;
 RECURSIVE: R E C U R S I V E;
 DROP: D R O P;
+ROLE: R O L E;
+GRANT: G R A N T;
+REVOKE: R E V O K E;
+LOGIN: L O G I N;
+NOLOGIN: N O L O G I N;
+SUPERUSER: S U P E R U S E R;
+NOSUPERUSER: N O S U P E R U S E R;
+PRIVILEGES: P R I V I L E G E S;
+PASSWORD: P A S S W O R D;
 ALTER: A L T E R;
 ADD: A D D;
 COLUMN: C O L U M N;
