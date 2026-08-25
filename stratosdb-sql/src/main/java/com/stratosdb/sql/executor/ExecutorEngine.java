@@ -769,6 +769,7 @@ public class ExecutorEngine {
         if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn);
         if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
+        if (stmt instanceof CopyStatement s) return executeCopy(s, txn);
         if (stmt instanceof CreateRoleStatement s) return executeCreateRole(s);
         if (stmt instanceof DropRoleStatement s) return executeDropRole(s);
         if (stmt instanceof GrantStatement s) return executeGrant(s);
@@ -1719,7 +1720,7 @@ public class ExecutorEngine {
             for (int i = 0; i < stmt.values().size(); i++) {
                 fallback.addValue("col" + i, resolveValue(stmt.values().get(i)));
             }
-            return finishInsert(stmt, txn, fallback);
+            return finishInsert(stmt.tableName(), txn, fallback);
         }
 
         // The explicit (col1, col2, ...) list if the statement gave one;
@@ -1760,17 +1761,17 @@ public class ExecutorEngine {
             }
         }
 
-        return finishInsert(stmt, txn, tuple);
+        return finishInsert(stmt.tableName(), txn, tuple);
     }
 
-    private QueryResult finishInsert(InsertStatement stmt, Transaction txn, Tuple tuple) {
-        String beforeError = fireTriggers(stmt.tableName(), "BEFORE", "INSERT", tuple, txn);
+    private QueryResult finishInsert(String tableName, Transaction txn, Tuple tuple) {
+        String beforeError = fireTriggers(tableName, "BEFORE", "INSERT", tuple, txn);
         if (beforeError != null) {
             return QueryResult.error(beforeError);
         }
 
         byte[] data = tuple.serialize();
-        HeapTable table = tables.get(stmt.tableName());
+        HeapTable table = tables.get(tableName);
         HeapTable.InsertResult result = table.insertMvcc(data, txn.getXID());
 
         // A real, previously-latent bug: insertMvcc wraps data with MVCC
@@ -1789,11 +1790,11 @@ public class ExecutorEngine {
         // exact same wrapped bytes insertMvcc already computed and
         // stored, not a second, divergent computation of them.
         byte[] storedBytes = MVCCVisibility.wrap(data, txn.getXID(), MVCCVisibility.NO_XMAX);
-        walManager.logInsert(stmt.tableName(), txn.getXID(), result.pageId, result.slot, storedBytes);
-        maintainIndexesOnWrite(stmt.tableName(), tuple, result.pageId, result.slot);
-        recordUndo(new UndoAction.UndoInsert(stmt.tableName(), result.pageId, result.slot));
+        walManager.logInsert(tableName, txn.getXID(), result.pageId, result.slot, storedBytes);
+        maintainIndexesOnWrite(tableName, tuple, result.pageId, result.slot);
+        recordUndo(new UndoAction.UndoInsert(tableName, result.pageId, result.slot));
 
-        String afterError = fireTriggers(stmt.tableName(), "AFTER", "INSERT", tuple, txn);
+        String afterError = fireTriggers(tableName, "AFTER", "INSERT", tuple, txn);
         if (afterError != null) {
             return QueryResult.error(afterError);
         }
@@ -3255,6 +3256,402 @@ public class ExecutorEngine {
         tableOwners.remove(stmt.tableName());
         tablePrivileges.remove(stmt.tableName());
         return QueryResult.success("Table dropped: " + stmt.tableName());
+    }
+
+    /**
+     * COPY's own resolved format options - DELIMITER/NULL default
+     * differently depending on FORMAT, matching real Postgres's own
+     * defaults exactly (TEXT: tab delimiter, "\N" for NULL; CSV: comma
+     * delimiter, empty string for NULL), so this is resolved once up
+     * front rather than re-derived at every call site.
+     */
+    private record CopyFormatOptions(String format, char delimiter, String nullString) {
+        static CopyFormatOptions from(CopyStatement stmt, java.util.function.Function<String, Object> literalParser) {
+            String format = stmt.format() != null ? stmt.format() : "TEXT";
+            char delimiter = stmt.delimiter() != null
+                ? ((String) literalParser.apply(stmt.delimiter())).charAt(0)
+                : (format.equals("CSV") ? ',' : '\t');
+            String nullString = stmt.nullString() != null
+                ? (String) literalParser.apply(stmt.nullString())
+                : (format.equals("CSV") ? "" : "\\N");
+            return new CopyFormatOptions(format, delimiter, nullString);
+        }
+    }
+
+    /**
+     * One row -> one line of COPY output, in this statement's own
+     * resolved format - real Postgres's own two formats, not a
+     * simplification of either: TEXT backslash-escapes \\, \t, \n, \r
+     * within a field; CSV double-quotes a field only when it actually
+     * contains the delimiter, a quote, or a newline, doubling any
+     * embedded quote.
+     */
+    private String formatCopyLine(List<Object> values, CopyFormatOptions opts) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) sb.append(opts.delimiter());
+            Object v = values.get(i);
+            if (v == null) {
+                sb.append(opts.nullString());
+            } else {
+                String text = (v instanceof Map || v instanceof List) ? JsonParser.toJsonText(v) : v.toString();
+                sb.append(opts.format().equals("CSV") ? csvEscapeField(text, opts.delimiter()) : textEscapeField(text));
+            }
+        }
+        return sb.toString();
+    }
+
+    private String textEscapeField(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\' -> sb.append("\\\\");
+                case '\t' -> sb.append("\\t");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                default -> sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    private String csvEscapeField(String s, char delimiter) {
+        boolean needsQuoting = s.indexOf(delimiter) >= 0 || s.indexOf('"') >= 0 || s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0;
+        if (!needsQuoting) return s;
+        return "\"" + s.replace("\"", "\"\"") + "\"";
+    }
+
+    /**
+     * One line of COPY input -> raw field strings, still uncoerced to
+     * any column type (the caller does that with convertValueToType,
+     * the same real conversion logic ALTER COLUMN ... TYPE already
+     * uses). Real, honestly-stated limitation, stated plainly rather
+     * than silently mishandled: a CSV field containing an embedded
+     * literal newline inside its own quotes (valid per RFC 4180, and
+     * something real Postgres's own COPY does support) is not
+     * supported here, since input is read and parsed one physical line
+     * at a time - a real, separate piece of further work, not attempted
+     * given the scope already covered this round.
+     */
+    private List<String> parseCopyLine(String line, CopyFormatOptions opts) {
+        return opts.format().equals("CSV") ? parseCsvLine(line, opts.delimiter()) : parseTextLine(line, opts.delimiter());
+    }
+
+    private List<String> parseTextLine(String line, char delimiter) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '\\' && i + 1 < line.length()) {
+                char next = line.charAt(i + 1);
+                switch (next) {
+                    case 't' -> { current.append('\t'); i++; }
+                    case 'n' -> { current.append('\n'); i++; }
+                    case 'r' -> { current.append('\r'); i++; }
+                    case '\\' -> { current.append('\\'); i++; }
+                    default -> current.append(c); // an unrecognized escape - keep the literal backslash
+                }
+            } else if (c == delimiter) {
+                fields.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        fields.add(current.toString());
+        return fields;
+    }
+
+    private List<String> parseCsvLine(String line, char delimiter) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (inQuotes) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        current.append('"');
+                        i++;
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    current.append(c);
+                }
+            } else if (c == '"') {
+                inQuotes = true;
+            } else if (c == delimiter) {
+                fields.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        fields.add(current.toString());
+        return fields;
+    }
+
+    /**
+     * COPY table_name [(cols)] {FROM|TO} {'path'|STDIN|STDOUT} - the
+     * file-based case (a real, local path, opened and read/written
+     * directly by this engine's own process) is handled entirely here.
+     * STDIN/STDOUT need to stream real CopyData wire messages to/from
+     * whichever real client is connected, which this method - reached
+     * only through execute(), with no access to any socket at all -
+     * cannot do; StdWireServer intercepts those two cases before they
+     * ever reach here (see its own tryHandleCopyStatement), the same
+     * way it already intercepts the `\dt` meta-command's own query.
+     */
+    // --- Public API for StdWireServer's own COPY ... STDIN/STDOUT handling ---
+    // A COPY targeting a real, local file (the common case above) is handled
+    // entirely within executeCopy/execute() - no socket access needed at all.
+    // STDIN/STDOUT need to stream real CopyData wire messages to/from whichever
+    // real client is connected, which this class - reached only through
+    // execute(), with no access to any socket - cannot do; StdWireServer
+    // intercepts those two cases before they reach execute() at all (see its own
+    // tryHandleCopyStatement), driving these methods instead. Every format
+    // detail (CopyFormatOptions, formatCopyLine, parseCopyLine) stays private to
+    // this class - StdWireServer only ever sees raw text lines and error
+    // messages, never the format internals producing/consuming them.
+
+    /** Parses sql; returns the CopyStatement if it's a real COPY targeting STDIN/STDOUT, null otherwise (not a COPY at all, or a file-based COPY - both of which the normal execute() path already handles correctly on its own). */
+    public CopyStatement tryParseStdioCopy(String sql) {
+        Statement stmt;
+        try {
+            stmt = parser.parse(sql);
+        } catch (Exception e) {
+            return null;
+        }
+        return (stmt instanceof CopyStatement copy && copy.isStdio()) ? copy : null;
+    }
+
+    /** Validates a STDIN/STDOUT COPY statement (table exists, columns exist, privilege granted) before StdWireServer starts streaming anything - returns an error message, or null if OK to proceed. */
+    public String prepareCopy(CopyStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return "Table not found: " + stmt.tableName();
+        }
+        QueryResult denied = requirePrivilege(stmt.tableName(), stmt.isFrom() ? "INSERT" : "SELECT");
+        if (denied != null) {
+            return denied.getError();
+        }
+        List<String> allColumns = tableColumns.get(stmt.tableName());
+        List<String> targetColumns = stmt.columns() != null ? stmt.columns() : allColumns;
+        for (String col : targetColumns) {
+            if (!allColumns.contains(col)) {
+                return "Column not found: " + col + " on table " + stmt.tableName();
+            }
+        }
+        return null;
+    }
+
+    /** The number of columns this COPY targets - needed for CopyInResponse/CopyOutResponse's own column-count field, sent before any row data. Call only after prepareCopy() returned null. */
+    public int getCopyColumnCount(CopyStatement stmt) {
+        List<String> allColumns = tableColumns.get(stmt.tableName());
+        return (stmt.columns() != null ? stmt.columns() : allColumns).size();
+    }
+
+    /** Begins a real transaction for a COPY operation spanning many separate StdWireServer-driven calls - the same real transaction semantics execute() itself already gives one statement (one implicit, auto-committed transaction unless already inside an explicit BEGIN), just spread across many calls instead of one. */
+    public Transaction beginCopyTransaction() {
+        SessionState state = session.get();
+        return state.transaction != null ? state.transaction : transactionManager.begin();
+    }
+
+    public void commitCopyTransaction(Transaction txn) {
+        SessionState state = session.get();
+        if (state.transaction == null) {
+            walManager.logCommit(txn.getXID());
+            transactionManager.commit(txn);
+        }
+    }
+
+    public void abortCopyTransaction(Transaction txn) {
+        SessionState state = session.get();
+        if (state.transaction == null) {
+            transactionManager.abort(txn);
+        } else {
+            state.poisoned = true;
+        }
+    }
+
+    /** One line of real COPY FROM STDIN input -> one inserted row, through the exact same real insertion path (triggers, WAL, index maintenance) file-based COPY FROM and a normal INSERT already use. Returns an error message, or null on success. Call only after prepareCopy() returned null. */
+    public String copyFromStdinLine(CopyStatement stmt, String rawLine, Transaction txn) {
+        List<String> allColumns = tableColumns.get(stmt.tableName());
+        List<String> targetColumns = stmt.columns() != null ? stmt.columns() : allColumns;
+        Map<String, String> columnTypes = tableColumnTypes.getOrDefault(stmt.tableName(), Map.of());
+        Map<String, String> defaults = tableColumnDefaults.getOrDefault(stmt.tableName(), Map.of());
+        CopyFormatOptions opts = CopyFormatOptions.from(stmt, this::parseLiteral);
+
+        List<String> rawFields;
+        try {
+            rawFields = parseCopyLine(rawLine, opts);
+        } catch (Exception e) {
+            return "COPY: could not parse line: " + e.getMessage();
+        }
+        if (rawFields.size() != targetColumns.size()) {
+            return "COPY: line has " + rawFields.size() + " field(s) but " + targetColumns.size() + " column(s) were expected";
+        }
+
+        Map<String, Object> givenValues = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < targetColumns.size(); i++) {
+            String col = targetColumns.get(i);
+            String raw = rawFields.get(i);
+            try {
+                Object value = raw.equals(opts.nullString()) ? null : convertValueToType(raw, columnTypes.get(col));
+                givenValues.put(col, value);
+            } catch (IllegalArgumentException e) {
+                return "COPY: " + e.getMessage();
+            }
+        }
+
+        Tuple tuple = new Tuple();
+        for (String col : allColumns) {
+            if (givenValues.containsKey(col)) {
+                tuple.addValue(col, givenValues.get(col));
+            } else if (defaults.containsKey(col)) {
+                tuple.addValue(col, coerceForColumnType(col, columnTypes.get(col), resolveValue(defaults.get(col))));
+            } else {
+                tuple.addValue(col, null);
+            }
+        }
+
+        QueryResult result = finishInsert(stmt.tableName(), txn, tuple);
+        return result.isSuccess() ? null : result.getError();
+    }
+
+    /** Streams every row of stmt's own table, already formatted in stmt's own resolved COPY format, to lineConsumer one row at a time - never the whole table buffered in memory at once, the actual point of COPY existing at all for a genuinely large table. Call only after prepareCopy() returned null. */
+    public void copyToStdoutStream(CopyStatement stmt, Transaction txn, java.util.function.Consumer<String> lineConsumer) {
+        List<String> allColumns = tableColumns.get(stmt.tableName());
+        List<String> targetColumns = stmt.columns() != null ? stmt.columns() : allColumns;
+        CopyFormatOptions opts = CopyFormatOptions.from(stmt, this::parseLiteral);
+        HeapTable table = tables.get(stmt.tableName());
+
+        if (stmt.header()) {
+            lineConsumer.accept(formatCopyLine(new ArrayList<>(targetColumns), opts));
+        }
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            List<Object> values = new ArrayList<>(targetColumns.size());
+            for (String col : targetColumns) {
+                values.add(tuple.getValue(col));
+            }
+            lineConsumer.accept(formatCopyLine(values, opts));
+        }
+    }
+
+    private QueryResult executeCopy(CopyStatement stmt, Transaction txn) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        QueryResult denied = requirePrivilege(stmt.tableName(), stmt.isFrom() ? "INSERT" : "SELECT");
+        if (denied != null) return denied;
+
+        if (stmt.isStdio()) {
+            return QueryResult.error("COPY ... " + stmt.target()
+                + " requires a real client connection over the wire protocol, and is not supported when calling execute() directly");
+        }
+
+        List<String> allColumns = tableColumns.get(stmt.tableName());
+        List<String> targetColumns = stmt.columns() != null ? stmt.columns() : allColumns;
+        for (String col : targetColumns) {
+            if (!allColumns.contains(col)) {
+                return QueryResult.error("Column not found: " + col + " on table " + stmt.tableName());
+            }
+        }
+
+        CopyFormatOptions opts = CopyFormatOptions.from(stmt, this::parseLiteral);
+        String filePath = (String) parseLiteral(stmt.target());
+
+        return stmt.isFrom()
+            ? executeCopyFromFile(stmt, txn, filePath, targetColumns, allColumns, opts)
+            : executeCopyToFile(stmt, txn, filePath, targetColumns, opts);
+    }
+
+    private QueryResult executeCopyFromFile(CopyStatement stmt, Transaction txn, String filePath,
+                                             List<String> targetColumns, List<String> allColumns, CopyFormatOptions opts) {
+        Map<String, String> columnTypes = tableColumnTypes.getOrDefault(stmt.tableName(), Map.of());
+        Map<String, String> defaults = tableColumnDefaults.getOrDefault(stmt.tableName(), Map.of());
+        long rowCount = 0;
+        try (java.io.BufferedReader reader = java.nio.file.Files.newBufferedReader(java.nio.file.Path.of(filePath))) {
+            String line;
+            boolean first = true;
+            while ((line = reader.readLine()) != null) {
+                if (first && stmt.header()) {
+                    first = false;
+                    continue; // the header row names columns, not data - skipped, not inserted
+                }
+                first = false;
+                if (line.isEmpty()) continue;
+
+                List<String> rawFields = parseCopyLine(line, opts);
+                if (rawFields.size() != targetColumns.size()) {
+                    return QueryResult.error("COPY: line " + (rowCount + 1) + " has " + rawFields.size()
+                        + " field(s) but " + targetColumns.size() + " column(s) were expected - no further rows processed");
+                }
+
+                Map<String, Object> givenValues = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < targetColumns.size(); i++) {
+                    String col = targetColumns.get(i);
+                    String raw = rawFields.get(i);
+                    Object value = raw.equals(opts.nullString()) ? null : convertValueToType(raw, columnTypes.get(col));
+                    givenValues.put(col, value);
+                }
+
+                Tuple tuple = new Tuple();
+                for (String col : allColumns) {
+                    if (givenValues.containsKey(col)) {
+                        tuple.addValue(col, givenValues.get(col));
+                    } else if (defaults.containsKey(col)) {
+                        tuple.addValue(col, coerceForColumnType(col, columnTypes.get(col), resolveValue(defaults.get(col))));
+                    } else {
+                        tuple.addValue(col, null);
+                    }
+                }
+
+                QueryResult result = finishInsert(stmt.tableName(), txn, tuple);
+                if (!result.isSuccess()) {
+                    return QueryResult.error("COPY: line " + (rowCount + 1) + " failed: " + result.getError()
+                        + " - " + rowCount + " row(s) already inserted before this failure");
+                }
+                rowCount++;
+            }
+        } catch (java.io.IOException e) {
+            return QueryResult.error("COPY FROM '" + filePath + "' failed: " + e.getMessage());
+        } catch (IllegalArgumentException e) {
+            return QueryResult.error("COPY: " + e.getMessage());
+        }
+        return QueryResult.success("COPY " + rowCount);
+    }
+
+    private QueryResult executeCopyToFile(CopyStatement stmt, Transaction txn, String filePath, List<String> targetColumns, CopyFormatOptions opts) {
+        HeapTable table = tables.get(stmt.tableName());
+        long rowCount = 0;
+        try (java.io.BufferedWriter writer = java.nio.file.Files.newBufferedWriter(java.nio.file.Path.of(filePath))) {
+            if (stmt.header()) {
+                writer.write(formatCopyLine(new ArrayList<>(targetColumns), opts));
+                writer.newLine();
+            }
+            for (HeapTable.PositionedRow row : table.scanPositioned()) {
+                if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                    continue;
+                }
+                Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+                List<Object> values = new ArrayList<>(targetColumns.size());
+                for (String col : targetColumns) {
+                    values.add(tuple.getValue(col));
+                }
+                writer.write(formatCopyLine(values, opts));
+                writer.newLine();
+                rowCount++;
+            }
+        } catch (java.io.IOException e) {
+            return QueryResult.error("COPY TO '" + filePath + "' failed: " + e.getMessage());
+        }
+        return QueryResult.success("COPY " + rowCount);
     }
 
     /**

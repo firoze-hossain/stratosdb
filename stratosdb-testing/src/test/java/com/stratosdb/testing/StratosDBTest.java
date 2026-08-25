@@ -3233,6 +3233,142 @@ public class StratosDBTest {
         }
     }
 
+    // --- COPY: real bulk load/export - this project's own honestly-named "no COPY
+    // protocol support, INSERT-per-row isn't practical for real bulk data" gap.
+    // File-based COPY (a real, quoted server-side path) is fully covered here.
+    // STDIN/STDOUT (the more practically valuable variant - real client-driven bulk
+    // load without needing server filesystem access) needs a real wire-protocol
+    // connection and is covered separately in CopyStdioEndToEndTest.
+
+    @Test
+    void testCopyToFileThenCopyFromFileRoundTripsTextFormatCorrectly() throws Exception {
+        java.nio.file.Path tempFile = java.nio.file.Files.createTempFile("copytest", ".txt");
+        try {
+            database.execute("CREATE TABLE employees (id INT, name VARCHAR, department VARCHAR)");
+            database.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering')");
+            database.execute("INSERT INTO employees VALUES (2, 'Bob', NULL)");
+
+            QueryResult copyOut = database.execute("COPY employees TO '" + tempFile + "'");
+            assertTrue(copyOut.isSuccess(), () -> "COPY TO must succeed: " + copyOut.getError());
+
+            String content = java.nio.file.Files.readString(tempFile);
+            assertTrue(content.contains("\t"), "TEXT format's default delimiter is a tab");
+            assertTrue(content.contains("\\N"), "TEXT format represents NULL as \\N by default");
+
+            database.execute("CREATE TABLE employees_copy (id INT, name VARCHAR, department VARCHAR)");
+            QueryResult copyIn = database.execute("COPY employees_copy FROM '" + tempFile + "'");
+            assertTrue(copyIn.isSuccess(), () -> "COPY FROM must succeed: " + copyIn.getError());
+
+            QueryResult result = database.execute("SELECT * FROM employees_copy");
+            assertEquals(2, result.getRows().size());
+            Tuple bobRow = result.getRows().stream().filter(r -> r.getValue("id").equals(2)).findFirst().orElseThrow();
+            assertNull(bobRow.getValue("department"), "NULL must round-trip as a genuine NULL, not the literal string \\N");
+        } finally {
+            java.nio.file.Files.deleteIfExists(tempFile);
+        }
+    }
+
+    @Test
+    void testCopyCsvFormatWithHeaderAndQuoting() throws Exception {
+        java.nio.file.Path tempFile = java.nio.file.Files.createTempFile("copytest", ".csv");
+        try {
+            database.execute("CREATE TABLE notes (id INT, note_text VARCHAR)");
+            database.execute("INSERT INTO notes VALUES (1, 'has, a comma')");
+            database.execute("INSERT INTO notes VALUES (2, 'has \"a quote\"')");
+
+            QueryResult copyOut = database.execute("COPY notes TO '" + tempFile + "' WITH (FORMAT CSV, HEADER true)");
+            assertTrue(copyOut.isSuccess(), () -> "COPY TO CSV with HEADER must succeed: " + copyOut.getError());
+
+            String content = java.nio.file.Files.readString(tempFile);
+            assertTrue(content.startsWith("id,note_text"), "CSV HEADER must be the column names");
+            assertTrue(content.contains("\"has, a comma\""), "a CSV field containing the delimiter must be quoted");
+            assertTrue(content.contains("\"\"a quote\"\""), "an embedded double-quote must be doubled per CSV convention");
+
+            database.execute("CREATE TABLE notes_copy (id INT, note_text VARCHAR)");
+            QueryResult copyIn = database.execute("COPY notes_copy FROM '" + tempFile + "' WITH (FORMAT CSV, HEADER true)");
+            assertTrue(copyIn.isSuccess(), () -> "COPY FROM CSV with HEADER must succeed: " + copyIn.getError());
+
+            QueryResult result = database.execute("SELECT * FROM notes_copy");
+            assertEquals(2, result.getRows().size(), "the header row must be skipped, not inserted as data");
+            assertEquals("has, a comma", result.getRows().stream().filter(r -> r.getValue("id").equals(1)).findFirst().orElseThrow().getValue("note_text"));
+            assertEquals("has \"a quote\"", result.getRows().stream().filter(r -> r.getValue("id").equals(2)).findFirst().orElseThrow().getValue("note_text"));
+        } finally {
+            java.nio.file.Files.deleteIfExists(tempFile);
+        }
+    }
+
+    @Test
+    void testCopyRespectsACustomDelimiter() throws Exception {
+        java.nio.file.Path tempFile = java.nio.file.Files.createTempFile("copytest", ".txt");
+        try {
+            database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+            database.execute("INSERT INTO t VALUES (1, 'Dave')");
+            database.execute("COPY t TO '" + tempFile + "' WITH (DELIMITER '|')");
+            String content = java.nio.file.Files.readString(tempFile);
+            assertTrue(content.contains("1|Dave"), "a custom DELIMITER option must be respected: " + content);
+        } finally {
+            java.nio.file.Files.deleteIfExists(tempFile);
+        }
+    }
+
+    @Test
+    void testCopyFromRequiresInsertPrivilegeAndCopyToRequiresSelectPrivilege() throws Exception {
+        java.nio.file.Path tempFile = java.nio.file.Files.createTempFile("copytest", ".txt");
+        try {
+            database.setCurrentUser("owner");
+            database.execute("CREATE TABLE secured (id INT)");
+            database.execute("INSERT INTO secured VALUES (1)");
+            database.execute("CREATE ROLE readonly_role WITH LOGIN");
+            database.execute("GRANT SELECT ON secured TO readonly_role");
+
+            database.setCurrentUser("readonly_role");
+            QueryResult deniedCopyFrom = database.execute("COPY secured FROM '" + tempFile + "'");
+            assertFalse(deniedCopyFrom.isSuccess(), "COPY FROM without INSERT privilege must be denied");
+
+            QueryResult allowedCopyTo = database.execute("COPY secured TO '" + tempFile + "'");
+            assertTrue(allowedCopyTo.isSuccess(), () -> "COPY TO with SELECT privilege must succeed: " + allowedCopyTo.getError());
+        } finally {
+            java.nio.file.Files.deleteIfExists(tempFile);
+        }
+    }
+
+    @Test
+    void testCopyOnANonexistentTableFailsCleanly() {
+        QueryResult result = database.execute("COPY nonexistent_table TO '/tmp/whatever.txt'");
+        assertFalse(result.isSuccess());
+    }
+
+    @Test
+    void testCopyStdioViaDirectExecuteFailsWithAClearMessage() {
+        // execute() has no socket at all to stream COPY's own STDIN/STDOUT
+        // sub-protocol through - StdWireServer intercepts that case before it ever
+        // reaches here (see CopyStdioEndToEndTest for the real, working version).
+        database.execute("CREATE TABLE t (id INT)");
+        QueryResult result = database.execute("COPY t FROM STDIN");
+        assertFalse(result.isSuccess());
+    }
+
+    // --- A real, separate, pre-existing bug found and fixed while building COPY's
+    // own HEADER boolean option: bare boolean literals never worked anywhere in
+    // this SQL dialect at all - TRUE/FALSE were declared after IDENTIFIER in the
+    // grammar, so ANTLR's lexer (which breaks a same-length tie by picking
+    // whichever rule was declared first) always tokenized "true"/"false" as a
+    // generic identifier. A second, related bug was found and fixed alongside it:
+    // BOOLEAN_LITERAL: TRUE | FALSE; as a composite rule could never actually be
+    // produced once TRUE/FALSE existed as separate rules matching the same text.
+
+    @Test
+    void testBareBooleanLiteralsWorkInInsertAndSelect() {
+        database.execute("CREATE TABLE t (id INT, active BOOLEAN)");
+        QueryResult insertTrue = database.execute("INSERT INTO t VALUES (1, true)");
+        assertTrue(insertTrue.isSuccess(), () -> "a bare 'true' literal must parse and insert correctly: " + insertTrue.getError());
+        QueryResult insertFalse = database.execute("INSERT INTO t VALUES (2, false)");
+        assertTrue(insertFalse.isSuccess(), () -> "a bare 'false' literal must parse and insert correctly: " + insertFalse.getError());
+
+        QueryResult result = database.execute("SELECT active FROM t WHERE id = 1");
+        assertEquals(true, result.getRows().get(0).getValue("active"));
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

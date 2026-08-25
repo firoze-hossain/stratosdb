@@ -293,6 +293,50 @@ public final class StdWireMessages {
         });
     }
 
+    /**
+     * CopyInResponse/CopyOutResponse - sent once, right after a COPY
+     * statement is recognized, before any CopyData at all: tells the
+     * client "switch into COPY sub-protocol mode now." format 0 = text
+     * (covers both this engine's own TEXT and CSV COPY formats - real
+     * Postgres uses the same format byte for both, distinguishing them
+     * only via the earlier SQL text itself, not a different wire
+     * format code); this engine has no BINARY COPY format, so format 1
+     * is never sent. numColumns/columnFormats are both required fields
+     * of the real message even though this engine doesn't use
+     * per-column binary/text formatting - columnFormats is always all
+     * zeros (text), matching format itself.
+     */
+    public static void writeCopyInResponse(DataOutputStream out, int columnCount) throws IOException {
+        writeMessage(out, 'G', buf -> {
+            buf.put((byte) 0);
+            buf.putShort((short) columnCount);
+            for (int i = 0; i < columnCount; i++) {
+                buf.putShort((short) 0);
+            }
+        });
+    }
+
+    public static void writeCopyOutResponse(DataOutputStream out, int columnCount) throws IOException {
+        writeMessage(out, 'H', buf -> {
+            buf.put((byte) 0);
+            buf.putShort((short) columnCount);
+            for (int i = 0; i < columnCount; i++) {
+                buf.putShort((short) 0);
+            }
+        });
+    }
+
+    /** One CopyData message per line of COPY output - not the only valid chunking real Postgres allows (a CopyData message can hold any byte range, not necessarily whole lines), but simple, correct, and what every real client already handles regardless of how the server chooses to chunk it. */
+    public static void writeCopyData(DataOutputStream out, String line) throws IOException {
+        byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
+        writeMessage(out, 'd', buf -> buf.put(bytes));
+    }
+
+    /** Sent by the server once, after every row for a COPY TO STDOUT - or by the client, once, after every line for a COPY FROM STDIN (this engine writes the client-bound version; the client-bound version arriving on a real connection is read as an ordinary TypedMessage of type 'c', not through this method). */
+    public static void writeCopyDone(DataOutputStream out) throws IOException {
+        writeMessage(out, 'c', buf -> {});
+    }
+
     public static void writeCommandComplete(DataOutputStream out, String tag) throws IOException {
         writeMessage(out, 'C', buf -> putCString(buf, tag));
     }

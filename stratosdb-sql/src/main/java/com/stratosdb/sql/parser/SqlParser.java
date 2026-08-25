@@ -74,6 +74,8 @@ public class SqlParser {
             return buildDelete(ctx.delete());
         } else if (ctx.dropTable() != null) {
             return buildDropTable(ctx.dropTable());
+        } else if (ctx.copyStatement() != null) {
+            return buildCopyStatement(ctx.copyStatement());
         } else if (ctx.createRole() != null) {
             return buildCreateRole(ctx.createRole());
         } else if (ctx.dropRole() != null) {
@@ -590,6 +592,34 @@ public class SqlParser {
     private DropTableStatement buildDropTable(StratosSQLParser.DropTableContext ctx) {
         String tableName = ctx.tableName().getText();
         return new DropTableStatement(tableName);
+    }
+
+    private CopyStatement buildCopyStatement(StratosSQLParser.CopyStatementContext ctx) {
+        String tableName = ctx.tableName().getText();
+        List<String> columns = ctx.columnName().isEmpty() ? null
+            : ctx.columnName().stream().map(RuleContext::getText).toList();
+        boolean isFrom = ctx.FROM() != null;
+
+        StratosSQLParser.CopyTargetContext targetCtx = ctx.copyTarget();
+        boolean isStdio = targetCtx.STDIN() != null || targetCtx.STDOUT() != null;
+        String target = isStdio ? targetCtx.getText().toUpperCase(java.util.Locale.ROOT) : targetCtx.STRING_LITERAL().getText();
+
+        String format = null;
+        String delimiter = null;
+        boolean header = false;
+        String nullString = null;
+        for (StratosSQLParser.CopyOptionContext opt : ctx.copyOption()) {
+            if (opt.FORMAT() != null) {
+                format = (opt.CSV() != null ? "CSV" : "TEXT");
+            } else if (opt.DELIMITER() != null) {
+                delimiter = opt.STRING_LITERAL().getText();
+            } else if (opt.HEADER() != null) {
+                header = opt.FALSE() == null;
+            } else if (opt.NULL() != null) {
+                nullString = opt.STRING_LITERAL().getText();
+            }
+        }
+        return new CopyStatement(tableName, columns, isFrom, target, isStdio, format, delimiter, header, nullString);
     }
 
     private CreateRoleStatement buildCreateRole(StratosSQLParser.CreateRoleContext ctx) {

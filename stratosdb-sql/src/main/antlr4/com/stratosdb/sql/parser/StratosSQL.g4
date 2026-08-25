@@ -3,12 +3,15 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
+copyStatement: COPY tableName (LPAREN columnName (COMMA columnName)* RPAREN)? (FROM | TO) copyTarget (WITH? LPAREN copyOption (COMMA copyOption)* RPAREN)? SEMICOLON?;
+copyTarget: STRING_LITERAL | STDIN | STDOUT;
+copyOption: FORMAT (TEXT | CSV) | DELIMITER STRING_LITERAL | HEADER (TRUE | FALSE)? | NULL STRING_LITERAL;
 createRole: CREATE ROLE roleName (WITH)? roleOption* SEMICOLON?;
 roleOption: LOGIN | NOLOGIN | SUPERUSER | NOSUPERUSER | PASSWORD STRING_LITERAL;
 dropRole: DROP ROLE roleName SEMICOLON?;
@@ -151,7 +154,7 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | JSON | JSONB) (LBRACKET RBRACKET)?;
 
 // Literals
-literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | BOOLEAN_LITERAL | NULL;
+literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | TRUE | FALSE | NULL;
 defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | NEXTVAL LPAREN STRING_LITERAL RPAREN;
 
 // Identifiers
@@ -161,6 +164,30 @@ alias: IDENTIFIER | STRING_LITERAL;
 limitValue: INTEGER_LITERAL;
 
 // Lexer rules
+// TRUE/FALSE MUST be declared before IDENTIFIER (see IDENTIFIER's own
+// comment below for why token declaration order matters here) - a real,
+// previously-latent bug: these were originally declared far below,
+// after IDENTIFIER, meaning ANTLR's lexer - which breaks a tie between
+// two rules matching the exact same input length by picking whichever
+// was declared FIRST - always tokenized a bare "true"/"false" as a
+// generic IDENTIFIER, never as these two rules. `INSERT INTO t VALUES
+// (true)` failed with a genuine syntax error; found while building
+// COPY's own HEADER boolean option, but this affected every bare
+// boolean literal anywhere in this SQL dialect, not just COPY.
+//
+// A second, related, real bug fixed alongside it: a separate
+// BOOLEAN_LITERAL: TRUE | FALSE; lexer rule used to exist too, and every
+// parser rule below referenced BOOLEAN_LITERAL rather than TRUE/FALSE
+// directly - but a composite lexer rule like that can NEVER actually be
+// produced as its own token type once TRUE/FALSE also exist as
+// separate, standalone lexer rules matching the identical text: the
+// same declaration-order tie-break above means TRUE/FALSE always claim
+// that input first, so BOOLEAN_LITERAL's own token type was never once
+// emitted by the lexer no matter where it was declared - removed
+// entirely; every rule that needs a boolean literal now references
+// (TRUE | FALSE) directly, the token types the lexer actually produces.
+TRUE: T R U E;
+FALSE: F A L S E;
 CREATE: C R E A T E;
 TABLE: T A B L E;
 VIEW: V I E W;
@@ -170,6 +197,13 @@ UNION: U N I O N;
 ALL: A L L;
 RECURSIVE: R E C U R S I V E;
 DROP: D R O P;
+COPY: C O P Y;
+STDIN: S T D I N;
+STDOUT: S T D O U T;
+FORMAT: F O R M A T;
+DELIMITER: D E L I M I T E R;
+HEADER: H E A D E R;
+CSV: C S V;
 ROLE: R O L E;
 GRANT: G R A N T;
 REVOKE: R E V O K E;
@@ -317,17 +351,19 @@ JSON_EXTRACT_TEXT: '->>';
 STAR: '*';
 
 // Literals
+// Any keyword-like token that could match the exact same text as a valid
+// identifier (TRUE/FALSE being the real example that was actually
+// bitten by this) MUST be declared before this rule - ANTLR's lexer
+// breaks a tie between two rules matching the same-length input by
+// picking whichever rule was declared first, so a keyword declared
+// AFTER this one would always lose to being tokenized as a plain
+// IDENTIFIER instead, no matter how the keyword's own rule is written.
 IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
 STRING_LITERAL: '\'' ('\'\'' | ~['])* '\'';
 /** Postgres's own $$ ... $$ delimiter for a function body - lets the body contain semicolons, quotes, or anything else without conflicting with the surrounding statement's own delimiters. Non-greedy (.*?) so the FIRST closing $$ ends the body, not the last one in the whole remaining input. */
 DOLLAR_QUOTED_STRING: '$$' .*? '$$';
 INTEGER_LITERAL: [0-9]+;
 FLOAT_LITERAL: [0-9]+ '.' [0-9]+;
-BOOLEAN_LITERAL: TRUE | FALSE;
-
-// Boolean literals (must be defined as lexer tokens)
-TRUE: T R U E;
-FALSE: F A L S E;
 
 // Fragment rules for case-insensitivity
 fragment A: [aA];

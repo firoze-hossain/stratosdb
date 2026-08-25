@@ -169,7 +169,7 @@ public class StdWireServer {
                         StdWireMessages.writeEmptyQueryResponse(out);
                         continue;
                     }
-                    inTransaction = executeAndRespond(statement, out, inTransaction);
+                    inTransaction = executeAndRespond(statement, in, out, inTransaction);
                 }
                 StdWireMessages.writeReadyForQuery(out, inTransaction ? 'T' : 'I');
                 out.flush();
@@ -293,9 +293,12 @@ public class StdWireServer {
     }
 
     /** Returns the new inTransaction state after executing one statement. */
-    private boolean executeAndRespond(String sql, DataOutputStream out, boolean inTransaction) throws IOException {
+    private boolean executeAndRespond(String sql, DataInputStream in, DataOutputStream out, boolean inTransaction) throws IOException {
         if (tryHandleTableListingQuery(sql, out)) {
             return inTransaction; // a catalog-introspection query is never itself transaction control
+        }
+        if (tryHandleCopyStatement(sql, in, out)) {
+            return inTransaction; // COPY is never itself transaction control either
         }
 
         QueryResult result;
@@ -380,6 +383,129 @@ public class StdWireServer {
         }
 
         StdWireMessages.writeCommandComplete(out, "SELECT " + tableNames.size());
+        return true;
+    }
+
+    /**
+     * Intercepts a real COPY ... FROM/TO STDIN/STDOUT before it ever
+     * reaches the normal execute() path - the same real reason
+     * tryHandleTableListingQuery intercepts `\dt`'s own query above:
+     * ExecutorEngine.execute(), reached with no socket access at all,
+     * cannot stream the real CopyIn/CopyOut wire sub-protocol a real
+     * client needs. A file-based COPY (a real, quoted path, not
+     * STDIN/STDOUT) is NOT intercepted here - tryParseStdioCopy returns
+     * null for it, so it correctly falls through to the normal
+     * execute() path, which already handles it entirely on its own.
+     */
+    private boolean tryHandleCopyStatement(String sql, DataInputStream in, DataOutputStream out) throws IOException {
+        com.stratosdb.sql.ast.CopyStatement copyStmt = db.getExecutor().tryParseStdioCopy(sql);
+        if (copyStmt == null) {
+            return false;
+        }
+
+        String prepareError = db.getExecutor().prepareCopy(copyStmt);
+        if (prepareError != null) {
+            StdWireMessages.writeErrorResponse(out, prepareError);
+            return true;
+        }
+
+        return copyStmt.isFrom() ? handleCopyFromStdin(copyStmt, in, out) : handleCopyToStdout(copyStmt, out);
+    }
+
+    /**
+     * COPY ... FROM STDIN: sends CopyInResponse, then reads real
+     * CopyData messages from the client until CopyDone (success) or
+     * CopyFail (the client itself aborted) - a CopyData message's own
+     * byte chunk is NOT guaranteed to align with line boundaries (real
+     * Postgres allows a client to chunk however it likes), so chunks
+     * are buffered and only complete, newline-terminated lines are
+     * ever handed to copyFromStdinLine. Every row runs inside one real
+     * transaction spanning the whole COPY (see
+     * ExecutorEngine.beginCopyTransaction's own javadoc) - a single bad
+     * row aborts that whole transaction, not just that one row, the
+     * same real, honest guarantee this engine's own DML already gives.
+     */
+    private boolean handleCopyFromStdin(com.stratosdb.sql.ast.CopyStatement copyStmt, DataInputStream in, DataOutputStream out) throws IOException {
+        int columnCount = db.getExecutor().getCopyColumnCount(copyStmt);
+        StdWireMessages.writeCopyInResponse(out, columnCount);
+        out.flush();
+
+        com.stratosdb.transaction.Transaction txn = db.getExecutor().beginCopyTransaction();
+        long rowCount = 0;
+        String firstError = null;
+        StringBuilder partial = new StringBuilder();
+
+        readLoop:
+        while (true) {
+            StdWireMessages.TypedMessage msg = StdWireMessages.readTypedMessage(in);
+            switch (msg.type()) {
+                case 'd' -> {
+                    partial.append(new String(msg.body(), java.nio.charset.StandardCharsets.UTF_8));
+                    int newlineIdx;
+                    while ((newlineIdx = partial.indexOf("\n")) >= 0) {
+                        String line = partial.substring(0, newlineIdx);
+                        partial.delete(0, newlineIdx + 1);
+                        if (line.isEmpty()) continue;
+                        if (firstError == null) {
+                            String err = db.getExecutor().copyFromStdinLine(copyStmt, line, txn);
+                            if (err != null) {
+                                firstError = "COPY: row " + (rowCount + 1) + " failed: " + err;
+                            } else {
+                                rowCount++;
+                            }
+                        }
+                    }
+                }
+                case 'c' -> { break readLoop; } // CopyDone
+                case 'f' -> {
+                    firstError = "COPY aborted by client";
+                    break readLoop;
+                }
+                default -> {
+                    firstError = "Unexpected message during COPY: " + msg.type();
+                    break readLoop;
+                }
+            }
+        }
+
+        if (firstError != null) {
+            db.getExecutor().abortCopyTransaction(txn);
+            StdWireMessages.writeErrorResponse(out, firstError);
+        } else {
+            db.getExecutor().commitCopyTransaction(txn);
+            StdWireMessages.writeCommandComplete(out, "COPY " + rowCount);
+        }
+        return true;
+    }
+
+    /**
+     * COPY ... TO STDOUT: sends CopyOutResponse, then streams every row
+     * as a real CopyData message, one row at a time (via
+     * ExecutorEngine.copyToStdoutStream's own callback, never the whole
+     * table buffered in memory first), then CopyDone.
+     */
+    private boolean handleCopyToStdout(com.stratosdb.sql.ast.CopyStatement copyStmt, DataOutputStream out) throws IOException {
+        int columnCount = db.getExecutor().getCopyColumnCount(copyStmt);
+        StdWireMessages.writeCopyOutResponse(out, columnCount);
+
+        com.stratosdb.transaction.Transaction txn = db.getExecutor().beginCopyTransaction();
+        long[] rowCount = {0};
+        try {
+            db.getExecutor().copyToStdoutStream(copyStmt, txn, line -> {
+                try {
+                    StdWireMessages.writeCopyData(out, line);
+                    rowCount[0]++;
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+        } catch (java.io.UncheckedIOException e) {
+            db.getExecutor().abortCopyTransaction(txn);
+            throw e.getCause();
+        }
+        db.getExecutor().commitCopyTransaction(txn);
+        StdWireMessages.writeCopyDone(out);
+        StdWireMessages.writeCommandComplete(out, "COPY " + rowCount[0]);
         return true;
     }
 
