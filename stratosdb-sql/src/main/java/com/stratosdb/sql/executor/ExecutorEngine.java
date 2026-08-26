@@ -787,6 +787,7 @@ public class ExecutorEngine {
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
+        if (stmt instanceof CheckpointStatement) return executeCheckpoint();
         if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
         if (stmt instanceof DropViewStatement s) return executeDropView(s);
         if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
@@ -1700,6 +1701,31 @@ public class ExecutorEngine {
 
         return QueryResult.success("Vacuumed " + stmt.tableName() + ": reclaimed "
             + result.reclaimedVersions() + " dead row version(s) across " + result.pagesCompacted() + " page(s)");
+    }
+
+    /**
+     * CHECKPOINT: flushes every dirty page to disk, then archives (if
+     * enabled) and truncates the WAL - see CheckpointStatement's own
+     * javadoc for why PitrBackup needs exactly this before it's safe to
+     * copy the data directory's own files. Superuser-only - a real,
+     * deliberate restriction (not the same "unrestricted unless a role
+     * exists" default DML gets - see hasPrivilege's own javadoc), since
+     * CHECKPOINT is a real, database-wide operation with the concurrency
+     * caveat WALManager.checkpointAndArchive's own javadoc states
+     * plainly, not something every ordinary role should be able to
+     * trigger at will.
+     */
+    private QueryResult executeCheckpoint() {
+        String currentUser = session.get().currentUser;
+        if (currentUser != null) {
+            Role role = roles.get(currentUser);
+            if (role == null || !role.superuser()) {
+                return QueryResult.error("permission denied: CHECKPOINT requires superuser");
+            }
+        }
+        bufferPool.flushAll();
+        walManager.checkpointAndArchive();
+        return QueryResult.success("CHECKPOINT");
     }
 
     private QueryResult executeInsert(InsertStatement stmt, Transaction txn) {

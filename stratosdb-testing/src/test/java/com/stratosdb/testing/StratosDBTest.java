@@ -3369,6 +3369,35 @@ public class StratosDBTest {
         assertEquals(true, result.getRows().get(0).getValue("active"));
     }
 
+    // --- CHECKPOINT: the real, remote-triggerable hook PitrBackup needs before it's
+    // safe to copy the data directory - see CheckpointStatement's own javadoc. Real
+    // WAL archiving + multi-segment PITR replay is covered end to end in
+    // WalArchivingTest and PitrEndToEndTest; this covers CHECKPOINT's own SQL-level
+    // behavior and its deliberate superuser restriction.
+
+    @Test
+    void testCheckpointSucceedsWhenUnrestricted() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        QueryResult result = database.execute("CHECKPOINT");
+        assertTrue(result.isSuccess(), () -> "CHECKPOINT must succeed for an unrestricted session: " + result.getError());
+    }
+
+    @Test
+    void testCheckpointRequiresSuperuserOnceRolesExist() {
+        database.setCurrentUser("owner");
+        database.execute("CREATE ROLE regular_user WITH LOGIN");
+        database.setCurrentUser("regular_user");
+        QueryResult deniedResult = database.execute("CHECKPOINT");
+        assertFalse(deniedResult.isSuccess(), "a non-superuser role must be denied CHECKPOINT");
+
+        database.setCurrentUser("owner");
+        database.execute("CREATE ROLE dba WITH LOGIN SUPERUSER");
+        database.setCurrentUser("dba");
+        QueryResult allowedResult = database.execute("CHECKPOINT");
+        assertTrue(allowedResult.isSuccess(), () -> "a superuser role must be allowed CHECKPOINT: " + allowedResult.getError());
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

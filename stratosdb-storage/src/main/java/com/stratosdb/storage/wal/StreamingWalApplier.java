@@ -175,6 +175,8 @@ public class StreamingWalApplier {
                 Cursor c = new Cursor(pos);
                 Long xid = tryReadLong(buf, c);
                 if (xid == null) return null;
+                Long commitTimestamp = tryReadLong(buf, c); // not used by replication apply itself - see WALManager.logCommit's own javadoc for why this field exists (point-in-time recovery, a separate consumer of this same record format) - but must still be read here to stay aligned with the record's real, current length
+                if (commitTimestamp == null) return null;
                 applyCommittedTransaction(xid);
                 return c.pos;
             }

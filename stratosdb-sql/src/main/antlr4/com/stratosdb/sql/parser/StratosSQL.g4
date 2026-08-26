@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -57,6 +57,7 @@ triggerHandlerName: IDENTIFIER;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
+checkpointStatement: CHECKPOINT SEMICOLON?;
 beginTxn: BEGIN TRANSACTION? SEMICOLON? | START TRANSACTION SEMICOLON?;
 commitTxn: COMMIT SEMICOLON?;
 rollbackTxn: ROLLBACK SEMICOLON?;
@@ -289,6 +290,7 @@ INNER: I N N E R;
 EXPLAIN: E X P L A I N;
 ANALYZE: A N A L Y Z E;
 VACUUM: V A C U U M;
+CHECKPOINT: C H E C K P O I N T;
 BEGIN: B E G I N;
 START: S T A R T;
 TRANSACTION: T R A N S A C T I O N;

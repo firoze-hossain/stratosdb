@@ -20,7 +20,91 @@ public class WALManager {
     private FileChannel walChannel;
     private final AtomicLong currentLSN;
     private boolean sync = true;
-    
+    /**
+     * Where completed WAL is archived before this manager's own active
+     * WAL file gets truncated/recycled - null (the default) means
+     * archiving is disabled, matching real Postgres's own
+     * archive_mode = off default. Without this, PITR cannot exist at
+     * all: this engine's own WAL is truncated to zero the moment its
+     * contents are safely reflected on disk (see recover()'s and
+     * close()'s own comments on why - it's the right, simple design
+     * for crash recovery alone), so the only WAL ever on disk at any
+     * moment is whatever's accumulated since the last checkpoint/close.
+     * PitrRestore needs a continuous, never-discarded history of WAL
+     * going back to a base backup's own starting point - archiving is
+     * what actually preserves that, copying each about-to-be-discarded
+     * WAL segment somewhere permanent first.
+     */
+    private String walArchiveDirectory;
+    private final AtomicLong nextArchiveSequence = new AtomicLong(1);
+
+    /** Enables WAL archiving to archiveDirectory - every completed WAL segment (whatever's accumulated since the last archive point) is copied there, sequentially numbered, right before this manager's own active WAL file is truncated. Call once, right after construction, before any real write traffic - see PitrBackup for the real client that actually uses this. */
+    public void setWalArchiveDirectory(String archiveDirectory) {
+        this.walArchiveDirectory = archiveDirectory;
+        File dir = new File(archiveDirectory);
+        if (!dir.exists() && !dir.mkdirs()) {
+            LOG.warn("Failed to create WAL archive directory: {}", archiveDirectory);
+        }
+        // Resume numbering from whatever's already archived, rather than starting
+        // back at 1 and immediately colliding with (or worse, silently overwriting)
+        // segments from an earlier run - a real, necessary correctness step, not
+        // just a nicety, since archived segments are exactly what PITR replay
+        // depends on existing, intact, in order.
+        long highest = 0;
+        File[] existing = dir.listFiles((d, name) -> name.matches("\\d{12}\\.walseg"));
+        if (existing != null) {
+            for (File f : existing) {
+                long seq = Long.parseLong(f.getName().substring(0, 12));
+                highest = Math.max(highest, seq);
+            }
+        }
+        nextArchiveSequence.set(highest + 1);
+    }
+
+    public String getWalArchiveDirectory() {
+        return walArchiveDirectory;
+    }
+
+    /**
+     * Copies the current WAL file's own contents (byte 0 through the
+     * current LSN) to a new, sequentially-numbered file in the archive
+     * directory - called right before every truncation point this class
+     * already has (see recover()'s and close()'s own calls to this),
+     * never anywhere else, so a truncation can never discard anything
+     * that wasn't safely archived first whenever archiving is enabled.
+     * A no-op (returns -1) when archiving isn't configured, or when
+     * there's genuinely nothing to archive (a fresh WAL with LSN 0) -
+     * an empty, zero-byte archive segment would only clutter the
+     * archive directory and complicate PITR replay's own "read this
+     * segment" logic for no benefit.
+     */
+    private long archiveCurrentWalIfEnabled() {
+        if (walArchiveDirectory == null) {
+            return -1;
+        }
+        long upToLsn = currentLSN.get();
+        if (upToLsn == 0) {
+            return -1;
+        }
+        long sequence = nextArchiveSequence.getAndIncrement();
+        String fileName = String.format("%012d.walseg", sequence);
+        File archiveFile = new File(walArchiveDirectory, fileName);
+        try (RandomAccessFile source = new RandomAccessFile(new File(walDirectory, "wal.log"), "r");
+             java.io.FileOutputStream dest = new java.io.FileOutputStream(archiveFile)) {
+            byte[] buffer = new byte[(int) upToLsn];
+            source.seek(0);
+            source.readFully(buffer);
+            dest.write(buffer);
+            dest.getFD().sync(); // durable before the active WAL that held this same data gets truncated
+            LOG.info("Archived WAL segment {} ({} bytes)", fileName, upToLsn);
+            return sequence;
+        } catch (Exception e) {
+            LOG.error("Failed to archive WAL segment {} - active WAL will NOT be truncated, to avoid data loss", fileName, e);
+            nextArchiveSequence.decrementAndGet(); // this sequence number was never actually consumed - don't leave a permanent gap in the archive's own numbering
+            return -2; // signals failure distinctly from -1 (disabled) so callers can refuse to truncate
+        }
+    }
+
     // Operation types
     public static final int OP_INSERT = 1;
     public static final int OP_UPDATE = 2;
@@ -139,13 +223,20 @@ public class WALManager {
     }
     
     /**
-     * Log a commit
+     * Log a commit. Now includes a real wall-clock timestamp alongside
+     * the transaction id - a real, necessary WAL format change for
+     * point-in-time recovery (see PitrRestore), which needs to know
+     * WHEN each transaction committed to decide whether it happened
+     * before or after a requested recovery target time. Crash recovery
+     * itself never needed this (it only cares whether a commit record
+     * exists at all, not when) - this is purely additive for that path.
      */
     public void logCommit(long transactionId) {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(16);
+            ByteBuffer buffer = ByteBuffer.allocate(24);
             buffer.putInt(OP_COMMIT);
             buffer.putLong(transactionId);
+            buffer.putLong(System.currentTimeMillis());
             writeBuffer(buffer, true);
         } catch (Exception e) {
             LOG.error("Failed to log commit", e);
@@ -316,6 +407,7 @@ public class WALManager {
                     }
                     case OP_COMMIT: {
                         readLong(); // transactionId - already collected in pass 1
+                        readLong(); // commit timestamp - not needed here either; see skipOrCollectCommit's own comment
                         break;
                     }
                     case OP_CHECKPOINT: {
@@ -351,10 +443,24 @@ public class WALManager {
             // exact point, every redone write is independently fsynced,
             // so there's nothing left in the log that isn't already
             // reflected on disk.
-            walChannel.truncate(0);
-            walChannel.position(0);
-            currentLSN.set(0);
-            walChannel.force(true);
+            //
+            // Archived first (if enabled) - see archiveCurrentWalIfEnabled's
+            // own javadoc. A failed archive attempt (-2) means truncation is
+            // skipped entirely this time: losing whatever's in the WAL right
+            // now would be fine for crash recovery alone (it's already
+            // reflected on disk above), but would silently break PITR's own
+            // guarantee that archived WAL is a complete, gapless history -
+            // better to leave a redundant, already-applied segment in the
+            // active WAL (redone again, harmlessly, next restart) than to
+            // create a permanent gap an archive-dependent restore could
+            // never detect or recover from.
+            long archiveResult = archiveCurrentWalIfEnabled();
+            if (archiveResult != -2) {
+                walChannel.truncate(0);
+                walChannel.position(0);
+                currentLSN.set(0);
+                walChannel.force(true);
+            }
 
             LOG.info("Recovery complete: replayed {} operation(s) from {} committed transaction(s) across {} page(s)",
                 replayedOps, committedXids.size(), dirtyPages.size());
@@ -395,6 +501,7 @@ public class WALManager {
             }
             case OP_COMMIT: {
                 long xid = readLong();
+                readLong(); // commit timestamp - not needed for crash recovery's own "was this xid committed at all" check, but must still be read to stay aligned with the new record format (see logCommit)
                 committedXids.add(xid);
                 return true;
             }
@@ -525,6 +632,47 @@ public class WALManager {
         }
     }
 
+    /**
+     * The real, remote-triggerable operation behind the new CHECKPOINT
+     * SQL statement (see CheckpointStatement's own javadoc): writes a
+     * checkpoint marker record, then archives (if enabled) and
+     * truncates - the exact same pattern close() already uses for a
+     * graceful shutdown, just callable explicitly, mid-session, by
+     * PitrBackup before it's safe to copy the data directory. Does NOT
+     * itself flush dirty pages to disk - the caller (ExecutorEngine's
+     * own executeCheckpoint) does that first via BufferPoolManager,
+     * since this class has no reference to the buffer pool at all.
+     *
+     * Real, honestly-stated limitation: unlike close()/recover(), which
+     * only ever run at a quiet point (startup/shutdown, with no
+     * concurrent writers), this can be called mid-session while other
+     * transactions are actively writing. logInsert/logCommit/logUpdate
+     * reserve their own write position via an atomic getAndAdd on
+     * currentLSN specifically to allow safe concurrent writers with no
+     * lock - but this method's own truncate(0) is a real, genuine hazard
+     * to that scheme if it races with a writer that already reserved a
+     * position but hasn't written there yet. This engine has no formal
+     * "quiesce all writers" mechanism to close that gap properly (a
+     * real, separate, further piece of work) - CHECKPOINT is safest run
+     * when write traffic is low, the same practical advice real
+     * Postgres itself gives for its own CHECKPOINT command, though for
+     * different underlying reasons.
+     */
+    public synchronized void checkpointAndArchive() {
+        checkpoint();
+        long archiveResult = archiveCurrentWalIfEnabled();
+        if (archiveResult != -2) {
+            try {
+                walChannel.truncate(0);
+                walChannel.position(0);
+                currentLSN.set(0);
+                walChannel.force(true);
+            } catch (Exception e) {
+                LOG.error("Failed to truncate WAL after CHECKPOINT", e);
+            }
+        }
+    }
+
     public void close() {
         if (walChannel == null || !walChannel.isOpen()) {
             return; // already closed - makes close() safe to call more than once
@@ -541,9 +689,16 @@ public class WALManager {
             // before recover()'s own truncation ever gets a chance to prevent
             // anything further - found via testing three sequential restarts
             // with data added in the middle one, not by inspection.
-            walChannel.truncate(0);
-            currentLSN.set(0);
-            walChannel.force(true);
+            //
+            // Archived first (if enabled) - see recover()'s own, identical
+            // reasoning for why a failed archive attempt skips truncation
+            // entirely rather than risk a permanent gap in PITR's own history.
+            long archiveResult = archiveCurrentWalIfEnabled();
+            if (archiveResult != -2) {
+                walChannel.truncate(0);
+                currentLSN.set(0);
+                walChannel.force(true);
+            }
             walChannel.close();
         } catch (Exception e) {
             LOG.error("Failed to close WAL", e);
