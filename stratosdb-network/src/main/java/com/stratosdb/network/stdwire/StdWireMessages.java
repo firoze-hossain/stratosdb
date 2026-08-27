@@ -401,6 +401,23 @@ public final class StdWireMessages {
         out.write(scratch.array(), 0, bodyLen);
     }
 
+    /**
+     * Writes an already-read TypedMessage's own exact bytes back out
+     * verbatim - the real, generic passthrough primitive StratosPooler
+     * needs to forward a message between a client and a real backend
+     * connection without needing to understand that message's own
+     * specific type/format at all (RowDescription, DataRow, CopyData,
+     * whatever it is - a pooler proxying at the message-boundary level
+     * doesn't need to parse SQL results, only recognize message
+     * boundaries and, for ReadyForQuery specifically, its own single
+     * transaction-status byte - see StratosPooler's own javadoc).
+     */
+    public static void writeRawMessage(DataOutputStream out, TypedMessage msg) throws IOException {
+        out.writeByte(msg.type());
+        out.writeInt(msg.body().length + 4);
+        out.write(msg.body());
+    }
+
     private static void putCString(java.nio.ByteBuffer buf, String s) {
         buf.put(s.getBytes(StandardCharsets.UTF_8));
         buf.put((byte) 0);
