@@ -34,6 +34,18 @@ import java.net.Socket;
  * primary that also stays up continuously - not yet a general-purpose,
  * production-grade standby that can be restarted independently of the
  * primary without data duplication.
+ *
+ * A real, separate, more serious hazard this class now protects
+ * against instead of risking silently: this client's own
+ * lastAppliedOffset is only meaningful relative to the primary's WAL
+ * epoch it was recorded against (see WALManager.walEpoch's own
+ * javadoc) - a primary CHECKPOINT truncates and renumbers its own
+ * active WAL file, so the same numeric offset can mean something
+ * completely different before and after one. Every (re)connection now
+ * sends its own remembered epoch alongside its offset; if the primary
+ * reports back a different epoch, this client sets needsResync and
+ * stops retrying automatically, rather than silently applying
+ * unrelated bytes at a stale offset - see needsResync's own javadoc.
  */
 public class ReplicationClient {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicationClient.class);
@@ -45,6 +57,9 @@ public class ReplicationClient {
     private volatile boolean running = false;
     private Thread replicationThread;
     private volatile long lastAppliedOffset = 0;
+    private volatile long lastAppliedEpoch = 0;
+    /** Set once the primary reports a WAL epoch different from what this replica last recorded - see this class's own javadoc for the real corruption risk this prevents. Once true, the replication loop stops retrying automatically; a fresh ReplicationClient against a fresh base backup is required, not a silent, automatic recovery. */
+    private volatile boolean needsResync = false;
     private volatile boolean connected = false;
     private volatile Socket activeSocket;
 
@@ -86,7 +101,7 @@ public class ReplicationClient {
     }
 
     private void runLoop() {
-        while (running) {
+        while (running && !needsResync) {
             try {
                 connectAndStream();
             } catch (IOException e) {
@@ -99,7 +114,7 @@ public class ReplicationClient {
                 return;
             }
             connected = false;
-            if (running) {
+            if (running && !needsResync) {
                 try {
                     Thread.sleep(RECONNECT_DELAY_MILLIS);
                 } catch (InterruptedException e) {
@@ -107,6 +122,11 @@ public class ReplicationClient {
                     return;
                 }
             }
+        }
+        if (needsResync) {
+            LOG.error("Replication to {}:{} stopped permanently: this replica's own WAL epoch is stale relative to the primary's current one. "
+                + "A fresh base backup is required - see WALManager.walEpoch's own javadoc for why continuing would risk silent data corruption instead.",
+                primaryHost, primaryPort);
         }
     }
 
@@ -117,10 +137,22 @@ public class ReplicationClient {
             java.io.DataOutputStream out = new java.io.DataOutputStream(socket.getOutputStream());
             DataInputStream in = new DataInputStream(socket.getInputStream());
 
+            out.writeLong(lastAppliedEpoch);
             out.writeLong(lastAppliedOffset);
             out.flush();
+            long primaryEpoch = in.readLong();
+
+            if (primaryEpoch != lastAppliedEpoch) {
+                needsResync = true;
+                LOG.error("Primary {}:{} reports WAL epoch {} but this replica last applied against epoch {} - "
+                    + "this replica's own offset can no longer be trusted (see WALManager.walEpoch's own javadoc). "
+                    + "Stopping replication; a fresh base backup is required.",
+                    primaryHost, primaryPort, primaryEpoch, lastAppliedEpoch);
+                return;
+            }
+
             connected = true;
-            LOG.info("Connected to primary {}:{}, resuming from offset {}", primaryHost, primaryPort, lastAppliedOffset);
+            LOG.info("Connected to primary {}:{}, resuming from epoch {} offset {}", primaryHost, primaryPort, primaryEpoch, lastAppliedOffset);
 
             while (running) {
                 int chunkLength = in.readInt();
@@ -130,6 +162,11 @@ public class ReplicationClient {
                 lastAppliedOffset += chunkLength;
             }
         }
+    }
+
+    /** True once a WAL epoch mismatch has been detected - see this field's own javadoc. Once true, this ReplicationClient will never resume automatically; a fresh instance against a fresh base backup is required. */
+    public boolean needsResync() {
+        return needsResync;
     }
 
     public boolean isConnected() {

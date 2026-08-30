@@ -187,4 +187,13 @@ public class StratosDB {
     public WALManager getWalManager() { return walManager; }
     public TransactionManager getTransactionManager() { return transactionManager; }
     public ExecutorEngine getExecutor() { return executor; }
+
+    /** Puts this instance into (or out of) real, enforced read-only replica mode - see ExecutorEngine's own READ_ONLY_SAFE_STATEMENTS javadoc. The real mechanism PROMOTE (see StdWireServer.tryHandlePromoteStatement) flips off when this instance stops following a primary and starts accepting writes as one. */
+    public void setReadOnly(boolean readOnly) {
+        executor.setReadOnly(readOnly);
+    }
+
+    public boolean isReadOnly() {
+        return executor.isReadOnly();
+    }
 }

@@ -19,6 +19,24 @@ public class WALManager {
     private final String walDirectory;
     private FileChannel walChannel;
     private final AtomicLong currentLSN;
+    /**
+     * Increments every time the active WAL file is truncated (via
+     * CHECKPOINT, recover(), or close()) - a real, necessary fix for a
+     * real, serious bug found while building replication-dependent HA
+     * orchestration on top of this: readBytesFrom's own offset is
+     * relative to the CURRENT wal.log file, which gets reset to empty
+     * on every truncation. A replica holding an offset from BEFORE a
+     * truncation, reconnecting or resuming AFTER one, could otherwise
+     * silently receive and apply completely unrelated bytes from the
+     * new, post-truncation file at that same numeric offset - genuine,
+     * silent data corruption, not just a stall, and exactly the kind of
+     * thing a failover scenario (a replica reconnecting to a promoted
+     * primary, or resuming after a primary-side CHECKPOINT) would
+     * actually trigger. See readBytesFromChecked's own javadoc for the
+     * real fix: a replica's own remembered offset is only ever trusted
+     * if it was also remembered against this same epoch.
+     */
+    private final AtomicLong walEpoch;
     private boolean sync = true;
     /**
      * Where completed WAL is archived before this manager's own active
@@ -116,6 +134,7 @@ public class WALManager {
     public WALManager(String dataDirectory) {
         this.walDirectory = dataDirectory + "/wal";
         this.currentLSN = new AtomicLong(0);
+        this.walEpoch = new AtomicLong(0);
         initialize();
     }
     
@@ -134,10 +153,34 @@ public class WALManager {
             RandomAccessFile raf = new RandomAccessFile(walFile, "rw");
             this.walChannel = raf.getChannel();
             this.currentLSN.set(walChannel.size());
+            loadWalEpoch();
             
-            LOG.info("WAL initialized at LSN: {}", currentLSN.get());
+            LOG.info("WAL initialized at LSN: {}, epoch {}", currentLSN.get(), walEpoch.get());
         } catch (Exception e) {
             LOG.error("Failed to initialize WAL", e);
+        }
+    }
+
+    private File epochFile() {
+        return new File(walDirectory, "wal_epoch.txt");
+    }
+
+    private void loadWalEpoch() {
+        File f = epochFile();
+        if (f.exists()) {
+            try {
+                walEpoch.set(Long.parseLong(java.nio.file.Files.readString(f.toPath()).trim()));
+            } catch (Exception e) {
+                LOG.warn("Failed to read WAL epoch file, defaulting to 0", e);
+            }
+        }
+    }
+
+    private void saveWalEpoch() {
+        try {
+            java.nio.file.Files.writeString(epochFile().toPath(), String.valueOf(walEpoch.get()));
+        } catch (Exception e) {
+            LOG.error("Failed to persist WAL epoch", e);
         }
     }
     
@@ -456,10 +499,15 @@ public class WALManager {
             // never detect or recover from.
             long archiveResult = archiveCurrentWalIfEnabled();
             if (archiveResult != -2) {
+                boolean hadContent = currentLSN.get() > 0;
                 walChannel.truncate(0);
                 walChannel.position(0);
                 currentLSN.set(0);
                 walChannel.force(true);
+                if (hadContent) {
+                    walEpoch.incrementAndGet();
+                    saveWalEpoch();
+                }
             }
 
             LOG.info("Recovery complete: replayed {} operation(s) from {} committed transaction(s) across {} page(s)",
@@ -603,6 +651,27 @@ public class WALManager {
         return currentLSN.get();
     }
 
+    public long getWalEpoch() {
+        return walEpoch.get();
+    }
+
+    /**
+     * The real, safe replacement for readBytesFrom when the caller is
+     * ReplicationServer, streaming to a replica that remembers its own
+     * offset ACROSS reconnections/checkpoints - see walEpoch's own
+     * javadoc for the real, serious bug this exists to prevent. Returns
+     * null specifically to signal "this offset can no longer be trusted
+     * at all, a fresh resync is required" - genuinely distinct from a
+     * zero-length array, which correctly means "valid offset, just
+     * nothing new since it yet."
+     */
+    public synchronized byte[] readBytesFromChecked(long expectedEpoch, long fromOffset) {
+        if (expectedEpoch != walEpoch.get()) {
+            return null;
+        }
+        return readBytesFrom(fromOffset);
+    }
+
     /**
      * Reads raw WAL bytes from fromOffset up to the current LSN, for
      * streaming to a connected replica (see ReplicationServer) - the
@@ -667,6 +736,14 @@ public class WALManager {
                 walChannel.position(0);
                 currentLSN.set(0);
                 walChannel.force(true);
+                // Unconditional, unlike recover()'s own guard above: checkpoint()
+                // just above always writes a real record first, so this truncation
+                // always discards genuine, non-zero content a connected replica may
+                // already have read - the offset space is always being reused here,
+                // never a true no-op the way an empty database's own first-ever
+                // recover() call can be.
+                walEpoch.incrementAndGet();
+                saveWalEpoch();
             } catch (Exception e) {
                 LOG.error("Failed to truncate WAL after CHECKPOINT", e);
             }
@@ -698,6 +775,8 @@ public class WALManager {
                 walChannel.truncate(0);
                 currentLSN.set(0);
                 walChannel.force(true);
+                walEpoch.incrementAndGet();
+                saveWalEpoch();
             }
             walChannel.close();
         } catch (Exception e) {

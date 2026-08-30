@@ -124,6 +124,8 @@ public class SqlParser {
             return new VacuumStatement(ctx.vacuum().tableName().getText());
         } else if (ctx.checkpointStatement() != null) {
             return new CheckpointStatement();
+        } else if (ctx.promoteStatement() != null) {
+            return new PromoteStatement();
         } else if (ctx.beginTxn() != null) {
             return new BeginStatement();
         } else if (ctx.commitTxn() != null) {

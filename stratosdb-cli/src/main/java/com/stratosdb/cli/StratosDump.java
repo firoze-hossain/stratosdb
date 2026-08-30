@@ -67,7 +67,31 @@ public class StratosDump {
     private final DataOutputStream out;
 
     public StratosDump(String host, int port, String user, String database, String password) throws IOException {
-        this.socket = new Socket(host, port);
+        this(host, port, user, database, password, 0);
+    }
+
+    /**
+     * socketTimeoutMillis: 0 (the default constructor above) preserves
+     * this class's own original, no-timeout behavior exactly - suitable
+     * for a real, one-off, reliable operation like PitrBackup's own
+     * CHECKPOINT call, where waiting as long as it takes is correct.
+     * A positive value applies both a real connect timeout and a real
+     * per-read timeout - added specifically for StratosHa's own repeated
+     * health checks, where a hung connection (the exact real race a
+     * primary genuinely crashing mid-response can create - found by
+     * testing StratosHa's own real failover scenario repeatedly, not by
+     * inspection: an intermittent, timing-dependent hang, not a
+     * deterministic one) must fail fast rather than block the watchdog's
+     * own health-check loop indefinitely.
+     */
+    public StratosDump(String host, int port, String user, String database, String password, int socketTimeoutMillis) throws IOException {
+        this.socket = new Socket();
+        if (socketTimeoutMillis > 0) {
+            this.socket.connect(new java.net.InetSocketAddress(host, port), socketTimeoutMillis);
+            this.socket.setSoTimeout(socketTimeoutMillis);
+        } else {
+            this.socket.connect(new java.net.InetSocketAddress(host, port));
+        }
         this.in = new DataInputStream(new java.io.BufferedInputStream(socket.getInputStream()));
         this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         StdWireMessages.writeStartupMessage(out, user, database);

@@ -761,7 +761,48 @@ public class ExecutorEngine {
         return new java.util.HashSet<>(tables.keySet());
     }
 
+    /**
+     * True when this engine is acting as a replica following a
+     * primary's own replicated WAL stream (see ReplicationClient) - a
+     * real, necessary addition for HA: without this, nothing stopped a
+     * "replica" from accepting writes directly through its own SQL
+     * layer while StreamingWalApplier was ALSO independently modifying
+     * the same underlying storage from the primary's own replicated
+     * WAL, guaranteed silent divergence between the two. Enforced with
+     * an ALLOWLIST of genuinely read-safe statement types, not a
+     * denylist of write types - a new statement type added later
+     * defaults to correctly BLOCKED in read-only mode until explicitly
+     * reviewed and added to the allowlist, rather than silently
+     * slipping through unreviewed. Matches real Postgres's own "cannot
+     * execute INSERT in a read-only transaction" behavior on a hot
+     * standby, though enforced per-statement here rather than only
+     * inside an explicit transaction.
+     */
+    private volatile boolean readOnly = false;
+
+    public void setReadOnly(boolean readOnly) {
+        this.readOnly = readOnly;
+    }
+
+    public boolean isReadOnly() {
+        return readOnly;
+    }
+
+    private static final java.util.Set<Class<? extends Statement>> READ_ONLY_SAFE_STATEMENTS = java.util.Set.of(
+        SelectStatement.class, ShowTablesStatement.class, ShowStatsStatement.class, ShowCatalogStatement.class,
+        ExplainStatement.class, BeginStatement.class, CommitStatement.class,
+        RollbackStatement.class, SavepointStatement.class, ReleaseSavepointStatement.class, RollbackToSavepointStatement.class,
+        CopyStatement.class, // COPY TO is a read; COPY FROM is separately rejected inside executeCopy/the STDIN handshake below
+        PromoteStatement.class // PROMOTE's whole purpose is to EXIT read-only mode - blocking it here would make promotion impossible
+    );
+
     private QueryResult dispatch(Statement stmt, Transaction txn) throws DeadlockException {
+        if (readOnly && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
+            return QueryResult.error("cannot execute statement in a read-only replica");
+        }
+        if (readOnly && stmt instanceof CopyStatement copyStmt && copyStmt.isFrom()) {
+            return QueryResult.error("cannot execute COPY FROM in a read-only replica");
+        }
         if (stmt instanceof CreateTableStatement s) return executeCreateTable(s);
         if (stmt instanceof CreateIndexStatement s) return executeCreateIndex(s, txn);
         if (stmt instanceof InsertStatement s) return executeInsert(s, txn);
@@ -788,6 +829,9 @@ public class ExecutorEngine {
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
         if (stmt instanceof CheckpointStatement) return executeCheckpoint();
+        if (stmt instanceof PromoteStatement) {
+            return QueryResult.error("PROMOTE must be run through a real client connection (a StdWireServer configured as a replica) - see StdWireServer.setReplicationClient's own javadoc");
+        }
         if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
         if (stmt instanceof DropViewStatement s) return executeDropView(s);
         if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
@@ -3455,6 +3499,9 @@ public class ExecutorEngine {
 
     /** Validates a STDIN/STDOUT COPY statement (table exists, columns exist, privilege granted) before StdWireServer starts streaming anything - returns an error message, or null if OK to proceed. */
     public String prepareCopy(CopyStatement stmt) {
+        if (readOnly && stmt.isFrom()) {
+            return "cannot execute COPY FROM in a read-only replica";
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return "Table not found: " + stmt.tableName();
         }

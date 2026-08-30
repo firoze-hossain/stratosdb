@@ -49,6 +49,23 @@ public class StdWireServer {
     private ServerSocket serverSocket;
     private ExecutorService connectionExecutor;
     private final AtomicInteger nextPid = new AtomicInteger(1000);
+    /** Non-null only when this server's own StratosDB instance is currently following a primary as a replica - see setReplicationClient's own javadoc and the new PROMOTE command below. */
+    private volatile com.stratosdb.network.replication.ReplicationClient replicationClient;
+
+    /**
+     * Configures this server's own instance as a replica currently
+     * following client - wired in by whatever process starts both a
+     * StratosDB instance and a ReplicationClient together (see
+     * ReplicationClient's own javadoc), so that the new PROMOTE command
+     * below has something real to stop when an operator or an HA
+     * orchestrator (see StratosHa) decides this replica should become
+     * the new primary. Pass null (the default) for an instance that was
+     * never a replica at all, or one that has already been promoted -
+     * PROMOTE then correctly reports there's nothing to promote.
+     */
+    public void setReplicationClient(com.stratosdb.network.replication.ReplicationClient replicationClient) {
+        this.replicationClient = replicationClient;
+    }
 
     public StdWireServer(int port, StratosDB db) {
         this(port, db, null);
@@ -300,6 +317,9 @@ public class StdWireServer {
         if (tryHandleCopyStatement(sql, in, out)) {
             return inTransaction; // COPY is never itself transaction control either
         }
+        if (tryHandlePromoteStatement(sql, out)) {
+            return inTransaction; // PROMOTE is never itself transaction control either
+        }
 
         QueryResult result;
         try {
@@ -410,6 +430,49 @@ public class StdWireServer {
         }
 
         return copyStmt.isFrom() ? handleCopyFromStdin(copyStmt, in, out) : handleCopyToStdout(copyStmt, out);
+    }
+
+    /**
+     * PROMOTE - the real, remote-triggerable operation an operator or
+     * an HA orchestrator (see StratosHa) uses to turn this replica into
+     * a new primary: stops the real ReplicationClient this server was
+     * configured with (see setReplicationClient's own javadoc), then
+     * flips off real, enforced read-only mode (see ExecutorEngine's own
+     * READ_ONLY_SAFE_STATEMENTS javadoc) so this instance starts
+     * accepting writes directly. Intercepted here, before ever reaching
+     * ExecutorEngine's own execute(), for the same real reason COPY's
+     * STDIN/STDOUT sub-protocol is - the actual work needed
+     * (stopping a ReplicationClient object) lives entirely outside
+     * ExecutorEngine's own knowledge, in this class instead.
+     *
+     * Idempotent and honest about it either way: calling PROMOTE a
+     * second time (or on an instance that was never a replica at all)
+     * correctly reports there's nothing to promote, rather than
+     * silently succeeding or throwing.
+     */
+    private boolean tryHandlePromoteStatement(String sql, DataOutputStream out) throws IOException {
+        com.stratosdb.sql.ast.Statement parsed;
+        try {
+            parsed = sqlParser.parse(sql);
+        } catch (Exception e) {
+            return false; // not parseable as PROMOTE at all - let the normal execute() path report the real syntax error
+        }
+        if (!(parsed instanceof com.stratosdb.sql.ast.PromoteStatement)) {
+            return false;
+        }
+
+        com.stratosdb.network.replication.ReplicationClient client = replicationClient;
+        if (client == null) {
+            StdWireMessages.writeErrorResponse(out, "not a replica - nothing to promote (either this instance was never configured as one, or it has already been promoted)");
+            return true;
+        }
+
+        client.stop();
+        db.setReadOnly(false);
+        replicationClient = null; // a second PROMOTE call must correctly report "nothing to promote" above, not silently stop an already-stopped client again
+        LOG.info("Replica promoted to primary - replication stopped, read-only mode disabled");
+        StdWireMessages.writeCommandComplete(out, "PROMOTE");
+        return true;
     }
 
     /**
