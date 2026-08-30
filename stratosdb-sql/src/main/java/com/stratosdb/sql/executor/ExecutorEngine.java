@@ -460,11 +460,28 @@ public class ExecutorEngine {
         this.slowQueryThresholdMs = thresholdMs;
     }
 
+    /** The real pg_stat_statements equivalent - see QueryStatsRegistry's own javadoc. Never disabled (unlike slow-query logging's own opt-in threshold): recording into a ConcurrentHashMap is cheap enough to always be on, matching real Postgres's own pg_stat_statements default posture in modern versions. */
+    private final QueryStatsRegistry queryStatsRegistry = new QueryStatsRegistry();
+
+    public QueryStatsRegistry getQueryStatsRegistry() {
+        return queryStatsRegistry;
+    }
+
+    /** The real pg_stat_activity equivalent - see SessionActivityRegistry's own javadoc. */
+    private final SessionActivityRegistry sessionActivityRegistry = new SessionActivityRegistry();
+
+    public SessionActivityRegistry getSessionActivityRegistry() {
+        return sessionActivityRegistry;
+    }
+
     public QueryResult execute(String sql) {
         long startNanos = System.nanoTime();
         QueryResult result = executeInternal(sql);
+        long elapsedNanos = System.nanoTime() - startNanos;
+        long rowCount = (result.isSuccess() && result.getRows() != null) ? result.getRows().size() : 0;
+        queryStatsRegistry.record(sql, elapsedNanos, rowCount);
         if (slowQueryThresholdMs >= 0) {
-            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+            long elapsedMs = elapsedNanos / 1_000_000;
             if (elapsedMs >= slowQueryThresholdMs) {
                 LOG.warn("Slow query ({} ms, threshold {} ms): {}", elapsedMs, slowQueryThresholdMs, sql);
             }
@@ -518,6 +535,7 @@ public class ExecutorEngine {
         Transaction txn = explicit ? state.transaction : transactionManager.begin();
         try {
             QueryResult result = dispatch(stmt, txn);
+            recordTableStats(stmt, result);
 
             if (result.isSuccess()) {
                 recordCatalogChange(stmt, sql);
@@ -790,11 +808,58 @@ public class ExecutorEngine {
 
     private static final java.util.Set<Class<? extends Statement>> READ_ONLY_SAFE_STATEMENTS = java.util.Set.of(
         SelectStatement.class, ShowTablesStatement.class, ShowStatsStatement.class, ShowCatalogStatement.class,
+        ShowStatementsStatement.class, ShowActivityStatement.class, ShowTableStatsStatement.class,
         ExplainStatement.class, BeginStatement.class, CommitStatement.class,
         RollbackStatement.class, SavepointStatement.class, ReleaseSavepointStatement.class, RollbackToSavepointStatement.class,
         CopyStatement.class, // COPY TO is a read; COPY FROM is separately rejected inside executeCopy/the STDIN handshake below
         PromoteStatement.class // PROMOTE's whole purpose is to EXIT read-only mode - blocking it here would make promotion impossible
     );
+
+    /** The real pg_stat_user_tables equivalent - see TableStatsRegistry's own javadoc. */
+    private final TableStatsRegistry tableStatsRegistry = new TableStatsRegistry();
+
+    public TableStatsRegistry getTableStatsRegistry() {
+        return tableStatsRegistry;
+    }
+
+    private static final java.util.regex.Pattern ROW_COUNT_PATTERN = java.util.regex.Pattern.compile("^(\\d+) row");
+
+    /**
+     * The single, centralized real hook point for per-table statistics
+     * - right after dispatch() returns, in the one place every real
+     * DML statement's own result already passes through, rather than
+     * scattered instrumentation inside each of executeInsert/
+     * executeUpdate/executeDelete/executeSelect individually. A failed
+     * statement records nothing (see TableStats' own javadoc - a
+     * rolled-back INSERT never touched the table for real). INSERT's
+     * own row count is always exactly 1 - one InsertStatement's own
+     * VALUES clause is always one row's worth in this dialect, so no
+     * message parsing is needed there; UPDATE/DELETE's own real count
+     * is read directly from their already-established, stable "N
+     * row(s)" success message text (see executeUpdate/executeDelete's
+     * own message format) rather than duplicating that count's own
+     * computation a second time here.
+     */
+    private void recordTableStats(Statement stmt, QueryResult result) {
+        if (!result.isSuccess()) {
+            return;
+        }
+        if (stmt instanceof InsertStatement s) {
+            tableStatsRegistry.recordInsert(s.tableName(), 1);
+        } else if (stmt instanceof SelectStatement s) {
+            tableStatsRegistry.recordSelect(s.tableName(), result.getRows() == null ? 0 : result.getRows().size());
+        } else if (stmt instanceof UpdateStatement s) {
+            tableStatsRegistry.recordUpdate(s.tableName(), extractRowCount(result.getMessage()));
+        } else if (stmt instanceof DeleteStatement s) {
+            tableStatsRegistry.recordDelete(s.tableName(), extractRowCount(result.getMessage()));
+        }
+    }
+
+    private long extractRowCount(String message) {
+        if (message == null) return 0;
+        var matcher = ROW_COUNT_PATTERN.matcher(message.replaceFirst("^\\D*", ""));
+        return matcher.find() ? Long.parseLong(matcher.group(1)) : 0;
+    }
 
     private QueryResult dispatch(Statement stmt, Transaction txn) throws DeadlockException {
         if (readOnly && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
@@ -824,6 +889,9 @@ public class ExecutorEngine {
         if (stmt instanceof AlterTableDropDefaultStatement s) return executeAlterTableDropDefault(s);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ShowStatsStatement) return executeShowStats();
+        if (stmt instanceof ShowTableStatsStatement) return executeShowTableStats();
+        if (stmt instanceof ShowStatementsStatement) return executeShowStatements();
+        if (stmt instanceof ShowActivityStatement) return executeShowActivity();
         if (stmt instanceof ShowCatalogStatement) return executeShowCatalog();
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
@@ -3325,6 +3393,7 @@ public class ExecutorEngine {
         tableColumnDefaults.remove(stmt.tableName());
         tableOwners.remove(stmt.tableName());
         tablePrivileges.remove(stmt.tableName());
+        tableStatsRegistry.remove(stmt.tableName());
         return QueryResult.success("Table dropped: " + stmt.tableName());
     }
 
@@ -4206,6 +4275,7 @@ public class ExecutorEngine {
         }
 
         catalogLines.remove("TABLE:" + stmt.oldTableName());
+        tableStatsRegistry.rename(stmt.oldTableName(), stmt.newTableName());
         regenerateTableDdl(stmt.newTableName());
         return QueryResult.success("Table renamed: " + stmt.oldTableName() + " -> " + stmt.newTableName());
     }
@@ -4409,6 +4479,84 @@ public class ExecutorEngine {
         addStat(rows, "view_count", String.valueOf(views.size()));
         addStat(rows, "index_count", String.valueOf(indexesByName.size()));
         addStat(rows, "oldest_active_xid", String.valueOf(transactionManager.getOldestActiveXid()));
+        return QueryResult.success(rows);
+    }
+
+    /**
+     * SHOW STATEMENTS - the real pg_stat_statements equivalent, one row
+     * per distinct normalized query shape (see QueryNormalizer), sorted
+     * by total_time_ms descending - the same real, first-thing-an-
+     * operator-checks ordering pg_stat_statements itself defaults
+     * queries to ("what's actually consuming the most time in
+     * aggregate", not "what ran most recently").
+     */
+    /**
+     * SHOW TABLE STATS - the real pg_stat_user_tables equivalent, one
+     * row per table that has any real recorded activity - not one row
+     * per table that merely exists, since a never-touched table has
+     * nothing meaningful to report and an operator scanning this output
+     * cares about what's actually happening, not a fixed inventory
+     * (SHOW TABLES already answers "what tables exist").
+     */
+    private QueryResult executeShowTableStats() {
+        List<Tuple> rows = new ArrayList<>();
+        List<String> tableNames = new ArrayList<>(tableStatsRegistry.getAll().keySet());
+        tableNames.sort(String::compareTo);
+        for (String tableName : tableNames) {
+            TableStats stats = tableStatsRegistry.getAll().get(tableName);
+            Tuple row = new Tuple();
+            row.addValue("table_name", tableName);
+            row.addValue("seq_scan", stats.getSeqScans());
+            row.addValue("rows_returned", stats.getRowsReturned());
+            row.addValue("rows_inserted", stats.getRowsInserted());
+            row.addValue("rows_updated", stats.getRowsUpdated());
+            row.addValue("rows_deleted", stats.getRowsDeleted());
+            rows.add(row);
+        }
+        return QueryResult.success(rows);
+    }
+
+    private QueryResult executeShowStatements() {
+        List<Tuple> rows = new ArrayList<>();
+        List<java.util.Map.Entry<String, QueryStats>> entries = new ArrayList<>(queryStatsRegistry.getAll().entrySet());
+        entries.sort((a, b) -> Double.compare(b.getValue().getTotalTimeMs(), a.getValue().getTotalTimeMs()));
+        for (var entry : entries) {
+            Tuple row = new Tuple();
+            row.addValue("query", entry.getKey());
+            row.addValue("calls", entry.getValue().getCalls());
+            row.addValue("total_time_ms", Math.round(entry.getValue().getTotalTimeMs() * 100.0) / 100.0);
+            row.addValue("min_time_ms", Math.round(entry.getValue().getMinTimeMs() * 100.0) / 100.0);
+            row.addValue("max_time_ms", Math.round(entry.getValue().getMaxTimeMs() * 100.0) / 100.0);
+            row.addValue("mean_time_ms", Math.round(entry.getValue().getMeanTimeMs() * 100.0) / 100.0);
+            row.addValue("rows", entry.getValue().getTotalRows());
+            rows.add(row);
+        }
+        return QueryResult.success(rows);
+    }
+
+    /**
+     * SHOW ACTIVITY - the real pg_stat_activity equivalent, one row per
+     * currently-registered connection (see SessionActivityRegistry's own
+     * javadoc), sorted by connection id (real Postgres's own pg_stat_activity
+     * has no guaranteed default order either - connection id gives a
+     * stable, deterministic one for real testing and real operator
+     * reading alike).
+     */
+    private QueryResult executeShowActivity() {
+        List<Tuple> rows = new ArrayList<>();
+        List<SessionActivity> sessions = new ArrayList<>(sessionActivityRegistry.getAll().values());
+        sessions.sort(java.util.Comparator.comparingLong(s -> s.connectionId));
+        for (SessionActivity session : sessions) {
+            Tuple row = new Tuple();
+            row.addValue("pid", session.connectionId);
+            row.addValue("user", session.username);
+            row.addValue("client_addr", session.clientAddr);
+            row.addValue("state", session.state);
+            row.addValue("query", session.query);
+            row.addValue("query_start", session.queryStart == 0 ? null : java.time.Instant.ofEpochMilli(session.queryStart).toString());
+            row.addValue("backend_start", java.time.Instant.ofEpochMilli(session.backendStart).toString());
+            rows.add(row);
+        }
         return QueryResult.success(rows);
     }
 

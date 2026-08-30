@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
@@ -32,6 +32,9 @@ dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
 showTables: SHOW TABLES SEMICOLON?;
 showStats: SHOW STATS SEMICOLON?;
+showTableStats: SHOW TABLE STATS SEMICOLON?;
+showStatements: SHOW STATEMENTS SEMICOLON?;
+showActivity: SHOW ACTIVITY SEMICOLON?;
 showCatalog: SHOW CATALOG SEMICOLON?;
 createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
 dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
@@ -248,6 +251,8 @@ DEFAULT: D E F A U L T;
 SHOW: S H O W;
 TABLES: T A B L E S;
 STATS: S T A T S;
+STATEMENTS: S T A T E M E N T S;
+ACTIVITY: A C T I V I T Y;
 CATALOG: C A T A L O G;
 SEQUENCE: S E Q U E N C E;
 FUNCTION: F U N C T I O N;

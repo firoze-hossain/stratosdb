@@ -3398,6 +3398,72 @@ public class StratosDBTest {
         assertTrue(allowedResult.isSuccess(), () -> "a superuser role must be allowed CHECKPOINT: " + allowedResult.getError());
     }
 
+    // --- Real, structured observability: this project's own honestly-named "SHOW
+    // STATS is one flat snapshot, not the per-query/per-table/per-connection
+    // breakdowns real monitoring tooling expects" gap. SHOW ACTIVITY and the real
+    // Prometheus exporter both need a real, separate connection/HTTP server, and
+    // are covered in ObservabilityEndToEndTest instead.
+
+    @Test
+    void testShowStatementsAggregatesByNormalizedQueryShape() {
+        database.execute("CREATE TABLE t (id INT, name VARCHAR)");
+        database.execute("INSERT INTO t VALUES (1, 'Alice')");
+        database.execute("INSERT INTO t VALUES (2, 'Bob')");
+        database.execute("INSERT INTO t VALUES (3, 'Carol')");
+        database.execute("SELECT * FROM t WHERE id = 1");
+        database.execute("SELECT * FROM t WHERE id = 2");
+
+        QueryResult result = database.execute("SHOW STATEMENTS");
+        assertTrue(result.isSuccess());
+
+        Tuple insertRow = result.getRows().stream()
+            .filter(r -> ((String) r.getValue("query")).startsWith("INSERT"))
+            .findFirst().orElseThrow(() -> new AssertionError("no INSERT row found in SHOW STATEMENTS"));
+        assertEquals(3L, insertRow.getValue("calls"), "three INSERTs with different literal values must aggregate into one normalized row with calls=3");
+
+        Tuple selectRow = result.getRows().stream()
+            .filter(r -> ((String) r.getValue("query")).startsWith("SELECT"))
+            .findFirst().orElseThrow(() -> new AssertionError("no SELECT row found in SHOW STATEMENTS"));
+        assertEquals(2L, selectRow.getValue("calls"), "two SELECTs with different literal WHERE values must aggregate into one normalized row with calls=2");
+        assertEquals(2L, selectRow.getValue("rows"), "total rows returned across both aggregated SELECTs must be 2 (1 each)");
+    }
+
+    @Test
+    void testShowTableStatsTracksPerTableActivity() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("INSERT INTO t VALUES (2)");
+        database.execute("SELECT * FROM t");
+        database.execute("UPDATE t SET id = 3 WHERE id = 1");
+        database.execute("DELETE FROM t WHERE id = 2");
+
+        QueryResult result = database.execute("SHOW TABLE STATS");
+        assertTrue(result.isSuccess());
+        Tuple row = result.getRows().stream().filter(r -> r.getValue("table_name").equals("t")).findFirst().orElseThrow();
+        assertEquals(1L, row.getValue("seq_scan"));
+        assertEquals(2L, row.getValue("rows_inserted"));
+        assertEquals(1L, row.getValue("rows_updated"));
+        assertEquals(1L, row.getValue("rows_deleted"));
+    }
+
+    @Test
+    void testShowTableStatsSurvivesRenameAndClearsOnDrop() {
+        database.execute("CREATE TABLE t (id INT)");
+        database.execute("INSERT INTO t VALUES (1)");
+        database.execute("ALTER TABLE t RENAME TO t_renamed");
+
+        QueryResult afterRename = database.execute("SHOW TABLE STATS");
+        assertTrue(afterRename.getRows().stream().anyMatch(r -> r.getValue("table_name").equals("t_renamed")),
+            "a table's own stats must be carried forward under its new name after RENAME");
+        assertTrue(afterRename.getRows().stream().noneMatch(r -> r.getValue("table_name").equals("t")),
+            "the old table name must no longer appear at all after RENAME");
+
+        database.execute("DROP TABLE t_renamed");
+        QueryResult afterDrop = database.execute("SHOW TABLE STATS");
+        assertTrue(afterDrop.getRows().stream().noneMatch(r -> r.getValue("table_name").equals("t_renamed")),
+            "a dropped table's own stats must be removed entirely, not linger");
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

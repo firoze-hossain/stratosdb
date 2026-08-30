@@ -114,6 +114,12 @@ public class SqlParser {
             return new ShowTablesStatement();
         } else if (ctx.showStats() != null) {
             return new ShowStatsStatement();
+        } else if (ctx.showTableStats() != null) {
+            return new ShowTableStatsStatement();
+        } else if (ctx.showStatements() != null) {
+            return new ShowStatementsStatement();
+        } else if (ctx.showActivity() != null) {
+            return new ShowActivityStatement();
         } else if (ctx.showCatalog() != null) {
             return new ShowCatalogStatement();
         } else if (ctx.explain() != null) {

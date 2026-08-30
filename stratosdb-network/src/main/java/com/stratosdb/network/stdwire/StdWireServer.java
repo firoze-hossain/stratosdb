@@ -126,6 +126,7 @@ public class StdWireServer {
     private void handleConnection(Socket socket) {
         String remote = socket.getRemoteSocketAddress().toString();
         LOG.debug("pg-wire client connected: {}", remote);
+        com.stratosdb.sql.executor.SessionActivity activity = null;
         try (Socket s = socket;
              DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
@@ -143,9 +144,15 @@ public class StdWireServer {
             // null right after being correctly set.
             db.closeSession();
 
-            if (!performStartup(in, out)) {
+            String username = performStartup(in, out);
+            if (username == null) {
                 return;
             }
+            // The real pg_stat_activity equivalent - registered only once startup
+            // genuinely succeeds (an authentication failure is never itself "activity"
+            // worth showing an operator), unregistered in the finally block below
+            // regardless of how this connection eventually ends.
+            activity = db.getExecutor().getSessionActivityRegistry().register(username, remote);
 
             // Extended query protocol state - per connection, matching the protocol's own
             // scoping (a prepared statement/portal only ever means something to the
@@ -186,21 +193,29 @@ public class StdWireServer {
                         StdWireMessages.writeEmptyQueryResponse(out);
                         continue;
                     }
+                    activity.state = "active";
+                    activity.query = statement;
+                    activity.queryStart = System.currentTimeMillis();
                     inTransaction = executeAndRespond(statement, in, out, inTransaction);
                 }
+                activity.state = inTransaction ? "idle in transaction" : "idle";
                 StdWireMessages.writeReadyForQuery(out, inTransaction ? 'T' : 'I');
                 out.flush();
             }
         } catch (IOException e) {
             LOG.debug("pg-wire connection {} closed: {}", remote, e.getMessage());
         } finally {
+            if (activity != null) {
+                db.getExecutor().getSessionActivityRegistry().unregister(activity);
+            }
             db.closeSession();
             LOG.debug("pg-wire client disconnected: {}", remote);
         }
     }
 
     /** Returns false if the connection should be closed (SSL request handled, then the client is expected to reconnect in plaintext, or the startup was malformed). */
-    private boolean performStartup(DataInputStream in, DataOutputStream out) throws IOException {
+    /** Returns the authenticated username on success, or null on failure (an ErrorResponse has already been sent in that case). A String return, not a boolean, specifically so the caller can register this connection's own SessionActivity (see SessionActivityRegistry) without needing any shared, cross-connection state to recover the username afterward - a plain instance field here would race across concurrent connections on this same, shared StdWireServer. */
+    private String performStartup(DataInputStream in, DataOutputStream out) throws IOException {
         byte[] body = StdWireMessages.readUntypedPacket(in);
         int code = readInt(body, 0);
 
@@ -215,7 +230,7 @@ public class StdWireServer {
         if (code != StdWireMessages.PROTOCOL_VERSION_3) {
             StdWireMessages.writeErrorResponse(out, "Only protocol version 3.0 is supported");
             out.flush();
-            return false;
+            return null;
         }
 
         Map<String, String> params = StdWireMessages.parseStartupParams(body, 4);
@@ -224,7 +239,7 @@ public class StdWireServer {
 
         if (userStore != null) {
             if (!performScramAuthentication(params.get("user"), in, out)) {
-                return false; // performScramAuthentication already sent the ErrorResponse
+                return null; // performScramAuthentication already sent the ErrorResponse
             }
         } else {
             // Trust auth: no password required - the unchanged default when no
@@ -247,7 +262,7 @@ public class StdWireServer {
         StdWireMessages.writeBackendKeyData(out, nextPid.getAndIncrement(), 12345);
         StdWireMessages.writeReadyForQuery(out, 'I');
         out.flush();
-        return true;
+        return params.get("user");
     }
 
     /**
