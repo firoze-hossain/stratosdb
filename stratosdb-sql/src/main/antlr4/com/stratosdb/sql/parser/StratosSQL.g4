@@ -3,10 +3,10 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
 
 // DDL
-createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* RPAREN SEMICOLON?;
+createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* (COMMA PRIMARY KEY LPAREN columnName (COMMA columnName)* RPAREN)? RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
 copyStatement: COPY tableName (LPAREN columnName (COMMA columnName)* RPAREN)? (FROM | TO) copyTarget (WITH? LPAREN copyOption (COMMA copyOption)* RPAREN)? SEMICOLON?;
@@ -33,15 +33,18 @@ viewName: IDENTIFIER;
 showTables: SHOW TABLES SEMICOLON?;
 showStats: SHOW STATS SEMICOLON?;
 showTableStats: SHOW TABLE STATS SEMICOLON?;
+showTransactionIsolationLevel: SHOW TRANSACTION ISOLATION LEVEL SEMICOLON?;
 showStatements: SHOW STATEMENTS SEMICOLON?;
 showActivity: SHOW ACTIVITY SEMICOLON?;
+showParameter: SHOW IDENTIFIER SEMICOLON?;
+setParameter: SET IDENTIFIER ASSIGN (literal | IDENTIFIER) SEMICOLON?;
 showCatalog: SHOW CATALOG SEMICOLON?;
 createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
 dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
 sequenceName: IDENTIFIER;
 createFunction: CREATE (OR REPLACE)? FUNCTION functionName LPAREN (functionParam (COMMA functionParam)*)? RPAREN RETURNS dataType AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
 dropFunction: DROP FUNCTION functionName SEMICOLON?;
-functionName: IDENTIFIER;
+functionName: IDENTIFIER (DOT IDENTIFIER)?;
 createExtension: CREATE EXTENSION extensionName AS STRING_LITERAL SEMICOLON?;
 dropExtension: DROP EXTENSION extensionName SEMICOLON?;
 extensionName: IDENTIFIER;
@@ -71,8 +74,9 @@ rollbackToSavepoint: ROLLBACK TO SAVEPOINT? savepointName SEMICOLON?;
 savepointName: IDENTIFIER;
 
 // DML
-insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN SEMICOLON?;
-select: SELECT selectList FROM tableName joinClause* (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
+insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN returningClause? SEMICOLON?;
+returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
+select: SELECT selectList (FROM tableName (AS? IDENTIFIER)? joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: IDENTIFIER;
 joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
@@ -88,7 +92,7 @@ update: UPDATE tableName SET assignment (COMMA assignment)* (WHERE expression)? 
 delete: DELETE FROM tableName (WHERE expression)? SEMICOLON?;
 
 // Definitions
-columnDef: columnName dataType (NOT NULL)? (DEFAULT defaultValue)?;
+columnDef: columnName dataType (NOT NULL)? (DEFAULT defaultValue)? (PRIMARY KEY)?;
 assignment: columnName ASSIGN literal;
 orderList: orderItem (COMMA orderItem)*;
 orderItem: columnName (ASC | DESC)?;
@@ -301,6 +305,11 @@ PROMOTE: P R O M O T E;
 BEGIN: B E G I N;
 START: S T A R T;
 TRANSACTION: T R A N S A C T I O N;
+PRIMARY: P R I M A R Y;
+RETURNING: R E T U R N I N G;
+KEY: K E Y;
+ISOLATION: I S O L A T I O N;
+LEVEL: L E V E L;
 COMMIT: C O M M I T;
 ROLLBACK: R O L L B A C K;
 SAVEPOINT: S A V E P O I N T;

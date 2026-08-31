@@ -3464,6 +3464,98 @@ public class StratosDBTest {
             "a dropped table's own stats must be removed entirely, not linger");
     }
 
+    // --- Broader driver/ORM verification: real gaps found while getting real,
+    // independent client libraries and ORMs (node-postgres, SQLAlchemy, Django,
+    // Hibernate, and the real, official org.postgresql JDBC driver) working
+    // against this engine - see PROGRESS.md for the full list and the real,
+    // separate connections/binary-protocol tests these don't cover.
+
+    @Test
+    void testFromLessSelectSupportsRealBuiltinFunctions() {
+        QueryResult version = database.execute("SELECT version()");
+        assertTrue(version.isSuccess());
+        assertTrue(((String) version.getRows().get(0).getValue("version()")).startsWith("PostgreSQL"),
+            "version() must start with \"PostgreSQL\" so client-side version-string parsing logic still works");
+
+        QueryResult qualified = database.execute("SELECT pg_catalog.version()");
+        assertTrue(qualified.isSuccess(), "a schema-qualified function call must parse and resolve the same as the bare form");
+
+        QueryResult schema = database.execute("SELECT current_schema()");
+        assertTrue(schema.isSuccess());
+        assertEquals("public", schema.getRows().get(0).getValue("current_schema()"));
+    }
+
+    @Test
+    void testShowTransactionIsolationLevelAndGenericShowSetParameter() {
+        QueryResult isolation = database.execute("SHOW TRANSACTION ISOLATION LEVEL");
+        assertTrue(isolation.isSuccess());
+        assertEquals("read committed", isolation.getRows().get(0).getValue("transaction_isolation"));
+
+        QueryResult known = database.execute("SHOW standard_conforming_strings");
+        assertTrue(known.isSuccess());
+        assertEquals("on", known.getRows().get(0).getValue("standard_conforming_strings"));
+
+        QueryResult unknown = database.execute("SHOW not_a_real_parameter");
+        assertFalse(unknown.isSuccess(), "an unrecognized parameter must report a real error, not a fabricated value");
+
+        // The real, official org.postgresql JDBC driver's own standard connection
+        // setup, found missing entirely during real driver verification.
+        QueryResult set = database.execute("SET extra_float_digits = 3");
+        assertTrue(set.isSuccess());
+        assertEquals("SET", set.getMessage());
+    }
+
+    @Test
+    void testPrimaryKeySyntaxBothForms() {
+        assertTrue(database.execute("CREATE TABLE pk_inline (id INT PRIMARY KEY, name VARCHAR)").isSuccess());
+        assertTrue(database.execute("CREATE TABLE pk_table_level (id INT, name VARCHAR, PRIMARY KEY (id))").isSuccess());
+        // Both forms must still behave as an ordinary, working table afterward -
+        // this engine tracks the declaration as real metadata (see
+        // ExecutorEngine.tablePrimaryKeys' own javadoc) without yet enforcing
+        // uniqueness, a real, honestly-named, separate gap.
+        assertTrue(database.execute("INSERT INTO pk_inline VALUES (1, 'Alice')").isSuccess());
+        assertTrue(database.execute("INSERT INTO pk_table_level VALUES (1, 'Alice')").isSuccess());
+    }
+
+    @Test
+    void testInsertReturningBothSingleColumnAndStar() {
+        database.execute("CREATE TABLE returning_test (id INT, name VARCHAR)");
+
+        QueryResult single = database.execute("INSERT INTO returning_test (id, name) VALUES (1, 'Alice') RETURNING id");
+        assertTrue(single.isSuccess());
+        assertEquals(1, single.getRows().size());
+        assertEquals(1, single.getRows().get(0).getValue("id"));
+
+        QueryResult star = database.execute("INSERT INTO returning_test (id, name) VALUES (2, 'Bob') RETURNING *");
+        assertTrue(star.isSuccess());
+        assertEquals("Bob", star.getRows().get(0).getValue("name"));
+
+        // The real insert must still have genuinely happened, not just the RETURNING projection.
+        QueryResult all = database.execute("SELECT * FROM returning_test");
+        assertEquals(2, all.getRows().size());
+    }
+
+    @Test
+    void testTableAndColumnAliasing() {
+        database.execute("CREATE TABLE alias_test (id INT, name VARCHAR)");
+        database.execute("INSERT INTO alias_test VALUES (1, 'Alice')");
+
+        // A real table alias in FROM - found missing entirely because Hibernate's
+        // own HQL-to-SQL translator always generates one.
+        QueryResult tableAlias = database.execute("SELECT t.id, t.name FROM alias_test t");
+        assertTrue(tableAlias.isSuccess());
+        assertEquals(1, tableAlias.getRows().get(0).getValue("t.id"));
+
+        // A real column alias (AS) - found missing entirely because the official
+        // JDBC driver reads a query's own result set back BY that alias name.
+        QueryResult columnAlias = database.execute("SELECT id AS my_id, name AS my_name FROM alias_test");
+        assertTrue(columnAlias.isSuccess());
+        Tuple row = columnAlias.getRows().get(0);
+        assertEquals(1, row.getValue("my_id"));
+        assertEquals("Alice", row.getValue("my_name"));
+        assertNull(row.getValue("id"), "the real, original column name must no longer appear once it's been aliased");
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

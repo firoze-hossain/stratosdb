@@ -120,6 +120,21 @@ public class SqlParser {
             return new ShowStatementsStatement();
         } else if (ctx.showActivity() != null) {
             return new ShowActivityStatement();
+        } else if (ctx.showTransactionIsolationLevel() != null) {
+            return new ShowTransactionIsolationLevelStatement();
+        } else if (ctx.showParameter() != null) {
+            return new ShowParameterStatement(ctx.showParameter().IDENTIFIER().getText());
+        } else if (ctx.setParameter() != null) {
+            // ctx.setParameter().IDENTIFIER() returns BOTH the parameter name and,
+            // when the value itself is a bare identifier rather than a literal
+            // (e.g. SET search_path = public), that value too - the parameter
+            // name is always the FIRST one; a literal value is read separately
+            // via ctx.setParameter().literal() when present.
+            String paramName = ctx.setParameter().IDENTIFIER(0).getText();
+            String value = ctx.setParameter().literal() != null
+                ? ctx.setParameter().literal().getText()
+                : ctx.setParameter().IDENTIFIER(1).getText();
+            return new SetParameterStatement(paramName, value);
         } else if (ctx.showCatalog() != null) {
             return new ShowCatalogStatement();
         } else if (ctx.explain() != null) {
@@ -190,7 +205,7 @@ public class SqlParser {
         } else if (ctx.createFunction() != null) {
             return buildCreateFunction(ctx.createFunction());
         } else if (ctx.dropFunction() != null) {
-            return new DropFunctionStatement(ctx.dropFunction().functionName().getText());
+            return new DropFunctionStatement(stripSchemaQualifier(ctx.dropFunction().functionName().getText()));
         } else if (ctx.createProcedure() != null) {
             return buildCreateProcedure(ctx.createProcedure());
         } else if (ctx.dropProcedure() != null) {
@@ -214,8 +229,23 @@ public class SqlParser {
         throw new IllegalArgumentException("Unsupported SQL statement");
     }
 
+    /**
+     * Strips an optional schema qualifier (e.g. "pg_catalog.version" -> "version")
+     * from a function name - this engine has no real schema/namespace concept at
+     * all, so a qualified reference is treated the same way a schema-less engine
+     * reasonably would: the qualifier is accepted syntactically (so real clients
+     * that always write "pg_catalog.version()" - virtually every serious Postgres
+     * driver/ORM does, for at least server-version detection - don't hit a syntax
+     * error), but only the actual function name after the last dot is ever looked
+     * up.
+     */
+    private static String stripSchemaQualifier(String possiblyQualifiedName) {
+        int lastDot = possiblyQualifiedName.lastIndexOf('.');
+        return lastDot >= 0 ? possiblyQualifiedName.substring(lastDot + 1) : possiblyQualifiedName;
+    }
+
     private CreateFunctionStatement buildCreateFunction(StratosSQLParser.CreateFunctionContext ctx) {
-        String name = ctx.functionName().getText();
+        String name = stripSchemaQualifier(ctx.functionName().getText());
         List<FunctionParam> params = new ArrayList<>();
         for (StratosSQLParser.FunctionParamContext paramCtx : ctx.functionParam()) {
             params.add(new FunctionParam(paramCtx.IDENTIFIER().getText(), paramCtx.dataType().getText()));
@@ -233,7 +263,7 @@ public class SqlParser {
 
     /** extensionName is a bare identifier looked up in ExecutorEngine's own extension registry (see CreateNativeFunctionStatement's own javadoc for why this differs from real Postgres's own two-string-literal 'obj_file', 'symbol' convention). nativeSymbol's raw STRING_LITERAL text is kept quoted, unquoted later by the executor's own parseLiteral, matching this project's established convention. */
     private CreateNativeFunctionStatement buildCreateNativeFunction(StratosSQLParser.CreateNativeFunctionContext ctx) {
-        String name = ctx.functionName().getText();
+        String name = stripSchemaQualifier(ctx.functionName().getText());
         List<FunctionParam> params = new ArrayList<>();
         for (StratosSQLParser.FunctionParamContext paramCtx : ctx.functionParam()) {
             params.add(new FunctionParam(paramCtx.IDENTIFIER().getText(), paramCtx.dataType().getText()));
@@ -325,10 +355,27 @@ public class SqlParser {
             // all - not even a matter of the executor ignoring them.
             boolean notNull = colCtx.NOT() != null;
             String defaultValue = colCtx.defaultValue() != null ? colCtx.defaultValue().getText() : null;
-            columns.add(new ColumnDefinition(name, type, notNull, defaultValue));
+            // A real, inline column-level PRIMARY KEY ("id INT PRIMARY KEY") -
+            // found missing entirely (not even parseable) during a real, broad
+            // driver/ORM verification pass: virtually every serious ORM's own
+            // default DDL generation declares a primary key one way or the
+            // other, and this engine previously supported neither form at all.
+            boolean primaryKey = colCtx.PRIMARY() != null;
+            columns.add(new ColumnDefinition(name, type, notNull, defaultValue, primaryKey));
         }
 
-        return new CreateTableStatement(tableName, columns);
+        // A real, standalone table-level PRIMARY KEY (col1, col2, ...) constraint
+        // clause - the OTHER real form virtually every serious ORM's own default
+        // DDL generation actually uses (SQLAlchemy's own default output writes
+        // this form even for a single-column primary key, never the inline one).
+        List<String> primaryKeyColumns = new ArrayList<>();
+        if (ctx.PRIMARY() != null) {
+            for (StratosSQLParser.ColumnNameContext colNameCtx : ctx.columnName()) {
+                primaryKeyColumns.add(colNameCtx.getText());
+            }
+        }
+
+        return new CreateTableStatement(tableName, columns, primaryKeyColumns);
     }
 
     private InsertStatement buildInsert(StratosSQLParser.InsertContext ctx) {
@@ -364,7 +411,18 @@ public class SqlParser {
             columns.add(colCtx.getText());
         }
 
-        return new InsertStatement(tableName, columns, values);
+        List<String> returningColumns = new ArrayList<>();
+        if (ctx.returningClause() != null) {
+            if (ctx.returningClause().STAR() != null) {
+                returningColumns.add("*");
+            } else {
+                for (StratosSQLParser.ColumnNameContext colCtx : ctx.returningClause().columnName()) {
+                    returningColumns.add(colCtx.getText());
+                }
+            }
+        }
+
+        return new InsertStatement(tableName, columns, values, returningColumns);
     }
 
     /**
@@ -489,8 +547,15 @@ public class SqlParser {
     }
 
     private SelectStatement buildSelect(StratosSQLParser.SelectContext ctx) {
-        String tableName = ctx.tableName().getText();
+        // A real, FROM-less SELECT ("SELECT version()", "SELECT 1") is genuinely
+        // valid Postgres SQL, and virtually every serious client/ORM relies on it
+        // for at least server-version detection at connection time - see
+        // ExecutorEngine.executeSelect's own comment for how this is executed
+        // (the select list's own expressions evaluated exactly once, with no table
+        // to iterate at all, producing exactly one output row).
+        String tableName = ctx.tableName() != null ? ctx.tableName().getText() : null;
         List<String> columns = new ArrayList<>();
+        List<String> columnAliases = new ArrayList<>();
         List<AggregateCall> aggregates = new ArrayList<>();
         List<WindowFunctionCall> windowFunctions = new ArrayList<>();
         List<FunctionCallItem> functionCalls = new ArrayList<>();
@@ -507,9 +572,8 @@ public class SqlParser {
                 } else if (itemCtx.functionCall() != null) {
                     functionCalls.add(buildFunctionCallItem(itemCtx.functionCall(), alias));
                 } else if (itemCtx.columnName() != null) {
-                    // No alias support for plain columns yet (a separate, smaller gap than
-                    // aggregate aliasing) - the requested column text is used as-is, same as before.
                     columns.add(itemCtx.columnName().getText());
+                    columnAliases.add(alias);
                 } else {
                     // The `expression (AS alias)?` selectItem alternative - not really meaningful
                     // for this engine's simple SELECT list (an expression like "age > 30" isn't a
@@ -536,11 +600,11 @@ public class SqlParser {
         WhereExpr where = buildWhereExpr(ctx.expression());
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls);
+        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases);
     }
 
     private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {
-        String functionName = ctx.functionName().getText();
+        String functionName = stripSchemaQualifier(ctx.functionName().getText());
         List<String> args = new ArrayList<>();
         for (StratosSQLParser.FunctionArgContext argCtx : ctx.functionArg()) {
             args.add(argCtx.getText());

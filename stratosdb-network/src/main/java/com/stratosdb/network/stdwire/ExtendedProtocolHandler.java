@@ -122,7 +122,7 @@ final class ExtendedProtocolHandler {
             return inTransaction;
         }
 
-        String substituted = substituteParams(stmt.query(), bind.paramValues());
+        String substituted = substituteParams(stmt.query(), bind.paramValues(), bind.paramFormatCodes());
         QueryResult result;
         try {
             result = db.execute(substituted);
@@ -253,7 +253,7 @@ final class ExtendedProtocolHandler {
      * text substitution into the query rather than a native parameterized
      * execution path, and why that remains injection-safe.
      */
-    private String substituteParams(String query, byte[][] paramValues) {
+    private String substituteParams(String query, byte[][] paramValues, int[] paramFormatCodes) {
         Matcher matcher = PARAM_PLACEHOLDER.matcher(query);
         StringBuilder result = new StringBuilder();
         int lastEnd = 0;
@@ -261,7 +261,8 @@ final class ExtendedProtocolHandler {
             result.append(query, lastEnd, matcher.start());
             int paramIndex = Integer.parseInt(matcher.group(1)) - 1;
             byte[] rawValue = (paramIndex >= 0 && paramIndex < paramValues.length) ? paramValues[paramIndex] : null;
-            result.append(formatParamAsSqlLiteral(rawValue));
+            int formatCode = (paramIndex >= 0 && paramIndex < paramFormatCodes.length) ? paramFormatCodes[paramIndex] : 0;
+            result.append(formatParamAsSqlLiteral(rawValue, formatCode));
             lastEnd = matcher.end();
         }
         result.append(query.substring(lastEnd));
@@ -269,19 +270,56 @@ final class ExtendedProtocolHandler {
     }
 
     /**
-     * Renders one bound parameter's raw bytes (text format - see
-     * StdWireMessages' javadoc, binary format isn't supported) as a SQL
-     * literal: NULL for a SQL NULL, a bare token for something that
-     * parses as a number or a boolean (matching the grammar's own bare
-     * BOOLEAN_LITERAL/INTEGER_LITERAL/FLOAT_LITERAL tokens), and a
-     * properly quoted, escaped string literal otherwise - doubling any
-     * embedded single quote, the standard SQL escaping rule, so a value
-     * containing a quote can never break out of the literal it's placed
-     * into.
+     * Renders one bound parameter's raw bytes as a SQL literal: NULL for
+     * a SQL NULL, a bare token for something that parses as a number or
+     * a boolean (matching the grammar's own bare BOOLEAN_LITERAL/
+     * INTEGER_LITERAL/FLOAT_LITERAL tokens), and a properly quoted,
+     * escaped string literal otherwise - doubling any embedded single
+     * quote, the standard SQL escaping rule, so a value containing a
+     * quote can never break out of the literal it's placed into.
+     *
+     * formatCode 1 (binary) is now real, not ignored - found missing
+     * entirely during a real, broad driver/ORM verification pass: the
+     * real, official org.postgresql JDBC driver sends every setInt/
+     * setLong/setBoolean-bound parameter in BINARY format from its very
+     * first execution (not just after some "prepareThreshold" is
+     * reached, a real, wrong assumption corrected only by adding
+     * temporary diagnostic logging and reading the actual bytes, not by
+     * reasoning about the driver's own documented defaults). Before this
+     * fix, a binary parameter's own raw bytes (e.g. the 4 real bytes
+     * {0,0,0,1} for the integer 1) were read as if they were UTF-8 TEXT,
+     * producing a garbled string that then got quoted and inserted into
+     * the target column as-is - genuine, silent stored-data corruption,
+     * not just a display glitch, since a real int column could end up
+     * holding a string of near-unprintable bytes instead of the real
+     * integer.
+     *
+     * Decoded by real, known Postgres binary wire-format byte length,
+     * since the format code alone only says "binary," not which
+     * specific type: 1 byte -> boolean, 4 bytes -> a signed, big-endian
+     * int4, 8 bytes -> a signed, big-endian int8. A real, honestly-
+     * named ambiguity: int8 and float8 are both 8 bytes in Postgres's
+     * own binary wire format, and nothing at the Bind message level
+     * distinguishes them - int8 is treated as the default here since a
+     * bound integer id/count is a far more common case in real ORM-
+     * generated SQL than a bound 8-byte binary double; a real, separate,
+     * further piece of work would thread the target column's own
+     * declared type through from Parse time to resolve this correctly
+     * in every case, including binary float8. Any other byte length
+     * (or any decode failure) falls back to the original, UTF-8-text
+     * interpretation this method already used for every parameter
+     * before this fix, so no previously-working, real text-format case
+     * regresses.
      */
-    private String formatParamAsSqlLiteral(byte[] rawValue) {
+    private String formatParamAsSqlLiteral(byte[] rawValue, int formatCode) {
         if (rawValue == null) {
             return "NULL";
+        }
+        if (formatCode == 1) {
+            String decoded = tryDecodeBinary(rawValue);
+            if (decoded != null) {
+                return decoded;
+            }
         }
         String text = new String(rawValue, StandardCharsets.UTF_8);
         if (text.equalsIgnoreCase("true") || text.equalsIgnoreCase("false")) {
@@ -291,6 +329,21 @@ final class ExtendedProtocolHandler {
             return text;
         }
         return "'" + text.replace("'", "''") + "'";
+    }
+
+    /** Returns a real SQL literal for a real, known binary encoding by byte length, or null when the length isn't one this implementation recognizes at all - see formatParamAsSqlLiteral's own javadoc for the full, honest reasoning. */
+    private String tryDecodeBinary(byte[] rawValue) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(rawValue).order(java.nio.ByteOrder.BIG_ENDIAN);
+        if (rawValue.length == 1) {
+            return rawValue[0] != 0 ? "true" : "false";
+        }
+        if (rawValue.length == 4) {
+            return String.valueOf(buf.getInt());
+        }
+        if (rawValue.length == 8) {
+            return String.valueOf(buf.getLong());
+        }
+        return null;
     }
 
     private boolean isNumericLiteral(String text) {

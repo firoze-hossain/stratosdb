@@ -96,7 +96,8 @@ public final class StdWireMessages {
     }
 
     /** Bind ('B'): binds a portal (destinationPortal, empty = unnamed) to a previously-Parsed statement, with concrete parameter values - paramValues entries are raw bytes as sent (null entry = SQL NULL), always interpreted as text format here (see the class javadoc: format codes are read and stored but this implementation only ever produces/consumes text). */
-    public record BindMessage(String portalName, String statementName, byte[][] paramValues) {}
+    /** paramFormatCodes: one entry per parameter in paramValues, resolved to its real, effective value (0=text, 1=binary) - the PG wire protocol's own three shorthand cases (zero codes sent meaning "all text", one code sent meaning "applies to every parameter", or exactly one code per parameter) are already normalized here, so a caller never needs to re-derive which case applies. */
+    public record BindMessage(String portalName, String statementName, byte[][] paramValues, int[] paramFormatCodes) {}
 
     public static BindMessage readBindMessage(TypedMessage msg) {
         byte[] body = msg.body();
@@ -108,7 +109,11 @@ public final class StdWireMessages {
 
         int paramFormatCodeCount = readShortAt(body, pos);
         pos += 2;
-        pos += paramFormatCodeCount * 2; // format codes themselves are ignored - see class javadoc
+        int[] rawFormatCodes = new int[paramFormatCodeCount];
+        for (int i = 0; i < paramFormatCodeCount; i++) {
+            rawFormatCodes[i] = readShortAt(body, pos);
+            pos += 2;
+        }
 
         int paramValueCount = readShortAt(body, pos);
         pos += 2;
@@ -124,9 +129,22 @@ public final class StdWireMessages {
                 pos += len;
             }
         }
+
+        // Normalize the three real, valid shorthand cases the wire protocol itself
+        // defines - see this record's own javadoc - into one format code per real
+        // parameter, so formatParamAsSqlLiteral never needs to re-derive this.
+        int[] paramFormatCodes = new int[paramValueCount];
+        if (paramFormatCodeCount == 0) {
+            // paramFormatCodes already all-zero (text) by Java's own array default.
+        } else if (paramFormatCodeCount == 1) {
+            java.util.Arrays.fill(paramFormatCodes, rawFormatCodes[0]);
+        } else {
+            System.arraycopy(rawFormatCodes, 0, paramFormatCodes, 0, Math.min(paramFormatCodeCount, paramValueCount));
+        }
+
         // result format codes (trailing Int16 count + Int16[] codes) are intentionally
         // not parsed - this implementation always responds in text format regardless.
-        return new BindMessage(portalName, statementName, paramValues);
+        return new BindMessage(portalName, statementName, paramValues, paramFormatCodes);
     }
 
     /** Describe ('D'): 'S' for a prepared statement (client wants ParameterDescription + RowDescription/NoData) or 'P' for a portal (client wants RowDescription/NoData only). */
