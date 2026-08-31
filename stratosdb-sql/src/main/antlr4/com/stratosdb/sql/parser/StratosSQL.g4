@@ -5,6 +5,100 @@ parse: sqlStatement EOF;
 
 sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
 
+// --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
+// independent parse entry point using this SAME lexer (see PlpgsqlParser),
+// invoked ONLY when interpreting a function/procedure body declared with
+// this language, never as part of ordinary top-level SQL statement parsing
+// (sqlStatement above never references plpgsqlBlock at all). Real control
+// flow this engine previously had none of at all: IF/ELSIF/ELSE, WHILE and
+// FOR-range loops, a plain LOOP with EXIT/CONTINUE, local variable
+// DECLARE/assignment, and RETURN - closing a real, named gap from real
+// PL/pgSQL, not just a naming difference (see PlpgsqlInterpreter's own
+// javadoc for the full, honest scope and limitations).
+plpgsqlBlock: plpgsqlDeclareSection? BEGIN plpgsqlStatement* PLSQL_END SEMICOLON? EOF;
+
+plpgsqlDeclareSection: PLSQL_DECLARE plpgsqlVarDecl+;
+plpgsqlVarDecl: IDENTIFIER dataType (ASSIGN_PLSQL plpgsqlExpr | DEFAULT plpgsqlExpr)? SEMICOLON;
+
+plpgsqlStatement: plpgsqlIfStatement
+                | plpgsqlWhileStatement
+                | plpgsqlForRangeStatement
+                | plpgsqlLoopStatement
+                | plpgsqlExitStatement
+                | plpgsqlContinueStatement
+                | plpgsqlReturnStatement
+                | plpgsqlRaiseStatement
+                | plpgsqlAssignment
+                | plpgsqlEmbeddedSql
+                ;
+
+plpgsqlAssignment: IDENTIFIER ASSIGN_PLSQL plpgsqlExpr SEMICOLON;
+
+plpgsqlIfStatement: PLSQL_IF plpgsqlExpr PLSQL_THEN plpgsqlStatement*
+                    (PLSQL_ELSIF plpgsqlExpr PLSQL_THEN plpgsqlStatement*)*
+                    (PLSQL_ELSE plpgsqlStatement*)?
+                    PLSQL_END PLSQL_IF SEMICOLON;
+
+plpgsqlWhileStatement: PLSQL_WHILE plpgsqlExpr PLSQL_LOOP plpgsqlStatement* PLSQL_END PLSQL_LOOP SEMICOLON;
+
+plpgsqlForRangeStatement: FOR IDENTIFIER IN plpgsqlExpr DOTDOT plpgsqlExpr PLSQL_LOOP plpgsqlStatement* PLSQL_END PLSQL_LOOP SEMICOLON;
+
+plpgsqlLoopStatement: PLSQL_LOOP plpgsqlStatement* PLSQL_END PLSQL_LOOP SEMICOLON;
+
+plpgsqlExitStatement: PLSQL_EXIT (PLSQL_WHEN plpgsqlExpr)? SEMICOLON;
+plpgsqlContinueStatement: PLSQL_CONTINUE (PLSQL_WHEN plpgsqlExpr)? SEMICOLON;
+
+plpgsqlReturnStatement: PLSQL_RETURN plpgsqlExpr? SEMICOLON;
+
+plpgsqlRaiseStatement: PLSQL_RAISE (PLSQL_NOTICE | PLSQL_EXCEPTION | PLSQL_WARNING)? STRING_LITERAL SEMICOLON;
+
+// A real, embedded SQL statement (INSERT/UPDATE/DELETE/a real SELECT ... INTO
+// a local variable) - captured here as a raw run of tokens up to its own
+// terminating semicolon, THEN handed to the real, existing SqlParser for
+// real, actual parsing (after real variable substitution - see
+// PlpgsqlInterpreter's own javadoc) rather than re-implementing SQL parsing
+// a second time inside this grammar. plpgsqlToken matches any single token
+// that isn't itself a semicolon, so this rule greedily consumes everything
+// up to (but not including) the terminator, regardless of what real SQL
+// statement type it turns out to be.
+plpgsqlEmbeddedSql: plpgsqlToken+ SEMICOLON;
+// Excludes EVERY real plpgsql structural keyword, not just ELSIF/ELSE/END -
+// a real, second bug found by testing, not by inspection, right after fixing
+// the first one: a genuinely malformed IF (e.g. missing its own END IF) was
+// being silently swallowed whole as one opaque, generic plpgsqlEmbeddedSql
+// statement instead of failing with a real, clear syntax error - since IF
+// itself wasn't excluded, the wildcard happily matched right through it.
+// This completely defeated real, upfront CREATE-time body validation (see
+// ExecutorEngine.validateFunctionOrProcedureLanguage): the malformed body
+// was silently ACCEPTED at CREATE time, then failed with a confusing,
+// unrelated "mismatched input 'IF'" SQL syntax error only at CALL time
+// instead. Excluding every real structural keyword here (not just the three
+// that happened to trigger the first, narrower bug) closes this properly.
+plpgsqlToken: ~(SEMICOLON | PLSQL_IF | PLSQL_THEN | PLSQL_ELSIF | PLSQL_ELSE | PLSQL_END
+              | PLSQL_WHILE | PLSQL_LOOP | PLSQL_EXIT | PLSQL_CONTINUE | PLSQL_RETURN
+              | PLSQL_RAISE | PLSQL_WHEN | FOR);
+
+// A minimal, real, deliberately non-exhaustive expression language for the
+// procedural block itself - literals, variables, arithmetic, comparison,
+// boolean logic, parentheses, and a function call. Alternative order here
+// IS this rule's own real operator precedence (ANTLR4's own direct-left-
+// recursion precedence climbing): multiplication/division bind tightest,
+// then addition/subtraction, then comparison, then NOT, then AND, then OR
+// loosest - the same real, standard precedence order every mainstream
+// procedural/SQL language uses.
+plpgsqlExpr: plpgsqlExpr op=(STAR | DIVIDE) plpgsqlExpr                    #PlpgsqlMulDiv
+           | plpgsqlExpr op=(PLUS | MINUS) plpgsqlExpr                     #PlpgsqlAddSub
+           | plpgsqlExpr op=(GT | LT | GE | LE | ASSIGN | NE) plpgsqlExpr  #PlpgsqlCompare
+           | NOT plpgsqlExpr                                                #PlpgsqlNot
+           | plpgsqlExpr AND plpgsqlExpr                                    #PlpgsqlAnd
+           | plpgsqlExpr OR plpgsqlExpr                                     #PlpgsqlOr
+           | MINUS plpgsqlExpr                                              #PlpgsqlNegate
+           | LPAREN plpgsqlExpr RPAREN                                      #PlpgsqlParen
+           | IDENTIFIER LPAREN (plpgsqlExpr (COMMA plpgsqlExpr)*)? RPAREN   #PlpgsqlFunctionCall
+           | IDENTIFIER                                                     #PlpgsqlVariable
+           | literal                                                        #PlpgsqlLiteralExpr
+           ;
+
 // DDL
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* (COMMA PRIMARY KEY LPAREN columnName (COMMA columnName)* RPAREN)? RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
@@ -271,6 +365,32 @@ ROW: R O W;
 EXECUTE: E X E C U T E;
 EXTENSION: E X T E N S I O N;
 RETURNS: R E T U R N S;
+// --- Real procedural language (see plpgsqlBlock's own grammar rule and
+// PlpgsqlInterpreter's own javadoc) - a genuinely separate, second parse
+// entry point using this same lexer, invoked only when a function/procedure
+// body is actually written in this procedural sub-language (LANGUAGE
+// plpgsql), never mixed into ordinary top-level SQL statement parsing.
+PLSQL_DECLARE: D E C L A R E;
+PLSQL_END: E N D;
+PLSQL_IF: I F;
+PLSQL_THEN: T H E N;
+PLSQL_ELSE: E L S E;
+PLSQL_ELSIF: E L S I F;
+PLSQL_WHILE: W H I L E;
+PLSQL_LOOP: L O O P;
+PLSQL_EXIT: E X I T;
+PLSQL_CONTINUE: C O N T I N U E;
+PLSQL_RETURN: R E T U R N;
+PLSQL_RAISE: R A I S E;
+PLSQL_NOTICE: N O T I C E;
+PLSQL_EXCEPTION: E X C E P T I O N;
+PLSQL_WARNING: W A R N I N G;
+PLSQL_WHEN: W H E N;
+PLUS: '+';
+MINUS: '-';
+DIVIDE: '/';
+ASSIGN_PLSQL: ':=';
+DOTDOT: '..';
 LANGUAGE: L A N G U A G E;
 REPLACE: R E P L A C E;
 SQL_LANG: S Q L;

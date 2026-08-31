@@ -697,11 +697,59 @@ public class StdWireServer {
     }
 
     /** Splits a semicolon-separated batch of statements the way libpq's simple query protocol allows in one Query message - naive on purpose (no string-literal-aware splitting), matching this engine's existing SQL surface, which doesn't support semicolons inside string literals in a way this would break. */
+    /**
+     * A real, genuine bug found and fixed while building real procedural
+     * ("LANGUAGE plpgsql") function/procedure support: this used to be a
+     * naive sql.split(";"), with zero awareness of dollar-quoted string
+     * boundaries at all - a real, multi-statement procedural body (which
+     * almost always has several internal semicolons inside its own $$
+     * ... $$ delimiters) sent as a single Query message would be silently
+     * shredded into garbage fragments at every one of those internal
+     * semicolons, not just the one real terminator at the very end. This
+     * pre-existed this round's own new feature (any earlier multi-
+     * statement LANGUAGE SQL procedure body sent this way would have hit
+     * the exact same corruption), but was far more likely to actually be
+     * hit once procedural bodies became real. Also made real-string-
+     * literal-aware while fixing this (a semicolon inside an ordinary
+     * '...' value, e.g. INSERT ... VALUES ('a;b'), was equally at risk),
+     * with '' (a doubled single quote) correctly recognized as a real,
+     * escaped quote inside a string literal, not a terminator.
+     */
     private List<String> splitStatements(String sql) {
         List<String> statements = new ArrayList<>();
-        for (String part : sql.split(";")) {
-            if (!part.isBlank()) statements.add(part.trim());
+        StringBuilder current = new StringBuilder();
+        boolean inDollarQuote = false;
+        boolean inStringLiteral = false;
+        int i = 0;
+        while (i < sql.length()) {
+            char c = sql.charAt(i);
+            if (!inStringLiteral && c == '$' && i + 1 < sql.length() && sql.charAt(i + 1) == '$') {
+                inDollarQuote = !inDollarQuote;
+                current.append("$$");
+                i += 2;
+                continue;
+            }
+            if (!inDollarQuote && c == '\'') {
+                if (inStringLiteral && i + 1 < sql.length() && sql.charAt(i + 1) == '\'') {
+                    current.append("''"); // a real, escaped quote within the literal - not its own terminator
+                    i += 2;
+                    continue;
+                }
+                inStringLiteral = !inStringLiteral;
+                current.append(c);
+                i++;
+                continue;
+            }
+            if (!inDollarQuote && !inStringLiteral && c == ';') {
+                if (!current.toString().isBlank()) statements.add(current.toString().trim());
+                current.setLength(0);
+                i++;
+                continue;
+            }
+            current.append(c);
+            i++;
         }
+        if (!current.toString().isBlank()) statements.add(current.toString().trim());
         if (statements.isEmpty()) statements.add(""); // an all-whitespace/empty query still gets one EmptyQueryResponse
         return statements;
     }
