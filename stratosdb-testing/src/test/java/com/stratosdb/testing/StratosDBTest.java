@@ -3628,6 +3628,92 @@ public class StratosDBTest {
         assertFalse(invalidRange.isSuccess(), "a genuinely malformed range literal must be rejected");
     }
 
+    // --- Full-text search (tsvector/tsquery): this project's own honestly-named
+    // "GIN indexing on arrays/JSON exists, but not Postgres's own text-search
+    // machinery" gap.
+
+    @Test
+    void testToTsVectorTokenizesRemovesStopWordsAndTracksPositions() {
+        QueryResult result = database.execute("SELECT to_tsvector('The quick brown fox jumps over the lazy dog')");
+        assertTrue(result.isSuccess());
+        String vector = result.getRows().get(0).getValue(0).toString();
+        assertTrue(vector.contains("'fox':4"), "a real lexeme must carry its own real 1-based position: " + vector);
+        assertFalse(vector.contains("'the'"), "a real stop word must be removed entirely: " + vector);
+        assertFalse(vector.contains("'over'"), "a real, common preposition stop word must be removed: " + vector);
+    }
+
+    @Test
+    void testToTsQueryParsesBooleanExpressionWithCorrectPrecedence() {
+        QueryResult result = database.execute("SELECT to_tsquery('quick & (fox | cat)')");
+        assertTrue(result.isSuccess());
+        assertEquals("'quick' & ('fox' | 'cat')", result.getRows().get(0).getValue(0).toString());
+    }
+
+    @Test
+    void testTsMatchOperatorFullScanAndReturnsSameEndTag() throws Exception {
+        assertTrue(database.execute("CREATE TABLE articles (id INT, title VARCHAR, body TSVECTOR)").isSuccess());
+        database.execute("INSERT INTO articles VALUES (1, 'Fox story', 'The quick brown fox jumps over the lazy dog')");
+        database.execute("INSERT INTO articles VALUES (2, 'Cat story', 'A sleepy cat naps all afternoon in the sun')");
+        database.execute("INSERT INTO articles VALUES (3, 'Dog and fox', 'A clever fox outwitted the barking dog')");
+
+        assertRowIds(database.execute("SELECT id FROM articles WHERE body @@ 'fox & dog'"), 1, 3);
+        assertRowIds(database.execute("SELECT id FROM articles WHERE body @@ 'cat | quick'"), 1, 2);
+        assertRowIds(database.execute("SELECT id FROM articles WHERE body @@ '!fox'"), 2);
+        assertRowIds(database.execute("SELECT id FROM articles WHERE body @@ '(cat | dog) & !elephant'"), 1, 2, 3);
+    }
+
+    @Test
+    void testTsMatchOperatorIsGinAccelerated() throws Exception {
+        assertTrue(database.execute("CREATE TABLE articles2 (id INT, body TSVECTOR)").isSuccess());
+        database.execute("INSERT INTO articles2 VALUES (1, 'The quick brown fox jumps over the lazy dog')");
+        database.execute("INSERT INTO articles2 VALUES (2, 'A sleepy cat naps all afternoon in the sun')");
+        database.execute("INSERT INTO articles2 VALUES (3, 'A clever fox outwitted the barking dog')");
+        assertTrue(database.execute("CREATE INDEX idx_body2 ON articles2 (body) USING GIN").isSuccess());
+
+        // Real GIN acceleration must produce the exact same, correct results
+        // as the full-scan path above - including the pure-NOT case, which
+        // has no safely-required lexeme at all and must correctly fall back
+        // to a real full scan even with a real GIN index present.
+        assertRowIds(database.execute("SELECT id FROM articles2 WHERE body @@ 'fox & dog'"), 1, 3);
+        assertRowIds(database.execute("SELECT id FROM articles2 WHERE body @@ 'cat | quick'"), 1, 2);
+        assertRowIds(database.execute("SELECT id FROM articles2 WHERE body @@ '!fox'"), 2);
+
+        // A row inserted AFTER the GIN index already exists must also be
+        // real-time indexed and correctly matched, not just rows present
+        // at CREATE INDEX time.
+        database.execute("INSERT INTO articles2 VALUES (4, 'A hungry fox hunts at night')");
+        assertRowIds(database.execute("SELECT id FROM articles2 WHERE body @@ 'fox'"), 1, 3, 4);
+    }
+
+    @Test
+    void testTsVectorAndGinIndexSurviveARealRestart() {
+        database.execute("CREATE TABLE articles3 (id INT, body TSVECTOR)");
+        database.execute("INSERT INTO articles3 VALUES (1, 'The quick brown fox jumps over the lazy dog')");
+        database.execute("INSERT INTO articles3 VALUES (2, 'A sleepy cat naps all afternoon in the sun')");
+        database.execute("CREATE INDEX idx_body3 ON articles3 (body) USING GIN");
+
+        database.shutdown();
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config);
+
+        assertRowIds(database.execute("SELECT id FROM articles3 WHERE body @@ 'fox'"), 1);
+        assertTrue(database.execute("INSERT INTO articles3 VALUES (3, 'Another fox tale')").isSuccess(),
+            "a real tsvector column must still accept new inserts after a real restart");
+        assertRowIds(database.execute("SELECT id FROM articles3 WHERE body @@ 'fox'"), 1, 3);
+    }
+
+    private void assertRowIds(QueryResult result, int... expectedIds) {
+        assertTrue(result.isSuccess(), () -> "expected success but got: " + result.getError());
+        java.util.Set<Integer> actual = new java.util.TreeSet<>();
+        for (Tuple row : result.getRows()) {
+            actual.add((Integer) row.getValue("id"));
+        }
+        java.util.Set<Integer> expected = new java.util.TreeSet<>();
+        for (int id : expectedIds) expected.add(id);
+        assertEquals(expected, actual);
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

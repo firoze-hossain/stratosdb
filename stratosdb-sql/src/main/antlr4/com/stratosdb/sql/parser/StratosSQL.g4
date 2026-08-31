@@ -223,6 +223,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName LIKE literal                                #LikeCompare
           | columnName CONTAINS literal                            #ContainsCompare
           | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
+          | columnName TS_MATCH literal                           #TsMatchCompare
           | columnName JSON_EXTRACT_TEXT literal ASSIGN literal    #JsonExtractTextEqCompare
           | LPAREN columnName COMMA columnName RPAREN OVERLAPS LPAREN literal COMMA literal RPAREN #RangeOverlapsCompare
           | columnName IN LPAREN valueList RPAREN                  #InListExpr
@@ -259,6 +260,7 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | JSON | JSONB
         | INET | CIDR
         | INT4RANGE | DATERANGE
+        | TSVECTOR | TSQUERY
         // A bare IDENTIFIER names a real, user-defined type (see createType's
         // own grammar rule) - an enum created via CREATE TYPE ... AS ENUM,
         // referenced here by its own real name (e.g. "status mood_enum") the
@@ -338,6 +340,8 @@ INET: I N E T;
 CIDR: C I D R;
 INT4RANGE: I N T '4' R A N G E;
 DATERANGE: D A T E R A N G E;
+TSVECTOR: T S V E C T O R;
+TSQUERY: T S Q U E R Y;
 INSERT: I N S E R T;
 INTO: I N T O;
 VALUES: V A L U E S;
@@ -502,6 +506,7 @@ GE: '>=';
 LE: '<=';
 NE: '!=';
 ARRAY_CONTAINS: '@>';
+TS_MATCH: '@@';
 JSON_EXTRACT_TEXT: '->>';
 STAR: '*';
 

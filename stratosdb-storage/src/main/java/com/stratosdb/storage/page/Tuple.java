@@ -143,9 +143,65 @@ public class Tuple {
             writeValue(out, range.upper());
             out.writeByte(range.lowerInclusive() ? 1 : 0);
             out.writeByte(range.upperInclusive() ? 1 : 0);
+        } else if (value instanceof TsVector tsVector) {
+            // A real tsvector value (see TsVector's own javadoc) - its own
+            // lexeme->positions map is written using the exact same real
+            // Map/List encoding (tags 7/6) already used for a real JSON
+            // object/array, reused recursively here rather than a second,
+            // separate encoding scheme for what is structurally the same
+            // shape (a String key to a list of values).
+            java.util.Map<String, Object> asMap = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<String, java.util.List<Integer>> entry : tsVector.lexemePositions().entrySet()) {
+                asMap.put(entry.getKey(), new ArrayList<Object>(entry.getValue()));
+            }
+            out.writeInt(9);
+            writeValue(out, asMap);
+        } else if (value instanceof TsQuery tsQuery) {
+            out.writeInt(10);
+            writeTsQueryExpr(out, tsQuery.root());
         } else {
             throw new IllegalArgumentException("Unsupported type: " + value.getClass());
         }
+    }
+
+    /**
+     * A real, recursive, tagged binary encoding for a TsQueryExpr tree -
+     * 0=Lexeme (a real String value, reusing writeValue's own existing
+     * String encoding rather than a second, separate one), 1=And,
+     * 2=Or (each followed by two recursive encodings of their own left/
+     * right operands), 3=Not (followed by one recursive encoding of its
+     * own operand).
+     */
+    private static void writeTsQueryExpr(DataOutputStream out, TsQueryExpr expr) throws IOException {
+        if (expr instanceof TsQueryExpr.Lexeme lexeme) {
+            out.writeByte(0);
+            writeValue(out, lexeme.value());
+        } else if (expr instanceof TsQueryExpr.And and) {
+            out.writeByte(1);
+            writeTsQueryExpr(out, and.left());
+            writeTsQueryExpr(out, and.right());
+        } else if (expr instanceof TsQueryExpr.Or or) {
+            out.writeByte(2);
+            writeTsQueryExpr(out, or.left());
+            writeTsQueryExpr(out, or.right());
+        } else if (expr instanceof TsQueryExpr.Not not) {
+            out.writeByte(3);
+            writeTsQueryExpr(out, not.operand());
+        } else {
+            throw new IllegalArgumentException("Unsupported TsQueryExpr: " + expr.getClass());
+        }
+    }
+
+    /** The exact, symmetric reverse of writeTsQueryExpr - see that method's own javadoc for the real, tagged encoding this reads back. */
+    private static TsQueryExpr readTsQueryExpr(DataInputStream in) throws IOException {
+        int tag = in.readByte();
+        return switch (tag) {
+            case 0 -> new TsQueryExpr.Lexeme((String) readValue(in));
+            case 1 -> new TsQueryExpr.And(readTsQueryExpr(in), readTsQueryExpr(in));
+            case 2 -> new TsQueryExpr.Or(readTsQueryExpr(in), readTsQueryExpr(in));
+            case 3 -> new TsQueryExpr.Not(readTsQueryExpr(in));
+            default -> throw new IllegalArgumentException("Unknown TsQueryExpr tag: " + tag);
+        };
     }
     
     /**
@@ -220,6 +276,26 @@ public class Tuple {
                 boolean upperInclusive = in.readByte() == 1;
                 return new RangeValue(lower, upper, lowerInclusive, upperInclusive);
             }
+            case 9: {
+                // The exact reverse of the real Map/List encoding writeValue's own
+                // TsVector case built - each value comes back as a real
+                // List<Object> of boxed Integer positions (see case 1's own
+                // Integer round-trip), converted back into TsVector's own real
+                // List<Integer> shape.
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> asMap = (java.util.Map<String, Object>) readValue(in);
+                java.util.Map<String, java.util.List<Integer>> lexemePositions = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, Object> entry : asMap.entrySet()) {
+                    java.util.List<Integer> positions = new ArrayList<>();
+                    for (Object pos : (java.util.List<?>) entry.getValue()) {
+                        positions.add(((Number) pos).intValue());
+                    }
+                    lexemePositions.put(entry.getKey(), positions);
+                }
+                return new TsVector(lexemePositions);
+            }
+            case 10:
+                return new TsQuery(readTsQueryExpr(in));
             case -1:
                 return null;
             default:

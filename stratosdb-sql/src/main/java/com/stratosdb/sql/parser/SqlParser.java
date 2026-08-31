@@ -508,6 +508,9 @@ public class SqlParser {
         if (ctx instanceof StratosSQLParser.ArrayContainsCompareContext c) {
             return new WhereExpr.ArrayContains(c.columnName().getText(), c.literal().getText());
         }
+        if (ctx instanceof StratosSQLParser.TsMatchCompareContext c) {
+            return new WhereExpr.TsMatch(c.columnName().getText(), c.literal().getText());
+        }
         if (ctx instanceof StratosSQLParser.JsonExtractTextEqCompareContext c) {
             return new WhereExpr.JsonExtractTextEquals(c.columnName().getText(), c.literal(0).getText(), c.literal(1).getText());
         }

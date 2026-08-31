@@ -26,6 +26,8 @@ public sealed interface WhereExpr {
 
     /** column @> 'value' - checks whether an array column contains a given scalar element. A deliberately scoped-down version of real Postgres's @> (which compares two full arrays for set containment) - this compares an array column against a single element, the more common, simpler case. */
     record ArrayContains(String column, String literalElement) implements WhereExpr {}
+    /** column @@ literal - column is a real tsvector column; literalElement is a real, raw tsquery string literal (e.g. "'quick & fox'"), parsed via TextSearch.toTsQuery at evaluation time (see ExecutorEngine's own evaluateWhereExpr and tryGinOrBitmapIndexScan). */
+    record TsMatch(String column, String tsqueryLiteral) implements WhereExpr {}
 
     /** column ->> 'key' = 'value' - extracts a top-level JSON key as text and compares it for equality. Deliberately scoped to top-level keys and equality only - real Postgres's ->> also supports array-index extraction and #>>'{path,to,key}' for nested paths, real further work not attempted here. */
     record JsonExtractTextEquals(String column, String key, String value) implements WhereExpr {}

@@ -1685,7 +1685,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "SERIAL", "BIGSERIAL",
         "VARCHAR", "TEXT", "CHAR", "BOOLEAN", "BOOL", "DATE", "TIME", "TIMESTAMP",
         "DECIMAL", "DOUBLE", "FLOAT", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
-        "INET", "CIDR", "INT4RANGE", "DATERANGE"
+        "INET", "CIDR", "INT4RANGE", "DATERANGE", "TSVECTOR", "TSQUERY"
     );
 
     private boolean isKnownBuiltInType(String type) {
@@ -1914,6 +1914,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (entry.getValue() != null) {
                     index.insertExact(jsonKeyValueIndexKey(entry.getKey().toString(), entry.getValue()), rid);
                 }
+            }
+        } else if (value instanceof com.stratosdb.storage.page.TsVector tsVector) {
+            // Each real lexeme is already fully normalized (lowercased, stop
+            // words removed) by TextSearch.toTsVector - insertExact (not
+            // insert) here for the exact same real reason ArrayContains'
+            // own element indexing already uses it: the lexeme itself is
+            // the real search key, not raw text that still needs its own,
+            // separate tokenization pass.
+            for (String lexeme : tsVector.lexemes()) {
+                index.insertExact(lexeme, rid);
             }
         } else {
             index.insert(value.toString(), rid);
@@ -2433,6 +2443,25 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             String key = stripQuotes(jsonExtract.key());
             String value = stripQuotes(jsonExtract.value());
             candidateRids = ginEntry.index().search(key + ":" + value);
+        } else if (stmt.where() instanceof WhereExpr.TsMatch tsMatch) {
+            GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), tsMatch.column());
+            if (ginEntry == null) {
+                return null;
+            }
+            com.stratosdb.storage.page.TsQuery query = TextSearch.toTsQuery(stripQuotes(tsMatch.tsqueryLiteral()));
+            java.util.Set<String> requiredLexemes = requiredLexemes(query.root());
+            if (requiredLexemes.isEmpty()) {
+                // A query with no safely-required lexeme at all (e.g. a bare
+                // "!cat", or every branch negated) - GIN has no useful way to
+                // narrow candidates down at all here, so fall back to a real,
+                // full scan rather than risk missing a real match.
+                return null;
+            }
+            java.util.Set<BTreePage.RID> unioned = new java.util.HashSet<>();
+            for (String lexeme : requiredLexemes) {
+                unioned.addAll(ginEntry.index().search(lexeme));
+            }
+            candidateRids = new ArrayList<>(unioned);
         } else if (stmt.where() instanceof WhereExpr.Comparison cmp && cmp.operator().equals("=")
             && findEqualityIndex(stmt.tableName(), cmp.column()) == null) {
             // Only used when no BTREE/HASH already covers this column - those are strictly
@@ -2469,6 +2498,49 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             tuples.add(applyColumnAliases(project(tuple, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()));
         }
         return tuples;
+    }
+
+    /**
+     * A safe, "necessary condition" set of lexemes for GIN acceleration: any
+     * row that genuinely matches this tsquery expression is GUARANTEED to
+     * contain at least one lexeme from the returned set - so unioning a GIN
+     * lookup across every lexeme in this set is a safe (though not
+     * necessarily tight) superset of the real matches, which the existing
+     * recheck (matchesWhere, called on every candidate right after this
+     * method returns) then filters down to the exact, correct answer.
+     *
+     * The real rule, by node type:
+     *   - a bare lexeme requires itself, trivially.
+     *   - AND: the real, matching row must satisfy BOTH sides, so it must
+     *     contain at least one required lexeme from EACH side - which
+     *     means the (looser, but still safe) union of both sides' own
+     *     required sets is also a valid, necessary condition.
+     *   - OR: the real, matching row must satisfy AT LEAST ONE side, so it
+     *     must contain a required lexeme from that side - again, the
+     *     union of both sides covers this correctly.
+     *   - NOT: no useful, narrowing necessary condition can be derived at
+     *     all (a row matching "!cat" could be any row that simply doesn't
+     *     contain "cat") - contributes an empty set, not a failure; an AND
+     *     containing a NOT branch alongside a real, positive one (e.g.
+     *     "cat & !dog") still correctly keeps "cat" as required, since
+     *     the empty set from the NOT branch just doesn't add anything to
+     *     the union, rather than poisoning it.
+     */
+    private java.util.Set<String> requiredLexemes(com.stratosdb.storage.page.TsQueryExpr expr) {
+        if (expr instanceof com.stratosdb.storage.page.TsQueryExpr.Lexeme l) {
+            return java.util.Set.of(l.value());
+        }
+        if (expr instanceof com.stratosdb.storage.page.TsQueryExpr.And a) {
+            java.util.Set<String> combined = new java.util.HashSet<>(requiredLexemes(a.left()));
+            combined.addAll(requiredLexemes(a.right()));
+            return combined;
+        }
+        if (expr instanceof com.stratosdb.storage.page.TsQueryExpr.Or o) {
+            java.util.Set<String> combined = new java.util.HashSet<>(requiredLexemes(o.left()));
+            combined.addAll(requiredLexemes(o.right()));
+            return combined;
+        }
+        return java.util.Set.of(); // Not - see this method's own javadoc
     }
 
     private GinIndexEntry findGinIndex(String tableName, String columnName) {
@@ -5081,6 +5153,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // settings store SHOW <param> could then read back correctly too.
             return argValues.get(1);
         }
+        if (lowerName.equals("to_tsvector") && argValues.size() == 1) {
+            return TextSearch.toTsVector(String.valueOf(argValues.get(0)));
+        }
+        if (lowerName.equals("to_tsquery") && argValues.size() == 1) {
+            return TextSearch.toTsQuery(String.valueOf(argValues.get(0)));
+        }
         CreateFunctionStatement func = functions.get(functionName);
         if (func == null) {
             throw new IllegalArgumentException("Function not found: " + functionName);
@@ -5150,6 +5228,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * by-convention path is real, further work, not attempted here.
      */
     private Object invokeFunction(String functionName, List<Object> argValues, Transaction txn) throws DeadlockException {
+        String txnLowerName = functionName.toLowerCase(java.util.Locale.ROOT);
+        if (txnLowerName.equals("to_tsvector") && argValues.size() == 1) {
+            return TextSearch.toTsVector(String.valueOf(argValues.get(0)));
+        }
+        if (txnLowerName.equals("to_tsquery") && argValues.size() == 1) {
+            return TextSearch.toTsQuery(String.valueOf(argValues.get(0)));
+        }
         CreateFunctionStatement func = functions.get(functionName);
         if (func == null) {
             throw new IllegalArgumentException("Function not found: " + functionName);
@@ -5349,6 +5434,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
             }
             return false;
+        }
+        if (expr instanceof WhereExpr.TsMatch tsMatch) {
+            Object value = resolveColumnValue(row, tsMatch.column(), outerRow);
+            if (!(value instanceof com.stratosdb.storage.page.TsVector vector)) {
+                return false; // not a real tsvector column at all, or NULL - @@ is false either way
+            }
+            com.stratosdb.storage.page.TsQuery query = TextSearch.toTsQuery(stripQuotes(tsMatch.tsqueryLiteral()));
+            return query.matches(vector);
         }
         if (expr instanceof WhereExpr.JsonExtractTextEquals jsonExtract) {
             Object value = resolveColumnValue(row, jsonExtract.column(), outerRow);
@@ -5751,6 +5844,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return RangeValue.parse(rawValue, normalizedType.equals("DATERANGE"));
             } catch (IllegalArgumentException e) {
                 throw new IllegalArgumentException("Invalid " + normalizedType + " for column \"" + columnName + "\": " + e.getMessage());
+            }
+        }
+        if (normalizedType.equals("TSVECTOR")) {
+            // A real tsvector column stores the ALREADY-TOKENIZED result, not raw
+            // text - a real value inserted directly here is treated as the real,
+            // original text to tokenize (matching to_tsvector()'s own behavior),
+            // so `INSERT INTO t (doc) VALUES ('The quick fox')` and
+            // `INSERT INTO t (doc) VALUES (to_tsvector('The quick fox'))` produce
+            // the exact same, real stored tsvector either way.
+            return TextSearch.toTsVector(rawValue);
+        }
+        if (normalizedType.equals("TSQUERY")) {
+            try {
+                return TextSearch.toTsQuery(rawValue);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid tsquery for column \"" + columnName + "\": " + e.getMessage());
             }
         }
         // A real, user-defined enum type (see CreateTypeStatement's own javadoc) -
