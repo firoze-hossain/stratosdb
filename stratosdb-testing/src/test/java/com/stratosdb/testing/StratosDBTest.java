@@ -3556,6 +3556,78 @@ public class StratosDBTest {
         assertNull(row.getValue("id"), "the real, original column name must no longer appear once it's been aliased");
     }
 
+    // --- CREATE TYPE / enums / richer types: this project's own honestly-named
+    // "CREATE TYPE / enums / richer types — confirmed missing. No custom types,
+    // no enums, no network types (INET, CIDR), no ranges" gap.
+
+    @Test
+    void testCreateTypeEnumValidatesAllowedValues() {
+        assertTrue(database.execute("CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')").isSuccess());
+        assertTrue(database.execute("CREATE TABLE person (id INT, name VARCHAR, current_mood mood)").isSuccess());
+        assertTrue(database.execute("INSERT INTO person VALUES (1, 'Alice', 'happy')").isSuccess());
+        assertTrue(database.execute("INSERT INTO person VALUES (2, 'Bob', 'sad')").isSuccess());
+
+        QueryResult invalid = database.execute("INSERT INTO person VALUES (3, 'Carol', 'angry')");
+        assertFalse(invalid.isSuccess(), "a value not in the enum's own declared set must be rejected");
+        assertTrue(invalid.getError().contains("angry"));
+
+        assertTrue(database.execute("DROP TYPE mood").isSuccess());
+    }
+
+    @Test
+    void testEnumTypeSurvivesARealRestart() {
+        database.execute("CREATE TYPE priority AS ENUM ('low', 'medium', 'high')");
+        database.execute("CREATE TABLE tasks (id INT, task_priority priority)");
+        database.execute("INSERT INTO tasks VALUES (1, 'high')");
+
+        database.shutdown();
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(tempDir.toString());
+        database = new StratosDB(config);
+
+        assertTrue(database.execute("INSERT INTO tasks VALUES (2, 'medium')").isSuccess(),
+            "a real, valid enum value must still be accepted after a real restart");
+        QueryResult invalid = database.execute("INSERT INTO tasks VALUES (3, 'invalid_value')");
+        assertFalse(invalid.isSuccess(), "enum validation must still be enforced after a real restart, not silently dropped");
+        assertEquals(2, database.execute("SELECT * FROM tasks").getRows().size());
+    }
+
+    @Test
+    void testUnrecognizedTypeNameIsRejectedAtCreateTableTime() {
+        QueryResult result = database.execute("CREATE TABLE bad_table (id INT, col some_typo_type)");
+        assertFalse(result.isSuccess(), "a type name that is neither a built-in keyword nor a real, registered enum type must be rejected immediately, not silently accepted");
+        assertTrue(result.getError().contains("some_typo_type"));
+    }
+
+    @Test
+    void testInetAndCidrValidateRealNetworkAddresses() {
+        assertTrue(database.execute("CREATE TABLE hosts (id INT, addr INET, subnet CIDR)").isSuccess());
+        assertTrue(database.execute("INSERT INTO hosts VALUES (1, '192.168.1.1', '192.168.1.0/24')").isSuccess());
+        assertTrue(database.execute("INSERT INTO hosts VALUES (2, '10.0.0.5/8', '10.0.0.0/8')").isSuccess(),
+            "INET's own /prefix-length suffix is optional, unlike CIDR's own required one");
+
+        QueryResult badInet = database.execute("INSERT INTO hosts VALUES (3, 'not-an-ip', '192.168.1.0/24')");
+        assertFalse(badInet.isSuccess(), "a real, invalid IP address string must be rejected");
+
+        QueryResult cidrMissingPrefix = database.execute("INSERT INTO hosts VALUES (4, '192.168.1.1', '192.168.1.0')");
+        assertFalse(cidrMissingPrefix.isSuccess(), "CIDR, unlike INET, must always require its own /prefix-length");
+    }
+
+    @Test
+    void testInt4RangeAndDateRangeParseAndValidateRealRangeLiterals() {
+        assertTrue(database.execute("CREATE TABLE ranges (id INT, r INT4RANGE, d DATERANGE)").isSuccess());
+        assertTrue(database.execute("INSERT INTO ranges VALUES (1, '[1,10)', '[2024-01-01,2024-12-31]')").isSuccess());
+        assertTrue(database.execute("INSERT INTO ranges VALUES (2, '(5,)', '[2024-06-01,)')").isSuccess(),
+            "either bound may be genuinely open-ended (unbounded), matching real Postgres's own real range semantics");
+
+        var rows = database.execute("SELECT * FROM ranges").getRows();
+        assertEquals("[1,10)", rows.get(0).getValue("r").toString(), "a range value's own real display format must round-trip exactly");
+        assertEquals("(5,)", rows.get(1).getValue("r").toString());
+
+        QueryResult invalidRange = database.execute("INSERT INTO ranges VALUES (3, 'notarange', '[2024-01-01,2024-12-31]')");
+        assertFalse(invalidRange.isSuccess(), "a genuinely malformed range literal must be rejected");
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
 
 // --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
 // independent parse entry point using this SAME lexer (see PlpgsqlParser),
@@ -134,7 +134,9 @@ showParameter: SHOW IDENTIFIER SEMICOLON?;
 setParameter: SET IDENTIFIER ASSIGN (literal | IDENTIFIER) SEMICOLON?;
 showCatalog: SHOW CATALOG SEMICOLON?;
 createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
+createType: CREATE TYPE typeName AS ENUM LPAREN STRING_LITERAL (COMMA STRING_LITERAL)* RPAREN SEMICOLON?;
 dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
+dropType: DROP TYPE typeName SEMICOLON?;
 sequenceName: IDENTIFIER;
 createFunction: CREATE (OR REPLACE)? FUNCTION functionName LPAREN (functionParam (COMMA functionParam)*)? RPAREN RETURNS dataType AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
 dropFunction: DROP FUNCTION functionName SEMICOLON?;
@@ -254,7 +256,16 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | DOUBLE | FLOAT
         | BYTEA | BLOB
         | UUID
-        | JSON | JSONB) (LBRACKET RBRACKET)?;
+        | JSON | JSONB
+        | INET | CIDR
+        | INT4RANGE | DATERANGE
+        // A bare IDENTIFIER names a real, user-defined type (see createType's
+        // own grammar rule) - an enum created via CREATE TYPE ... AS ENUM,
+        // referenced here by its own real name (e.g. "status mood_enum") the
+        // same way any of this rule's own built-in keywords are. Listed last
+        // so a real, hardcoded type keyword above is always preferred over
+        // this generic fallback where both could otherwise match.
+        | IDENTIFIER) (LBRACKET RBRACKET)?;
 
 // Literals
 literal: STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | TRUE | FALSE | NULL;
@@ -262,6 +273,7 @@ defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | NEXTVA
 
 // Identifiers
 tableName: IDENTIFIER;
+typeName: IDENTIFIER;
 columnName: IDENTIFIER (DOT IDENTIFIER)?;
 alias: IDENTIFIER | STRING_LITERAL;
 limitValue: INTEGER_LITERAL;
@@ -321,6 +333,11 @@ ADD: A D D;
 COLUMN: C O L U M N;
 RENAME: R E N A M E;
 TYPE: T Y P E;
+ENUM: E N U M;
+INET: I N E T;
+CIDR: C I D R;
+INT4RANGE: I N T '4' R A N G E;
+DATERANGE: D A T E R A N G E;
 INSERT: I N S E R T;
 INTO: I N T O;
 VALUES: V A L U E S;

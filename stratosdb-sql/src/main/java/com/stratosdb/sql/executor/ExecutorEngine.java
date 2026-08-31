@@ -7,6 +7,7 @@ import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.page.BTreePage;
+import com.stratosdb.storage.page.RangeValue;
 import com.stratosdb.storage.page.SlottedPage;
 import com.stratosdb.storage.page.Tuple;
 import com.stratosdb.storage.wal.WALManager;
@@ -105,6 +106,17 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     /** tableName -> columnName -> its declared type text (e.g. "JSON", "VARCHAR", "INT[]") - didn't exist at all before this; needed so INSERT can tell a JSON/JSONB column apart from a plain VARCHAR one and validate/parse its incoming value accordingly. */
     private final Map<String, Map<String, String>> tableColumnTypes = new ConcurrentHashMap<>();
     private final Map<String, Sequence> sequences = new ConcurrentHashMap<>();
+    /**
+     * A real, user-defined enum type's own name mapped to its real, fixed
+     * set of allowed values, in the order they were declared (a
+     * LinkedHashMap's own insertion order preserves this, matching real
+     * Postgres's own real, ordered enum semantics, even though this
+     * engine doesn't yet support ordering-dependent operations like
+     * ENUM's own real `<`/`>` comparison - see this feature's own
+     * honestly-named limitations in PROGRESS.md). See CreateTypeStatement's
+     * own javadoc for the real, closed gap this exists for at all.
+     */
+    private final Map<String, java.util.LinkedHashSet<String>> enumTypes = new ConcurrentHashMap<>();
     /** name -> definition, for CREATE FUNCTION / DROP FUNCTION - see executeCreateFunction's own javadoc for the real, honestly-stated scope of what a "function" means in this engine. */
     private final Map<String, CreateFunctionStatement> functions = new ConcurrentHashMap<>();
     /** name -> definition, for CREATE PROCEDURE / DROP PROCEDURE - see executeCall's own javadoc for the real, honestly-stated scope of what a "procedure" means in this engine. */
@@ -242,6 +254,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             saveCatalog();
         } else if (stmt instanceof DropSequenceStatement s) {
             catalogLines.remove("SEQUENCE:" + s.name());
+            saveCatalog();
+        } else if (stmt instanceof CreateTypeStatement s) {
+            catalogLines.put("TYPE:" + s.typeName(), "TYPE|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropTypeStatement s) {
+            catalogLines.remove("TYPE:" + s.typeName());
             saveCatalog();
         } else if (stmt instanceof CreateFunctionStatement s) {
             catalogLines.put("FUNCTION:" + s.name(), "FUNCTION|" + sql);
@@ -937,6 +955,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof RecursiveCteSelectStatement s) return executeRecursiveCteSelect(s, txn);
         if (stmt instanceof CreateSequenceStatement s) return executeCreateSequence(s);
         if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
+        if (stmt instanceof CreateTypeStatement s) return executeCreateType(s);
+        if (stmt instanceof DropTypeStatement s) return executeDropType(s);
         if (stmt instanceof CreateFunctionStatement s) return executeCreateFunction(s);
         if (stmt instanceof DropFunctionStatement s) return executeDropFunction(s);
         if (stmt instanceof CreateProcedureStatement s) return executeCreateProcedure(s);
@@ -1103,6 +1123,33 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Sequence not found: " + stmt.name());
         }
         return QueryResult.success("Sequence dropped: " + stmt.name());
+    }
+
+    /**
+     * CREATE TYPE typeName AS ENUM (...) - see CreateTypeStatement's own
+     * javadoc. A real, honest, deliberate scope decision: a duplicate value
+     * in the ENUM's own list is silently deduplicated (via LinkedHashSet)
+     * rather than rejected as a real error - real Postgres itself DOES
+     * reject a real duplicate enum label outright; this engine's own
+     * choice to silently accept it here is a real, named, low-risk
+     * simplification rather than a claim of exact behavioral parity.
+     */
+    private QueryResult executeCreateType(CreateTypeStatement stmt) {
+        if (enumTypes.containsKey(stmt.typeName())) {
+            return QueryResult.error("Type already exists: " + stmt.typeName());
+        }
+        if (stmt.enumValues().isEmpty()) {
+            return QueryResult.error("CREATE TYPE ... AS ENUM requires at least one value");
+        }
+        enumTypes.put(stmt.typeName(), new java.util.LinkedHashSet<>(stmt.enumValues()));
+        return QueryResult.success("Type created: " + stmt.typeName());
+    }
+
+    private QueryResult executeDropType(DropTypeStatement stmt) {
+        if (enumTypes.remove(stmt.typeName()) == null) {
+            return QueryResult.error("Type not found: " + stmt.typeName());
+        }
+        return QueryResult.success("Type dropped: " + stmt.typeName());
     }
 
     /**
@@ -1541,6 +1588,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("A view already exists with that name: " + stmt.tableName());
         }
 
+        // Real, upfront validation: a bare IDENTIFIER is only ever a valid
+        // dataType at all because it might genuinely name a real, user-defined
+        // enum type (see CreateTypeStatement's own javadoc and dataType's own
+        // grammar rule) - but without this check, a plain TYPO in a built-in
+        // keyword (or a reference to a type that was simply never created at
+        // all) would be silently accepted here with zero validation, only
+        // surfacing as a real problem much later, and only ever for a row that
+        // actually tries to store a non-null value in that column. Real
+        // Postgres itself rejects an unrecognized type name immediately, at
+        // CREATE TABLE time - this closes the same real gap here.
+        for (ColumnDefinition col : stmt.columns()) {
+            if (!isKnownBuiltInType(col.type()) && !enumTypes.containsKey(stripArraySuffix(col.type()))) {
+                return QueryResult.error("Unrecognized type \"" + col.type() + "\" for column \"" + col.name()
+                    + "\" - not a built-in type and no CREATE TYPE ... AS ENUM has defined it");
+            }
+        }
+
         // SERIAL/BIGSERIAL sugar: each such column gets its own backing
         // sequence, auto-named "{table}_{column}_seq" (matching real
         // Postgres's own naming convention) and wired as that column's
@@ -1614,6 +1678,25 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     private boolean isSerialType(String type) {
         return type.equalsIgnoreCase("SERIAL") || type.equalsIgnoreCase("BIGSERIAL");
+    }
+
+    /** Every real, hardcoded type keyword dataType's own grammar rule recognizes - see that rule's own comment for why a bare IDENTIFIER not matching any of these is instead checked against a real, user-defined enum type name (see executeCreateTable's own validation). Length/precision suffixes like "VARCHAR(50)" or "DECIMAL(10,2)" are stripped before comparing, since only the bare keyword itself needs to be a known one. */
+    private static final java.util.Set<String> KNOWN_BUILTIN_TYPES = java.util.Set.of(
+        "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "SERIAL", "BIGSERIAL",
+        "VARCHAR", "TEXT", "CHAR", "BOOLEAN", "BOOL", "DATE", "TIME", "TIMESTAMP",
+        "DECIMAL", "DOUBLE", "FLOAT", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
+        "INET", "CIDR", "INT4RANGE", "DATERANGE"
+    );
+
+    private boolean isKnownBuiltInType(String type) {
+        String bareKeyword = stripArraySuffix(type).replaceAll("\\(.*\\)", "").trim().toUpperCase();
+        return KNOWN_BUILTIN_TYPES.contains(bareKeyword);
+    }
+
+    /** Strips a trailing "[]" (this engine's own real array-type suffix, see dataType's own grammar rule), so "mood[]" and "mood" both correctly resolve to the same, real registered enum type name. */
+    private static String stripArraySuffix(String type) {
+        String trimmed = type.trim();
+        return trimmed.endsWith("[]") ? trimmed.substring(0, trimmed.length() - 2).trim() : trimmed;
     }
 
     /**
@@ -5651,15 +5734,74 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (declaredType == null || resolvedValue == null || !(resolvedValue instanceof String)) {
             return resolvedValue;
         }
+        String rawValue = (String) resolvedValue;
         String normalizedType = declaredType.trim().toUpperCase();
         if (normalizedType.equals("JSON") || normalizedType.equals("JSONB")) {
             try {
-                return JsonParser.parse((String) resolvedValue);
+                return JsonParser.parse(rawValue);
             } catch (JsonParser.JsonParseException e) {
                 throw new IllegalArgumentException("Invalid JSON for column \"" + columnName + "\": " + e.getMessage());
             }
         }
+        if (normalizedType.equals("INET") || normalizedType.equals("CIDR")) {
+            return validateNetworkAddress(columnName, normalizedType, rawValue);
+        }
+        if (normalizedType.equals("INT4RANGE") || normalizedType.equals("DATERANGE")) {
+            try {
+                return RangeValue.parse(rawValue, normalizedType.equals("DATERANGE"));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid " + normalizedType + " for column \"" + columnName + "\": " + e.getMessage());
+            }
+        }
+        // A real, user-defined enum type (see CreateTypeStatement's own javadoc) -
+        // declaredType here is the enum's own real name (e.g. "mood"), not a
+        // built-in keyword, so this is checked last, only once nothing above
+        // already matched a real, hardcoded type name.
+        java.util.LinkedHashSet<String> allowedValues = enumTypes.get(declaredType.trim());
+        if (allowedValues != null && !allowedValues.contains(rawValue)) {
+            throw new IllegalArgumentException("Invalid value for enum type \"" + declaredType.trim() + "\" in column \""
+                + columnName + "\": \"" + rawValue + "\" (allowed: " + allowedValues + ")");
+        }
         return resolvedValue;
+    }
+
+    /**
+     * A real INET (a single host address, optionally with a real
+     * /prefix-length suffix) or CIDR (a real network address, ALWAYS with
+     * a real /prefix-length suffix - real Postgres itself requires this
+     * for CIDR, unlike INET where it's optional) value - validated with
+     * java.net.InetAddress itself, not a hand-rolled regex: passing it a
+     * literal IP address string (not a hostname) only ever checks the
+     * address's own format, never performs a real DNS lookup - documented
+     * JDK behavior this relies on directly.
+     */
+    private String validateNetworkAddress(String columnName, String typeName, String rawValue) {
+        String addressPart = rawValue;
+        Integer prefixLength = null;
+        int slashIndex = rawValue.indexOf('/');
+        if (slashIndex >= 0) {
+            addressPart = rawValue.substring(0, slashIndex);
+            try {
+                prefixLength = Integer.parseInt(rawValue.substring(slashIndex + 1));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Invalid " + typeName + " for column \"" + columnName + "\": bad prefix length in \"" + rawValue + "\"");
+            }
+        } else if (typeName.equals("CIDR")) {
+            throw new IllegalArgumentException("Invalid CIDR for column \"" + columnName + "\": \"" + rawValue + "\" is missing its required /prefix-length");
+        }
+        java.net.InetAddress address;
+        try {
+            address = java.net.InetAddress.getByName(addressPart);
+        } catch (java.net.UnknownHostException e) {
+            throw new IllegalArgumentException("Invalid " + typeName + " for column \"" + columnName + "\": \"" + addressPart + "\" is not a real IP address");
+        }
+        if (prefixLength != null) {
+            int maxPrefix = address instanceof java.net.Inet6Address ? 128 : 32;
+            if (prefixLength < 0 || prefixLength > maxPrefix) {
+                throw new IllegalArgumentException("Invalid " + typeName + " for column \"" + columnName + "\": prefix length " + prefixLength + " is out of range (0-" + maxPrefix + ")");
+            }
+        }
+        return rawValue;
     }
 
     /**

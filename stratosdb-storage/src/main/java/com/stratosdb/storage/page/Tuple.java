@@ -127,6 +127,22 @@ public class Tuple {
                 out.write(keyBytes);
                 writeValue(out, entry.getValue());
             }
+        } else if (value instanceof RangeValue range) {
+            // A real INT4RANGE/DATERANGE value (see RangeValue's own javadoc) -
+            // its own lower/upper bounds are always themselves either an
+            // Integer or a String (this engine's own established convention
+            // for a date, see RangeValue.parseBound), both already handled by
+            // this same writeValue - reused recursively here rather than
+            // duplicating their own encoding a second time. Each bound is
+            // preceded by a real presence flag, since either side may
+            // genuinely be null (an unbounded end - see RangeValue's own
+            // javadoc), which the recursive writeValue call itself already
+            // handles correctly via its own type tag -1 for a null value.
+            out.writeInt(8);
+            writeValue(out, range.lower());
+            writeValue(out, range.upper());
+            out.writeByte(range.lowerInclusive() ? 1 : 0);
+            out.writeByte(range.upperInclusive() ? 1 : 0);
         } else {
             throw new IllegalArgumentException("Unsupported type: " + value.getClass());
         }
@@ -196,6 +212,13 @@ public class Tuple {
                     map.put(key, readValue(in));
                 }
                 return map;
+            }
+            case 8: {
+                Object lower = readValue(in);
+                Object upper = readValue(in);
+                boolean lowerInclusive = in.readByte() == 1;
+                boolean upperInclusive = in.readByte() == 1;
+                return new RangeValue(lower, upper, lowerInclusive, upperInclusive);
             }
             case -1:
                 return null;

@@ -202,6 +202,15 @@ public class SqlParser {
             return new CreateSequenceStatement(name, startValue, incrementBy);
         } else if (ctx.dropSequence() != null) {
             return new DropSequenceStatement(ctx.dropSequence().sequenceName().getText());
+        } else if (ctx.createType() != null) {
+            String typeName = ctx.createType().typeName().getText();
+            List<String> enumValues = new ArrayList<>();
+            for (var literal : ctx.createType().STRING_LITERAL()) {
+                enumValues.add(unquoteStringLiteral(literal.getText()));
+            }
+            return new CreateTypeStatement(typeName, enumValues);
+        } else if (ctx.dropType() != null) {
+            return new DropTypeStatement(ctx.dropType().typeName().getText());
         } else if (ctx.createFunction() != null) {
             return buildCreateFunction(ctx.createFunction());
         } else if (ctx.dropFunction() != null) {
@@ -239,6 +248,12 @@ public class SqlParser {
      * error), but only the actual function name after the last dot is ever looked
      * up.
      */
+    /** Strips a real STRING_LITERAL token's own surrounding single quotes and un-escapes a doubled '' into a real, single ' - the standard SQL escaping rule, the same one ExecutorEngine's own unescapeStringLiteral already applies to a value at execution time; this is purely a PARSE-time convenience for a statement (like CREATE TYPE's own enum value list) whose literal values are needed directly in the AST itself, not resolved later against a row. */
+    private static String unquoteStringLiteral(String stringLiteralText) {
+        String inner = stringLiteralText.substring(1, stringLiteralText.length() - 1);
+        return inner.replace("''", "'");
+    }
+
     private static String stripSchemaQualifier(String possiblyQualifiedName) {
         int lastDot = possiblyQualifiedName.lastIndexOf('.');
         return lastDot >= 0 ? possiblyQualifiedName.substring(lastDot + 1) : possiblyQualifiedName;
