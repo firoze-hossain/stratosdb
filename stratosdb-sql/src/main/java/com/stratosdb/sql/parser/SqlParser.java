@@ -110,6 +110,22 @@ public class SqlParser {
         } else if (ctx.alterTableDropDefault() != null) {
             StratosSQLParser.AlterTableDropDefaultContext actx = ctx.alterTableDropDefault();
             return new AlterTableDropDefaultStatement(actx.tableName().getText(), actx.columnName().getText());
+        } else if (ctx.alterTableEnableRls() != null) {
+            return new AlterTableEnableRlsStatement(ctx.alterTableEnableRls().tableName().getText());
+        } else if (ctx.alterTableDisableRls() != null) {
+            return new AlterTableDisableRlsStatement(ctx.alterTableDisableRls().tableName().getText());
+        } else if (ctx.alterTableForceRls() != null) {
+            return new AlterTableForceRlsStatement(ctx.alterTableForceRls().tableName().getText());
+        } else if (ctx.createPolicy() != null) {
+            StratosSQLParser.CreatePolicyContext pctx = ctx.createPolicy();
+            String command = pctx.policyCommand() != null ? pctx.policyCommand().getText().toUpperCase() : "ALL";
+            String roleName = pctx.roleName() != null ? pctx.roleName().getText() : null;
+            WhereExpr usingExpr = buildWhereExpr(pctx.expression(0));
+            WhereExpr withCheckExpr = pctx.expression().size() > 1 ? buildWhereExpr(pctx.expression(1)) : null;
+            return new CreatePolicyStatement(pctx.policyName().getText(), pctx.tableName().getText(), command, roleName, usingExpr, withCheckExpr);
+        } else if (ctx.dropPolicy() != null) {
+            StratosSQLParser.DropPolicyContext pctx = ctx.dropPolicy();
+            return new DropPolicyStatement(pctx.policyName().getText(), pctx.tableName().getText());
         } else if (ctx.showTables() != null) {
             return new ShowTablesStatement();
         } else if (ctx.showStats() != null) {
@@ -510,6 +526,9 @@ public class SqlParser {
         }
         if (ctx instanceof StratosSQLParser.TsMatchCompareContext c) {
             return new WhereExpr.TsMatch(c.columnName().getText(), c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.EqZeroArgFunctionCompareContext c) {
+            return new WhereExpr.EqZeroArgFunction(c.columnName().getText(), c.IDENTIFIER().getText());
         }
         if (ctx instanceof StratosSQLParser.JsonExtractTextEqCompareContext c) {
             return new WhereExpr.JsonExtractTextEquals(c.columnName().getText(), c.literal(0).getText(), c.literal(1).getText());

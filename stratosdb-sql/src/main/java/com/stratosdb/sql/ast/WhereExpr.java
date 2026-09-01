@@ -28,6 +28,12 @@ public sealed interface WhereExpr {
     record ArrayContains(String column, String literalElement) implements WhereExpr {}
     /** column @@ literal - column is a real tsvector column; literalElement is a real, raw tsquery string literal (e.g. "'quick & fox'"), parsed via TextSearch.toTsQuery at evaluation time (see ExecutorEngine's own evaluateWhereExpr and tryGinOrBitmapIndexScan). */
     record TsMatch(String column, String tsqueryLiteral) implements WhereExpr {}
+    /** column = functionName() - a real, general comparison against a zero-arg function's own result (e.g. `owner = current_user()`), found missing entirely while building real row-level security: without this, a policy could only ever compare a column against a fixed literal, never against the real, dynamic identity of whoever is actually running the query - the single most common real RLS pattern. */
+    record EqZeroArgFunction(String column, String functionName) implements WhereExpr {}
+    /** A real, constant true/false predicate - used by row-level security's own real "default deny" rule (RLS enabled, but no policy applies to this command/role at all - real Postgres's own real behavior is zero rows visible/writable, not an error and not every row). A small, dedicated variant rather than faking this with a comparison against non-existent columns. */
+    record BooleanLiteral(boolean value) implements WhereExpr {}
+    /** column = functionName() - a real, general comparison against a zero-arg function's own result (e.g. `owner = current_user()`), found missing entirely while building real row-level security: without this, a policy could only ever compare a column against a fixed literal, never against the real, dynamic identity of whoever is actually running the query - the single most common real RLS pattern. */
+
 
     /** column ->> 'key' = 'value' - extracts a top-level JSON key as text and compares it for equality. Deliberately scoped to top-level keys and equality only - real Postgres's ->> also supports array-index extraction and #>>'{path,to,key}' for nested paths, real further work not attempted here. */
     record JsonExtractTextEquals(String column, String key, String value) implements WhereExpr {}

@@ -117,6 +117,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * own javadoc for the real, closed gap this exists for at all.
      */
     private final Map<String, java.util.LinkedHashSet<String>> enumTypes = new ConcurrentHashMap<>();
+
+    // --- Row-level security - this project's own previously entirely-missing
+    // gap, now real. See CreatePolicyStatement's own javadoc and
+    // applyRowLevelSecurity's own javadoc for the full feature.
+    /** tableName -> true once ALTER TABLE ... ENABLE ROW LEVEL SECURITY has run - absent (not false) means RLS was never enabled at all, the real, honest default matching every table before this feature existed. */
+    private final Set<String> rlsEnabledTables = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** tableName -> true once ALTER TABLE ... FORCE ROW LEVEL SECURITY has run - real Postgres's own real distinction: RLS alone still exempts the table's own owner (see hasPrivilege's own owner-bypass precedent); FORCE additionally binds the owner too. */
+    private final Set<String> rlsForcedTables = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** tableName -> every real policy CREATE POLICY has defined on it, in creation order (real Postgres's own multiple permissive policies are OR'd together - see applyRowLevelSecurity). */
+    private final Map<String, List<CreatePolicyStatement>> policiesByTable = new ConcurrentHashMap<>();
     /** name -> definition, for CREATE FUNCTION / DROP FUNCTION - see executeCreateFunction's own javadoc for the real, honestly-stated scope of what a "function" means in this engine. */
     private final Map<String, CreateFunctionStatement> functions = new ConcurrentHashMap<>();
     /** name -> definition, for CREATE PROCEDURE / DROP PROCEDURE - see executeCall's own javadoc for the real, honestly-stated scope of what a "procedure" means in this engine. */
@@ -260,6 +270,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             saveCatalog();
         } else if (stmt instanceof DropTypeStatement s) {
             catalogLines.remove("TYPE:" + s.typeName());
+            saveCatalog();
+        } else if (stmt instanceof AlterTableEnableRlsStatement s) {
+            catalogLines.put("RLS:" + s.tableName(), "RLS|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof AlterTableDisableRlsStatement s) {
+            catalogLines.remove("RLS:" + s.tableName());
+            catalogLines.remove("RLS_FORCE:" + s.tableName());
+            saveCatalog();
+        } else if (stmt instanceof AlterTableForceRlsStatement s) {
+            catalogLines.put("RLS_FORCE:" + s.tableName(), "RLS_FORCE|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof CreatePolicyStatement s) {
+            catalogLines.put("POLICY:" + s.tableName() + ":" + s.policyName(), "POLICY|" + sql);
+            saveCatalog();
+        } else if (stmt instanceof DropPolicyStatement s) {
+            catalogLines.remove("POLICY:" + s.tableName() + ":" + s.policyName());
             saveCatalog();
         } else if (stmt instanceof CreateFunctionStatement s) {
             catalogLines.put("FUNCTION:" + s.name(), "FUNCTION|" + sql);
@@ -957,6 +983,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
         if (stmt instanceof CreateTypeStatement s) return executeCreateType(s);
         if (stmt instanceof DropTypeStatement s) return executeDropType(s);
+        if (stmt instanceof AlterTableEnableRlsStatement s) return executeAlterTableEnableRls(s);
+        if (stmt instanceof AlterTableDisableRlsStatement s) return executeAlterTableDisableRls(s);
+        if (stmt instanceof AlterTableForceRlsStatement s) return executeAlterTableForceRls(s);
+        if (stmt instanceof CreatePolicyStatement s) return executeCreatePolicy(s);
+        if (stmt instanceof DropPolicyStatement s) return executeDropPolicy(s);
         if (stmt instanceof CreateFunctionStatement s) return executeCreateFunction(s);
         if (stmt instanceof DropFunctionStatement s) return executeDropFunction(s);
         if (stmt instanceof CreateProcedureStatement s) return executeCreateProcedure(s);
@@ -2142,6 +2173,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult finishInsert(String tableName, Transaction txn, Tuple tuple) {
+        // Real row-level security's own write-side check (see
+        // checkRowLevelSecurityWrite's own javadoc) - checked here,
+        // centrally, since every real INSERT path in this engine converges
+        // on this one method before a row is ever actually stored.
+        QueryResult rlsDenied = checkRowLevelSecurityWrite(tableName, "INSERT", tuple, txn);
+        if (rlsDenied != null) {
+            return rlsDenied;
+        }
         String beforeError = fireTriggers(tableName, "BEFORE", "INSERT", tuple, txn);
         if (beforeError != null) {
             return QueryResult.error(beforeError);
@@ -2201,6 +2240,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             Tuple projected = project(new Tuple(), stmt.columns(), stmt.functionCalls());
             return QueryResult.success(List.of(projected));
         }
+        // Real row-level security: narrows what this SELECT can see, on top
+        // of whatever WHERE clause it already had - see applyRowLevelSecurity's
+        // own javadoc for the full rule (multiple permissive policies OR'd,
+        // owner/superuser exemption, real default-deny when RLS is enabled
+        // but no policy applies at all).
+        stmt = new SelectStatement(stmt.tableName(), stmt.columns(),
+            applyRowLevelSecurity(stmt.tableName(), "SELECT", stmt.where()),
+            stmt.orderBy(), stmt.limit(), stmt.joins(), stmt.aggregates(), stmt.groupBy(),
+            stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases());
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             List<Tuple> materializedRows = session.get().materializedCteRows.get(stmt.tableName());
@@ -3597,6 +3645,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         QueryResult denied = requirePrivilege(stmt.tableName(), "UPDATE");
         if (denied != null) return denied;
+        // Real row-level security: which existing rows this UPDATE may even
+        // see/touch at all (see applyRowLevelSecurity's own javadoc) - the
+        // write-side WITH CHECK validation of the NEW, post-assignment row
+        // happens separately, further below, once that new row actually exists.
+        stmt = new UpdateStatement(stmt.tableName(), stmt.assignments(),
+            applyRowLevelSecurity(stmt.tableName(), "UPDATE", stmt.where()));
 
         int updated = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -3616,6 +3670,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
             for (Assignment assignment : stmt.assignments()) {
                 setColumnValue(tuple, assignment.column(), parseLiteral(assignment.value()));
+            }
+
+            QueryResult rlsWriteDenied = checkRowLevelSecurityWrite(stmt.tableName(), "UPDATE", tuple, txn);
+            if (rlsWriteDenied != null) {
+                return rlsWriteDenied;
             }
 
             String beforeError = fireTriggers(stmt.tableName(), "BEFORE", "UPDATE", tuple, txn);
@@ -3660,6 +3719,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         QueryResult denied = requirePrivilege(stmt.tableName(), "DELETE");
         if (denied != null) return denied;
+        // Real row-level security: which rows this DELETE may even see/remove
+        // at all (see applyRowLevelSecurity's own javadoc) - DELETE has no
+        // WITH CHECK step of its own (there's no new row for one to validate).
+        stmt = new DeleteStatement(stmt.tableName(), applyRowLevelSecurity(stmt.tableName(), "DELETE", stmt.where()));
 
         int deleted = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -4168,6 +4231,121 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return QueryResult.error("permission denied: must be owner or superuser to alter table " + tableName);
     }
 
+    /**
+     * True if the current session is entirely exempt from row-level
+     * security on tableName at all - a superuser always is (matching
+     * hasPrivilege's own superuser bypass); the table's own real owner
+     * is too, UNLESS FORCE ROW LEVEL SECURITY was set for this table
+     * (real Postgres's own real distinction - see
+     * AlterTableForceRlsStatement's own javadoc). Also exempt: the same,
+     * deliberate backward-compatibility cases hasPrivilege's own javadoc
+     * documents (no current user ever set at all, or an unknown role) -
+     * RLS enforcement, like every other privilege check in this engine,
+     * only ever begins once a real role genuinely exists.
+     */
+    private boolean isExemptFromRls(String tableName) {
+        String currentUser = session.get().currentUser;
+        if (currentUser == null) return true;
+        Role role = roles.get(currentUser);
+        if (role == null) return true;
+        if (role.superuser()) return true;
+        if (!rlsForcedTables.contains(tableName) && currentUser.equals(tableOwners.get(tableName))) return true;
+        return false;
+    }
+
+    private boolean policyAppliesToCommand(CreatePolicyStatement policy, String command) {
+        return policy.command().equals("ALL") || policy.command().equals(command);
+    }
+
+    /** A policy with no TO clause at all applies to every role (real Postgres's own implicit PUBLIC) - otherwise it applies only when the current session's own real, authenticated user matches exactly. */
+    private boolean policyAppliesToRole(CreatePolicyStatement policy, String currentUser) {
+        return policy.roleName() == null || policy.roleName().equals(currentUser);
+    }
+
+    /**
+     * The real, core row-level security rewrite: given a real WHERE clause
+     * a SELECT/UPDATE/DELETE already has (possibly null, meaning "no WHERE
+     * at all"), returns a new WHERE clause that additionally restricts the
+     * result to only the rows the current session's own applicable
+     * policies actually permit for this real command - or the original,
+     * unchanged WHERE clause when RLS isn't enabled here at all, or the
+     * current session is entirely exempt (see isExemptFromRls).
+     *
+     * Every genuinely applicable policy's own USING expression is combined
+     * with OR (real Postgres's own real "multiple permissive policies" rule
+     * - a row is visible if ANY applicable policy allows it, not only when
+     * every one does), then the whole, combined result is ANDed onto the
+     * statement's own original WHERE clause, so RLS only ever NARROWS what
+     * a query can see, never widens it.
+     *
+     * If RLS is enabled but genuinely NO policy applies to this exact
+     * command/role combination, the real, correct answer is zero rows
+     * visible at all (real Postgres's own real "default deny" behavior),
+     * not an error and not silently showing every row - expressed here as
+     * a real WhereExpr.BooleanLiteral(false).
+     */
+    private WhereExpr applyRowLevelSecurity(String tableName, String command, WhereExpr originalWhere) {
+        if (!rlsEnabledTables.contains(tableName) || isExemptFromRls(tableName)) {
+            return originalWhere;
+        }
+        String currentUser = session.get().currentUser;
+        List<CreatePolicyStatement> policies = policiesByTable.getOrDefault(tableName, List.of());
+        WhereExpr combinedPolicyExpr = null;
+        for (CreatePolicyStatement policy : policies) {
+            if (!policyAppliesToCommand(policy, command) || !policyAppliesToRole(policy, currentUser)) {
+                continue;
+            }
+            combinedPolicyExpr = combinedPolicyExpr == null ? policy.usingExpr() : new WhereExpr.Or(combinedPolicyExpr, policy.usingExpr());
+        }
+        WhereExpr rlsExpr = combinedPolicyExpr != null ? combinedPolicyExpr : new WhereExpr.BooleanLiteral(false);
+        return originalWhere == null ? rlsExpr : new WhereExpr.And(originalWhere, rlsExpr);
+    }
+
+    /**
+     * Real row-level security's own write-side check: does newTuple (the
+     * row an INSERT is about to create, or an UPDATE's own post-assignment
+     * new version) genuinely satisfy at least one applicable policy's own
+     * WITH CHECK expression? Returns a real error QueryResult if not (the
+     * write must be rejected), null when it's genuinely allowed (or RLS
+     * doesn't apply here at all - not enabled, or the session is exempt).
+     *
+     * For UPDATE specifically, real Postgres's own real rule is reused: a
+     * policy with no explicit WITH CHECK falls back to reusing its own
+     * USING expression as the check instead (the same row-visibility rule
+     * doubling as the row-writability rule, since an UPDATE that couldn't
+     * even SELECT the row it's changing has no real check to fall back on
+     * either way). For INSERT, there's no prior row for USING to mean
+     * anything about at all - a policy with no explicit WITH CHECK simply
+     * contributes nothing to a fresh INSERT's own check.
+     */
+    private QueryResult checkRowLevelSecurityWrite(String tableName, String command, Tuple newTuple, Transaction txn) {
+        if (!rlsEnabledTables.contains(tableName) || isExemptFromRls(tableName)) {
+            return null;
+        }
+        String currentUser = session.get().currentUser;
+        List<CreatePolicyStatement> policies = policiesByTable.getOrDefault(tableName, List.of());
+        WhereExpr combinedCheckExpr = null;
+        for (CreatePolicyStatement policy : policies) {
+            if (!policyAppliesToCommand(policy, command) || !policyAppliesToRole(policy, currentUser)) {
+                continue;
+            }
+            WhereExpr checkExpr = policy.withCheckExpr() != null ? policy.withCheckExpr()
+                : (command.equals("UPDATE") ? policy.usingExpr() : null);
+            if (checkExpr == null) {
+                continue;
+            }
+            combinedCheckExpr = combinedCheckExpr == null ? checkExpr : new WhereExpr.Or(combinedCheckExpr, checkExpr);
+        }
+        // Real default-deny (see applyRowLevelSecurity's own javadoc for the
+        // same real rule on the read side): RLS enabled, but genuinely no
+        // policy's own check applies to this exact write at all.
+        boolean allowed = combinedCheckExpr != null && evaluateWhereExpr(newTuple, combinedCheckExpr, txn, null);
+        if (!allowed) {
+            return QueryResult.error("new row violates row-level security policy for table \"" + tableName + "\"");
+        }
+        return null;
+    }
+
     private QueryResult executeCreateRole(CreateRoleStatement stmt) {
         if (roles.containsKey(stmt.roleName())) {
             return QueryResult.error("Role already exists: " + stmt.roleName());
@@ -4674,6 +4852,62 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return QueryResult.success("Default dropped for column: " + stmt.columnName());
     }
 
+    private QueryResult executeAlterTableEnableRls(AlterTableEnableRlsStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
+        rlsEnabledTables.add(stmt.tableName());
+        return QueryResult.success("Row level security enabled on: " + stmt.tableName());
+    }
+
+    private QueryResult executeAlterTableDisableRls(AlterTableDisableRlsStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
+        rlsEnabledTables.remove(stmt.tableName());
+        rlsForcedTables.remove(stmt.tableName());
+        return QueryResult.success("Row level security disabled on: " + stmt.tableName());
+    }
+
+    private QueryResult executeAlterTableForceRls(AlterTableForceRlsStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
+        rlsForcedTables.add(stmt.tableName());
+        return QueryResult.success("Row level security forced on: " + stmt.tableName());
+    }
+
+    private QueryResult executeCreatePolicy(CreatePolicyStatement stmt) {
+        if (!tables.containsKey(stmt.tableName())) {
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+        if (denied != null) return denied;
+        List<CreatePolicyStatement> existing = policiesByTable.computeIfAbsent(stmt.tableName(), k -> new java.util.concurrent.CopyOnWriteArrayList<>());
+        for (CreatePolicyStatement p : existing) {
+            if (p.policyName().equals(stmt.policyName())) {
+                return QueryResult.error("Policy already exists: " + stmt.policyName() + " on table " + stmt.tableName());
+            }
+        }
+        existing.add(stmt);
+        return QueryResult.success("Policy created: " + stmt.policyName());
+    }
+
+    private QueryResult executeDropPolicy(DropPolicyStatement stmt) {
+        List<CreatePolicyStatement> existing = policiesByTable.get(stmt.tableName());
+        boolean removed = existing != null && existing.removeIf(p -> p.policyName().equals(stmt.policyName()));
+        if (!removed) {
+            return QueryResult.error("Policy not found: " + stmt.policyName() + " on table " + stmt.tableName());
+        }
+        return QueryResult.success("Policy dropped: " + stmt.policyName());
+    }
+
     /**
      * A view is never materialized - just its defining query, remembered
      * under a name. See executeSelectOverView for how a SELECT against a
@@ -5125,7 +5359,6 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private static final java.util.Map<String, java.util.function.Supplier<Object>> BUILTIN_ZERO_ARG_FUNCTIONS = java.util.Map.of(
         "version", () -> "PostgreSQL 16.0 (StratosDB pg-wire compatibility layer)",
         "current_database", () -> "stratos",
-        "current_user", () -> "stratos",
         // This engine has no real schema/namespace concept at all - "public" is the
         // same, real, conventional default real Postgres itself uses, and is the
         // most honest answer a real client's own schema-scoping logic (SQLAlchemy's
@@ -5133,8 +5366,33 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         "current_schema", () -> "public"
     );
 
+    /**
+     * The real, dynamic, currently-authenticated username for THIS session
+     * (see SessionState's own javadoc) - or "stratos" as an honest,
+     * consistent default when no real user was ever set at all (every
+     * pre-existing caller using execute() directly, matching this
+     * engine's own established backward-compatibility convention
+     * elsewhere - see hasPrivilege's own javadoc for the same real
+     * pattern). Deliberately NOT in BUILTIN_ZERO_ARG_FUNCTIONS above,
+     * since that map's own suppliers are captured once, at class-init
+     * time, with no way to reach this instance's own session state - a
+     * real, genuine bug found while building row-level security:
+     * current_user() had been permanently hardcoded to always return
+     * "stratos" regardless of who was actually connected, which would
+     * make any real RLS policy using it (the single most common real
+     * RLS pattern, e.g. "owner = current_user()") completely useless,
+     * since it could never distinguish one real user from another.
+     */
+    private String currentUserFunction() {
+        String currentUser = session.get().currentUser;
+        return currentUser != null ? currentUser : "stratos";
+    }
+
     private Object invokeFunction(String functionName, List<Object> argValues) {
         String lowerName = functionName.toLowerCase(java.util.Locale.ROOT);
+        if (argValues.isEmpty() && lowerName.equals("current_user")) {
+            return currentUserFunction();
+        }
         if (argValues.isEmpty() && BUILTIN_ZERO_ARG_FUNCTIONS.containsKey(lowerName)) {
             return BUILTIN_ZERO_ARG_FUNCTIONS.get(lowerName).get();
         }
@@ -5234,6 +5492,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if (txnLowerName.equals("to_tsquery") && argValues.size() == 1) {
             return TextSearch.toTsQuery(String.valueOf(argValues.get(0)));
+        }
+        if (txnLowerName.equals("current_user") && argValues.isEmpty()) {
+            return currentUserFunction();
         }
         CreateFunctionStatement func = functions.get(functionName);
         if (func == null) {
@@ -5393,6 +5654,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private boolean evaluateWhereExpr(Tuple row, WhereExpr expr, Transaction txn, Tuple outerRow) {
+        if (expr instanceof WhereExpr.BooleanLiteral bool) {
+            return bool.value();
+        }
         if (expr instanceof WhereExpr.And and) {
             return evaluateWhereExpr(row, and.left(), txn, outerRow) && evaluateWhereExpr(row, and.right(), txn, outerRow);
         }
@@ -5442,6 +5706,19 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             com.stratosdb.storage.page.TsQuery query = TextSearch.toTsQuery(stripQuotes(tsMatch.tsqueryLiteral()));
             return query.matches(vector);
+        }
+        if (expr instanceof WhereExpr.EqZeroArgFunction eqFn) {
+            Object columnValue = resolveColumnValue(row, eqFn.column(), outerRow);
+            // current_user() is special-cased directly (a simple, non-throwing
+            // session lookup - see currentUserFunction's own javadoc) since it's
+            // the real, primary reason this expression type exists at all (see
+            // WhereExpr.EqZeroArgFunction's own javadoc); any other zero-arg
+            // function name goes through the ordinary, no-txn invokeFunction
+            // overload instead.
+            Object functionResult = eqFn.functionName().equalsIgnoreCase("current_user")
+                ? currentUserFunction()
+                : invokeFunction(eqFn.functionName(), List.of());
+            return java.util.Objects.equals(columnValue, functionResult);
         }
         if (expr instanceof WhereExpr.JsonExtractTextEquals jsonExtract) {
             Object value = resolveColumnValue(row, jsonExtract.column(), outerRow);

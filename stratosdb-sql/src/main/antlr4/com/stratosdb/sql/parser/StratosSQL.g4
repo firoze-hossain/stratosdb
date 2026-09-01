@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
 
 // --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
 // independent parse entry point using this SAME lexer (see PlpgsqlParser),
@@ -121,6 +121,15 @@ alterTableRenameTable: ALTER TABLE tableName RENAME TO tableName SEMICOLON?;
 alterTableAlterColumnType: ALTER TABLE tableName ALTER COLUMN? columnName TYPE dataType SEMICOLON?;
 alterTableSetDefault: ALTER TABLE tableName ALTER COLUMN? columnName SET DEFAULT defaultValue SEMICOLON?;
 alterTableDropDefault: ALTER TABLE tableName ALTER COLUMN? columnName DROP DEFAULT SEMICOLON?;
+alterTableEnableRls: ALTER TABLE tableName ENABLE ROW LEVEL SECURITY SEMICOLON?;
+alterTableDisableRls: ALTER TABLE tableName DISABLE ROW LEVEL SECURITY SEMICOLON?;
+alterTableForceRls: ALTER TABLE tableName FORCE ROW LEVEL SECURITY SEMICOLON?;
+
+createPolicy: CREATE POLICY policyName ON tableName (FOR policyCommand)? (TO roleName)?
+              USING LPAREN expression RPAREN (WITH CHECK LPAREN expression RPAREN)? SEMICOLON?;
+dropPolicy: DROP POLICY policyName ON tableName SEMICOLON?;
+policyCommand: SELECT | INSERT | UPDATE | DELETE | ALL;
+policyName: IDENTIFIER;
 createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
@@ -215,6 +224,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName LE columnName                                #LeColumnCompare
           | columnName NE columnName                                #NeColumnCompare
           | columnName ASSIGN literal                              #EqCompare
+          | columnName ASSIGN IDENTIFIER LPAREN RPAREN             #EqZeroArgFunctionCompare
           | columnName GT literal                                  #GtCompare
           | columnName LT literal                                  #LtCompare
           | columnName GE literal                                  #GeCompare
@@ -331,6 +341,12 @@ NOSUPERUSER: N O S U P E R U S E R;
 PRIVILEGES: P R I V I L E G E S;
 PASSWORD: P A S S W O R D;
 ALTER: A L T E R;
+SECURITY: S E C U R I T Y;
+ENABLE: E N A B L E;
+DISABLE: D I S A B L E;
+FORCE: F O R C E;
+POLICY: P O L I C Y;
+CHECK: C H E C K;
 ADD: A D D;
 COLUMN: C O L U M N;
 RENAME: R E N A M E;
