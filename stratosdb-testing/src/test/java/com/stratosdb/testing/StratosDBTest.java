@@ -3714,6 +3714,42 @@ public class StratosDBTest {
         assertEquals(expected, actual);
     }
 
+    // --- Negative number literals: this engine's own grammar previously could
+    // not represent a negative number literal anywhere at all (INSERT values,
+    // UPDATE SET, WHERE comparisons, DEFAULT values) - found while building a
+    // real pgbench-equivalent benchmarking tool, whose own standard
+    // transaction genuinely needs to set a balance column to a negative value.
+
+    @Test
+    void testNegativeIntegerLiteralInInsertAndUpdate() {
+        assertTrue(database.execute("CREATE TABLE balances (id INT, amount INT)").isSuccess());
+        assertTrue(database.execute("INSERT INTO balances VALUES (1, -500)").isSuccess());
+        assertEquals(-500, database.execute("SELECT * FROM balances WHERE id = 1").getRows().get(0).getValue("amount"));
+
+        assertTrue(database.execute("UPDATE balances SET amount = -1234 WHERE id = 1").isSuccess());
+        assertEquals(-1234, database.execute("SELECT * FROM balances WHERE id = 1").getRows().get(0).getValue("amount"));
+    }
+
+    @Test
+    void testNegativeIntegerLiteralInWhereClauseAndDefault() {
+        assertTrue(database.execute("CREATE TABLE readings (id INT, temperature INT DEFAULT -1)").isSuccess());
+        assertTrue(database.execute("INSERT INTO readings (id) VALUES (1)").isSuccess());
+        assertEquals(-1, database.execute("SELECT * FROM readings WHERE id = 1").getRows().get(0).getValue("temperature"),
+            "a real negative DEFAULT value must be genuinely usable");
+
+        database.execute("INSERT INTO readings VALUES (2, -40)");
+        var found = database.execute("SELECT * FROM readings WHERE temperature = -40");
+        assertEquals(1, found.getRows().size(), "a real negative literal must be usable in a WHERE comparison too");
+        assertEquals(2, found.getRows().get(0).getValue("id"));
+    }
+
+    @Test
+    void testNegativeFloatLiteral() {
+        assertTrue(database.execute("CREATE TABLE measurements (id INT, delta FLOAT)").isSuccess());
+        assertTrue(database.execute("INSERT INTO measurements VALUES (1, -3.14)").isSuccess());
+        assertEquals(-3.14, (Double) database.execute("SELECT * FROM measurements WHERE id = 1").getRows().get(0).getValue("delta"), 0.0001);
+    }
+
     private void deleteRecursively(java.io.File file) {
         java.io.File[] children = file.listFiles();
         if (children != null) {

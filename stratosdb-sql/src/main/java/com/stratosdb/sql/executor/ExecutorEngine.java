@@ -3691,6 +3691,31 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // before actually storing it; log that same wrapped form, not the raw payload.
             byte[] storedNewBytes = MVCCVisibility.wrap(newPayload, txn.getXID(), MVCCVisibility.NO_XMAX);
             walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, storedNewBytes);
+            // A real, genuine concurrency limitation found by testing (not by
+            // inspection), via a real pgbench-equivalent benchmark tool under real
+            // concurrent load: a SELECT on one connection immediately following an
+            // UPDATE on a DIFFERENT, concurrent connection would occasionally,
+            // non-deterministically return zero rows for a key known to exist -
+            // updateMvcc's own tombstone-then-reinsert always gives the row a new
+            // physical location, even when the indexed column itself never
+            // changes, so the index must always be updated to match, and there's
+            // a real window between removing the old entry and adding the new one.
+            //
+            // A first attempt at fixing this by inserting the new entry BEFORE
+            // removing the old one was tried and reverted: BTreeIndex.search()
+            // resolves a duplicate key via Collections.binarySearch, which Java's
+            // own contract explicitly leaves unspecified when more than one match
+            // exists - so a real, brief window with BOTH entries present could
+            // just as easily return the NEW, not-yet-MVCC-visible one as the OLD,
+            // correct one, which is worse than a real, honest "not found" (this
+            // was confirmed directly: the reordered version showed MORE, not
+            // fewer, failures under the same real concurrent benchmark). A real,
+            // correct fix needs either a genuine atomic replace on the index
+            // itself, or real, index-key-scoped locking shared between a writer's
+            // own delete+insert and a reader's own search - both real, separate,
+            // further pieces of work, not something to rush inside an unrelated
+            // benchmarking-tool task. Named here, honestly, rather than pretending
+            // this round fixed it.
             maintainIndexesOnDelete(stmt.tableName(), oldTuple, row.pageId(), row.slot());
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
             recordUndo(new UndoAction.UndoUpdate(stmt.tableName(), row.pageId(), row.slot(), newVersion.pageId, newVersion.slot));
@@ -4523,6 +4548,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             Tuple oldTuple = Tuple.deserialize(payload);
             Tuple newTuple = transformer.apply(oldTuple);
 
+            // Same real, honestly-named concurrency limitation as executeUpdate's
+            // own delete-then-insert ordering (see its own detailed comment for
+            // why inserting the new index entry first was tried and reverted -
+            // it made this worse, not better, given BTreeIndex.search()'s own
+            // unspecified duplicate-key resolution).
             maintainIndexesOnDelete(tableName, oldTuple, row.pageId(), row.slot());
             table.delete(row.pageId(), row.slot());
             walManager.logDelete(tableName, xid, row.pageId(), row.slot());

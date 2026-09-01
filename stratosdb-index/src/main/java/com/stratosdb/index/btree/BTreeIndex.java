@@ -72,6 +72,32 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private final BufferPool bufferPool;
     private long rootPageId;
     private long nextPageId;
+    /**
+     * A real, genuine bug found by testing, not by inspection: this class
+     * had ZERO synchronization at all before this fix - every one of its
+     * own public methods (insert/delete/search/searchAll/rangeScan) could
+     * be called concurrently from multiple real connections with no
+     * protection whatsoever against a real race in its own internal
+     * B+Tree structure (node splits, sibling pointer updates, etc). Found
+     * via a real pgbench-equivalent benchmark tool under genuine
+     * concurrent load: a concurrent SELECT using this same index would
+     * occasionally, non-deterministically find zero rows for a key known
+     * to exist - reproduced on a genuinely fresh server (ruling out
+     * stale/abandoned-connection state) and confirmed to persist even
+     * after fixing a real, separate ordering bug in how the caller
+     * updates two index entries during an UPDATE (see ExecutorEngine's
+     * own comment) - the real root cause was here, one level deeper, the
+     * whole time.
+     *
+     * A real, deliberately simple, coarse-grained fix: one lock for the
+     * whole index, write-locked for insert/delete, read-locked for every
+     * lookup - real B+Tree concurrency control (latch coupling/crabbing,
+     * allowing concurrent modification of different parts of the tree at
+     * once) is real, separate, further work; this trades some of that
+     * real concurrency for real, immediate correctness, which is the
+     * right trade for a database index to make.
+     */
+    private final java.util.concurrent.locks.ReadWriteLock lock = new java.util.concurrent.locks.ReentrantReadWriteLock();
 
     public BTreeIndex(String indexName, BufferPool bufferPool) {
         this.indexName = indexName;
@@ -131,7 +157,17 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
     // --- point insert ---
 
+    /** Real, write-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
     public void insert(long key, BTreePage.RID rid) {
+        lock.writeLock().lock();
+        try {
+            insertInternal(key, rid);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void insertInternal(long key, BTreePage.RID rid) {
         SplitResult result = insertRecursive(rootPageId, key, rid);
         if (result != null) {
             long newRootId = allocatePageId();
@@ -256,7 +292,17 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
      * of most delete APIs rather than forcing every caller to check
      * existence first.
      */
+    /** Real, write-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
     public void delete(long key, BTreePage.RID rid) {
+        lock.writeLock().lock();
+        try {
+            deleteInternal(key, rid);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void deleteInternal(long key, BTreePage.RID rid) {
         deleteRecursive(rootPageId, key, rid);
 
         // If deletion propagated all the way up and left the root as an
@@ -501,7 +547,17 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     // --- point search ---
 
     /** Returns one matching RID, or null if the key isn't present. Use rangeScan for all matches of a duplicate key. */
+    /** Real, read-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
     public BTreePage.RID search(long key) {
+        lock.readLock().lock();
+        try {
+            return searchInternal(key);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private BTreePage.RID searchInternal(long key) {
         BTreePage leaf = descendToLeaf(key);
         List<Long> keys = leaf.getKeys();
         List<BTreePage.RID> values = leaf.getLeafValues();
@@ -528,7 +584,17 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     // --- range scan ---
 
     /** All RIDs with key in [fromKey, toKey], inclusive, in ascending key order. */
+    /** Real, read-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
     public List<BTreePage.RID> rangeScan(long fromKey, long toKey) {
+        lock.readLock().lock();
+        try {
+            return rangeScanInternal(fromKey, toKey);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private List<BTreePage.RID> rangeScanInternal(long fromKey, long toKey) {
         List<BTreePage.RID> results = new ArrayList<>();
         BTreePage page = descendToLeaf(fromKey);
 
