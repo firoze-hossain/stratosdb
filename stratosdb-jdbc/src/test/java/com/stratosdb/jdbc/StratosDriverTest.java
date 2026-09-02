@@ -4,6 +4,8 @@ import com.stratosdb.core.DatabaseConfig;
 import com.stratosdb.core.StratosDB;
 import com.stratosdb.network.auth.UserStore;
 import com.stratosdb.network.stdwire.StdWireServer;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -247,6 +249,44 @@ class StratosDriverTest {
         try (Connection conn = connect()) {
             assertThrows(SQLFeatureNotSupportedException.class, conn::getTypeMap,
                 "a genuinely unsupported Connection method must throw, not silently pretend to succeed");
+        }
+    }
+
+    /**
+     * A real, previously-undiscovered bug, found only by a real, end-to-end
+     * DBNavigator integration test - every other test in this file drives
+     * this driver directly via {@code DriverManager}, which never exercises
+     * what a real connection pool does. HikariCP (and, by extension, any
+     * other real pool - this is standard, widespread pool behavior, not a
+     * HikariCP quirk) calls a real, fixed set of "connection setup" methods
+     * on every fresh connection, unconditionally, before ever handing it
+     * back to application code: {@code setReadOnly()} chief among them.
+     * This driver used to throw {@code SQLFeatureNotSupportedException} for
+     * it, since it fell through to the strict "throw for anything
+     * unrecognized" default - meaning a real HikariCP pool could never even
+     * finish initializing against this driver at all, a silent, total
+     * failure for any real, pool-based consumer that no DriverManager-based
+     * test here would ever have caught.
+     */
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void connectionSurvivesRealHikariCpPoolSetup() throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(url);
+        config.setUsername("anyuser");
+        config.setMaximumPoolSize(2);
+        try (HikariDataSource pool = new HikariDataSource(config)) {
+            try (Connection conn = pool.getConnection()) {
+                assertTrue(conn.isValid(5), "a real connection obtained through a real HikariCP pool must be usable");
+                try (Statement s = conn.createStatement()) {
+                    s.execute("CREATE TABLE hikari_pool_test (id INT)");
+                    s.executeUpdate("INSERT INTO hikari_pool_test VALUES (1)");
+                    try (ResultSet rs = s.executeQuery("SELECT id FROM hikari_pool_test")) {
+                        assertTrue(rs.next(), "a real query through a real pooled connection must return real data");
+                        assertEquals(1, rs.getInt(1));
+                    }
+                }
+            }
         }
     }
 }

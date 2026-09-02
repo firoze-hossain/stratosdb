@@ -27,5 +27,23 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+          Test-only: a real, permanent regression test drives this driver
+          through a real HikariCP pool (see StratosDriverTest's own
+          "connectionSurvivesRealHikariCpPoolSetup" test) - added after a
+          real, end-to-end DBNavigator integration test found that a real
+          connection pool's own standard setup calls (setReadOnly() in
+          particular) were never exercised by any test using this driver
+          directly via DriverManager, and the driver threw
+          SQLFeatureNotSupportedException for it, which would have broken
+          every real pool-based consumer of this driver silently until
+          someone actually tried one.
+        -->
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>5.1.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>
