@@ -1,37 +1,42 @@
 package com.stratosdb.jdbc;
 
-import com.stratosdb.sql.executor.QueryResult;
-
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static com.stratosdb.jdbc.JdbcSupport.notSupported;
 
 /**
- * Real behavior: executeQuery, executeUpdate (with a best-effort affected-
- * row count parsed from the server's message - "Updated N row(s)" /
- * "Deleted N row(s)" map to N, a successful INSERT maps to 1, DDL maps to
- * 0), execute (the generic form, tracking whether the result was a row set
- * or an update for the getResultSet()/getUpdateCount() follow-up calls),
- * close, isClosed, getConnection.
+ * Real behavior: executeQuery, executeUpdate, execute (the generic form,
+ * tracking whether the result was a row set or an update for the
+ * getResultSet()/getUpdateCount() follow-up calls), close, isClosed,
+ * getConnection - all now over the real, current wire protocol via
+ * {@code StratosConnection.runSimpleQuery} (see that class's own javadoc
+ * for why this is a full rewrite, not a patch, of what used to be here).
  *
- * Everything else required by java.sql.Statement (61 methods on that
- * interface) throws SQLFeatureNotSupportedException via the shared
- * fallback - same dynamic-proxy approach as StratosConnection, for the
- * same reason (61 hand-written stubs vs. one fallback case).
+ * A row-returning statement is recognized by its own real CommandComplete
+ * tag starting with "SELECT" - the real, current server tags every
+ * row-returning statement this way (a genuine SELECT, and this engine's
+ * own native SHOW TABLES/SHOW CATALOG/etc. commands alike - see
+ * StdWireServer's own executeShowTables and buildCommandTag), which is a
+ * more reliable signal than an empty column list, since a SELECT that
+ * genuinely matches zero rows also has an empty column list (RowDescription
+ * has no row to introspect column names from at all - a real, documented,
+ * pre-existing limitation of this engine's own simple query protocol, not
+ * something this driver can work around, but one it must not misinterpret
+ * as "this wasn't a query at all").
+ *
+ * Forward-only, read-only. Everything else required by java.sql.Statement
+ * throws SQLFeatureNotSupportedException via the shared fallback, same
+ * dynamic-proxy approach as StratosConnection.
  */
 class StratosStatement implements InvocationHandler {
-    private static final Pattern ROW_COUNT_PATTERN = Pattern.compile("(\\d+) row\\(s\\)");
-
     private final StratosConnection connection;
     private volatile boolean closed = false;
-    private QueryResult lastResult;
+    private StratosConnection.WireResult lastResult;
 
     private StratosStatement(StratosConnection connection) {
         this.connection = connection;
@@ -49,30 +54,30 @@ class StratosStatement implements InvocationHandler {
         switch (name) {
             case "executeQuery": {
                 checkOpen();
-                QueryResult result = runQuery((String) args[0]);
-                if (result.getRows() == null) {
+                lastResult = connection.runSimpleQuery((String) args[0]);
+                if (!isRowReturning(lastResult)) {
                     throw new SQLException("executeQuery() called with a statement that produced no result set "
-                        + "(message: " + result.getMessage() + ") - use executeUpdate() for INSERT/UPDATE/DELETE/DDL");
+                        + "(command tag: " + lastResult.commandTag() + ") - use executeUpdate() for INSERT/UPDATE/DELETE/DDL");
                 }
-                return StratosResultSet.create(result.getRows());
+                return StratosResultSet.create(lastResult.columns(), lastResult.rows());
             }
             case "executeUpdate": {
                 checkOpen();
-                QueryResult result = runQuery((String) args[0]);
-                return parseUpdateCount(result);
+                lastResult = connection.runSimpleQuery((String) args[0]);
+                return parseUpdateCount(lastResult.commandTag());
             }
             case "execute": {
                 checkOpen();
-                lastResult = runQuery((String) args[0]);
-                return lastResult.getRows() != null;
+                lastResult = connection.runSimpleQuery((String) args[0]);
+                return isRowReturning(lastResult);
             }
             case "getResultSet":
-                if (lastResult == null || lastResult.getRows() == null) {
+                if (lastResult == null || !isRowReturning(lastResult)) {
                     return null;
                 }
-                return StratosResultSet.create(lastResult.getRows());
+                return StratosResultSet.create(lastResult.columns(), lastResult.rows());
             case "getUpdateCount":
-                return lastResult == null ? -1 : parseUpdateCount(lastResult);
+                return lastResult == null ? -1 : parseUpdateCount(lastResult.commandTag());
             case "getMoreResults":
                 return false; // this driver never produces multiple result sets from one statement
             case "close":
@@ -115,27 +120,22 @@ class StratosStatement implements InvocationHandler {
         }
     }
 
-    private QueryResult runQuery(String sql) throws SQLException {
-        QueryResult result = connection.execute(sql);
-        if (!result.isSuccess()) {
-            throw new SQLException(result.getError());
-        }
-        return result;
+    static boolean isRowReturning(StratosConnection.WireResult result) {
+        return result.commandTag().startsWith("SELECT");
     }
 
-    private int parseUpdateCount(QueryResult result) {
-        String message = result.getMessage();
-        if (message == null) {
-            return 0;
+    /** Parses a real Postgres-style CommandComplete tag ("SELECT n", "INSERT 0 n", "UPDATE n", "DELETE n", "CREATE TABLE", "BEGIN", ...) into a real JDBC update count - -1 for a row-returning statement (per the JDBC contract: not an update count at all), the tag's own trailing number for INSERT/UPDATE/DELETE, 0 for anything else (DDL, transaction control). */
+    static int parseUpdateCount(String commandTag) {
+        if (commandTag.startsWith("SELECT")) {
+            return -1;
         }
-        if (message.startsWith("Inserted row at")) {
-            return 1;
+        String[] parts = commandTag.trim().split("\\s+");
+        String last = parts[parts.length - 1];
+        try {
+            return Integer.parseInt(last);
+        } catch (NumberFormatException e) {
+            return 0; // DDL (CREATE TABLE, DROP TABLE, ...) or transaction control (BEGIN, COMMIT, ROLLBACK) - no row count at all
         }
-        Matcher m = ROW_COUNT_PATTERN.matcher(message);
-        if (m.find()) {
-            return Integer.parseInt(m.group(1));
-        }
-        return 0; // DDL (CREATE TABLE, CREATE INDEX, DROP TABLE) or anything else with no row count
     }
 
     private void checkOpen() throws SQLException {

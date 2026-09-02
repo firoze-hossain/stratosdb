@@ -43,9 +43,10 @@ java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar [dataDir
 Defaults to `./stratosdb_data` and port 6582.
 
 ```bash
-# Terminal 2: the CLI (StratosShell, StratosDB's JDBC-based client for this custom
-# protocol - a separate tool from stdsql, which speaks stdwire instead; since the
-# shaded jar's default main class is stdsql, StratosShell needs -cp, not -jar)
+# Terminal 2: the CLI (StratosShell, StratosDB's JDBC-based client - takes
+# host/port/username/password positionally; connects using stratosdb-jdbc,
+# StratosDB's own real driver, which speaks the same real, current wire
+# protocol as psql/pgjdbc/psycopg2 - see section 3a below)
 java -cp stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar com.stratosdb.cli.StratosShell [host] [port] [username] [password] [--ssl]
 ```
 
@@ -91,53 +92,38 @@ EXPLAIN SELECT * FROM users JOIN orders ON users.id = orders.user_id;
 
 Then **stop the server (Ctrl+C) and restart it pointed at the same data directory**, then reconnect the CLI — the table, its rows, and the index should all still be there. That's Week 1 and Week 2's durability and transaction work, visible from the outside rather than just in a test file.
 
-### Connecting with a real PostgreSQL client instead
+### 3a. Connecting with a real PostgreSQL client instead
 
-Add `--stdwire` to also start a real PostgreSQL wire protocol server against the same database, on `port + 1` by default (or a specific port via `--stdwire=PORT`):
+No extra flag needed any more: the default port already speaks a real, current PostgreSQL-wire-protocol-v3-compatible protocol (`StdWireServer`) - this is what `StratosShell`, `stdsql`, and `stratosdb-jdbc` (StratosDB's own real JDBC driver) all speak too, so any of them can reach the same server on the same port.
 
-```bash
-java -jar stratosdb-network/target/stratosdb-network-1.0.0-SNAPSHOT.jar ./stratosdb_data 6582 --stdwire
-# custom protocol on 6582, PostgreSQL-wire-compatible protocol on 6583
-```
+A real, previously-broken default, corrected here rather than left implicit: `StratosServerMain` used to start a small, separate, custom-protocol server (`StratosServer`) on the default port, only optionally *also* starting this real, PostgreSQL-compatible one on a secondary port via `--stdwire`. That old server and protocol have been removed entirely - the default port is now always the real one. `--stdwire`/`--stdwire=PORT` are still accepted for backward compatibility with any script that already passes them, but are now harmless no-ops (a note is printed explaining why).
 
-```bash
-java -jar stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar -h localhost -p 6583 -U anyuser -d anydb
-```
-
-Any real PostgreSQL client also works here unmodified, not just this project's own `stdsql` - this was verified against real `psql` and Python's `psycopg2` independently (see `PROGRESS.md`):
+Any real PostgreSQL client works here unmodified, not just this project's own tools - this was verified against real `psql` and Python's `psycopg2` independently (see `PROGRESS.md`):
 
 ```bash
-psql -h localhost -p 6583 -U anyuser -d anydb
+psql -h localhost -p 6582 -U anyuser -d anydb
 ```
 
 Both the simple and extended query protocols work (parameterized queries via `Parse`/`Bind`/`Execute` - `psycopg2`'s own default `cur.execute("... WHERE id = %s", (1,))` API uses this automatically), and real SCRAM-SHA-256 authentication is available (see section 4 below to turn it on - trust auth, unauthenticated, remains the default). Known limits: `psql`'s `\d`/`\l`/tab-completion don't work yet (they query real Postgres system catalog tables StratosDB doesn't emulate beyond `\dt`), and SCRAM channel binding (`SCRAM-SHA-256-PLUS`) isn't implemented - plain SQL statements, parameterized queries, and password authentication all work regardless.
 
-## 4. Try authentication and TLS
+## 4. Try real SCRAM authentication
 
-Both are opt-in — the server defaults to open access over plain TCP, exactly as it always has, so nothing above requires either. To turn them on, you write a small amount of Java (there's no `CREATE USER` SQL yet, and no config-file support — credentials are configured in code at startup):
+Opt-in - the server defaults to open (trust) access over plain TCP, exactly as it always has, so nothing above requires it. To turn it on, you write a small amount of Java (there's no `CREATE USER` SQL yet, and no config-file support - credentials are configured in code at startup):
 
 ```java
 UserStore users = new UserStore();
 users.addUser("alice", "correct-horse-battery-staple"); // real PBKDF2 hashing under the hood
 
-SSLContext serverContext = TlsSupport.loadServerContext("/path/to/keystore.p12", "keystore-password".toCharArray());
-
-StratosServer server = new StratosServer(port, db, users, serverContext);
+StdWireServer server = new StdWireServer(port, db, users);
 server.start();
 ```
 
-Generate a test keystore with the JDK's own `keytool` if you don't have a real certificate handy:
+**A real, honestly-stated gap, not a broken example left in place**: `StdWireServer` - the real, current server every example above connects to - has no TLS support at all yet; every SSL negotiation attempt is unconditionally declined. Requesting `ssl=true` from `stratosdb-jdbc` (or `StratosShell --ssl`) now throws a clear, immediate error explaining this, rather than silently connecting unencrypted or hanging on a negotiation the server will never complete. Real TLS support against `StdWireServer` is real, separate, future work - there is no working TLS example to show here right now.
+
+Connect with `StratosShell` (StratosDB's JDBC-based client, using `stratosdb-jdbc` - StratosDB's own real driver):
 
 ```bash
-keytool -genkeypair -alias stratosdb -keyalg RSA -keysize 2048 -validity 365 \
-  -keystore keystore.p12 -storetype PKCS12 -storepass changeit -keypass changeit \
-  -dname "CN=localhost, OU=StratosDB, O=StratosDB, L=Test, ST=Test, C=US"
-```
-
-Then connect with `StratosShell` (StratosDB's JDBC-based client for this custom protocol - a separate tool from `stdsql`, which speaks `stdwire` instead and takes `psql`-style `-h`/`-p`/`-U`/`-d` flags; since the shaded jar's default main class is `stdsql`, `StratosShell` needs to be invoked explicitly):
-
-```bash
-java -cp stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar com.stratosdb.cli.StratosShell localhost 6582 alice correct-horse-battery-staple --ssl
+java -cp stratosdb-cli/target/stratosdb-cli-1.0.0-SNAPSHOT.jar com.stratosdb.cli.StratosShell localhost 6582 alice correct-horse-battery-staple
 ```
 
 Or via raw JDBC:
@@ -146,11 +132,8 @@ Or via raw JDBC:
 Properties props = new Properties();
 props.setProperty("user", "alice");
 props.setProperty("password", "correct-horse-battery-staple");
-props.setProperty("ssl", "true");
 Connection conn = DriverManager.getConnection("jdbc:stratos://localhost:6582/", props);
 ```
-
-**Read this before relying on TLS for anything real**: the client currently trusts *any* certificate the server presents - there is no certificate verification wired up yet. That's still real encryption (a passive eavesdropper reading the raw bytes off the wire gets nothing useful), but it does **not** protect against an active attacker who intercepts the connection and presents their own certificate - the client has no way to tell a genuine StratosDB server from an impostor. `TlsSupport`'s javadoc says this explicitly. Treat this as "encryption," not "authentication of the server," until real certificate/truststore verification is added.
 
 ## 5. Sanity-check the planner is actually choosing differently
 
@@ -176,4 +159,4 @@ Defaults to 100,000 rows and 300 queries per scenario if you don't pass argument
 - **`mvn test` fails on `BTreeIndexTest`'s big test with a timeout**: likely means the buffer pool eviction path is slower on your machine than expected. The test already sizes its pool to avoid pathological thrashing (a bug I hit and fixed while building this — see `PROGRESS.md`), but if it's still too slow, that's worth reporting with your JDK version and OS.
 - **ANTLR-related compile errors**: means the grammar (`StratosSQL.g4`) and the hand-written `SqlParser.java` have drifted out of sync again — this has happened twice already in this project's history (a missing `UPDATE` dispatch, a `VARCHAR` length requirement that broke the project's own tests). Check `SqlParser.buildStatement()` against the grammar's `sqlStatement` alternatives first.
 - **`stratosdb-cli` jar not found**: confirm `mvn clean install` (not just `package` on a single module) ran from the repo root, since `stratosdb-cli` depends on every other module having been built and installed to your local `.m2` repository first.
-- **CLI can't connect / "Could not connect to StratosDB"**: the CLI no longer starts its own embedded engine - make sure `StratosServerMain` is actually running first, pointed at the host/port the CLI is trying to reach.
+- **CLI can't connect / "Could not connect to StratosDB"**: the CLI no longer starts its own embedded engine - make sure `StratosServerMain` is actually running first, pointed at the host/port the CLI is trying to reach (it starts the real, PostgreSQL-wire-compatible server by default now - see section 3a above).

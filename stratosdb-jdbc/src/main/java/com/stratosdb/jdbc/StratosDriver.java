@@ -9,10 +9,13 @@ import java.util.Properties;
 import java.util.logging.Logger;
 
 /**
- * JDBC driver for StratosDB. URL format: jdbc:stratos://host:port/
- * (a trailing path segment is accepted and ignored - StratosDB has no
- * multiple-databases-per-server concept yet, just one data directory per
- * server process).
+ * JDBC driver for StratosDB. URL format: jdbc:stratos://host:port/database
+ * (the database segment is sent as the real StartupMessage's own
+ * "database" parameter - see StratosConnection's own javadoc for the
+ * real, current wire protocol this now speaks. StratosDB itself still
+ * has no real multiple-databases-per-server concept, so any value here
+ * is accepted without being meaningfully validated server-side - defaults
+ * to "stratos" if the path segment is omitted).
  *
  * Registers itself with DriverManager on class load, the standard JDBC
  * pattern: {@code Class.forName("com.stratosdb.jdbc.StratosDriver")} (or
@@ -37,8 +40,13 @@ public class StratosDriver implements Driver {
             return null; // per Driver contract: null (not an exception) for a URL this driver doesn't handle
         }
         String hostPort = url.substring(URL_PREFIX.length());
+        String database = "stratos";
         int slash = hostPort.indexOf('/');
         if (slash >= 0) {
+            String pathSegment = hostPort.substring(slash + 1);
+            if (!pathSegment.isEmpty()) {
+                database = pathSegment;
+            }
             hostPort = hostPort.substring(0, slash);
         }
         int colon = hostPort.indexOf(':');
@@ -59,10 +67,9 @@ public class StratosDriver implements Driver {
         String password = info != null ? info.getProperty("password") : null;
 
         // Non-standard but common convention for "extra" driver options: ssl=true
-        // enables TLS. There is no client-side certificate verification yet (see
-        // TlsSupport's javadoc) - this encrypts the connection, it does not
-        // authenticate the server, so it does not defend against an active
-        // man-in-the-middle. Stated here rather than left to be discovered.
+        // enables TLS. See StratosConnection's own javadoc for why this currently
+        // always throws a clear, honest error - the real, current server has no
+        // TLS support at all yet.
         boolean ssl = info != null && "true".equalsIgnoreCase(info.getProperty("ssl"));
         SSLContext sslContext = null;
         if (ssl) {
@@ -73,7 +80,7 @@ public class StratosDriver implements Driver {
             }
         }
 
-        return StratosConnection.connect(host, port, username, password, sslContext);
+        return StratosConnection.connect(host, port, username, password, database, sslContext);
     }
 
     @Override
