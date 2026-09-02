@@ -51,10 +51,17 @@ import static com.stratosdb.jdbc.JdbcSupport.notSupported;
  * createStatement/prepareStatement, real getMetaData() (see
  * StratosDatabaseMetaData - built from this engine's own real, native
  * introspection commands, since StratosDB has no pg_catalog/
- * information_schema emulation to delegate to), and real multi-statement
+ * information_schema emulation to delegate to), real multi-statement
  * transactions (setAutoCommit(false) sends BEGIN; commit()/rollback()
  * send COMMIT/ROLLBACK, each immediately followed by a fresh BEGIN while
- * still in manual-commit mode - standard JDBC semantics).
+ * still in manual-commit mode - standard JDBC semantics), and the
+ * standard "pool setup" surface real connection pools call
+ * unconditionally on every fresh connection (setReadOnly/isReadOnly,
+ * network timeout, transaction isolation, holdability) - found to be a
+ * real, hard blocker the hard way: a real, end-to-end integration test
+ * connecting through a real HikariCP pool (not this driver's own
+ * DriverManager-based tests, which never exercise this at all) failed
+ * outright on setReadOnly() before this was added.
  *
  * A real, honestly-handled gap: the real, current server
  * ({@code StdWireServer}) has no TLS support at all yet - every SSL
@@ -78,6 +85,7 @@ class StratosConnection implements InvocationHandler {
     private final DataOutputStream out;
     private volatile boolean closed = false;
     private volatile boolean autoCommit = true;
+    private volatile boolean readOnly = false;
     private Connection proxy;
     private DatabaseMetaData metaData;
 
@@ -399,6 +407,58 @@ class StratosConnection implements InvocationHandler {
             case "getCatalog":
             case "getSchema":
                 return null;
+            // Real, explicit support for the standard "pool setup" surface real
+            // connection pools (HikariCP among them) call unconditionally on
+            // every fresh connection - found the hard way: a real, end-to-end
+            // integration test connecting through a real HikariDataSource (not
+            // this driver's own DriverManager-based tests, which never exercise
+            // this at all) failed outright, since setReadOnly() previously fell
+            // through to the strict "throw for anything unrecognized" default
+            // below - correct for most of Connection's own large surface
+            // (createBlob/setSavepoint/etc., where silently faking behavior
+            // would be genuinely misleading), but wrong for this one, real,
+            // well-known, safe-to-support class of method. This is a real,
+            // deliberate exception to that general policy, not a relaxation of
+            // it - see this class's own javadoc.
+            case "setReadOnly":
+                // A real, honest no-op: this engine has no distinct read-only
+                // transaction mode to actually switch into - the flag is
+                // tracked and returned faithfully by isReadOnly() below, matching
+                // the JDBC spec's own framing of this as a hint a driver MAY act
+                // on, not a guarantee it must enforce.
+                readOnly = (Boolean) args[0];
+                return null;
+            case "isReadOnly":
+                return readOnly;
+            case "getNetworkTimeout":
+                return 0; // 0 = no timeout configured, the real JDBC convention - this driver has no configurable socket-level timeout yet
+            case "setNetworkTimeout":
+                return null; // accepted, honestly unenforced - see getNetworkTimeout's own comment
+            case "getTransactionIsolation":
+                // The real, honest, only value this engine's own MVCC ever
+                // provides - see ExecutorEngine.executeShowTransactionIsolationLevel,
+                // which reports the same, real, fixed "read committed" regardless
+                // of what a client asks for.
+                return java.sql.Connection.TRANSACTION_READ_COMMITTED;
+            case "setTransactionIsolation": {
+                int requested = (Integer) args[0];
+                if (requested != java.sql.Connection.TRANSACTION_READ_COMMITTED) {
+                    throw new SQLException("StratosDB's own real MVCC engine only ever provides "
+                        + "READ COMMITTED isolation - a stronger level (REPEATABLE READ/SERIALIZABLE) "
+                        + "cannot be honestly promised, so this is refused rather than silently granting "
+                        + "weaker guarantees than requested.");
+                }
+                return null; // already what this engine always does - a real, honest no-op
+            }
+            case "getHoldability":
+                return java.sql.ResultSet.CLOSE_CURSORS_AT_COMMIT; // this driver has no cursor-holdability concept beyond the JDBC default
+            case "setHoldability": {
+                int requested = (Integer) args[0];
+                if (requested != java.sql.ResultSet.CLOSE_CURSORS_AT_COMMIT) {
+                    throw notSupported("Connection", "setHoldability(HOLD_CURSORS_OVER_COMMIT)");
+                }
+                return null;
+            }
             case "getWarnings":
                 return null;
             case "clearWarnings":
