@@ -2706,9 +2706,40 @@ public class StratosDBTest {
         java.io.File bridgeSourceC = findFileUpward("native/stratosbridge.c");
         assertNotNull(bridgeSourceC, "Could not locate native/stratosbridge.c by walking up from the working directory");
 
+        // Real, previously-undiscovered bugs, found only by a real `mvn test`
+        // run on macOS (this project's own Linux-only sandbox could never
+        // have caught either): the JDK's own real JNI headers are split into
+        // a platform-independent jni.h and a platform-SPECIFIC jni_md.h, in a
+        // subdirectory named after the platform - "linux" on Linux, but
+        // "darwin" on macOS and "win32" on Windows, never "linux" on either.
+        // native/build.sh (this project's own real, documented build script
+        // for actual users) already gets this right with a real
+        // directory-existence check and fallback; this test helper never
+        // reused that same logic and simply hardcoded the Linux-only path
+        // instead, since it had only ever been run on Linux until now.
+        String jniMdDir = javaHome + "/include/linux";
+        if (!new java.io.File(jniMdDir).isDirectory()) {
+            jniMdDir = javaHome + "/include/darwin"; // macOS
+        }
+        if (!new java.io.File(jniMdDir).isDirectory()) {
+            jniMdDir = javaHome + "/include/win32"; // Windows
+        }
+
+        // A second, related real bug the first one was masking: the compiled
+        // bridge library's own output filename was hardcoded as
+        // "libstratosbridge.so" - correct on Linux, but the real, production
+        // NativeExtensionBridge.findBridgeLibrary() (stratosdb-sql module)
+        // looks it up via System.mapLibraryName("stratosbridge"), the real,
+        // standard JDK API that already correctly returns
+        // "libstratosbridge.dylib" on macOS and "stratosbridge.dll" on
+        // Windows - this test needs to build the exact file that real,
+        // production lookup will actually go looking for, not a
+        // Linux-specific guess at its name.
+        String bridgeLibName = System.mapLibraryName("stratosbridge");
+
         runAndCheck(new String[]{"gcc", "-shared", "-fPIC",
-            "-I" + javaHome + "/include", "-I" + javaHome + "/include/linux", "-I" + nativeDir.getPath(),
-            bridgeSourceC.getPath(), "-o", new java.io.File(nativeDir, "libstratosbridge.so").getPath(), "-ldl"});
+            "-I" + javaHome + "/include", "-I" + jniMdDir, "-I" + nativeDir.getPath(),
+            bridgeSourceC.getPath(), "-o", new java.io.File(nativeDir, bridgeLibName).getPath(), "-ldl"});
 
         java.io.File sampleExtC = new java.io.File(workDir, "sample_ext.c");
         java.nio.file.Files.writeString(sampleExtC.toPath(),
