@@ -62,6 +62,11 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <!-- See stratosdb-network's own pom.xml for the full account of why this
+                                 attaches the shaded jar separately rather than replacing this module's
+                                 own primary, library-usable jar. -->
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>standalone</shadedClassifierName>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.stratosdb.cli.StdSql</mainClass>

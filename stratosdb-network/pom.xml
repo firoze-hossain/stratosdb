@@ -52,6 +52,47 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <!--
+                              A real, previously-undiscovered problem, found
+                              only by publishing this module through a real
+                              multi-module build pipeline (JitPack) and
+                              consuming it as a real library dependency: by
+                              default, maven-shade-plugin REPLACES this
+                              module's own primary jar with a shaded/uber jar
+                              that bundles every dependency's own classes
+                              directly inside it, and correspondingly strips
+                              those dependencies from the published POM
+                              (since the shaded jar no longer needs them
+                              resolved separately). That's the right shape
+                              for a standalone, directly-executable
+                              "java -jar" artifact (this module's own real
+                              StratosServerMain), but it is NOT a valid shape
+                              for a library dependency: any other module or
+                              project (like stratosdb-jdbc, or a real,
+                              external consumer such as DBNavigator) that
+                              needs this module's own real classes ends up
+                              with physically duplicated copies of
+                              stratosdb-core/stratosdb-common/etc. wherever
+                              those are ALSO present as their own, separate
+                              dependencies - a genuine, physical split
+                              package, not merely a JPMS module-boundary
+                              ambiguity, and a real, direct cause of
+                              confusing, shifting "module X and Y export the
+                              same package" errors for any consumer.
+                              shadedArtifactAttached + shadedClassifierName
+                              is maven-shade-plugin's own real, standard,
+                              documented mechanism for exactly this
+                              situation: the shaded, standalone-executable
+                              jar becomes a SEPARATE artifact (this module's
+                              own coordinates plus the "standalone"
+                              classifier), while the module's own PRIMARY
+                              jar - the one any normal <dependency> reference
+                              resolves - remains a real, thin jar with a
+                              real, accurate POM listing its own actual,
+                              real dependencies.
+                            -->
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>standalone</shadedClassifierName>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.stratosdb.network.server.StratosServerMain</mainClass>
