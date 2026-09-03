@@ -181,7 +181,7 @@ savepointName: IDENTIFIER;
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN returningClause? SEMICOLON?;
 returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
-select: SELECT selectList (FROM tableName (AS? IDENTIFIER)? joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? SEMICOLON?;
+select: SELECT selectList (FROM tableName (AS? IDENTIFIER)? joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? SEMICOLON?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: IDENTIFIER;
 joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
@@ -289,6 +289,7 @@ typeName: IDENTIFIER;
 columnName: IDENTIFIER (DOT IDENTIFIER)?;
 alias: IDENTIFIER | STRING_LITERAL;
 limitValue: INTEGER_LITERAL;
+offsetValue: INTEGER_LITERAL;
 
 // Lexer rules
 // TRUE/FALSE MUST be declared before IDENTIFIER (see IDENTIFIER's own
@@ -372,6 +373,7 @@ BY: B Y;
 GROUP: G R O U P;
 HAVING: H A V I N G;
 LIMIT: L I M I T;
+OFFSET: O F F S E T;
 ASC: A S C;
 DESC: D E S C;
 AND: A N D;

@@ -2247,7 +2247,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         // but no policy applies at all).
         stmt = new SelectStatement(stmt.tableName(), stmt.columns(),
             applyRowLevelSecurity(stmt.tableName(), "SELECT", stmt.where()),
-            stmt.orderBy(), stmt.limit(), stmt.joins(), stmt.aggregates(), stmt.groupBy(),
+            stmt.orderBy(), stmt.limit(), stmt.offset(), stmt.joins(), stmt.aggregates(), stmt.groupBy(),
             stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases());
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
@@ -2423,18 +2423,41 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return finishSimpleSelect(stmt, tuples);
     }
 
-    private QueryResult finishSimpleSelect(SelectStatement stmt, List<Tuple> tuples) {
-        if (stmt.limit() != null) {
+    /**
+     * Applies a real SELECT's OFFSET and LIMIT together, matching standard
+     * SQL semantics: OFFSET skips that many rows from the front first, THEN
+     * LIMIT keeps at most that many of whatever remains - not the other way
+     * around, and not independently. Both are optional and may appear alone,
+     * together, or neither. An invalid (non-numeric) value for either is
+     * ignored rather than failing the query, matching this engine's own
+     * existing, established tolerance for an invalid LIMIT.
+     */
+    private static <T> List<T> applyLimitOffset(List<T> rows, String limit, String offset) {
+        if (offset != null) {
             try {
-                int limit = Integer.parseInt(stmt.limit());
-                if (tuples.size() > limit) {
-                    tuples = tuples.subList(0, limit);
+                int skip = Integer.parseInt(offset);
+                if (skip > 0) {
+                    rows = skip >= rows.size() ? List.of() : rows.subList(skip, rows.size());
+                }
+            } catch (NumberFormatException e) {
+                // Ignore invalid offset
+            }
+        }
+        if (limit != null) {
+            try {
+                int lim = Integer.parseInt(limit);
+                if (rows.size() > lim) {
+                    rows = rows.subList(0, lim);
                 }
             } catch (NumberFormatException e) {
                 // Ignore invalid limit
             }
         }
+        return rows;
+    }
 
+    private QueryResult finishSimpleSelect(SelectStatement stmt, List<Tuple> tuples) {
+        tuples = applyLimitOffset(tuples, stmt.limit(), stmt.offset());
         return QueryResult.success(tuples);
     }
 
@@ -2754,16 +2777,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
 
-        if (outer.limit() != null) {
-            try {
-                int limit = Integer.parseInt(outer.limit());
-                if (filtered.size() > limit) {
-                    filtered = filtered.subList(0, limit);
-                }
-            } catch (NumberFormatException e) {
-                // Ignore invalid limit
-            }
-        }
+        filtered = applyLimitOffset(filtered, outer.limit(), outer.offset());
 
         return QueryResult.success(filtered);
     }
@@ -2825,16 +2839,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             result.add(projected);
         }
 
-        if (stmt.limit() != null) {
-            try {
-                int limit = Integer.parseInt(stmt.limit());
-                if (result.size() > limit) {
-                    result = result.subList(0, limit);
-                }
-            } catch (NumberFormatException e) {
-                // Ignore invalid limit, matching this engine's existing plain-select behavior.
-            }
-        }
+        result = applyLimitOffset(result, stmt.limit(), stmt.offset());
 
         return QueryResult.success(result);
     }
@@ -2957,16 +2962,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             resultRows.add(outputRow);
         }
 
-        if (stmt.limit() != null) {
-            try {
-                int limit = Integer.parseInt(stmt.limit());
-                if (resultRows.size() > limit) {
-                    resultRows = resultRows.subList(0, limit);
-                }
-            } catch (NumberFormatException e) {
-                // Ignore invalid limit
-            }
-        }
+        resultRows = applyLimitOffset(resultRows, stmt.limit(), stmt.offset());
 
         return QueryResult.success(resultRows);
     }
@@ -3096,16 +3092,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             tuples.add(project(row, stmt.columns()));
         }
 
-        if (stmt.limit() != null) {
-            try {
-                int limit = Integer.parseInt(stmt.limit());
-                if (tuples.size() > limit) {
-                    tuples = tuples.subList(0, limit);
-                }
-            } catch (NumberFormatException e) {
-                // Ignore invalid limit
-            }
-        }
+        tuples = applyLimitOffset(tuples, stmt.limit(), stmt.offset());
 
         return QueryResult.success(tuples);
     }

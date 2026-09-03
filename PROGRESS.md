@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Tests passing | **374 / 374** |
+| Tests passing | **375 / 375** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 

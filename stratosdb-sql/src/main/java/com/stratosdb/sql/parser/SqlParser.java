@@ -636,8 +636,9 @@ public class SqlParser {
         String havingClause = ctx.havingClause() != null ? ctx.havingClause().getText() : null;
         WhereExpr where = buildWhereExpr(ctx.expression());
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
+        String offset = ctx.offsetValue() != null ? ctx.offsetValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, where, null, limit, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases);
+        return new SelectStatement(tableName, columns, where, null, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases);
     }
 
     private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {

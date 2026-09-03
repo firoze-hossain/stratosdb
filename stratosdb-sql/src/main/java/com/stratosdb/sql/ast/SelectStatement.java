@@ -17,7 +17,7 @@ import java.util.List;
  * result set BACK by that exact alias name, not the original column.
  */
 public record SelectStatement(String tableName, List<String> columns, WhereExpr where,
-                              String orderBy, String limit, List<JoinClause> joins,
+                              String orderBy, String limit, String offset, List<JoinClause> joins,
                               List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
                               List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                               List<String> columnAliases) implements Statement {}
