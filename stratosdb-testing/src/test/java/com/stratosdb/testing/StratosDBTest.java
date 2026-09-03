@@ -3985,4 +3985,39 @@ public class StratosDBTest {
         assertEquals("Hash Join: Seq Scan on users -> Seq Scan on orders ON users.id=orders.user_id",
             result.getMessage());
     }
+
+    /**
+     * Real OFFSET support - found missing entirely via a real, live
+     * DBNavigator GUI session: its own "open table data" feature sends
+     * {@code SELECT * FROM t LIMIT 500 OFFSET 0} as its very first query for
+     * ANY table, on ANY engine, as standard pagination - a real, reasonable
+     * query no client should need to special-case around, and one this
+     * engine's own grammar simply had no OFFSET clause to accept at all
+     * until now.
+     */
+    @Test
+    void testOffsetSkipsRowsBeforeLimitTakesTheRest() {
+        database.execute("CREATE TABLE items (id INT)");
+        for (int i = 1; i <= 10; i++) {
+            database.execute("INSERT INTO items VALUES (" + i + ")");
+        }
+
+        QueryResult exact = database.execute("SELECT * FROM items LIMIT 500 OFFSET 0");
+        assertTrue(exact.isSuccess());
+        assertEquals(10, exact.getRows().size());
+
+        QueryResult page = database.execute("SELECT id FROM items ORDER BY id LIMIT 3 OFFSET 2");
+        assertEquals(3, page.getRows().size());
+        assertEquals(3, page.getRows().get(0).getValue("id"));
+        assertEquals(4, page.getRows().get(1).getValue("id"));
+        assertEquals(5, page.getRows().get(2).getValue("id"));
+
+        QueryResult offsetOnly = database.execute("SELECT id FROM items ORDER BY id OFFSET 7");
+        assertEquals(3, offsetOnly.getRows().size());
+        assertEquals(8, offsetOnly.getRows().get(0).getValue("id"));
+
+        QueryResult beyondRange = database.execute("SELECT id FROM items OFFSET 100");
+        assertTrue(beyondRange.isSuccess());
+        assertEquals(0, beyondRange.getRows().size());
+    }
 }
