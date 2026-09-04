@@ -99,6 +99,28 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         session.get().currentUser = username;
     }
 
+    /** Non-null only when this engine's own database is part of a real, multi-database StratosCluster - see DatabaseClusterHost's own javadoc. Null (the default) for a plain, standalone, non-clustered StratosDB instance. */
+    private DatabaseClusterHost clusterHost;
+    /** This engine's own database's own name within its cluster - only meaningful when clusterHost is non-null. A single, fixed, per-instance property, not per-session: every session connected to this particular ExecutorEngine is, by construction, connected to this same one database. */
+    private String currentDatabaseName;
+
+    /**
+     * Called once, by {@code StratosCluster}, immediately after
+     * constructing this engine's own owning {@code StratosDB} instance -
+     * see {@link DatabaseClusterHost}'s own javadoc for the full account
+     * of why {@code CREATE DATABASE}/{@code DROP DATABASE}/
+     * {@code SHOW DATABASES} need this at all. Never called at all by any
+     * caller constructing a plain, standalone {@code StratosDB} directly
+     * (every existing test and internal tool) - the deliberate, real
+     * backward-compatibility mechanism: those three statements then
+     * honestly refuse with a clear error, rather than silently doing
+     * nothing or throwing a confusing NullPointerException.
+     */
+    public void setClusterHost(DatabaseClusterHost clusterHost, String currentDatabaseName) {
+        this.clusterHost = clusterHost;
+        this.currentDatabaseName = currentDatabaseName;
+    }
+
     // Store column names for each table
     private final Map<String, List<String>> tableColumns;
     /** tableName -> columnName -> its raw default expression text (a literal, or once SERIAL/sequences exist, a "nextval('seqname')" marker) - null/absent means no default, so an omitted column gets SQL NULL. */
@@ -947,6 +969,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn);
         if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
         if (stmt instanceof DropTableStatement s) return executeDropTable(s);
+        if (stmt instanceof CreateDatabaseStatement s) return executeCreateDatabase(s);
+        if (stmt instanceof DropDatabaseStatement s) return executeDropDatabase(s);
+        if (stmt instanceof ShowDatabasesStatement) return executeShowDatabases();
+
         if (stmt instanceof CopyStatement s) return executeCopy(s, txn);
         if (stmt instanceof CreateRoleStatement s) return executeCreateRole(s);
         if (stmt instanceof DropRoleStatement s) return executeDropRole(s);
@@ -3786,6 +3812,47 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         tablePrimaryKeys.remove(stmt.tableName());
         tableStatsRegistry.remove(stmt.tableName());
         return QueryResult.success("Table dropped: " + stmt.tableName());
+    }
+
+    /** See DatabaseClusterHost's own javadoc for why this honestly refuses on a plain, non-clustered StratosDB instance rather than silently doing nothing. */
+    private QueryResult executeCreateDatabase(CreateDatabaseStatement stmt) {
+        if (clusterHost == null) {
+            return QueryResult.error("CREATE DATABASE requires a real, multi-database StratosDB cluster - "
+                + "this server was started as a plain, single-database instance, not a cluster");
+        }
+        try {
+            clusterHost.createDatabase(stmt.databaseName());
+            return QueryResult.success("Database created: " + stmt.databaseName());
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            return QueryResult.error(e.getMessage());
+        }
+    }
+
+    /** See DatabaseClusterHost's own javadoc for the real safety rule (cannot drop the currently-open database) and for why this honestly refuses on a plain, non-clustered instance. */
+    private QueryResult executeDropDatabase(DropDatabaseStatement stmt) {
+        if (clusterHost == null) {
+            return QueryResult.error("DROP DATABASE requires a real, multi-database StratosDB cluster - "
+                + "this server was started as a plain, single-database instance, not a cluster");
+        }
+        try {
+            clusterHost.dropDatabase(stmt.databaseName(), currentDatabaseName);
+            return QueryResult.success("Database dropped: " + stmt.databaseName());
+        } catch (IllegalStateException e) {
+            return QueryResult.error(e.getMessage());
+        }
+    }
+
+    /** A real, honest empty result (not an error) on a plain, non-clustered instance - matching this engine's own established convention elsewhere (e.g. DBNavigator's own MetadataService.listDatabaseNames()) of reporting "no other databases" for an engine/instance with no real multi-database concept, rather than treating it as a failure. */
+    private QueryResult executeShowDatabases() {
+        List<Tuple> rows = new ArrayList<>();
+        if (clusterHost != null) {
+            for (String name : clusterHost.listDatabaseNames()) {
+                Tuple row = new Tuple();
+                row.addValue("name", name);
+                rows.add(row);
+            }
+        }
+        return QueryResult.success(rows);
     }
 
     /**

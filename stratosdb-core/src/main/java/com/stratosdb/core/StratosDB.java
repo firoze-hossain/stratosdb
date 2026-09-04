@@ -71,6 +71,12 @@ public class StratosDB {
         executor.setRoleCredentialSink(sink);
     }
 
+    /** Called once, by {@code StratosCluster}, immediately after constructing this instance - see {@code DatabaseClusterHost}'s own javadoc for the full account of why {@code CREATE DATABASE}/{@code DROP DATABASE}/{@code SHOW DATABASES} need this at all. Never called at all for a plain, standalone instance constructed directly (every existing test and internal tool) - those three statements then honestly refuse instead. */
+    public void setCluster(com.stratosdb.sql.executor.DatabaseClusterHost clusterHost, String currentDatabaseName) {
+        executor.setClusterHost(clusterHost, currentDatabaseName);
+    }
+
+
     /**
      * Call when a connection/session ends (not between individual
      * statements) - see ExecutorEngine.closeSession's javadoc for why this
