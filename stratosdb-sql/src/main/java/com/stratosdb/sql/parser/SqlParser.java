@@ -163,6 +163,12 @@ public class SqlParser {
             return new CheckpointStatement();
         } else if (ctx.promoteStatement() != null) {
             return new PromoteStatement();
+        } else if (ctx.createDatabase() != null) {
+            return new CreateDatabaseStatement(ctx.createDatabase().databaseName().getText());
+        } else if (ctx.dropDatabase() != null) {
+            return new DropDatabaseStatement(ctx.dropDatabase().databaseName().getText());
+        } else if (ctx.showDatabases() != null) {
+            return new ShowDatabasesStatement();
         } else if (ctx.beginTxn() != null) {
             return new BeginStatement();
         } else if (ctx.commitTxn() != null) {

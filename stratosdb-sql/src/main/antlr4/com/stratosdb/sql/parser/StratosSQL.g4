@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
 
 // --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
 // independent parse entry point using this SAME lexer (see PlpgsqlParser),
@@ -103,6 +103,10 @@ plpgsqlExpr: plpgsqlExpr op=(STAR | DIVIDE) plpgsqlExpr                    #Plpg
 createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* (COMMA PRIMARY KEY LPAREN columnName (COMMA columnName)* RPAREN)? RPAREN SEMICOLON?;
 createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
+createDatabase: CREATE DATABASE databaseName SEMICOLON?;
+dropDatabase: DROP DATABASE databaseName SEMICOLON?;
+showDatabases: SHOW DATABASES SEMICOLON?;
+databaseName: IDENTIFIER;
 copyStatement: COPY tableName (LPAREN columnName (COMMA columnName)* RPAREN)? (FROM | TO) copyTarget (WITH? LPAREN copyOption (COMMA copyOption)* RPAREN)? SEMICOLON?;
 copyTarget: STRING_LITERAL | STDIN | STDOUT;
 copyOption: FORMAT (TEXT | CSV) | DELIMITER STRING_LITERAL | HEADER (TRUE | FALSE)? | NULL STRING_LITERAL;
@@ -374,6 +378,8 @@ GROUP: G R O U P;
 HAVING: H A V I N G;
 LIMIT: L I M I T;
 OFFSET: O F F S E T;
+DATABASE: D A T A B A S E;
+DATABASES: D A T A B A S E S;
 ASC: A S C;
 DESC: D E S C;
 AND: A N D;

@@ -41,7 +41,12 @@ public class StdWireServer {
     private static final Logger LOG = LoggerFactory.getLogger(StdWireServer.class);
 
     private final int port;
-    private final StratosDB db;
+    /** Non-null only in single-database mode (the original, pre-cluster constructors) - the one, fixed StratosDB instance every connection is served by, regardless of what "database" it asked for in its own startup message (exactly this server's own real, original behavior, kept unchanged for every existing caller). Null in real, multi-database cluster mode - see {@link #cluster}. */
+    private final StratosDB fixedDb;
+    /** Non-null only in real, multi-database cluster mode (the new constructors) - see {@link com.stratosdb.core.StratosCluster}'s own javadoc. Null in single-database mode. */
+    private final com.stratosdb.core.StratosCluster cluster;
+    /** This connection's own thread's own currently-resolved database, in cluster mode - set once in performStartup, read by every other per-connection method via {@link #db()} for the lifetime of this connection. Irrelevant, never touched, in single-database mode. */
+    private final ThreadLocal<StratosDB> currentDb = new ThreadLocal<>();
     private final UserStore userStore; // null = trust auth, matching StratosServer's own established convention for this project
     /** Stateless - safe to keep one, reused only for isEffectivelyEmpty's own real lexer check below (real SQL parsing itself still goes through StratosDB.execute's own internal parser, not this instance). */
     private final SqlParser sqlParser = new SqlParser();
@@ -51,6 +56,11 @@ public class StdWireServer {
     private final AtomicInteger nextPid = new AtomicInteger(1000);
     /** Non-null only when this server's own StratosDB instance is currently following a primary as a replica - see setReplicationClient's own javadoc and the new PROMOTE command below. */
     private volatile com.stratosdb.network.replication.ReplicationClient replicationClient;
+
+    /** This connection's own thread's own currently-relevant database - the one, fixed instance in single-database mode, or whatever this thread most recently resolved via performStartup in cluster mode (correctly still the PREVIOUS connection's own database, or null, for a freshly-pooled thread that hasn't run performStartup yet this time around - callers that run before performStartup, like the defensive pre-startup closeSession() below, must handle a null result themselves). */
+    private StratosDB db() {
+        return cluster != null ? currentDb.get() : fixedDb;
+    }
 
     /**
      * Configures this server's own instance as a replica currently
@@ -73,25 +83,69 @@ public class StdWireServer {
 
     public StdWireServer(int port, StratosDB db, UserStore userStore) {
         this.port = port;
-        this.db = db;
+        this.fixedDb = db;
+        this.cluster = null;
         this.userStore = userStore;
         if (userStore != null) {
-            // The real bridge - see ExecutorEngine.RoleCredentialSink's own javadoc for
-            // why this can't be a direct dependency instead: CREATE ROLE ... LOGIN
-            // PASSWORD 'x' becomes a genuine, SCRAM-authenticatable credential in this
-            // server's own UserStore, not just privilege bookkeeping.
-            db.setRoleCredentialSink(new com.stratosdb.sql.executor.ExecutorEngine.RoleCredentialSink() {
-                @Override
-                public void onRoleCredential(String username, String plaintextPassword) {
-                    userStore.addUser(username, plaintextPassword);
-                }
-
-                @Override
-                public void onRoleDropped(String username) {
-                    userStore.removeUser(username);
-                }
-            });
+            wireRoleCredentialSink(db);
         }
+    }
+
+    /**
+     * Real, multi-database cluster mode - see {@link com.stratosdb.core.StratosCluster}'s
+     * own javadoc for the full account of what this actually means and
+     * why it's a genuinely different, separate thing from the single,
+     * fixed-database constructors above (which remain fully, unconditionally
+     * supported, unchanged). Each connection is routed to whichever
+     * database its own startup message's "database" parameter names
+     * (defaulting to {@code StratosCluster.DEFAULT_DATABASE} if omitted),
+     * with a real, honest "database does not exist" error - and the
+     * connection then closed - for a name the cluster doesn't have.
+     */
+    public StdWireServer(int port, com.stratosdb.core.StratosCluster cluster) {
+        this(port, cluster, null);
+    }
+
+    public StdWireServer(int port, com.stratosdb.core.StratosCluster cluster, UserStore userStore) {
+        this.port = port;
+        this.fixedDb = null;
+        this.cluster = cluster;
+        this.userStore = userStore;
+        if (userStore != null) {
+            // Roles are cluster-wide in real PostgreSQL, not per-database objects -
+            // matched here: every database already in the cluster gets the same real
+            // credential sink wired at startup. A database created later via a real,
+            // live CREATE DATABASE gets the same wiring lazily, the first time any
+            // connection actually resolves it (see performStartup below) - simpler
+            // than giving StratosCluster its own separate "on database created" hook
+            // for what is, either way, an idempotent, harmless re-wiring.
+            for (String name : cluster.listDatabaseNames()) {
+                wireRoleCredentialSink(cluster.getDatabase(name));
+            }
+        }
+    }
+
+    /**
+     * The real bridge - see ExecutorEngine.RoleCredentialSink's own
+     * javadoc for why this can't be a direct dependency instead:
+     * CREATE ROLE ... LOGIN PASSWORD 'x' becomes a genuine,
+     * SCRAM-authenticatable credential in this server's own UserStore,
+     * not just privilege bookkeeping. Idempotent - safe to call more
+     * than once for the same database instance (cluster mode re-wires
+     * on every connection's own startup, see performStartup below).
+     */
+    private void wireRoleCredentialSink(StratosDB target) {
+        target.setRoleCredentialSink(new com.stratosdb.sql.executor.ExecutorEngine.RoleCredentialSink() {
+            @Override
+            public void onRoleCredential(String username, String plaintextPassword) {
+                userStore.addUser(username, plaintextPassword);
+            }
+
+            @Override
+            public void onRoleDropped(String username) {
+                userStore.removeUser(username);
+            }
+        });
     }
 
     public void start() throws IOException {
@@ -141,8 +195,14 @@ public class StdWireServer {
             // and fixed while testing this real, end to end: a role's own GRANTed
             // privileges appeared to do nothing at all over a real connection, because
             // by the time a query actually ran, currentUser had already been reset to
-            // null right after being correctly set.
-            db.closeSession();
+            // null right after being correctly set. In cluster mode, db() correctly
+            // still holds whatever database THIS pooled thread most recently served
+            // (ThreadLocal semantics) - or null, for a thread that has never served a
+            // connection at all yet, hence the null check (single-database mode's own
+            // fixedDb is never null, so this never skips anything there).
+            if (db() != null) {
+                db().closeSession();
+            }
 
             String username = performStartup(in, out);
             if (username == null) {
@@ -152,13 +212,13 @@ public class StdWireServer {
             // genuinely succeeds (an authentication failure is never itself "activity"
             // worth showing an operator), unregistered in the finally block below
             // regardless of how this connection eventually ends.
-            activity = db.getExecutor().getSessionActivityRegistry().register(username, remote);
+            activity = db().getExecutor().getSessionActivityRegistry().register(username, remote);
 
             // Extended query protocol state - per connection, matching the protocol's own
             // scoping (a prepared statement/portal only ever means something to the
             // connection that created it). See ExtendedProtocolHandler's own javadoc for
             // the real, named simplification in how these are executed.
-            ExtendedProtocolHandler extended = new ExtendedProtocolHandler(db, this);
+            ExtendedProtocolHandler extended = new ExtendedProtocolHandler(db(), this);
 
             boolean inTransaction = false;
             while (running) {
@@ -206,9 +266,11 @@ public class StdWireServer {
             LOG.debug("pg-wire connection {} closed: {}", remote, e.getMessage());
         } finally {
             if (activity != null) {
-                db.getExecutor().getSessionActivityRegistry().unregister(activity);
+                db().getExecutor().getSessionActivityRegistry().unregister(activity);
             }
-            db.closeSession();
+            if (db() != null) {
+                db().closeSession();
+            }
             LOG.debug("pg-wire client disconnected: {}", remote);
         }
     }
@@ -237,6 +299,28 @@ public class StdWireServer {
         LOG.info("pg-wire startup: user={} database={} application_name={}",
             params.get("user"), params.get("database"), params.get("application_name"));
 
+        if (cluster != null) {
+            String requestedDb = params.get("database");
+            String targetName = (requestedDb == null || requestedDb.isBlank())
+                ? com.stratosdb.core.StratosCluster.DEFAULT_DATABASE : requestedDb;
+            StratosDB target = cluster.getDatabase(targetName);
+            if (target == null) {
+                // Real, honest refusal, matching real PostgreSQL's own real error for
+                // exactly this situation - not a silent fallback to some other database,
+                // and not accepted-then-broken-later.
+                StdWireMessages.writeErrorResponse(out, "database \"" + targetName + "\" does not exist");
+                out.flush();
+                return null;
+            }
+            currentDb.set(target);
+            if (userStore != null) {
+                // Idempotent - see wireRoleCredentialSink's own javadoc. Covers a
+                // database created after this server started (a real, live CREATE
+                // DATABASE), which never went through the constructor's own loop.
+                wireRoleCredentialSink(target);
+            }
+        }
+
         if (userStore != null) {
             if (!performScramAuthentication(params.get("user"), in, out)) {
                 return null; // performScramAuthentication already sent the ErrorResponse
@@ -253,7 +337,7 @@ public class StdWireServer {
         // auth already has no real identity guarantee, so this call is what actually
         // makes GRANT/REVOKE mean anything once a role IS created, not a promise that
         // every connection is now locked down by default.
-        db.setCurrentUser(params.get("user"));
+        db().setCurrentUser(params.get("user"));
         StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB pg-wire compatibility layer)");
         StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
         StdWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");
@@ -338,7 +422,7 @@ public class StdWireServer {
 
         QueryResult result;
         try {
-            result = db.execute(sql);
+            result = db().execute(sql);
         } catch (Exception e) {
             LOG.warn("Statement failed unexpectedly: {}", sql, e);
             StdWireMessages.writeErrorResponse(out, e.getMessage());
@@ -369,7 +453,16 @@ public class StdWireServer {
                 }
                 StdWireMessages.writeDataRow(out, values);
             }
-            StdWireMessages.writeCommandComplete(out, buildCommandTag(sql, rows.size()));
+            // A row-returning result is already known with certainty here (we're in
+            // the rows != null branch) - tag it directly as such rather than
+            // re-deriving this from the SQL text's own leading keyword via
+            // buildCommandTag, which only recognizes a fixed list of keywords and
+            // had no case at all for any SHOW-family statement (SHOW TABLES, SHOW
+            // CATALOG, SHOW DATABASES, ...) - a real, pre-existing gap, found via a
+            // real client hitting it directly (a plain Statement.executeQuery on any
+            // of those would have fallen through to the default "OK" tag, which a
+            // real JDBC driver correctly refuses to treat as a result set at all).
+            StdWireMessages.writeCommandComplete(out, "SELECT " + rows.size());
         } else {
             StdWireMessages.writeCommandComplete(out, buildCommandTag(sql, extractAffectedCount(result.getMessage())));
         }
@@ -411,7 +504,7 @@ public class StdWireServer {
         );
         StdWireMessages.writeRowDescription(out, columns);
 
-        java.util.List<String> tableNames = new java.util.ArrayList<>(db.getExecutor().getTableNames());
+        java.util.List<String> tableNames = new java.util.ArrayList<>(db().getExecutor().getTableNames());
         java.util.Collections.sort(tableNames);
         for (String tableName : tableNames) {
             StdWireMessages.writeDataRow(out, List.of("public", tableName, "table", "stratosdb"));
@@ -433,12 +526,12 @@ public class StdWireServer {
      * execute() path, which already handles it entirely on its own.
      */
     private boolean tryHandleCopyStatement(String sql, DataInputStream in, DataOutputStream out) throws IOException {
-        com.stratosdb.sql.ast.CopyStatement copyStmt = db.getExecutor().tryParseStdioCopy(sql);
+        com.stratosdb.sql.ast.CopyStatement copyStmt = db().getExecutor().tryParseStdioCopy(sql);
         if (copyStmt == null) {
             return false;
         }
 
-        String prepareError = db.getExecutor().prepareCopy(copyStmt);
+        String prepareError = db().getExecutor().prepareCopy(copyStmt);
         if (prepareError != null) {
             StdWireMessages.writeErrorResponse(out, prepareError);
             return true;
@@ -483,7 +576,7 @@ public class StdWireServer {
         }
 
         client.stop();
-        db.setReadOnly(false);
+        db().setReadOnly(false);
         replicationClient = null; // a second PROMOTE call must correctly report "nothing to promote" above, not silently stop an already-stopped client again
         LOG.info("Replica promoted to primary - replication stopped, read-only mode disabled");
         StdWireMessages.writeCommandComplete(out, "PROMOTE");
@@ -504,11 +597,11 @@ public class StdWireServer {
      * same real, honest guarantee this engine's own DML already gives.
      */
     private boolean handleCopyFromStdin(com.stratosdb.sql.ast.CopyStatement copyStmt, DataInputStream in, DataOutputStream out) throws IOException {
-        int columnCount = db.getExecutor().getCopyColumnCount(copyStmt);
+        int columnCount = db().getExecutor().getCopyColumnCount(copyStmt);
         StdWireMessages.writeCopyInResponse(out, columnCount);
         out.flush();
 
-        com.stratosdb.transaction.Transaction txn = db.getExecutor().beginCopyTransaction();
+        com.stratosdb.transaction.Transaction txn = db().getExecutor().beginCopyTransaction();
         long rowCount = 0;
         String firstError = null;
         StringBuilder partial = new StringBuilder();
@@ -525,7 +618,7 @@ public class StdWireServer {
                         partial.delete(0, newlineIdx + 1);
                         if (line.isEmpty()) continue;
                         if (firstError == null) {
-                            String err = db.getExecutor().copyFromStdinLine(copyStmt, line, txn);
+                            String err = db().getExecutor().copyFromStdinLine(copyStmt, line, txn);
                             if (err != null) {
                                 firstError = "COPY: row " + (rowCount + 1) + " failed: " + err;
                             } else {
@@ -547,10 +640,10 @@ public class StdWireServer {
         }
 
         if (firstError != null) {
-            db.getExecutor().abortCopyTransaction(txn);
+            db().getExecutor().abortCopyTransaction(txn);
             StdWireMessages.writeErrorResponse(out, firstError);
         } else {
-            db.getExecutor().commitCopyTransaction(txn);
+            db().getExecutor().commitCopyTransaction(txn);
             StdWireMessages.writeCommandComplete(out, "COPY " + rowCount);
         }
         return true;
@@ -563,13 +656,13 @@ public class StdWireServer {
      * table buffered in memory first), then CopyDone.
      */
     private boolean handleCopyToStdout(com.stratosdb.sql.ast.CopyStatement copyStmt, DataOutputStream out) throws IOException {
-        int columnCount = db.getExecutor().getCopyColumnCount(copyStmt);
+        int columnCount = db().getExecutor().getCopyColumnCount(copyStmt);
         StdWireMessages.writeCopyOutResponse(out, columnCount);
 
-        com.stratosdb.transaction.Transaction txn = db.getExecutor().beginCopyTransaction();
+        com.stratosdb.transaction.Transaction txn = db().getExecutor().beginCopyTransaction();
         long[] rowCount = {0};
         try {
-            db.getExecutor().copyToStdoutStream(copyStmt, txn, line -> {
+            db().getExecutor().copyToStdoutStream(copyStmt, txn, line -> {
                 try {
                     StdWireMessages.writeCopyData(out, line);
                     rowCount[0]++;
@@ -578,10 +671,10 @@ public class StdWireServer {
                 }
             });
         } catch (java.io.UncheckedIOException e) {
-            db.getExecutor().abortCopyTransaction(txn);
+            db().getExecutor().abortCopyTransaction(txn);
             throw e.getCause();
         }
-        db.getExecutor().commitCopyTransaction(txn);
+        db().getExecutor().commitCopyTransaction(txn);
         StdWireMessages.writeCopyDone(out);
         StdWireMessages.writeCommandComplete(out, "COPY " + rowCount[0]);
         return true;
