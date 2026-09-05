@@ -915,20 +915,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * executeUpdate/executeDelete/executeSelect individually. A failed
      * statement records nothing (see TableStats' own javadoc - a
      * rolled-back INSERT never touched the table for real). INSERT's
-     * own row count is always exactly 1 - one InsertStatement's own
-     * VALUES clause is always one row's worth in this dialect, so no
-     * message parsing is needed there; UPDATE/DELETE's own real count
-     * is read directly from their already-established, stable "N
-     * row(s)" success message text (see executeUpdate/executeDelete's
-     * own message format) rather than duplicating that count's own
-     * computation a second time here.
+     * own row count is read directly from its own real, already-parsed
+     * VALUES row list (s.rows().size()) - a real, multi-row INSERT
+     * genuinely inserts more than one row per statement now, so the
+     * older "always exactly 1" assumption this comment used to make no
+     * longer holds; UPDATE/DELETE's own real count is read directly
+     * from their already-established, stable "N row(s)" success message
+     * text (see executeUpdate/executeDelete's own message format)
+     * rather than duplicating that count's own computation a second
+     * time here.
      */
     private void recordTableStats(Statement stmt, QueryResult result) {
         if (!result.isSuccess()) {
             return;
         }
         if (stmt instanceof InsertStatement s) {
-            tableStatsRegistry.recordInsert(s.tableName(), 1);
+            tableStatsRegistry.recordInsert(s.tableName(), s.rows().size());
         } else if (stmt instanceof SelectStatement s) {
             // A real, FROM-less SELECT ("SELECT version()") has s.tableName() == null
             // (see ExecutorEngine.executeSelect's own comment) - it touches no real
@@ -2121,81 +2123,97 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (denied != null) return denied;
 
         List<String> allColumns = tableColumns.get(stmt.tableName());
-        if (allColumns == null) {
-            // Defensive fallback for a table somehow missing its column list -
-            // shouldn't happen in practice, since executeCreateTable always
-            // populates it, but keep the old col0/col1 behavior rather than
-            // crashing if it ever does.
-            Tuple fallback = new Tuple();
-            for (int i = 0; i < stmt.values().size(); i++) {
-                fallback.addValue("col" + i, resolveValue(stmt.values().get(i)));
+        List<Tuple> insertedTuples = new ArrayList<>();
+
+        for (List<String> rowValues : stmt.rows()) {
+            if (allColumns == null) {
+                // Defensive fallback for a table somehow missing its column list -
+                // shouldn't happen in practice, since executeCreateTable always
+                // populates it, but keep the old col0/col1 behavior rather than
+                // crashing if it ever does.
+                Tuple fallback = new Tuple();
+                for (int i = 0; i < rowValues.size(); i++) {
+                    fallback.addValue("col" + i, resolveValue(rowValues.get(i)));
+                }
+                QueryResult result = finishInsert(stmt.tableName(), txn, fallback);
+                if (!result.isSuccess()) return result;
+                insertedTuples.add(fallback);
+                continue;
             }
-            return applyReturning(finishInsert(stmt.tableName(), txn, fallback), fallback, stmt.returningColumns());
-        }
 
-        // The explicit (col1, col2, ...) list if the statement gave one;
-        // otherwise every column, in the table's own declared order - the
-        // two cases INSERT INTO t (a, b) VALUES (...) and INSERT INTO t
-        // VALUES (...) are handled correctly and distinctly, unlike before
-        // this fix (see buildInsert's javadoc for the bug this replaced).
-        List<String> targetColumns = stmt.columns().isEmpty() ? allColumns : stmt.columns();
-        if (targetColumns.size() != stmt.values().size()) {
-            return QueryResult.error("INSERT has " + stmt.values().size() + " value(s) but "
-                + targetColumns.size() + " column(s) were specified for table " + stmt.tableName());
-        }
-
-        Map<String, Object> givenValues = new java.util.LinkedHashMap<>();
-        Map<String, String> columnTypes = tableColumnTypes.getOrDefault(stmt.tableName(), Map.of());
-        for (int i = 0; i < targetColumns.size(); i++) {
-            String colName = targetColumns.get(i);
-            if (!allColumns.contains(colName)) {
-                return QueryResult.error("Column not found: " + colName + " on table " + stmt.tableName());
+            // The explicit (col1, col2, ...) list if the statement gave one;
+            // otherwise every column, in the table's own declared order - the
+            // two cases INSERT INTO t (a, b) VALUES (...) and INSERT INTO t
+            // VALUES (...) are handled correctly and distinctly, unlike before
+            // this fix (see buildInsert's javadoc for the bug this replaced).
+            List<String> targetColumns = stmt.columns().isEmpty() ? allColumns : stmt.columns();
+            if (targetColumns.size() != rowValues.size()) {
+                return QueryResult.error("INSERT has " + rowValues.size() + " value(s) but "
+                    + targetColumns.size() + " column(s) were specified for table " + stmt.tableName());
             }
-            Object resolved = resolveValue(stmt.values().get(i));
-            givenValues.put(colName, coerceForColumnType(colName, columnTypes.get(colName), resolved));
-        }
 
-        // Build the tuple in the TABLE's OWN column order (not the statement's
-        // order - callers may list columns in any order), applying each
-        // column's default for anything the statement didn't explicitly
-        // provide, or SQL NULL if it has no default either.
-        Map<String, String> defaults = tableColumnDefaults.getOrDefault(stmt.tableName(), Map.of());
-        Tuple tuple = new Tuple();
-        for (String col : allColumns) {
-            if (givenValues.containsKey(col)) {
-                tuple.addValue(col, givenValues.get(col));
-            } else if (defaults.containsKey(col)) {
-                tuple.addValue(col, coerceForColumnType(col, columnTypes.get(col), resolveValue(defaults.get(col))));
-            } else {
-                tuple.addValue(col, null);
+            Map<String, Object> givenValues = new java.util.LinkedHashMap<>();
+            Map<String, String> columnTypes = tableColumnTypes.getOrDefault(stmt.tableName(), Map.of());
+            for (int i = 0; i < targetColumns.size(); i++) {
+                String colName = targetColumns.get(i);
+                if (!allColumns.contains(colName)) {
+                    return QueryResult.error("Column not found: " + colName + " on table " + stmt.tableName());
+                }
+                Object resolved = resolveValue(rowValues.get(i));
+                givenValues.put(colName, coerceForColumnType(colName, columnTypes.get(colName), resolved));
             }
+
+            // Build the tuple in the TABLE's OWN column order (not the statement's
+            // order - callers may list columns in any order), applying each
+            // column's default for anything the statement didn't explicitly
+            // provide, or SQL NULL if it has no default either.
+            Map<String, String> defaults = tableColumnDefaults.getOrDefault(stmt.tableName(), Map.of());
+            Tuple tuple = new Tuple();
+            for (String col : allColumns) {
+                if (givenValues.containsKey(col)) {
+                    tuple.addValue(col, givenValues.get(col));
+                } else if (defaults.containsKey(col)) {
+                    tuple.addValue(col, coerceForColumnType(col, columnTypes.get(col), resolveValue(defaults.get(col))));
+                } else {
+                    tuple.addValue(col, null);
+                }
+            }
+
+            QueryResult result = finishInsert(stmt.tableName(), txn, tuple);
+            if (!result.isSuccess()) return result;
+            insertedTuples.add(tuple);
         }
 
-        return applyReturning(finishInsert(stmt.tableName(), txn, tuple), tuple, stmt.returningColumns());
+        return finishMultiRowInsert(insertedTuples, stmt.returningColumns());
     }
 
     /**
-     * Honors a real RETURNING clause (see InsertStatement's own javadoc for
-     * why this exists - Django's own postgresql backend always appends one).
-     * Only ever called from executeInsert's own two real call sites (never
-     * from finishInsert's OTHER two callers - COPY's own bulk-insert path and
-     * a trigger's own INSERT execution - neither of which has a real user
-     * RETURNING clause to honor at all), so finishInsert's own signature
-     * itself is untouched, keeping this a real, low-risk, additive change
-     * rather than one that ripples into unrelated call sites.
+     * Builds the real, final result of a (possibly multi-row) INSERT once
+     * every row has been successfully inserted - one real RETURNING row per
+     * inserted row, in insertion order (PostgreSQL's own real behavior for
+     * exactly this combination), or a real, honest row count message
+     * ("Inserted N row(s)") otherwise - see StdWireServer's own
+     * extractAffectedCount for where this message's count is read back out
+     * to build the real wire-protocol command tag PostgreSQL clients expect
+     * ("INSERT 0 N"), matching the same, established convention already
+     * used for "Updated N row(s)"/"Deleted N row(s)".
      */
-    private QueryResult applyReturning(QueryResult insertResult, Tuple insertedTuple, List<String> returningColumns) {
-        if (!insertResult.isSuccess() || returningColumns.isEmpty()) {
-            return insertResult;
+    private QueryResult finishMultiRowInsert(List<Tuple> insertedTuples, List<String> returningColumns) {
+        if (returningColumns.isEmpty()) {
+            return QueryResult.success("Inserted " + insertedTuples.size() + " row(s)");
         }
         if (returningColumns.size() == 1 && returningColumns.get(0).equals("*")) {
-            return QueryResult.success(List.of(insertedTuple));
+            return QueryResult.success(insertedTuples);
         }
-        Tuple projected = new Tuple();
-        for (String col : returningColumns) {
-            projected.addValue(col, findColumnValue(insertedTuple, col));
+        List<Tuple> projected = new ArrayList<>();
+        for (Tuple inserted : insertedTuples) {
+            Tuple row = new Tuple();
+            for (String col : returningColumns) {
+                row.addValue(col, findColumnValue(inserted, col));
+            }
+            projected.add(row);
         }
-        return QueryResult.success(List.of(projected));
+        return QueryResult.success(projected);
     }
 
     private QueryResult finishInsert(String tableName, Transaction txn, Tuple tuple) {

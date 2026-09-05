@@ -417,20 +417,24 @@ public class SqlParser {
 
     private InsertStatement buildInsert(StratosSQLParser.InsertContext ctx) {
         String tableName = ctx.tableName().getText();
-        List<String> values = new ArrayList<>();
 
-        if (ctx.valueList() != null) {
-            for (StratosSQLParser.InsertValueContext valCtx : ctx.valueList().insertValue()) {
+        // One real row per VALUES tuple - see InsertStatement's own javadoc
+        // for why this is now a list of rows rather than a single flat list.
+        List<List<String>> rows = new ArrayList<>();
+        for (StratosSQLParser.ValueListContext valueListCtx : ctx.valueList()) {
+            List<String> row = new ArrayList<>();
+            for (StratosSQLParser.InsertValueContext valCtx : valueListCtx.insertValue()) {
                 if (valCtx.literal() != null) {
-                    values.add(valCtx.literal().getText());
+                    row.add(valCtx.literal().getText());
                 } else {
                     // A nextval('seq') or currval('seq') call - stored as its
                     // own raw text (e.g. "nextval('t_id_seq')") for the
                     // executor to recognize and resolve at insert time,
                     // rather than trying to parse it as a literal.
-                    values.add(valCtx.getText());
+                    row.add(valCtx.getText());
                 }
             }
+            rows.add(row);
         }
 
         // The optional (col1, col2, ...) list right after the table name - a
@@ -459,7 +463,7 @@ public class SqlParser {
             }
         }
 
-        return new InsertStatement(tableName, columns, values, returningColumns);
+        return new InsertStatement(tableName, columns, rows, returningColumns);
     }
 
     /**

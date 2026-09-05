@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Tests passing | **380 / 380** |
+| Tests passing | **381 / 381** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -773,6 +773,16 @@ A real architectural risk caught and fixed before it became a bug: wiring `Execu
 A real, pre-existing bug found and fixed along the way, unrelated to this feature but only surfaced by it: the wire protocol's own command-tag logic had no case for any `SHOW`-family statement at all (`SHOW TABLES`, `SHOW CATALOG`, and now `SHOW DATABASES`), defaulting to a generic `"OK"` tag - meaning a plain `Statement.executeQuery("SHOW TABLES")` through any real JDBC client would have already been silently broken, since a real driver correctly refuses to treat an `"OK"`-tagged response as a result set. Fixed at the root: when a result is already known with certainty to return rows (the exact branch where this is checked), it is now tagged as such directly, rather than re-derived from a fragile, incomplete list of recognized SQL keywords.
 
 **Verified for real**: all 375 pre-existing tests still pass unchanged - a meaningful check given this touched `StdWireServer`'s own connection-handling code in over fifteen places (a real field rename, from a single fixed `StratosDB` to a per-connection-resolved one, needed to serve either a fixed database or a real cluster from the same server). Beyond the automated suite, a real, live, 8-case manual verification proved the whole feature end-to-end through the real, unmodified JDBC driver: default-database connection, `SHOW DATABASES`, `CREATE DATABASE`, genuine data isolation between two databases (a table created in one is provably invisible in the other), the drop-safety rule, dropping a database you are *not* connected to, and a clean refusal to connect to a nonexistent one. Real persistence was also proven directly: data was written across two databases, the server process was killed outright (not a clean shutdown), a completely fresh process was started on the same directory, and both databases and their real data were confirmed intact. A permanent test (`MultiDatabaseEndToEndTest`) now covers this same ground automatically, including the honest-refusal behavior on a plain, non-clustered instance.
+
+## Real, multi-row VALUES support
+
+Found missing entirely via a real, live DBNavigator session: `INSERT INTO t (...) VALUES (row1), (row2), (row3);` - standard SQL, part of the spec itself, and supported by every mainstream engine (PostgreSQL, MySQL, SQL Server, SQLite) including the very wire protocol this engine speaks. Not a stylistic omission - a genuine, real gap compared to essentially everything this engine is meant to be a drop-in match for.
+
+Implemented at the root: the grammar now allows a real, comma-separated list of `VALUES` tuples; `InsertStatement` holds a real list of rows rather than a single flat value list; and the executor processes each row in order, stopping cleanly at the first row that fails validation (matching this engine's own existing, established single-row error behavior, just applied per row) rather than silently skipping bad rows or partially succeeding without saying so.
+
+RETURNING now yields one real row per inserted row, in insertion order - PostgreSQL's own real behavior for exactly this combination. The wire protocol's own command tag now reports the real, total row count (`INSERT 0 N`) instead of the old, hardcoded assumption of exactly one row per statement - the same fix also corrected a related, real bug in per-table statistics recording, which had the identical hardcoded assumption baked in and would have quietly under-counted every multi-row insert's real contribution to a table's own row-count statistics.
+
+Verified live end-to-end: the exact multi-row `INSERT` that was failing (explicit column list), a positional (no-column-list) multi-row insert, `RETURNING` with multiple rows, a row with the wrong value count appearing mid-batch (not just first) failing cleanly with no partial rows visible afterward, and a plain single-row `INSERT` continuing to work exactly as it always has. All 380 pre-existing tests still pass unchanged; a new, permanent test (`testMultiRowInsertValuesLikePostgres`) covers this same ground automatically.
 
 ## What to do next
 
