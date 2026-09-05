@@ -261,17 +261,69 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         loadCatalog();
     }
 
+    /**
+     * Real, previously-latent bug found via a real, live incident: any
+     * genuinely multi-line SQL statement (a real, ordinary, pretty-
+     * formatted {@code CREATE TABLE} spanning several lines, exactly
+     * what any normal SQL editor produces - not a rare or unusual thing
+     * to type) corrupted catalog.txt the moment it was persisted. The
+     * real cause: catalogLines stores the raw, original SQL text
+     * verbatim (see this class's own real "verbatim replay" design
+     * principle), and catalog.txt's own format is one physical line per
+     * logical entry - a raw newline embedded inside that SQL text splits
+     * one logical entry across many physical lines the moment it's
+     * written, and each of those broken fragments then fails to parse
+     * as its own catalog entry on the next restart (an
+     * ArrayIndexOutOfBoundsException per fragment, from a line with no
+     * pipe delimiter at all - see loadCatalog's own per-line isolation
+     * fix for why this no longer cascades into other, unrelated tables
+     * too, though the affected table's own entry is still genuinely
+     * unrecoverable without this fix).
+     *
+     * Fixed by escaping real newline/carriage-return/backslash
+     * characters in the raw SQL text before it's ever written to a
+     * catalog line, and reversing that escaping when a line is read
+     * back - the stored line is now always genuinely one physical line,
+     * regardless of how the original SQL was formatted, and the exact,
+     * original multi-line text is faithfully restored on load (matching
+     * this class's own real "verbatim replay" design principle, now
+     * actually true for multi-line SQL too).
+     */
+    private static String escapeForCatalogLine(String text) {
+        return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r");
+    }
+
+    private static String unescapeFromCatalogLine(String text) {
+        StringBuilder sb = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\\' && i + 1 < text.length()) {
+                char next = text.charAt(i + 1);
+                if (next == 'n') { sb.append('\n'); i++; continue; }
+                if (next == 'r') { sb.append('\r'); i++; continue; }
+                if (next == '\\') { sb.append('\\'); i++; continue; }
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    /** Builds a real catalog line for a kind whose own value is raw, original SQL text - see escapeForCatalogLine's own javadoc for why this escaping is needed at all. Not used for INDEX/OWNER, whose own lines are already structured, programmatically-built fields rather than arbitrary, possibly-multi-line user SQL text. */
+    private static String catalogEntry(String kind, String sql) {
+        return kind + "|" + escapeForCatalogLine(sql);
+    }
+
     /** Called after any successfully-dispatched statement; updates the catalog only for the schema-changing statement types. */
     private void recordCatalogChange(Statement stmt, String sql) {
         if (dataDirectory == null) return; // no persistence configured
         if (stmt instanceof CreateTableStatement s) {
-            catalogLines.put("TABLE:" + s.tableName(), "TABLE|" + sql);
+            catalogLines.put("TABLE:" + s.tableName(), catalogEntry("TABLE", sql));
             saveCatalog();
         } else if (stmt instanceof DropTableStatement s) {
             catalogLines.remove("TABLE:" + s.tableName());
             saveCatalog();
         } else if (stmt instanceof CreateViewStatement s) {
-            catalogLines.put("VIEW:" + s.viewName(), "VIEW|" + sql);
+            catalogLines.put("VIEW:" + s.viewName(), catalogEntry("VIEW", sql));
             saveCatalog();
         } else if (stmt instanceof DropViewStatement s) {
             catalogLines.remove("VIEW:" + s.viewName());
@@ -282,59 +334,59 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     + "|" + (s.columnName2() == null ? "" : s.columnName2()));
             saveCatalog();
         } else if (stmt instanceof CreateSequenceStatement s) {
-            catalogLines.put("SEQUENCE:" + s.name(), "SEQUENCE|" + sql);
+            catalogLines.put("SEQUENCE:" + s.name(), catalogEntry("SEQUENCE", sql));
             saveCatalog();
         } else if (stmt instanceof DropSequenceStatement s) {
             catalogLines.remove("SEQUENCE:" + s.name());
             saveCatalog();
         } else if (stmt instanceof CreateTypeStatement s) {
-            catalogLines.put("TYPE:" + s.typeName(), "TYPE|" + sql);
+            catalogLines.put("TYPE:" + s.typeName(), catalogEntry("TYPE", sql));
             saveCatalog();
         } else if (stmt instanceof DropTypeStatement s) {
             catalogLines.remove("TYPE:" + s.typeName());
             saveCatalog();
         } else if (stmt instanceof AlterTableEnableRlsStatement s) {
-            catalogLines.put("RLS:" + s.tableName(), "RLS|" + sql);
+            catalogLines.put("RLS:" + s.tableName(), catalogEntry("RLS", sql));
             saveCatalog();
         } else if (stmt instanceof AlterTableDisableRlsStatement s) {
             catalogLines.remove("RLS:" + s.tableName());
             catalogLines.remove("RLS_FORCE:" + s.tableName());
             saveCatalog();
         } else if (stmt instanceof AlterTableForceRlsStatement s) {
-            catalogLines.put("RLS_FORCE:" + s.tableName(), "RLS_FORCE|" + sql);
+            catalogLines.put("RLS_FORCE:" + s.tableName(), catalogEntry("RLS_FORCE", sql));
             saveCatalog();
         } else if (stmt instanceof CreatePolicyStatement s) {
-            catalogLines.put("POLICY:" + s.tableName() + ":" + s.policyName(), "POLICY|" + sql);
+            catalogLines.put("POLICY:" + s.tableName() + ":" + s.policyName(), catalogEntry("POLICY", sql));
             saveCatalog();
         } else if (stmt instanceof DropPolicyStatement s) {
             catalogLines.remove("POLICY:" + s.tableName() + ":" + s.policyName());
             saveCatalog();
         } else if (stmt instanceof CreateFunctionStatement s) {
-            catalogLines.put("FUNCTION:" + s.name(), "FUNCTION|" + sql);
+            catalogLines.put("FUNCTION:" + s.name(), catalogEntry("FUNCTION", sql));
             saveCatalog();
         } else if (stmt instanceof DropFunctionStatement s) {
             catalogLines.remove("FUNCTION:" + s.name());
             saveCatalog();
         } else if (stmt instanceof CreateProcedureStatement s) {
-            catalogLines.put("PROCEDURE:" + s.name(), "PROCEDURE|" + sql);
+            catalogLines.put("PROCEDURE:" + s.name(), catalogEntry("PROCEDURE", sql));
             saveCatalog();
         } else if (stmt instanceof DropProcedureStatement s) {
             catalogLines.remove("PROCEDURE:" + s.name());
             saveCatalog();
         } else if (stmt instanceof CreateTriggerStatement s) {
-            catalogLines.put("TRIGGER:" + s.name(), "TRIGGER|" + sql);
+            catalogLines.put("TRIGGER:" + s.name(), catalogEntry("TRIGGER", sql));
             saveCatalog();
         } else if (stmt instanceof DropTriggerStatement s) {
             catalogLines.remove("TRIGGER:" + s.name());
             saveCatalog();
         } else if (stmt instanceof CreateExtensionStatement s) {
-            catalogLines.put("EXTENSION:" + s.name(), "EXTENSION|" + sql);
+            catalogLines.put("EXTENSION:" + s.name(), catalogEntry("EXTENSION", sql));
             saveCatalog();
         } else if (stmt instanceof DropExtensionStatement s) {
             catalogLines.remove("EXTENSION:" + s.name());
             saveCatalog();
         } else if (stmt instanceof CreateNativeFunctionStatement s) {
-            catalogLines.put("NATIVEFUNCTION:" + s.name(), "NATIVEFUNCTION|" + sql);
+            catalogLines.put("NATIVEFUNCTION:" + s.name(), catalogEntry("NATIVEFUNCTION", sql));
             saveCatalog();
         }
         // No DropIndexStatement exists yet in this grammar - nothing to remove for that case.
@@ -439,9 +491,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     // execute() already records this back into catalogLines
                     // via recordCatalogChange on success, so nothing extra
                     // needed here beyond checking it actually worked.
-                    QueryResult result = execute(parts[1]);
+                    String unescapedSql = unescapeFromCatalogLine(parts[1]);
+                    QueryResult result = execute(unescapedSql);
                     if (!result.isSuccess()) {
-                        LOG.error("Failed to replay catalog entry on startup: {} -> {}", parts[1], result.getError());
+                        LOG.error("Failed to replay catalog entry on startup: {} -> {}", unescapedSql, result.getError());
                     }
                 }
                 } catch (Exception e) {
@@ -4512,7 +4565,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         String sql = "CREATE ROLE " + stmt.roleName() + " WITH "
             + (stmt.login() ? "LOGIN " : "NOLOGIN ")
             + (stmt.superuser() ? "SUPERUSER" : "NOSUPERUSER");
-        catalogLines.put("ROLE:" + stmt.roleName(), "ROLE|" + sql);
+        catalogLines.put("ROLE:" + stmt.roleName(), catalogEntry("ROLE", sql));
         saveCatalog();
         return QueryResult.success("Role created: " + stmt.roleName());
     }
@@ -4589,7 +4642,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             catalogLines.remove(key);
         } else {
             String sql = "GRANT " + String.join(", ", granted) + " ON " + tableName + " TO " + roleName;
-            catalogLines.put(key, "GRANT|" + sql);
+            catalogLines.put(key, catalogEntry("GRANT", sql));
         }
         saveCatalog();
     }
@@ -4621,7 +4674,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
         sql.append(")");
-        catalogLines.put("TABLE:" + tableName, "TABLE|" + sql);
+        catalogLines.put("TABLE:" + tableName, catalogEntry("TABLE", sql.toString()));
         saveCatalog();
     }
 
@@ -5153,7 +5206,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 ddlSql = "CREATE INDEX " + indexName + " ON " + tableName + " (" + columns + ")" + usingClause + ";";
             } else {
                 int pipeIdx = value.indexOf('|');
-                ddlSql = pipeIdx >= 0 ? value.substring(pipeIdx + 1) : value;
+                ddlSql = pipeIdx >= 0 ? unescapeFromCatalogLine(value.substring(pipeIdx + 1)) : value;
             }
 
             Tuple row = new Tuple();
