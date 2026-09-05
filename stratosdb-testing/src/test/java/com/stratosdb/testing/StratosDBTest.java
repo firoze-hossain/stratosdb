@@ -4102,4 +4102,63 @@ public class StratosDBTest {
         assertEquals(1.11, (double) selectMixed.getRows().get(0).getValue("a"), 0.001);
         assertEquals(2.22, (double) selectMixed.getRows().get(0).getValue("b"), 0.001);
     }
+
+    /**
+     * Real, previously-latent data-loss bug found via a real, live
+     * incident: a process interruption at exactly the wrong moment left
+     * a truncated {@code CREATE TABLE employees (...)} line in
+     * catalog.txt (see ExecutorEngine.saveCatalog's own javadoc for the
+     * real, atomic-write fix this incident led to). Loading that
+     * corrupted line used to throw an uncaught
+     * {@code ArrayIndexOutOfBoundsException} that aborted loading of
+     * EVERY remaining catalog entry too - a real, cascading multiplier
+     * that would have made an unrelated, perfectly healthy table
+     * disappear on restart just because a completely different table's
+     * own catalog line happened to be corrupted. This reproduces that
+     * exact corruption directly (bypassing the now-fixed write path
+     * entirely, since the point is to prove recovery from a
+     * post-corruption catalog file, however it got that way) and
+     * confirms only the genuinely corrupted table is lost - not its
+     * real, healthy neighbor.
+     */
+    @Test
+    void corruptedCatalogEntryDoesNotTakeDownAnUnrelatedHealthyTable(@org.junit.jupiter.api.io.TempDir Path corruptionTestDir) throws Exception {
+        // A real, valid database with two real tables, one of which will
+        // have its own catalog entry corrupted afterward.
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(corruptionTestDir.toString());
+        StratosDB db = new StratosDB(config);
+        db.execute("CREATE TABLE employees (employee_id INT, first_name VARCHAR)");
+        db.execute("INSERT INTO employees VALUES (1, 'John')");
+        db.execute("CREATE TABLE orders (order_id INT, amount NUMERIC(10,2))");
+        db.execute("INSERT INTO orders VALUES (100, 49.99)");
+        db.shutdown();
+
+        // Manually corrupt only the employees entry, splitting it across two
+        // broken lines - the exact real shape found in the real incident's
+        // own server log (a truncated "CREATE TABLE employees (" followed by
+        // a pipe-less fragment).
+        java.nio.file.Path catalogPath = corruptionTestDir.resolve("catalog.txt");
+        String corrupted = "OWNER|employees|anyuser\n"
+            + "TABLE|CREATE TABLE employees (\n"
+            + "employee_id INT, first_name VARCHAR)\n"
+            + "OWNER|orders|anyuser\n"
+            + "TABLE|CREATE TABLE orders (order_id INT, amount NUMERIC(10,2))\n";
+        java.nio.file.Files.writeString(catalogPath, corrupted);
+
+        // The real, decisive check: constructing a fresh StratosDB over this
+        // now-corrupted catalog must not throw at all.
+        StratosDB reopened = new StratosDB(config);
+        try {
+            QueryResult ordersResult = reopened.execute("SELECT order_id, amount FROM orders");
+            assertTrue(ordersResult.isSuccess(), "the unrelated, healthy 'orders' table must survive completely intact");
+            assertEquals(1, ordersResult.getRows().size());
+            assertEquals(100, ordersResult.getRows().get(0).getValue("order_id"));
+
+            QueryResult employeesResult = reopened.execute("SELECT * FROM employees");
+            assertFalse(employeesResult.isSuccess(), "employees' own catalog entry was genuinely, unrecoverably corrupted - it is expected to be gone");
+        } finally {
+            reopened.shutdown();
+        }
+    }
 }

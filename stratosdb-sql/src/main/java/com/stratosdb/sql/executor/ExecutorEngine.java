@@ -344,12 +344,40 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return dataDirectory == null ? null : new java.io.File(dataDirectory, "catalog.txt");
     }
 
+    /**
+     * Real, previously-latent data-loss bug found via a real, live
+     * incident: this used to write directly to catalog.txt via a plain
+     * {@code Files.write}, with no atomicity at all. A process
+     * interruption at exactly the wrong moment (a real, ordinary
+     * {@code Ctrl+C} included - not just a hard crash) could leave a
+     * truncated, partially-written file behind, corrupting whichever
+     * catalog line was last written - in the real incident this fixes,
+     * a {@code CREATE TABLE employees (...)} line was truncated to just
+     * {@code CREATE TABLE employees (}, and the table (its own real data
+     * still physically intact on disk the whole time) became completely
+     * inaccessible on the next restart, since its own schema definition
+     * could no longer be parsed back.
+     *
+     * Fixed with the standard, well-established pattern for exactly
+     * this situation: write the complete, new content to a temporary
+     * file in the SAME directory first (same directory matters - an
+     * atomic rename is only guaranteed atomic within one filesystem),
+     * then atomically rename it over the real catalog.txt. Either the
+     * old file remains fully intact (if the process dies before the
+     * rename completes) or the new file is fully, atomically in place
+     * (once the rename succeeds) - there is no window where a
+     * partially-written file is ever visible under the real filename.
+     */
     private void saveCatalog() {
         if (loadingCatalog) return; // deferred to one final write at the end of loadCatalog - see its javadoc
         java.io.File file = catalogFile();
         if (file == null) return;
         try {
-            java.nio.file.Files.write(file.toPath(), catalogLines.values());
+            java.io.File tmp = new java.io.File(file.getParentFile(), file.getName() + ".tmp");
+            java.nio.file.Files.write(tmp.toPath(), catalogLines.values());
+            java.nio.file.Files.move(tmp.toPath(), file.toPath(),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         } catch (java.io.IOException e) {
             LOG.error("Failed to save schema catalog to {}", file, e);
         }
@@ -377,6 +405,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         try {
             for (String line : java.nio.file.Files.readAllLines(file.toPath())) {
                 if (line.isBlank()) continue;
+                try {
                 String[] parts = line.split("\\|", 2);
                 String kind = parts[0];
                 if (kind.equals("INDEX")) {
@@ -414,6 +443,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     if (!result.isSuccess()) {
                         LOG.error("Failed to replay catalog entry on startup: {} -> {}", parts[1], result.getError());
                     }
+                }
+                } catch (Exception e) {
+                    // Real, previously-latent bug found via a real, live
+                    // incident: a single corrupted or malformed catalog line
+                    // (see saveCatalog's own javadoc for how one could end up
+                    // on disk in the first place, before its own real,
+                    // atomic-write fix) used to abort loading of EVERY
+                    // remaining catalog entry too, not just the bad one - a
+                    // real, cascading data-loss multiplier, since a
+                    // database's other, perfectly valid tables would also
+                    // disappear on restart just because one, unrelated
+                    // table's own catalog line happened to be corrupted.
+                    // Isolating each line's own processing here means the
+                    // rest of a database's real schema still loads
+                    // correctly even when one entry genuinely can't be
+                    // recovered.
+                    LOG.error("Failed to load catalog entry (skipping, rest of catalog still loads): {}", line, e);
                 }
             }
             LOG.info("Schema catalog loaded: {} table(s)/view(s)/index(es)", catalogLines.size());

@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Tests passing | **384 / 384** |
+| Tests passing | **385 / 385** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -807,6 +807,18 @@ Reproduced directly before touching any code: a real `SHOW TABLES` against a dat
 Fixed at the root: `QueryResult` can now carry its own real, known column names explicitly, independent of its row count, for exactly the callers (`SHOW`-style statements with a fixed, statically-known shape) that always know their own schema in advance. Applied everywhere the same class of bug existed: `SHOW TABLES`, `SHOW DATABASES`, `SHOW CATALOG`, `SHOW TABLE STATS`, `SHOW STATEMENTS`, and `SHOW ACTIVITY` were all fixed the same way, along with the extended query protocol's own (prepared statement) describe path, which needed the identical fix.
 
 Verified live: `DatabaseMetaData.getTables()` on a genuinely empty database now correctly returns zero rows instead of throwing, and `SHOW TABLES` now correctly reports its own real column even with zero matching rows. Covered by a permanent test (`emptyDatabaseStillReportsARealTableNameColumnShape`).
+
+## Real, serious bug: a killed server could corrupt its own catalog file, and one corrupted table could take down every other table with it
+
+Found via a real, live incident: after creating a table, inserting real data, and stopping the server with `Ctrl+C`, the next restart lost the table entirely - `DatabaseMetaData.getTables()` showed it as gone, even though its own real data was still physically intact on disk the whole time. The server's own startup log showed exactly why: `Failed to replay catalog entry on startup: CREATE TABLE employees ( -> Syntax error ... mismatched input '<EOF>'` immediately followed by an uncaught `ArrayIndexOutOfBoundsException` that aborted loading the rest of that database's schema catalog entirely.
+
+Two real, separate bugs, both found and fixed:
+
+**Root cause of the corruption itself**: `saveCatalog()` wrote directly to the real `catalog.txt` file via a plain `Files.write` - no atomicity at all. A process interruption at exactly the wrong moment (an ordinary `Ctrl+C` included, not just a hard crash) could leave a truncated, partially-written file behind. Fixed with the standard, well-established pattern for exactly this situation: write the complete new content to a temporary file in the same directory, then atomically rename it over the real `catalog.txt`. Either the old file remains fully intact, or the new one is fully, atomically in place - there is no window where a partially-written file is ever visible under the real filename.
+
+**A real, cascading multiplier found on top of that**: even with the corruption itself now prevented going forward, a single malformed catalog line (from this or any other cause) used to abort loading of every remaining entry in that database's catalog too - meaning one corrupted table could make every other, completely healthy table in the same database disappear on restart as well. Fixed by isolating each catalog line's own processing in its own try/catch: a line that genuinely can't be recovered is now skipped and logged, while the rest of that database's real schema still loads correctly.
+
+Verified live by directly reproducing the real incident: manually corrupting one table's own catalog entry in exactly the shape seen in the real report, restarting a fresh instance over it, and confirming the corrupted table is (unavoidably) gone while a separate, healthy table in the same database survives completely intact, with the server never crashing or throwing uncaught. Covered by a permanent test (`corruptedCatalogEntryDoesNotTakeDownAnUnrelatedHealthyTable`).
 
 ## What to do next
 
