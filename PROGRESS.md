@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Tests passing | **383 / 383** |
+| Tests passing | **384 / 384** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -797,6 +797,16 @@ Fixed by clearing the page cache as part of `close()`, right after the final flu
 Found missing entirely via a real, live user report: PostgreSQL treats `NUMERIC` and `DECIMAL` as exact synonyms, including the parameterized form (`NUMERIC(19,4)`) - this engine only ever recognized `DECIMAL`, silently parsing a bare `NUMERIC` as a user-defined type reference instead (the real grammar's own bare-IDENTIFIER fallback), producing a confusing "extraneous input '('" syntax error the moment a real precision/scale was given.
 
 Added `NUMERIC` as a genuine, full synonym for `DECIMAL` throughout - the grammar, the built-in type registry, and JDBC type coercion. Also fixed, found along the way since it was the same class of gap: a plain, parameter-less `NUMERIC`/`DECIMAL` (no precision/scale at all) now parses too, matching PostgreSQL's own real support for that form, which neither type had before this fix. Verified live: the user's own exact `NUMERIC(19,4)` case, a parameter-less `NUMERIC` column, `DECIMAL` and `NUMERIC` columns coexisting correctly in the same table, and the JDBC driver correctly reporting the column's real type. Covered by a permanent test (`testNumericIsARealSynonymForDecimal`).
+
+## Real bug: a genuinely empty result lost its own column shape, not just its rows
+
+Found via a real, live DBNavigator session: expanding the Tables folder of a genuinely empty database (a completely normal situation - a freshly-created database with nothing in it yet, not an error) failed with "Expected column not found in native introspection result: table_name."
+
+Reproduced directly before touching any code: a real `SHOW TABLES` against a database with zero real tables reported `Column count: 0` at the wire protocol level - not just zero rows, zero *columns*, even though `SHOW TABLES` always has exactly one, statically-known column (`table_name`) regardless of how many tables actually exist. The real root cause: the wire protocol derived a result's own column names from its first matching row, which doesn't exist when there are genuinely zero rows - a real, honest, previously-documented limitation of the simple query protocol without a schema catalog behind it, but one that broke a completely ordinary situation for any real client (`DatabaseMetaData.getTables()`, for example) that correctly expects a fixed column shape regardless of row count.
+
+Fixed at the root: `QueryResult` can now carry its own real, known column names explicitly, independent of its row count, for exactly the callers (`SHOW`-style statements with a fixed, statically-known shape) that always know their own schema in advance. Applied everywhere the same class of bug existed: `SHOW TABLES`, `SHOW DATABASES`, `SHOW CATALOG`, `SHOW TABLE STATS`, `SHOW STATEMENTS`, and `SHOW ACTIVITY` were all fixed the same way, along with the extended query protocol's own (prepared statement) describe path, which needed the identical fix.
+
+Verified live: `DatabaseMetaData.getTables()` on a genuinely empty database now correctly returns zero rows instead of throwing, and `SHOW TABLES` now correctly reports its own real column even with zero matching rows. Covered by a permanent test (`emptyDatabaseStillReportsARealTableNameColumnShape`).
 
 ## What to do next
 

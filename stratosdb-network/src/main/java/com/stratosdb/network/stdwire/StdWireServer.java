@@ -443,7 +443,7 @@ public class StdWireServer {
             // columns from the first row (every row in one result shares the
             // same shape) and stream each row, even if there are zero rows
             // (RowDescription must still go out so the client knows the shape).
-            List<StdWireMessages.Column> columns = describeColumns(rows);
+            List<StdWireMessages.Column> columns = describeColumns(rows, result.getColumnNames());
             StdWireMessages.writeRowDescription(out, columns);
             for (Tuple row : rows) {
                 List<String> values = new ArrayList<>(row.size());
@@ -698,10 +698,21 @@ public class StdWireServer {
         return value.toString();
     }
 
-    List<StdWireMessages.Column> describeColumns(List<Tuple> rows) {
+    List<StdWireMessages.Column> describeColumns(List<Tuple> rows, List<String> knownColumnNames) {
         List<StdWireMessages.Column> columns = new ArrayList<>();
         if (rows.isEmpty()) {
-            return columns; // no rows at all means no way to know column names from this result alone - a real, minor limitation of the simple query protocol without a schema catalog behind it
+            if (knownColumnNames != null) {
+                // A real, statically-known column shape, even with zero rows -
+                // see QueryResult.columnNames' own javadoc for the real bug
+                // this fixes. No sample value exists to infer a real type
+                // from, so text (OID 25) is used - correct and harmless,
+                // since every value here is sent in text format regardless
+                // of the declared OID (see inferTypeOid's own comment).
+                for (String name : knownColumnNames) {
+                    columns.add(new StdWireMessages.Column(name, 25, (short) -1));
+                }
+            }
+            return columns; // no rows AND no known column names means no way to know column names from this result at all - a real, minor limitation of the simple query protocol without a schema catalog behind it
         }
         Tuple first = rows.get(0);
         for (int i = 0; i < first.size(); i++) {

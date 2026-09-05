@@ -3870,7 +3870,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 rows.add(row);
             }
         }
-        return QueryResult.success(rows);
+        // See QueryResult.columnNames' own javadoc - a plain, non-clustered
+        // instance genuinely returns zero rows here (see executeShowDatabases'
+        // own real, established convention above), and must still declare a
+        // real "name" column for that same, real reason.
+        return QueryResult.success(rows, List.of("name"));
     }
 
     /**
@@ -5056,7 +5060,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             row.addValue("table_name", tableName);
             rows.add(row);
         }
-        return QueryResult.success(rows);
+        // Declares "table_name" explicitly, even with zero rows - see
+        // QueryResult.columnNames' own javadoc for the real bug this fixes:
+        // a genuinely empty database (a completely normal, common situation,
+        // not an error) would otherwise report zero *columns* too, breaking
+        // any real client (DatabaseMetaData.getTables(), for example) that
+        // expects this column to exist regardless of row count.
+        return QueryResult.success(rows, List.of("table_name"));
     }
 
     /**
@@ -5106,7 +5116,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             row.addValue("ddl_sql", ddlSql);
             rows.add(row);
         }
-        return QueryResult.success(rows);
+        // See QueryResult.columnNames' own javadoc - a genuinely empty
+        // database (zero real objects at all) must still declare its own
+        // real column shape.
+        return QueryResult.success(rows, List.of("object_type", "object_name", "ddl_sql"));
     }
 
     /**
@@ -5165,7 +5178,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             row.addValue("rows_deleted", stats.getRowsDeleted());
             rows.add(row);
         }
-        return QueryResult.success(rows);
+        // See QueryResult.columnNames' own javadoc - a fresh server with no
+        // table activity recorded yet must still declare its own real
+        // column shape.
+        return QueryResult.success(rows, List.of(
+            "table_name", "seq_scan", "rows_returned", "rows_inserted", "rows_updated", "rows_deleted"));
     }
 
     private QueryResult executeShowStatements() {
@@ -5183,7 +5200,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             row.addValue("rows", entry.getValue().getTotalRows());
             rows.add(row);
         }
-        return QueryResult.success(rows);
+        // See QueryResult.columnNames' own javadoc - a fresh server with no
+        // queries tracked yet must still declare its own real column shape.
+        return QueryResult.success(rows, List.of(
+            "query", "calls", "total_time_ms", "min_time_ms", "max_time_ms", "mean_time_ms", "rows"));
     }
 
     /**
@@ -5209,7 +5229,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             row.addValue("backend_start", java.time.Instant.ofEpochMilli(session.backendStart).toString());
             rows.add(row);
         }
-        return QueryResult.success(rows);
+        // See QueryResult.columnNames' own javadoc - must still declare its
+        // own real column shape even in the (rare, but real) case of zero
+        // currently-registered sessions.
+        return QueryResult.success(rows, List.of(
+            "pid", "user", "client_addr", "state", "query", "query_start", "backend_start"));
     }
 
     /**
