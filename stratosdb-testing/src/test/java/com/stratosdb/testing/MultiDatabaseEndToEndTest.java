@@ -183,6 +183,67 @@ public class MultiDatabaseEndToEndTest {
         }
     }
 
+    /**
+     * Real, previously-latent bug found via a real, live DBNavigator
+     * session: DROP DATABASE followed by CREATE DATABASE of the exact
+     * same name appeared to "keep" the previous database's own data.
+     * The real root cause: BufferPoolManager.close() flushed dirty pages
+     * and closed file handles, but never cleared its own in-memory page
+     * cache - so any connection that was already open and had touched a
+     * table before the drop could keep silently serving its own already
+     * -cached pages indefinitely, even after the real underlying files
+     * were deleted and a genuinely new, empty database created at that
+     * same path. This is exactly what DBNavigator's own per-database
+     * connection caching (one pooled connection per catalog) would hit:
+     * re-expanding the same database name after a drop+recreate, without
+     * DBNavigator itself ever knowing to open a fresh connection.
+     */
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void dropThenRecreateSameNameNeverLeaksThePreviousDatabasesData(@TempDir Path tempDir) throws Exception {
+        startClusterServer(tempDir);
+
+        try (Connection admin = connect(StratosCluster.DEFAULT_DATABASE)) {
+            admin.createStatement().executeUpdate("CREATE DATABASE testdb");
+        }
+
+        // A connection that stays open THROUGH the drop+recreate - exactly
+        // matching what a real, pooled, per-catalog client connection (like
+        // DBNavigator's own) would do if it never explicitly reconnects.
+        try (Connection stale = connect("testdb")) {
+            stale.createStatement().execute("CREATE TABLE t (id INT)");
+            stale.createStatement().executeUpdate("INSERT INTO t VALUES (999)");
+
+            try (Connection admin = connect(StratosCluster.DEFAULT_DATABASE)) {
+                admin.createStatement().executeUpdate("DROP DATABASE testdb");
+                admin.createStatement().executeUpdate("CREATE DATABASE testdb");
+            }
+
+            // The real, decisive check: the stale connection must NEVER see
+            // the previous database's own data - it may fail outright, or
+            // (as this fix produces) see nothing at all now that the table
+            // that stale connection thinks it knows about is genuinely gone,
+            // but it must not return the old value 999 under any
+            // circumstance.
+            try {
+                ResultSet rs = stale.createStatement().executeQuery("SELECT * FROM t");
+                assertFalse(rs.next(), "a stale connection must never still see the previous database's own row");
+            } catch (SQLException expectedOrNot) {
+                // A clean failure here is an acceptable, honest outcome too -
+                // the one and only real requirement is that 999 never comes back.
+            }
+        }
+
+        // A genuinely fresh connection must see the real, newly-created,
+        // empty database - not the previous one's own leftover table.
+        try (Connection fresh = connect("testdb")) {
+            SQLException e = assertThrows(SQLException.class,
+                () -> fresh.createStatement().executeQuery("SELECT * FROM t"),
+                "the recreated database must be genuinely empty - it never had this table created in it");
+            assertTrue(e.getMessage().contains("not found") || e.getMessage().contains("Table"));
+        }
+    }
+
     private static int freePort() throws Exception {
         try (ServerSocket s = new ServerSocket(0)) {
             return s.getLocalPort();

@@ -4068,4 +4068,38 @@ public class StratosDBTest {
         QueryResult single = database.execute("INSERT INTO employees VALUES (10, 'Solo', 'HR')");
         assertEquals("Inserted 1 row(s)", single.getMessage());
     }
+
+    /**
+     * Real {@code NUMERIC} support - found missing entirely via a real,
+     * live user report: PostgreSQL treats {@code NUMERIC} and
+     * {@code DECIMAL} as exact synonyms, including the parameterized
+     * form ({@code NUMERIC(19,4)}) - this engine only ever recognized
+     * {@code DECIMAL}, silently parsing a bare {@code NUMERIC} as a
+     * user-defined type reference instead (see the real grammar's own
+     * bare-IDENTIFIER fallback), producing a confusing "extraneous
+     * input '('" syntax error the moment a real precision/scale was
+     * given. Also covers the plain, parameter-less form
+     * ({@code NUMERIC}/{@code DECIMAL} alone) - a real gap found and
+     * fixed alongside this, since PostgreSQL supports that form too.
+     */
+    @Test
+    void testNumericIsARealSynonymForDecimal() {
+        database.execute("CREATE TABLE accounts (id INT, balance NUMERIC(19,4))");
+        database.execute("INSERT INTO accounts VALUES (1, 12345.6789)");
+        QueryResult select = database.execute("SELECT balance FROM accounts WHERE id = 1");
+        assertEquals(12345.6789, (double) select.getRows().get(0).getValue("balance"), 0.0001);
+
+        database.execute("CREATE TABLE plain (v NUMERIC)");
+        database.execute("INSERT INTO plain VALUES (3.14)");
+        QueryResult selectPlain = database.execute("SELECT v FROM plain");
+        assertEquals(3.14, (double) selectPlain.getRows().get(0).getValue("v"), 0.0001);
+
+        // NUMERIC and DECIMAL genuinely coexist as real synonyms, matching
+        // PostgreSQL exactly.
+        database.execute("CREATE TABLE mixed (a DECIMAL(10,2), b NUMERIC(10,2))");
+        database.execute("INSERT INTO mixed VALUES (1.11, 2.22)");
+        QueryResult selectMixed = database.execute("SELECT a, b FROM mixed");
+        assertEquals(1.11, (double) selectMixed.getRows().get(0).getValue("a"), 0.001);
+        assertEquals(2.22, (double) selectMixed.getRows().get(0).getValue("b"), 0.001);
+    }
 }

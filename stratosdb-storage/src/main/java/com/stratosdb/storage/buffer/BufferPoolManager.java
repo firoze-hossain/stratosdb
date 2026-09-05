@@ -221,8 +221,31 @@ public class BufferPoolManager implements BufferPool {
     }
 
     @Override
+    /**
+     * Real, previously-latent bug found via a real DROP DATABASE + CREATE
+     * DATABASE (same name) reproduction: flushing dirty pages and closing
+     * the underlying file handles is not enough to make this buffer pool
+     * stop serving reads. Any already-open connection that had touched
+     * this table before close() was called would keep finding its own
+     * already-cached pages sitting right here in pageCache, and would go
+     * on serving them - correctly reflecting exactly what this table
+     * looked like before shutdown, but silently wrong the moment the
+     * underlying data directory has since been deleted and a genuinely
+     * new, empty table created at the very same path (StratosCluster's
+     * own real DROP DATABASE/CREATE DATABASE support does precisely
+     * this). Clearing the cache here, after the final flush, means any
+     * further read attempt genuinely misses and falls through to
+     * diskManager - which, already closed by this same call, throws a
+     * real, honest I/O error instead of silently returning stale data.
+     */
     public void close() {
         flushAll();
+        globalLock.writeLock().lock();
+        try {
+            pageCache.clear();
+        } finally {
+            globalLock.writeLock().unlock();
+        }
         diskManager.close();
     }
 }
