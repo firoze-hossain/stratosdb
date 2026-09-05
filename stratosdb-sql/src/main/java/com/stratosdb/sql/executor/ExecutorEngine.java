@@ -1743,7 +1743,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private static final java.util.Set<String> KNOWN_BUILTIN_TYPES = java.util.Set.of(
         "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "SERIAL", "BIGSERIAL",
         "VARCHAR", "TEXT", "CHAR", "BOOLEAN", "BOOL", "DATE", "TIME", "TIMESTAMP",
-        "DECIMAL", "DOUBLE", "FLOAT", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
+        "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
         "INET", "CIDR", "INT4RANGE", "DATERANGE", "TSVECTOR", "TSQUERY"
     );
 
@@ -4682,7 +4682,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
                 throw new IllegalArgumentException("cannot convert " + value + " to " + newType);
             }
-            case "DOUBLE": case "FLOAT": case "DECIMAL": {
+            case "DOUBLE": case "FLOAT": case "DECIMAL": case "NUMERIC": {
                 if (value instanceof Double) return value;
                 if (value instanceof Integer i) return i.doubleValue();
                 if (value instanceof Long l) return l.doubleValue();

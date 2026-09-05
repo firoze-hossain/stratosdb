@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Tests passing | **381 / 381** |
+| Tests passing | **383 / 383** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -783,6 +783,20 @@ Implemented at the root: the grammar now allows a real, comma-separated list of 
 RETURNING now yields one real row per inserted row, in insertion order - PostgreSQL's own real behavior for exactly this combination. The wire protocol's own command tag now reports the real, total row count (`INSERT 0 N`) instead of the old, hardcoded assumption of exactly one row per statement - the same fix also corrected a related, real bug in per-table statistics recording, which had the identical hardcoded assumption baked in and would have quietly under-counted every multi-row insert's real contribution to a table's own row-count statistics.
 
 Verified live end-to-end: the exact multi-row `INSERT` that was failing (explicit column list), a positional (no-column-list) multi-row insert, `RETURNING` with multiple rows, a row with the wrong value count appearing mid-batch (not just first) failing cleanly with no partial rows visible afterward, and a plain single-row `INSERT` continuing to work exactly as it always has. All 380 pre-existing tests still pass unchanged; a new, permanent test (`testMultiRowInsertValuesLikePostgres`) covers this same ground automatically.
+
+## Real bug: DROP DATABASE + CREATE DATABASE (same name) could leak the previous database's own data
+
+Found via a real, live user report: dropping a database and immediately recreating one with the exact same name appeared to "keep" the previous database's own data. Reproduced directly before touching any code: a connection that stayed open across the drop+recreate (exactly what a real, pooled, per-database client connection does - DBNavigator's own included) kept seeing the *old* database's row even after a genuinely fresh, empty one was created at the same path, while a brand-new connection correctly saw the new, empty state throughout.
+
+The real root cause: `BufferPoolManager.close()` flushed every dirty page and closed the underlying file handles, but never cleared its own in-memory page cache. Any already-open connection that had touched a table before the drop could keep silently serving its own already-cached pages indefinitely - correctly reflecting exactly what that table looked like before shutdown, but silently wrong the moment the real underlying files have since been deleted and a genuinely new, empty table created at that very same path.
+
+Fixed by clearing the page cache as part of `close()`, right after the final flush - any further read against a shut-down instance now genuinely misses the cache and falls through to a closed disk manager, rather than silently returning stale data. Verified live before and after the fix with the exact reproduction above, and covered by a permanent test (`dropThenRecreateSameNameNeverLeaksThePreviousDatabasesData`).
+
+## Real NUMERIC support
+
+Found missing entirely via a real, live user report: PostgreSQL treats `NUMERIC` and `DECIMAL` as exact synonyms, including the parameterized form (`NUMERIC(19,4)`) - this engine only ever recognized `DECIMAL`, silently parsing a bare `NUMERIC` as a user-defined type reference instead (the real grammar's own bare-IDENTIFIER fallback), producing a confusing "extraneous input '('" syntax error the moment a real precision/scale was given.
+
+Added `NUMERIC` as a genuine, full synonym for `DECIMAL` throughout - the grammar, the built-in type registry, and JDBC type coercion. Also fixed, found along the way since it was the same class of gap: a plain, parameter-less `NUMERIC`/`DECIMAL` (no precision/scale at all) now parses too, matching PostgreSQL's own real support for that form, which neither type had before this fix. Verified live: the user's own exact `NUMERIC(19,4)` case, a parameter-less `NUMERIC` column, `DECIMAL` and `NUMERIC` columns coexisting correctly in the same table, and the JDBC driver correctly reporting the column's real type. Covered by a permanent test (`testNumericIsARealSynonymForDecimal`).
 
 ## What to do next
 
