@@ -4020,4 +4020,52 @@ public class StratosDBTest {
         assertTrue(beyondRange.isSuccess());
         assertEquals(0, beyondRange.getRows().size());
     }
+
+    /**
+     * Real, multi-row {@code VALUES} support - found missing entirely via
+     * a real, live DBNavigator session: standard SQL, part of the spec
+     * itself, and supported by every mainstream engine (PostgreSQL, MySQL,
+     * SQL Server, SQLite) including the very wire protocol this engine
+     * speaks - not a stylistic choice this engine was missing, a genuine
+     * gap. Covers real, correct row counts, real column-count validation
+     * per row (not just the first), real RETURNING with one row per
+     * inserted row in insertion order, and real backward compatibility
+     * with a plain, single-row INSERT.
+     */
+    @Test
+    void testMultiRowInsertValuesLikePostgres() {
+        database.execute("CREATE TABLE employees (id INT, name VARCHAR, department VARCHAR)");
+
+        QueryResult result = database.execute(
+            "INSERT INTO employees (id, name, department) VALUES "
+                + "(1, 'John', 'IT'), (2, 'Sarah', 'HR'), (3, 'Michael', 'Finance')");
+        assertTrue(result.isSuccess());
+        assertEquals("Inserted 3 row(s)", result.getMessage());
+
+        QueryResult select = database.execute("SELECT * FROM employees ORDER BY id");
+        assertEquals(3, select.getRows().size());
+        assertEquals("Sarah", select.getRows().get(1).getValue("name"));
+
+        QueryResult positional = database.execute("INSERT INTO employees VALUES (4, 'Linda', 'Finance'), (5, 'Robert', 'IT')");
+        assertEquals("Inserted 2 row(s)", positional.getMessage());
+
+        QueryResult returning = database.execute(
+            "INSERT INTO employees (id, name, department) VALUES (6, 'Emily', 'IT'), (7, 'David', 'Sales') RETURNING id, name");
+        assertTrue(returning.isSuccess());
+        assertEquals(2, returning.getRows().size());
+        assertEquals(6, returning.getRows().get(0).getValue("id"));
+        assertEquals("David", returning.getRows().get(1).getValue("name"));
+
+        // A row with the wrong number of values mid-batch fails cleanly - even
+        // when it's not the FIRST row, matching this engine's own existing,
+        // established single-row validation, just applied per row now.
+        QueryResult badBatch = database.execute(
+            "INSERT INTO employees VALUES (8, 'Ok', 'IT'), (9, 'Bad')");
+        assertFalse(badBatch.isSuccess());
+
+        // Plain, single-row INSERT - the one-element case of this same
+        // feature - still works exactly as it always has.
+        QueryResult single = database.execute("INSERT INTO employees VALUES (10, 'Solo', 'HR')");
+        assertEquals("Inserted 1 row(s)", single.getMessage());
+    }
 }

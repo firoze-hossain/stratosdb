@@ -730,6 +730,7 @@ public class StdWireServer {
 
     private static final Pattern UPDATED_PATTERN = Pattern.compile("Updated (\\d+) row");
     private static final Pattern DELETED_PATTERN = Pattern.compile("Deleted (\\d+) row");
+    private static final Pattern INSERTED_PATTERN = Pattern.compile("Inserted (\\d+) row");
 
     int extractAffectedCount(String message) {
         if (message == null) return 0;
@@ -737,7 +738,14 @@ public class StdWireServer {
         if (u.find()) return Integer.parseInt(u.group(1));
         Matcher d = DELETED_PATTERN.matcher(message);
         if (d.find()) return Integer.parseInt(d.group(1));
-        if (message.startsWith("Inserted")) return 1;
+        Matcher i = INSERTED_PATTERN.matcher(message);
+        if (i.find()) return Integer.parseInt(i.group(1));
+        // Older, single-row message format ("Inserted row at PAGE/SLOT"), still
+        // produced internally by finishInsert for COPY's own bulk-insert path
+        // and trigger-fired inserts - neither of which routes back through
+        // this method with a real user-facing command tag to report, but kept
+        // as a defensive fallback rather than assuming it can never happen.
+        if (message.startsWith("Inserted row")) return 1;
         return 0;
     }
 
