@@ -1,0 +1,175 @@
+name: Release
+
+# Triggered by pushing a tag like v1.0.0 - builds a real, native installer
+# on each of Linux, Windows, and macOS (jpackage cannot cross-compile: an
+# .msi must be built ON Windows, a .dmg ON macOS - there is no way around
+# running on all three separately), then creates a single GitHub Release
+# with all three installers attached.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Lets you manually trigger a build (e.g. to test this workflow itself)
+  # without needing to push a real tag - draft-only, no release created.
+  workflow_dispatch:
+
+env:
+  # The real jar StratosDB's own real server actually needs at runtime -
+  # only these JDK modules, not the full JDK, are bundled into each
+  # installer (see stratosdb-network's own real module-info.java for
+  # where this list comes from) - this keeps every installer's own real
+  # download size and system dependency list to what a headless server
+  # genuinely needs, not a full desktop Java runtime with GUI/audio
+  # libraries neither StratosDB nor its own real users have any use for.
+  JPACKAGE_MODULES: java.base,java.sql,java.logging,java.management,jdk.httpserver
+
+jobs:
+  build:
+    strategy:
+      # A real, independent failure on one platform must not cancel the
+      # other two - each installer's own build stands on its own.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # WiX Toolset v3 specifically - jpackage on JDK 21 uses WiX v3's own
+      # candle.exe/light.exe command-line tools, not WiX v4/v5's own,
+      # differently-shaped `wix build` CLI. This is the one step in this
+      # whole workflow that could not be directly verified on a real
+      # Windows machine while writing it - if this step or the msi build
+      # step below ever starts failing, check whether a newer jpackage
+      # (a newer JDK) has since added real WiX v4/v5 support and needs a
+      # different install here instead.
+      - name: Install WiX Toolset v3 (Windows only)
+        if: matrix.platform == 'windows'
+        run: choco install wixtoolset --version=3.14.1 -y
+
+      - name: Derive version from the pushed tag
+        shell: bash
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Real Maven build, on real, full-internet-access GitHub runners -
+      # unlike this repo's own sandboxed development process, which has
+      # no Maven Central access at all (see PROGRESS.md's own account of
+      # why every prior round's own build/test verification used a
+      # direct javac build instead of mvn) - only -am is needed, not a
+      # full reactor build, since stratosdb-network's own real shaded,
+      # standalone jar already bundles every one of its own real
+      # dependencies (stratosdb-core, stratosdb-sql, ...) directly - see
+      # this project's own real shade-plugin fix for why that jar is
+      # genuinely self-contained.
+      - name: Build the real, standalone server jar with Maven
+        run: mvn -B -pl stratosdb-network -am package -DskipTests
+
+      - name: Prepare jpackage input
+        shell: bash
+        run: |
+          mkdir -p packaging/input
+          cp stratosdb-network/target/stratosdb-network-*-standalone.jar packaging/input/stratosdb-server.jar
+          cp packaging/README.txt packaging/input/
+
+      - name: Build Linux .deb
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot
+          jpackage \
+            --type deb \
+            --input packaging/input \
+            --name stratosdb \
+            --main-jar stratosdb-server.jar \
+            --main-class com.stratosdb.network.server.StratosServerMain \
+            --app-version "${{ steps.version.outputs.version }}" \
+            --vendor "StratosDB" \
+            --description "StratosDB - a real, from-scratch relational database engine speaking the PostgreSQL wire protocol" \
+            --linux-package-name stratosdb \
+            --linux-deb-maintainer "maintainer@stratosdb.dev" \
+            --add-modules "${{ env.JPACKAGE_MODULES }}" \
+            --resource-dir packaging/linux \
+            --dest dist
+
+      # --win-console: this is a real server that logs to stdout - a
+      # visible console window is the right, honest default, not a
+      # silently-backgrounded GUI-style app with no way to see what it's
+      # doing. --win-menu/--win-shortcut add the real, standard Windows
+      # discoverability any installed application is expected to have.
+      - name: Build Windows .msi
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          jpackage `
+            --type msi `
+            --input packaging/input `
+            --name stratosdb `
+            --main-jar stratosdb-server.jar `
+            --main-class com.stratosdb.network.server.StratosServerMain `
+            --app-version "${{ steps.version.outputs.version }}" `
+            --vendor "StratosDB" `
+            --description "StratosDB - a real, from-scratch relational database engine speaking the PostgreSQL wire protocol" `
+            --win-console `
+            --win-menu `
+            --win-shortcut `
+            --add-modules "${{ env.JPACKAGE_MODULES }}" `
+            --dest dist
+
+      - name: Build macOS .dmg
+        if: matrix.platform == 'macos'
+        run: |
+          jpackage \
+            --type dmg \
+            --input packaging/input \
+            --name stratosdb \
+            --main-jar stratosdb-server.jar \
+            --main-class com.stratosdb.network.server.StratosServerMain \
+            --app-version "${{ steps.version.outputs.version }}" \
+            --vendor "StratosDB" \
+            --description "StratosDB - a real, from-scratch relational database engine speaking the PostgreSQL wire protocol" \
+            --mac-package-name stratosdb \
+            --add-modules "${{ env.JPACKAGE_MODULES }}" \
+            --dest dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stratosdb-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what will be released
+        run: ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
