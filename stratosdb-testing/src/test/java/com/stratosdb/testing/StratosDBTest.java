@@ -4161,4 +4161,56 @@ public class StratosDBTest {
             reopened.shutdown();
         }
     }
+
+    /**
+     * Real, previously-latent bug found via a real, live incident,
+     * genuinely separate from the one above: any ordinary, pretty-
+     * formatted multi-line SQL statement - a real, common way to write
+     * a {@code CREATE TABLE}, not a rare or unusual thing to type -
+     * corrupted its own catalog entry the moment it was persisted, since
+     * catalog.txt's own format is one physical line per logical entry
+     * and the raw SQL text's own embedded newlines split it across many
+     * broken physical lines instead. Every column of a real, six-column
+     * table disappeared on the very next restart. See
+     * ExecutorEngine.escapeForCatalogLine's own javadoc for the real
+     * fix: real newlines are escaped before being written and restored
+     * exactly on read, so the table (and SHOW CATALOG's own real,
+     * original, re-executable DDL text) both survive a restart intact
+     * regardless of how the original SQL was formatted.
+     */
+    @Test
+    void multiLineCreateTableSurvivesARealRestart(@TempDir Path multilineTestDir) throws Exception {
+        DatabaseConfig config = new DatabaseConfig();
+        config.setDataDirectory(multilineTestDir.toString());
+        StratosDB db = new StratosDB(config);
+        String sql = "CREATE TABLE employees (\n"
+            + "    employee_id INT,\n"
+            + "    first_name VARCHAR(50),\n"
+            + "    last_name VARCHAR(50),\n"
+            + "    department VARCHAR(50),\n"
+            + "    job_title VARCHAR(100),\n"
+            + "    salary NUMERIC(10,2),\n"
+            + "    hire_date DATE\n"
+            + ")";
+        db.execute(sql);
+        db.execute("INSERT INTO employees VALUES (1, 'John', 'Smith', 'IT', 'Software Engineer', 75000, '2022-01-15')");
+        db.shutdown();
+
+        StratosDB reopened = new StratosDB(config);
+        try {
+            QueryResult select = reopened.execute("SELECT * FROM employees");
+            assertTrue(select.isSuccess(), "a real, multi-line CREATE TABLE must survive a real restart intact");
+            assertEquals(1, select.getRows().size());
+            assertEquals("John", select.getRows().get(0).getValue("first_name"));
+
+            QueryResult catalog = reopened.execute("SHOW CATALOG");
+            String ddl = catalog.getRows().stream()
+                .filter(r -> "employees".equals(r.getValue("object_name")))
+                .findFirst().orElseThrow().getValue("ddl_sql").toString();
+            assertTrue(ddl.contains("\n"), "SHOW CATALOG must return the real, original multi-line text, not a flattened or escaped form");
+            assertFalse(ddl.contains("\\n"), "the returned DDL must be genuinely unescaped, not literal backslash-n text");
+        } finally {
+            reopened.shutdown();
+        }
+    }
 }

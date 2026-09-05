@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 9 |
-| Tests passing | **385 / 385** |
+| Tests passing | **386 / 386** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -819,6 +819,16 @@ Two real, separate bugs, both found and fixed:
 **A real, cascading multiplier found on top of that**: even with the corruption itself now prevented going forward, a single malformed catalog line (from this or any other cause) used to abort loading of every remaining entry in that database's catalog too - meaning one corrupted table could make every other, completely healthy table in the same database disappear on restart as well. Fixed by isolating each catalog line's own processing in its own try/catch: a line that genuinely can't be recovered is now skipped and logged, while the rest of that database's real schema still loads correctly.
 
 Verified live by directly reproducing the real incident: manually corrupting one table's own catalog entry in exactly the shape seen in the real report, restarting a fresh instance over it, and confirming the corrupted table is (unavoidably) gone while a separate, healthy table in the same database survives completely intact, with the server never crashing or throwing uncaught. Covered by a permanent test (`corruptedCatalogEntryDoesNotTakeDownAnUnrelatedHealthyTable`).
+
+## Real, separate bug: any ordinary multi-line SQL statement corrupted its own catalog entry
+
+Found via a second real, live incident, right after the process-kill-timing corruption fix above - and genuinely different from it: this one needs no special timing at all. A perfectly normal, pretty-formatted, multi-line `CREATE TABLE` - exactly what any real SQL editor produces, not a rare or unusual thing to type - corrupted its own catalog entry the moment it was created, and every column of a real, six-column table disappeared on the very next restart.
+
+The real cause: `catalogLines` stores the raw, original SQL text verbatim (this engine's own real "verbatim replay" design principle), but `catalog.txt`'s own format is one physical line per logical entry. A real newline embedded inside that SQL text split one logical catalog entry across many broken physical lines the instant it was written - and each of those fragments then failed to parse as its own entry on the next restart, exactly the same `ArrayIndexOutOfBoundsException` class already fixed above, just triggered by something far more common than a process kill.
+
+Fixed by escaping real newline, carriage-return, and backslash characters in the raw SQL text before it's ever written to a catalog line, and reversing that escaping wherever a line is read back - both when replaying entries on startup and in `SHOW CATALOG`'s own output, which now genuinely returns the real, original, valid, re-executable DDL text again, matching this engine's own "verbatim replay" principle for multi-line SQL too, not just single-line SQL.
+
+Verified live: reproduced the exact real incident (a real six-column, multi-line `CREATE TABLE`, restarted, every column reported as its own broken catalog entry), then confirmed the fix directly - the table and its real data now survive a real restart intact, and `SHOW CATALOG` returns the real, original multi-line text, itself genuinely valid, re-executable SQL. Covered by a permanent test (`multiLineCreateTableSurvivesARealRestart`).
 
 ## What to do next
 
