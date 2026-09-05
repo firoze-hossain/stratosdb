@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+package_type=deb
+
+case "$1" in
+    configure)
+        ln -sf /opt/stratosdb/bin/stratosdb /usr/bin/stratosdb
+        echo ""
+        echo "StratosDB installed. Start it with: stratosdb [data-dir] [port] [--cluster]"
+        echo "Looking for a GUI client? DBNavigator (https://github.com/firoze-hossain/DBNavigator) supports StratosDB directly."
+        echo ""
+    ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+exit 0
