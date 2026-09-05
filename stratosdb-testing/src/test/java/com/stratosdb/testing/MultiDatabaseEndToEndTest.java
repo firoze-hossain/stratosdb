@@ -244,6 +244,43 @@ public class MultiDatabaseEndToEndTest {
         }
     }
 
+    /**
+     * Real, previously-latent bug found via a real, live DBNavigator
+     * session: expanding the Tables folder of a genuinely empty database
+     * (a completely normal, common situation - a freshly-created database
+     * with nothing in it yet, not an error) failed with "Expected column
+     * not found in native introspection result: table_name". The real
+     * root cause: SHOW TABLES (and several sibling SHOW-style statements)
+     * derived their own column names from the first matching row - which
+     * doesn't exist when there are genuinely zero rows, so the wire
+     * protocol reported zero *columns*, not just zero rows, breaking any
+     * real client that expects a fixed column shape regardless of row
+     * count.
+     */
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void emptyDatabaseStillReportsARealTableNameColumnShape(@TempDir Path tempDir) throws Exception {
+        startClusterServer(tempDir);
+
+        try (Connection admin = connect(StratosCluster.DEFAULT_DATABASE)) {
+            admin.createStatement().executeUpdate("CREATE DATABASE emptydb");
+        }
+
+        try (Connection conn = connect("emptydb")) {
+            // The real, decisive check: DatabaseMetaData.getTables() must
+            // succeed with zero rows, not throw.
+            ResultSet rs = conn.getMetaData().getTables(null, null, "%", null);
+            assertFalse(rs.next(), "a genuinely empty database has zero tables, not an error");
+
+            // Directly confirms the wire protocol itself declares the real
+            // column, not just that the JDBC-level call happens to survive.
+            ResultSet direct = conn.createStatement().executeQuery("SHOW TABLES");
+            assertEquals(1, direct.getMetaData().getColumnCount());
+            assertEquals("table_name", direct.getMetaData().getColumnName(1));
+            assertFalse(direct.next());
+        }
+    }
+
     private static int freePort() throws Exception {
         try (ServerSocket s = new ServerSocket(0)) {
             return s.getLocalPort();

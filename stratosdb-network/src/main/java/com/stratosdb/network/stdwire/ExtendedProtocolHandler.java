@@ -178,7 +178,7 @@ final class ExtendedProtocolHandler {
             }
             List<Tuple> rows = portal.result().isSuccess() ? portal.result().getRows() : null;
             if (rows != null) {
-                StdWireMessages.writeRowDescription(out, server.describeColumns(rows));
+                StdWireMessages.writeRowDescription(out, server.describeColumns(rows, portal.result().getColumnNames()));
             } else {
                 StdWireMessages.writeNoData(out);
             }
