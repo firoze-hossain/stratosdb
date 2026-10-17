@@ -13,10 +13,16 @@
     <packaging>jar</packaging>
 
     <dependencies>
+        <!--
+          Test-only: stratosdb-network is only used by integration tests to
+          spin up in-memory test servers. At runtime, stratosdb-jdbc is 100%
+          self-contained with zero server or storage dependencies.
+        -->
         <dependency>
             <groupId>com.stratosdb</groupId>
             <artifactId>stratosdb-network</artifactId>
             <version>1.0.0-SNAPSHOT</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>

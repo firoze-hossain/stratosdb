@@ -1,6 +1,6 @@
 package com.stratosdb.jdbc;
 
-import com.stratosdb.network.tls.TlsSupport;
+import com.stratosdb.jdbc.internal.tls.TlsSupport;
 
 import javax.net.ssl.SSLContext;
 import java.security.GeneralSecurityException;

@@ -1,8 +1,8 @@
 package com.stratosdb.jdbc;
 
-import com.stratosdb.network.auth.ScramClient;
-import com.stratosdb.network.auth.ScramSha256;
-import com.stratosdb.network.stdwire.StdWireMessages;
+import com.stratosdb.jdbc.internal.auth.ScramClient;
+import com.stratosdb.jdbc.internal.auth.ScramSha256;
+import com.stratosdb.jdbc.internal.protocol.StdWireMessages;
 
 import javax.net.ssl.SSLContext;
 import java.io.BufferedInputStream;
