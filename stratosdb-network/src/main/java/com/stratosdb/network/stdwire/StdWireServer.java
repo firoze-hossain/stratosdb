@@ -264,6 +264,8 @@ public class StdWireServer {
             }
         } catch (IOException e) {
             LOG.debug("pg-wire connection {} closed: {}", remote, e.getMessage());
+        } catch (Throwable t) {
+            LOG.error("pg-wire connection unexpected error: {}", t.getMessage(), t);
         } finally {
             if (activity != null) {
                 db().getExecutor().getSessionActivityRegistry().unregister(activity);
