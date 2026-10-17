@@ -2,8 +2,21 @@
 set -e
 
 case "$1" in
-    remove|purge)
-        rm -f /usr/bin/stratosdb
+    purge)
+        rm -f /usr/bin/stratosdb /usr/bin/stdsql /usr/bin/stratosdb-setup
+        rm -f /lib/systemd/system/stratosdb.service /etc/systemd/system/stratosdb.service
+        rm -rf /etc/stratosdb
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        echo "StratosDB purged. Note: /var/lib/stratosdb was preserved for data safety."
+    ;;
+    remove)
+        rm -f /usr/bin/stratosdb /usr/bin/stdsql /usr/bin/stratosdb-setup
+        rm -f /lib/systemd/system/stratosdb.service /etc/systemd/system/stratosdb.service
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
     ;;
     upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
     ;;
