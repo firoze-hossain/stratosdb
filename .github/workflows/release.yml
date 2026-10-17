@@ -97,7 +97,7 @@ jobs:
             --main-class com.stratosdb.network.server.StratosServerMain \
             --app-version "${{ steps.version.outputs.version }}" \
             --vendor "StratosDB" \
-            --description "StratosDB - Relational Database Engine speaking PostgreSQL wire protocol" \
+            --description "StratosDB - High-performance Relational Database Engine with Native StratosWire Binary Protocol" \
             --linux-package-name stratosdb \
             --linux-deb-maintainer "maintainer@stratosdb.dev" \
             --add-modules "${{ env.JPACKAGE_MODULES }}" \
@@ -140,7 +140,7 @@ jobs:
             --main-class com.stratosdb.network.server.StratosServerMain `
             --app-version "${{ steps.version.outputs.version }}" `
             --vendor "StratosDB" `
-            --description "StratosDB - Relational Database Engine speaking PostgreSQL wire protocol" `
+            --description "StratosDB - High-performance Relational Database Engine with Native StratosWire Binary Protocol" `
             --win-console `
             --win-menu `
             --win-shortcut `
@@ -167,7 +167,7 @@ jobs:
             --main-class com.stratosdb.network.server.StratosServerMain \
             --app-version "${{ steps.version.outputs.version }}" \
             --vendor "StratosDB" \
-            --description "StratosDB - Relational Database Engine speaking PostgreSQL wire protocol" \
+            --description "StratosDB - High-performance Relational Database Engine with Native StratosWire Binary Protocol" \
             --mac-package-name StratosDB \
             --add-modules "${{ env.JPACKAGE_MODULES }}" \
             --dest dist
