@@ -171,17 +171,22 @@ public class StratosServerMain {
 
         if (clusterMode) {
             com.stratosdb.core.StratosCluster cluster = new com.stratosdb.core.StratosCluster(config);
-            StdWireServer server = new StdWireServer(port, cluster);
-            server.start();
-            System.out.println("StratosDB listening on port " + port
-                + " (PostgreSQL wire protocol, real multi-database cluster mode, data: " + dataDir + ") - "
-                + "databases: " + cluster.listDatabaseNames() + " - connect with psql -h localhost -p " + port
-                + " -U anyuser -d " + com.stratosdb.core.StratosCluster.DEFAULT_DATABASE
-                + ", or StratosShell/stdsql, or the real stratosdb-jdbc driver. Ctrl+C to stop.");
+            com.stratosdb.network.stratoswire.StratosWireServer nativeServer =
+                new com.stratosdb.network.stratoswire.StratosWireServer(port, cluster);
+            nativeServer.start();
+
+            StdWireServer compatServer = new StdWireServer(port + 1, cluster);
+            compatServer.start();
+
+            System.out.println("StratosDB Server started (Multi-database Cluster Mode, data: " + dataDir + "):");
+            System.out.println("  • Stratos Native Protocol (SWP v1.0): port " + port + " (Magic: STDB, native drivers & DBNavigator)");
+            System.out.println("  • PostgreSQL wire compatibility:      port " + (port + 1));
+            System.out.println("Databases: " + cluster.listDatabaseNames() + ". Ctrl+C to stop.");
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\nShutting down...");
-                server.stop();
+                nativeServer.stop();
+                compatServer.stop();
                 cluster.shutdown();
             }));
 
@@ -190,15 +195,22 @@ public class StratosServerMain {
         }
 
         StratosDB db = new StratosDB(config);
-        StdWireServer server = new StdWireServer(port, db);
-        server.start();
-        System.out.println("StratosDB listening on port " + port
-            + " (PostgreSQL wire protocol, data: " + dataDir + ") - connect with psql -h localhost -p " + port + " -U anyuser -d anydb, "
-            + "or StratosShell/stdsql, or the real stratosdb-jdbc driver. Ctrl+C to stop.");
+        com.stratosdb.network.stratoswire.StratosWireServer nativeServer =
+            new com.stratosdb.network.stratoswire.StratosWireServer(port, db);
+        nativeServer.start();
+
+        StdWireServer compatServer = new StdWireServer(port + 1, db);
+        compatServer.start();
+
+        System.out.println("StratosDB Server started (data: " + dataDir + "):");
+        System.out.println("  • Stratos Native Protocol (SWP v1.0): port " + port + " (Magic: STDB, native drivers & DBNavigator)");
+        System.out.println("  • PostgreSQL wire compatibility:      port " + (port + 1));
+        System.out.println("Ctrl+C to stop.");
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\nShutting down...");
-            server.stop();
+            nativeServer.stop();
+            compatServer.stop();
             db.shutdown();
         }));
 
