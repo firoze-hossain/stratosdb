@@ -1,13 +1,117 @@
 #!/bin/sh
 set -e
+
 package_type=deb
 
 case "$1" in
     configure)
+        # Create system user and group if not present
+        if ! getent group stratosdb >/dev/null 2>&1; then
+            groupadd --system stratosdb
+        fi
+        if ! getent passwd stratosdb >/dev/null 2>&1; then
+            useradd --system --gid stratosdb --home /var/lib/stratosdb --no-create-home --shell /bin/false stratosdb
+        fi
+
+        # Setup standard directories
+        mkdir -p /etc/stratosdb
+        mkdir -p /var/lib/stratosdb/data
+        mkdir -p /var/log/stratosdb
+
+        chown -R stratosdb:stratosdb /var/lib/stratosdb
+        chmod 700 /var/lib/stratosdb/data
+        chown -R stratosdb:stratosdb /var/log/stratosdb
+        chmod 755 /var/log/stratosdb
+        chown root:stratosdb /etc/stratosdb
+        chmod 775 /etc/stratosdb
+
+        # Install default configuration if none exists
+        if [ ! -f /etc/stratosdb/stratosdb.conf ]; then
+            if [ -f /opt/stratosdb/lib/app/stratosdb.conf ]; then
+                cp /opt/stratosdb/lib/app/stratosdb.conf /etc/stratosdb/stratosdb.conf
+            else
+                cat << 'EOF' > /etc/stratosdb/stratosdb.conf
+# StratosDB Configuration File
+port=6582
+data_directory=/var/lib/stratosdb/data
+cluster=true
+buffer_pool_size=1024
+sync_wal=true
+max_connections=100
+autovacuum_interval_ms=0
+slow_query_threshold_ms=-1
+EOF
+            fi
+            chown root:stratosdb /etc/stratosdb/stratosdb.conf
+            chmod 664 /etc/stratosdb/stratosdb.conf
+        fi
+
+        # Install systemd service unit
+        if [ -f /opt/stratosdb/lib/app/stratosdb.service ]; then
+            cp /opt/stratosdb/lib/app/stratosdb.service /lib/systemd/system/stratosdb.service
+            chmod 644 /lib/systemd/system/stratosdb.service
+        fi
+
+        # Binary symlinks and wrappers
         ln -sf /opt/stratosdb/bin/stratosdb /usr/bin/stratosdb
+
+        if [ -f /opt/stratosdb/lib/app/stratosdb-setup ]; then
+            install -m 755 /opt/stratosdb/lib/app/stratosdb-setup /usr/bin/stratosdb-setup
+        fi
+
+        cat << 'EOF' > /usr/bin/stdsql
+#!/bin/sh
+if [ -x /opt/stratosdb/runtime/bin/java ] && [ -f /opt/stratosdb/lib/app/stratosdb-cli.jar ]; then
+    exec /opt/stratosdb/runtime/bin/java -jar /opt/stratosdb/lib/app/stratosdb-cli.jar "$@"
+elif which java >/dev/null 2>&1 && [ -f /opt/stratosdb/lib/app/stratosdb-cli.jar ]; then
+    exec java -jar /opt/stratosdb/lib/app/stratosdb-cli.jar "$@"
+else
+    echo "Error: Cannot locate Java runtime or stratosdb-cli.jar" >&2
+    exit 1
+fi
+EOF
+        chmod 755 /usr/bin/stdsql
+
+        # Interactive configuration prompt if terminal is attached
+        if [ -t 0 ] && [ "$DEBIAN_FRONTEND" != "noninteractive" ]; then
+            echo ""
+            echo "=========================================================="
+            echo "           StratosDB Installation Successful              "
+            echo "=========================================================="
+            echo "Default Configuration:"
+            echo "  - Port:           6582 (PostgreSQL wire protocol)"
+            echo "  - Data Directory: /var/lib/stratosdb/data"
+            echo "  - Cluster Mode:   true (multi-database)"
+            echo "  - Service:        stratosdb.service"
+            echo "=========================================================="
+            printf "Would you like to customize these settings now? [y/N]: "
+            read -r CONFIRM_SETUP || CONFIRM_SETUP="n"
+            case "$CONFIRM_SETUP" in
+                [yY][eE][sS]|[yY])
+                    if [ -x /usr/bin/stratosdb-setup ]; then
+                        /usr/bin/stratosdb-setup || true
+                    fi
+                ;;
+                *)
+                    echo "Using default settings. You can reconfigure anytime by running:"
+                    echo "  sudo stratosdb-setup"
+                ;;
+            esac
+        fi
+
+        # Enable and start systemd service if systemd is running
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemctl enable stratosdb || true
+            systemctl restart stratosdb || true
+            echo ""
+            echo "StratosDB service is running: systemctl status stratosdb"
+        fi
+
         echo ""
-        echo "StratosDB installed. Start it with: stratosdb [data-dir] [port] [--cluster]"
-        echo "Looking for a GUI client? DBNavigator (https://github.com/firoze-hossain/DBNavigator) supports StratosDB directly."
+        echo "Connect via CLI:"
+        echo "  stdsql -h localhost -p 6582 -U anyuser -d anydb"
+        echo "Looking for a GUI? DBNavigator (https://github.com/firoze-hossain/DBNavigator) supports StratosDB directly."
         echo ""
     ;;
     abort-upgrade|abort-remove|abort-deconfigure)

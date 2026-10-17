@@ -1,0 +1,11 @@
+#!/bin/bash
+# StratosDB CLI client launcher for macOS
+
+if [ -f "/Applications/StratosDB.app/Contents/runtime/Contents/Home/bin/java" ] && [ -f "/Applications/StratosDB.app/Contents/app/stratosdb-cli.jar" ]; then
+    exec "/Applications/StratosDB.app/Contents/runtime/Contents/Home/bin/java" -jar "/Applications/StratosDB.app/Contents/app/stratosdb-cli.jar" "$@"
+elif which java >/dev/null 2>&1 && [ -f "/Applications/StratosDB.app/Contents/app/stratosdb-cli.jar" ]; then
+    exec java -jar "/Applications/StratosDB.app/Contents/app/stratosdb-cli.jar" "$@"
+else
+    echo "Error: Cannot locate Java runtime or StratosDB CLI client." >&2
+    exit 1
+fi

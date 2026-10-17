@@ -60,31 +60,112 @@ import com.stratosdb.network.stdwire.StdWireServer;
  */
 public class StratosServerMain {
     public static void main(String[] args) throws Exception {
-        String dataDir = "./stratosdb_data";
+        String explicitConfigFile = null;
+        String dataDir = null;
         Integer port = null;
-        boolean clusterMode = false;
+        Boolean clusterMode = null;
 
         java.util.List<String> positional = new java.util.ArrayList<>();
         boolean sawLegacyStdwireFlag = false;
-        for (String arg : args) {
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
             if (arg.equals("--stdwire") || arg.startsWith("--stdwire=")) {
                 sawLegacyStdwireFlag = true;
             } else if (arg.equals("--cluster")) {
                 clusterMode = true;
+            } else if (arg.startsWith("--config=")) {
+                explicitConfigFile = arg.substring("--config=".length());
+            } else if (arg.equals("--config") && i + 1 < args.length) {
+                explicitConfigFile = args[++i];
+            } else if (arg.startsWith("--port=")) {
+                port = Integer.parseInt(arg.substring("--port=".length()));
+            } else if (arg.equals("--port") && i + 1 < args.length) {
+                port = Integer.parseInt(args[++i]);
+            } else if (arg.startsWith("--data-dir=")) {
+                dataDir = arg.substring("--data-dir=".length());
+            } else if (arg.equals("--data-dir") && i + 1 < args.length) {
+                dataDir = args[++i];
             } else {
                 positional.add(arg);
             }
         }
+
+        // Positional args take precedence if provided: [dataDir] [port]
         if (positional.size() > 0) dataDir = positional.get(0);
         if (positional.size() > 1) port = Integer.parseInt(positional.get(1));
+
+        // Locate config file: explicit flag, env var, or standard system paths
+        String configFile = explicitConfigFile;
+        if (configFile == null) {
+            String envConf = System.getenv("STRATOSDB_CONF");
+            if (envConf != null && !envConf.isBlank()) {
+                configFile = envConf;
+            }
+        }
+        if (configFile == null) {
+            String[] candidatePaths = new String[] {
+                "/etc/stratosdb/stratosdb.conf",
+                System.getenv("PROGRAMDATA") != null ? System.getenv("PROGRAMDATA") + "\\StratosDB\\stratosdb.conf" : null,
+                "/usr/local/etc/stratosdb/stratosdb.conf",
+                "./stratosdb.conf"
+            };
+            for (String path : candidatePaths) {
+                if (path != null && new java.io.File(path).isFile()) {
+                    configFile = path;
+                    break;
+                }
+            }
+        }
+
+        DatabaseConfig config = new DatabaseConfig();
+
+        if (configFile != null && new java.io.File(configFile).isFile()) {
+            java.util.Properties props = new java.util.Properties();
+            try (java.io.InputStream in = new java.io.FileInputStream(configFile)) {
+                props.load(in);
+                System.out.println("Loaded StratosDB configuration from: " + configFile);
+                if (port == null && props.getProperty("port") != null) {
+                    port = Integer.parseInt(props.getProperty("port").trim());
+                }
+                if (dataDir == null) {
+                    if (props.getProperty("data_directory") != null) {
+                        dataDir = props.getProperty("data_directory").trim();
+                    } else if (props.getProperty("dataDirectory") != null) {
+                        dataDir = props.getProperty("dataDirectory").trim();
+                    }
+                }
+                if (clusterMode == null && props.getProperty("cluster") != null) {
+                    clusterMode = Boolean.parseBoolean(props.getProperty("cluster").trim());
+                }
+                if (props.getProperty("buffer_pool_size") != null) {
+                    config.setBufferPoolSize(Integer.parseInt(props.getProperty("buffer_pool_size").trim()));
+                }
+                if (props.getProperty("sync_wal") != null) {
+                    config.setSyncWAL(Boolean.parseBoolean(props.getProperty("sync_wal").trim()));
+                }
+                if (props.getProperty("max_connections") != null) {
+                    config.setMaxConnections(Integer.parseInt(props.getProperty("max_connections").trim()));
+                }
+                if (props.getProperty("autovacuum_interval_ms") != null) {
+                    config.setAutovacuumIntervalMs(Long.parseLong(props.getProperty("autovacuum_interval_ms").trim()));
+                }
+                if (props.getProperty("slow_query_threshold_ms") != null) {
+                    config.setSlowQueryThresholdMs(Long.parseLong(props.getProperty("slow_query_threshold_ms").trim()));
+                }
+            } catch (Exception e) {
+                System.err.println("Warning: failed to load configuration file " + configFile + ": " + e.getMessage());
+            }
+        }
+
+        if (dataDir == null) dataDir = "./stratosdb_data";
         if (port == null) port = ProtocolConstants.DEFAULT_PORT;
+        if (clusterMode == null) clusterMode = false;
 
         if (sawLegacyStdwireFlag) {
             System.out.println("Note: --stdwire is no longer needed - the real PostgreSQL "
                 + "wire-protocol server is always what this class starts now (see this class's own javadoc). Ignoring the flag.");
         }
 
-        DatabaseConfig config = new DatabaseConfig();
         config.setDataDirectory(dataDir);
         config.setPort(port);
 

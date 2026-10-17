@@ -1,0 +1,19 @@
+[Unit]
+Description=StratosDB Database Engine
+Documentation=https://github.com/firoze-hossain/stratosdb
+After=network.target
+
+[Service]
+Type=simple
+User=stratosdb
+Group=stratosdb
+EnvironmentFile=-/etc/stratosdb/stratosdb.conf
+ExecStart=/opt/stratosdb/bin/stratosdb --config /etc/stratosdb/stratosdb.conf
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
