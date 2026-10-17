@@ -1,6 +1,6 @@
 package com.stratosdb.jdbc;
 
-import com.stratosdb.network.stdwire.StdWireMessages;
+import com.stratosdb.jdbc.internal.protocol.StdWireMessages;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
