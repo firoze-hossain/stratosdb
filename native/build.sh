@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [ -z "$JAVA_HOME" ]; then
-    for candidate in /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/default-java "$(dirname "$(dirname "$(readlink -f "$(which java)")")")"; do
+    for candidate in /usr/lib/jvm/jdk-25.0.1-oracle-x64 /usr/lib/jvm/java-25-openjdk-amd64 /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/default-java "$(dirname "$(dirname "$(readlink -f "$(which java)")")")"; do
         if [ -f "$candidate/include/jni.h" ]; then
             JAVA_HOME="$candidate"
             break

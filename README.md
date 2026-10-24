@@ -34,7 +34,7 @@ See [`PROJECT_PLAN.md`](./PROJECT_PLAN.md) for the full, itemized roadmap and [`
 
 ## Quick start
 
-Prerequisites: JDK 21, Maven 3.9+.
+Prerequisites: JDK 25, Maven 3.9+.
 
 ```bash
 git clone https://github.com/firoze-hossain/stratosdb.git

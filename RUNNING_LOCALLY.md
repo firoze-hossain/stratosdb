@@ -4,7 +4,7 @@ Everything below was verified against the actual code, but not through a real `m
 
 ## Prerequisites
 
-- **JDK 21** (the project is pinned to Java 21 LTS — check with `java -version`)
+- **JDK 25** (the project is pinned to Java 25 LTS — check with `java -version`)
 - **Maven 3.9+** (check with `mvn -version`)
 - Internet access to Maven Central, to download dependencies (ANTLR4, JUnit 5, SLF4J, etc.)
 
