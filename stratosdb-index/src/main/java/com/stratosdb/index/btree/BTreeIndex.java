@@ -66,6 +66,11 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         public Page wrap(long pageId, byte[] existingBytes) {
             return new Page(pageId, existingBytes);
         }
+
+        @Override
+        public Page wrap(long pageId, java.nio.ByteBuffer directBuffer) {
+            return new Page(pageId, directBuffer);
+        }
     };
 
     private final String indexName;

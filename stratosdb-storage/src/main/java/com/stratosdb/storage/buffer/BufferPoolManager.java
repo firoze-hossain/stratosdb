@@ -20,15 +20,61 @@ public class BufferPoolManager implements BufferPool {
     private final Map<String, Map<Long, Integer>> pinCounts;
     private final ReentrantReadWriteLock globalLock;
 
+    private final Thread backgroundFlusherThread;
+    private final java.util.concurrent.atomic.AtomicBoolean flusherRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final Object flusherLock = new Object();
+    private final long flushIntervalMs;
+    private final java.util.concurrent.atomic.AtomicLong totalBackgroundFlushes = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong totalDirtyPagesFlushed = new java.util.concurrent.atomic.AtomicLong(0);
+
     private long hits = 0;
     private long misses = 0;
 
     public BufferPoolManager(int maxPages, DiskManager diskManager) {
+        this(maxPages, diskManager, 100L, true);
+    }
+
+    public BufferPoolManager(int maxPages, DiskManager diskManager, long flushIntervalMs, boolean startFlusher) {
         this.maxPages = maxPages;
         this.diskManager = diskManager;
+        this.flushIntervalMs = flushIntervalMs;
         this.pageCache = new ConcurrentHashMap<>();
         this.pinCounts = new ConcurrentHashMap<>();
         this.globalLock = new ReentrantReadWriteLock();
+
+        if (startFlusher && flushIntervalMs > 0) {
+            this.flusherRunning.set(true);
+            this.backgroundFlusherThread = new Thread(this::runBackgroundFlusher, "stratos-bgflusher-" + System.identityHashCode(this));
+            this.backgroundFlusherThread.setDaemon(true);
+            this.backgroundFlusherThread.start();
+            LOG.debug("Dirty page background flusher started with interval {}ms", flushIntervalMs);
+        } else {
+            this.flusherRunning.set(false);
+            this.backgroundFlusherThread = null;
+        }
+    }
+
+    private void runBackgroundFlusher() {
+        while (flusherRunning.get()) {
+            try {
+                synchronized (flusherLock) {
+                    flusherLock.wait(flushIntervalMs);
+                }
+                if (!flusherRunning.get()) {
+                    break;
+                }
+                int flushed = flushDirtyPagesInternal(false, 32);
+                if (flushed > 0) {
+                    totalBackgroundFlushes.incrementAndGet();
+                    totalDirtyPagesFlushed.addAndGet(flushed);
+                    LOG.debug("Background flusher wrote {} dirty pages to disk", flushed);
+                }
+            } catch (InterruptedException e) {
+                break;
+            } catch (Exception e) {
+                LOG.warn("Error during background dirty page flush", e);
+            }
+        }
     }
 
     private static final com.stratosdb.storage.page.PageFactory<SlottedPage> SLOTTED_PAGE_FACTORY =
@@ -40,10 +86,12 @@ public class BufferPoolManager implements BufferPool {
 
             @Override
             public SlottedPage wrap(long pageId, byte[] existingBytes) {
-                SlottedPage page = new SlottedPage(pageId);
-                page.getBuffer().put(existingBytes);
-                page.getBuffer().flip();
-                return page;
+                return new SlottedPage(pageId, existingBytes);
+            }
+
+            @Override
+            public SlottedPage wrap(long pageId, java.nio.ByteBuffer directBuffer) {
+                return new SlottedPage(pageId, directBuffer);
             }
         };
 
@@ -84,10 +132,14 @@ public class BufferPoolManager implements BufferPool {
             // Evict if needed
             evictIfNeeded();
 
-            // Load raw bytes from disk and let the factory interpret them as
-            // whatever page type this caller needs (SlottedPage, BTreePage, ...).
-            Page raw = diskManager.readPage(tableName, pageId);
-            T page = factory.wrap(pageId, raw.getBytes());
+            // Load from disk if page already exists, otherwise create a properly initialized empty page.
+            T page;
+            if (pageId >= diskManager.getTablePageCount(tableName)) {
+                page = factory.createEmpty(pageId);
+            } else {
+                Page raw = diskManager.readPage(tableName, pageId);
+                page = factory.wrap(pageId, raw.getBuffer());
+            }
 
             // Add to cache
             tablePages = pageCache.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
@@ -226,6 +278,95 @@ public class BufferPoolManager implements BufferPool {
     }
 
     @Override
+    public boolean isOffHeap() {
+        return true;
+    }
+
+    @Override
+    public long getOffHeapMemoryUsed() {
+        return (long) getCacheSize() * com.stratosdb.common.constants.PageConstants.PAGE_SIZE;
+    }
+
+    @Override
+    public int getDirtyPageCount() {
+        int count = 0;
+        for (Map<Long, Page> pages : pageCache.values()) {
+            for (Page page : pages.values()) {
+                if (page.isDirty()) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    @Override
+    public int flushDirtyPages(int maxPagesToFlush) {
+        return flushDirtyPagesInternal(false, maxPagesToFlush);
+    }
+
+    private int flushDirtyPagesInternal(boolean forceAll, int maxPagesToFlush) {
+        int flushed = 0;
+        for (Map.Entry<String, Map<Long, Page>> entry : pageCache.entrySet()) {
+            String tableName = entry.getKey();
+            Map<Long, Page> pages = entry.getValue();
+            Map<Long, Integer> pins = pinCounts.getOrDefault(tableName, Map.of());
+
+            for (Map.Entry<Long, Page> pageEntry : pages.entrySet()) {
+                if (!forceAll && maxPagesToFlush > 0 && flushed >= maxPagesToFlush) {
+                    return flushed;
+                }
+                Long pageId = pageEntry.getKey();
+                Page page = pageEntry.getValue();
+
+                if (page.isDirty()) {
+                    int pin = pins.getOrDefault(pageId, 0);
+                    if (pin == 0 || forceAll) {
+                        page.getLatch().readLock().lock();
+                        try {
+                            if (page.isDirty()) {
+                                diskManager.writePage(tableName, page);
+                                flushed++;
+                            }
+                        } finally {
+                            page.getLatch().readLock().unlock();
+                        }
+                    }
+                }
+            }
+        }
+        return flushed;
+    }
+
+    @Override
+    public boolean isBackgroundFlusherRunning() {
+        return flusherRunning.get() && backgroundFlusherThread != null && backgroundFlusherThread.isAlive();
+    }
+
+    @Override
+    public void stopBackgroundFlusher() {
+        if (flusherRunning.compareAndSet(true, false)) {
+            synchronized (flusherLock) {
+                flusherLock.notifyAll();
+            }
+            if (backgroundFlusherThread != null) {
+                try {
+                    backgroundFlusherThread.join(2000);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    public long getTotalBackgroundFlushes() {
+        return totalBackgroundFlushes.get();
+    }
+
+    public long getTotalDirtyPagesFlushed() {
+        return totalDirtyPagesFlushed.get();
+    }
+
     /**
      * Real, previously-latent bug found via a real DROP DATABASE + CREATE
      * DATABASE (same name) reproduction: flushing dirty pages and closing
@@ -243,7 +384,9 @@ public class BufferPoolManager implements BufferPool {
      * diskManager - which, already closed by this same call, throws a
      * real, honest I/O error instead of silently returning stale data.
      */
+    @Override
     public void close() {
+        stopBackgroundFlusher();
         flushAll();
         globalLock.writeLock().lock();
         try {

@@ -43,31 +43,34 @@ public class DiskManager {
     }
     
     /**
-     * Read a page from disk
+     * Read a page from disk directly into off-heap memory using positional I/O.
      */
     public Page readPage(String tableName, long pageId) {
         try {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
             
-            ByteBuffer buffer = ByteBuffer.allocate(PageConstants.PAGE_SIZE);
             long position = pageId * PageConstants.PAGE_SIZE;
+            Page page = new Page(pageId);
             
             // Check if file is large enough
             if (position >= channel.size()) {
                 // Page doesn't exist yet
-                return new Page(pageId);
+                return page;
             }
             
-            channel.position(position);
-            int bytesRead = channel.read(buffer);
+            ByteBuffer buffer = page.getBuffer().duplicate();
+            buffer.position(0);
+            buffer.limit(PageConstants.PAGE_SIZE);
             
-            if (bytesRead != PageConstants.PAGE_SIZE) {
-                LOG.warn("Partial read: {} bytes, expected {}", bytesRead, PageConstants.PAGE_SIZE);
-                return new Page(pageId);
+            long curPos = position;
+            while (buffer.hasRemaining()) {
+                int bytesRead = channel.read(buffer, curPos);
+                if (bytesRead <= 0) break;
+                curPos += bytesRead;
             }
             
-            return new Page(pageId, buffer.array());
+            return page;
         } catch (Exception e) {
             LOG.error("Failed to read page {} from table {}", pageId, tableName, e);
             return new Page(pageId);
@@ -75,25 +78,29 @@ public class DiskManager {
     }
     
     /**
-     * Write a page to disk
+     * Write a page to disk directly from its off-heap memory using thread-safe positional I/O.
      */
     public void writePage(String tableName, Page page) {
         try {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
             
-            ByteBuffer buffer = ByteBuffer.wrap(page.getBytes());
+            ByteBuffer buffer = page.getBuffer().duplicate();
+            buffer.position(0);
+            buffer.limit(PageConstants.PAGE_SIZE);
             long position = page.getPageId() * PageConstants.PAGE_SIZE;
             
-            channel.position(position);
-            channel.write(buffer);
+            long curPos = position;
+            while (buffer.hasRemaining()) {
+                int bytesWritten = channel.write(buffer, curPos);
+                curPos += bytesWritten;
+            }
             channel.force(false); // fsync
             
             page.setDirty(false);
             LOG.debug("Written page {} for table {}", page.getPageId(), tableName);
         } catch (Exception e) {
             LOG.error("Failed to write page {} for table {}", page.getPageId(), tableName, e);
-           // throw new StorageException("Failed to write page", e);
             throw new StorageException("Failed to write page");
         }
     }
@@ -106,12 +113,20 @@ public class DiskManager {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
             
-            long position = channel.size();
-            ByteBuffer buffer = ByteBuffer.wrap(page.getBytes());
-            
-            channel.position(position);
-            channel.write(buffer);
-            channel.force(false);
+            ByteBuffer buffer = page.getBuffer().duplicate();
+            buffer.position(0);
+            buffer.limit(PageConstants.PAGE_SIZE);
+
+            long position;
+            synchronized (channel) {
+                position = channel.size();
+                long curPos = position;
+                while (buffer.hasRemaining()) {
+                    int bytesWritten = channel.write(buffer, curPos);
+                    curPos += bytesWritten;
+                }
+                channel.force(false);
+            }
             
             long pageId = position / PageConstants.PAGE_SIZE;
             page.setDirty(false);
@@ -120,7 +135,6 @@ public class DiskManager {
             return pageId;
         } catch (Exception e) {
             LOG.error("Failed to append page to table {}", tableName, e);
-           // throw new StorageException("Failed to append page", e);
             throw new StorageException("Failed to append page");
         }
     }

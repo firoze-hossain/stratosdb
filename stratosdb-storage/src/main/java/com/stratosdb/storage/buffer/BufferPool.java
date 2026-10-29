@@ -17,5 +17,21 @@ public interface BufferPool {
     default com.stratosdb.storage.disk.DiskManager getDiskManager() {
         return null;
     }
+    default boolean isOffHeap() {
+        return true;
+    }
+    default long getOffHeapMemoryUsed() {
+        return (long) getCacheSize() * com.stratosdb.common.constants.PageConstants.PAGE_SIZE;
+    }
+    default int getDirtyPageCount() {
+        return 0;
+    }
+    default int flushDirtyPages(int maxPagesToFlush) {
+        return 0;
+    }
+    default boolean isBackgroundFlusherRunning() {
+        return false;
+    }
+    default void stopBackgroundFlusher() {}
     void close();
 }

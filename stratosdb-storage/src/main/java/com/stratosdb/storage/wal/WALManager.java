@@ -750,7 +750,12 @@ public class WALManager {
                         BTreePage originalPage = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, pageId);
                         BTreePage newPage = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, newPageId);
 
-                        if (newPage.getPageLSN() < recordLSN || originalPage.getPageLSN() < recordLSN) {
+                        boolean needsSplitReplay = newPage.getPageLSN() < recordLSN
+                            || originalPage.getPageLSN() < recordLSN
+                            || (newRootId != -1 && loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, newRootId).getPageLSN() < recordLSN)
+                            || (parentPageId != -1 && loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, parentPageId).getPageLSN() < recordLSN);
+
+                        if (needsSplitReplay) {
                             if (isLeaf) {
                                 newPage.setLeafContents(rightKeys, rightValues);
                                 newPage.setNextLeafPageId(nextLeafPageId);
@@ -1083,16 +1088,12 @@ public class WALManager {
             return sp;
         }
         if (page != null) {
-            com.stratosdb.storage.page.SlottedPage sp = new com.stratosdb.storage.page.SlottedPage(pageId);
-            sp.getBuffer().put(page.getBytes());
-            sp.getBuffer().flip();
+            com.stratosdb.storage.page.SlottedPage sp = new com.stratosdb.storage.page.SlottedPage(pageId, page.getBuffer());
             dirtyPages.put(key, sp);
             return sp;
         }
         com.stratosdb.storage.page.Page raw = diskManager.readPage(tableName, pageId);
-        com.stratosdb.storage.page.SlottedPage sp = new com.stratosdb.storage.page.SlottedPage(pageId);
-        sp.getBuffer().put(raw.getBytes());
-        sp.getBuffer().flip();
+        com.stratosdb.storage.page.SlottedPage sp = new com.stratosdb.storage.page.SlottedPage(pageId, raw.getBuffer());
         dirtyPages.put(key, sp);
         return sp;
     }
@@ -1107,12 +1108,17 @@ public class WALManager {
             return btp;
         }
         if (page != null) {
-            com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId, page.getBytes());
+            com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId, page.getBuffer());
+            dirtyPages.put(key, btp);
+            return btp;
+        }
+        if (pageId >= diskManager.getTablePageCount(indexName)) {
+            com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId);
             dirtyPages.put(key, btp);
             return btp;
         }
         com.stratosdb.storage.page.Page raw = diskManager.readPage(indexName, pageId);
-        com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId, raw.getBytes());
+        com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId, raw.getBuffer());
         dirtyPages.put(key, btp);
         return btp;
     }

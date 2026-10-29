@@ -175,6 +175,23 @@ public class HeapTable {
         LOG.debug("Scanned {} tuples from table {}", results.size(), name);
         return results;
     }
+
+    /**
+     * Sequential page scan that visits each page directly in off-heap memory under read latch,
+     * allowing zero-copy processing with near-zero Java GC heap allocations.
+     */
+    public void scanPages(java.util.function.Consumer<SlottedPage> pageConsumer) {
+        for (long pageId = 0; pageId <= lastPageId.get(); pageId++) {
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+            page.getLatch().readLock().lock();
+            try {
+                pageConsumer.accept(page);
+            } finally {
+                page.getLatch().readLock().unlock();
+                bufferPool.unpinPage(name, pageId);
+            }
+        }
+    }
     
     /**
      * Scan with limit

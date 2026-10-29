@@ -23,6 +23,14 @@ public class SlottedPage extends Page {
         super(pageId, data);
     }
 
+    public SlottedPage(long pageId, ByteBuffer directBuffer) {
+        super(pageId, directBuffer);
+    }
+
+    public SlottedPage(long pageId, java.lang.foreign.MemorySegment segment) {
+        super(pageId, segment);
+    }
+
     /** Returns the 8-byte PageLSN (pd_lsn) stored at bytes 0..7 of the slotted page header. */
     @Override
     public long getPageLSN() {

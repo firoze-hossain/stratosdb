@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 12 |
-| Tests passing | **408 / 408** |
+| Commits | 13 |
+| Tests passing | **413 / 413** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -903,6 +903,26 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Added `BTreeWalLoggingTest.java` (5 unit tests covering insert, leaf split, delete, merge/root collapse, and LSN redo idempotency).
   - Full reactor test suite reconfirmed at **408 / 408 tests passing across all 12 modules**.
   - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 2, Week 03 marked `Completed`), Sheet 3 (Row 16 marked `Resolved`), and Sheet 5 (Row 6 marked `Passed (Week 3)`).
+
+## 6-Month Roadmap — Sprint 2, Week 04: Direct Memory Buffer Pool & Off-Heap Storage ✅ DONE
+
+- ✅ **Direct Memory Off-Heap Page Frames**:
+  - Migrated `Page.java` frames to native off-heap memory using Java 25 Foreign Function & Memory API (`java.lang.foreign.MemorySegment` / `Arena.ofAuto().allocate(PAGE_SIZE, 8)`) and `DirectByteBuffer`.
+  - Stored page buffer data completely off-heap; page pin counts tracked via atomic lock-free `AtomicInteger`.
+  - Added zero-copy wrapping via `PageFactory.wrap(long pageId, ByteBuffer directBuffer)` implemented across `SlottedPage`, `BTreePage`, and `RAW_PAGE_FACTORY`, eliminating heap byte array clones during disk reads and page lookups.
+- ✅ **Periodic Background Dirty Page Flusher Daemon**:
+  - Implemented background flusher thread (`runBackgroundFlusher()`) in `BufferPoolManager.java` operating as a daemon with configurable flush interval.
+  - Asynchronously sweeps cached pages and writes unpinned dirty pages to disk under fine-grained page latch read locks (`page.getLatch().readLock()`).
+  - Implemented a graceful shutdown protocol (`stopBackgroundFlusher()`) utilizing monitor signaling (`flusherLock.notifyAll()`) rather than thread interruption, preventing JVM `ClosedByInterruptException` and file channel closure races.
+- ✅ **Thread-Safe Positional Disk I/O**:
+  - Refactored `DiskManager.java` (`readPage`, `writePage`, `appendPage`) to use positional `FileChannel.read(buffer, pos)` and `FileChannel.write(buffer, pos)` with buffer duplication.
+  - Eliminated channel position contention races between concurrent user threads, cache eviction, and the background flusher thread.
+- ✅ **Near-Zero GC Heap Allocation Sequential Scans**:
+  - Implemented zero-copy in-memory page iteration (`scanPages(Consumer<SlottedPage>)`) in `HeapTable.java`.
+  - Added comprehensive test suite in `OffHeapBufferPoolTest.java` (5 unit tests verifying native off-heap memory allocation, dirty page background flushes, eviction under memory pressure, clean flusher shutdown, and sequential scan allocation < 40KB across 32 pages vs 262KB+ on heap).
+- ✅ **Full Test Suite & Project Plan Alignment**:
+  - Full reactor test suite reconfirmed at **413 / 413 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 2, Week 04 marked `Completed`) and Sheet 3 (Row 17 marked `Resolved`).
 
 ## What to do next
 
