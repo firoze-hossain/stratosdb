@@ -90,6 +90,22 @@ public class Page {
     public void pin() { pinCount++; }
     public void unpin() { if (pinCount > 0) pinCount--; }
 
+    /**
+     * Returns the 8-byte PageLSN (pd_lsn) stored at bytes 0..7 of the page header.
+     * Represents the Log Sequence Number of the last WAL record that modified this page.
+     */
+    public long getPageLSN() {
+        return buffer.getLong(0);
+    }
+
+    /**
+     * Sets the 8-byte PageLSN (pd_lsn) at bytes 0..7 of the page header and marks the page dirty.
+     */
+    public void setPageLSN(long lsn) {
+        buffer.putLong(0, lsn);
+        this.dirty = true;
+    }
+
     /** This page's own physical latch - see the field's own javadoc for why this is a real, separate concern from MVCC's row-level locks. */
     public java.util.concurrent.locks.ReentrantReadWriteLock getLatch() { return latch; }
     

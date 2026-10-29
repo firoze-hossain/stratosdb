@@ -22,6 +22,18 @@ public class SlottedPage extends Page {
     public SlottedPage(long pageId, byte[] data) {
         super(pageId, data);
     }
+
+    /** Returns the 8-byte PageLSN (pd_lsn) stored at bytes 0..7 of the slotted page header. */
+    @Override
+    public long getPageLSN() {
+        return super.getPageLSN();
+    }
+
+    /** Sets the 8-byte PageLSN (pd_lsn) at bytes 0..7 of the slotted page header. */
+    @Override
+    public void setPageLSN(long lsn) {
+        super.setPageLSN(lsn);
+    }
     
     /**
      * Insert a tuple into the page

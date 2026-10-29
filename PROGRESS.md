@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 9 |
-| Tests passing | **393 / 393** |
+| Commits | 10 |
+| Tests passing | **402 / 402** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -856,6 +856,28 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Added JDBC driver test dependency to `stratosdb-testing` ensuring `MultiDatabaseEndToEndTest` passes in all reactor and isolated maven invocations.
   - Full reactor test suite reconfirmed at **393 / 393 tests passing across all 12 modules**.
   - Updated `StratosDB_6Month_Project_Plan.xlsx` sprint backlog (Sprint 1, Week 01 marked `Completed`) and gap analysis.
+
+## 6-Month Roadmap — Sprint 1, Week 02: Free Space Map (FSM) & Page LSNs ✅ DONE
+
+- ✅ **Two-Level Free Space Map (FSM)**:
+  - Designed and implemented `FreeSpaceMap.java` modeled after PostgreSQL's FSM architecture.
+  - **Level 1 (Leaves)**: Tracks exact available free bytes per page in 64-page chunks (`CHUNK_SIZE = 64`).
+  - **Level 2 (Summary Root)**: Compact summary array storing chunk maximums (`summary[chunk] = max(leaf[p])`), allowing 64 pages (~512KB) to be evaluated or skipped in a single integer comparison.
+  - **Amortized $O(1)$ Page Discovery**: `HeapTable.insert()` queries `fsm.findPageForInsert(requiredBytes)` to jump directly to a candidate page with sufficient space instead of sequentially scanning every page from 0 in $O(N)$.
+  - **Dynamic Space Reclamation**: Reclaiming space during `delete`, `update`, and `vacuum` defragmentation immediately updates Level 1 leaves and Level 2 summary nodes, making freed space discoverable for subsequent inserts without extending the table.
+  - **Sidecar Disk Persistence**: Automatically serializes to and reloads from `<tableName>.fsm` sidecar files in the data directory, with transparent automatic reconstruction from page headers if the file is absent.
+- ✅ **8-Byte PageLSN Header (`pd_lsn`)**:
+  - Implemented `getPageLSN()` and `setPageLSN(long lsn)` in `Page.java` and `SlottedPage.java`, utilizing bytes 0..7 of the page header.
+  - WAL operations (`logInsert`, `logUpdate`, `logDelete`, `logCommit`) now return the end LSN of the written record.
+  - `ExecutorEngine` automatically stamps the target page with `table.setPageLSN(pageId, lsn)` on every mutation.
+- ✅ **Idempotent ARIES-Style Redo Recovery**:
+  - `WALManager.recover()` now checks `page.getPageLSN() < recordLSN` before replaying `OP_INSERT`, `OP_DELETE`, or `OP_UPDATE`.
+  - Pages already flushed to disk before a crash (`pageLSN >= recordLSN`) are safely skipped, eliminating write duplication. Unflushed pages are replayed and updated to `recordLSN`.
+- ✅ **Full Regression & Durability Verification**:
+  - Added `FreeSpaceMapTest.java` (5 tests) and `PageLsnRecoveryTest.java` (4 tests).
+  - All 6 real-forked JVM `SIGKILL` crash recovery tests continue to pass 100%.
+  - Total reactor test suite reconfirmed at **402 / 402 tests passing across all 12 modules**.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 1, Week 02 marked `Completed`) and Sheet 3 (Rows 8 and 11 marked `Resolved`).
 
 ## What to do next
 

@@ -56,6 +56,7 @@ public class HeapTable {
      * the heap tuple to verify visibility.
      */
     private final BitSet visibilityMap = new BitSet();
+    private final FreeSpaceMap fsm;
 
     public HeapTable(String name, BufferPool bufferPool) {
         this.name = name;
@@ -67,6 +68,7 @@ public class HeapTable {
         // page beyond the first for any table that survived a restart.
         long existingPages = bufferPool.getTablePageCount(name);
         this.lastPageId = new java.util.concurrent.atomic.AtomicLong(existingPages > 0 ? existingPages - 1 : 0);
+        this.fsm = new FreeSpaceMap(name, bufferPool, existingPages);
     }
 
     /** Whether pageId is currently known to be "all visible" - see visibilityMap's own javadoc for the exact guarantee this means. Conservatively false (never crashes) for a pageId never observed. */
@@ -77,48 +79,41 @@ public class HeapTable {
     /**
      * Insert a tuple.
      *
-     * Real, fine-grained page latching, not one coarse table-wide lock:
-     * each existing page is tried under its OWN write latch, held only
-     * for that page's own insert attempt - concurrent inserts landing on
-     * different pages of the same table now genuinely proceed in
-     * parallel, rather than serializing through one lock regardless of
-     * which page each one actually targets.
-     *
-     * The real, separate risk this replaces a coarse lock's brute-force
-     * fix for (a real, serious bug found while testing sequence-generated
-     * ids under concurrency, though not specific to sequences at all):
-     * two threads both deciding to extend the table with a new page could
-     * race on lastPageId itself - not a page's own contents, but the
-     * decision of which page id even IS the new one. Solved here with a
-     * real compareAndSet retry loop: a thread that loses the race to
-     * publish its own candidate new page id (because a concurrent thread
-     * already advanced lastPageId past it) doesn't silently double-use a
-     * page id or corrupt anything - it simply retries with a fresh
-     * candidate. The same loop also handles the rarer case where a "new"
-     * page is found already full by the time this thread's own write
-     * latch on it is granted (another thread got there first and filled
-     * it) - retried, not assumed to succeed.
+     * Queries the 2-level Free Space Map (FSM) in O(1) amortized time to immediately locate
+     * a candidate page with sufficient free space, eliminating the legacy O(N) sequential page scan.
+     * Uses fine-grained page latching to protect page bytes under concurrency.
      */
     public InsertResult insert(byte[] tupleData) {
-        // Fast path: try every existing page under its own write latch, held only
-        // for this one insert attempt on that specific page.
-        long snapshotLast = lastPageId.get();
-        for (long pageId = 0; pageId <= snapshotLast; pageId++) {
-            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+        int itemSize = 6 + tupleData.length;
+
+        // Query the 2-level Free Space Map in O(1) amortized time instead of
+        // scanning every existing page linearly from 0.
+        int maxRetries = 3;
+        for (int retry = 0; retry < maxRetries; retry++) {
+            long candidatePageId = fsm.findPageForInsert(itemSize);
+            if (candidatePageId < 0) {
+                break; // No existing page has sufficient free space
+            }
+
+            SlottedPage page = (SlottedPage) bufferPool.getPage(name, candidatePageId);
             page.getLatch().writeLock().lock();
             try {
                 if (page.hasSpace(tupleData)) {
                     int slot = page.insertTuple(tupleData);
                     if (slot != -1) {
-                        bufferPool.markDirty(name, pageId);
-                        visibilityMap.clear((int) pageId); // a new (possibly uncommitted) tuple just landed here
-                        LOG.debug("Inserted at {}/{}", pageId, slot);
-                        return new InsertResult(pageId, slot);
+                        fsm.update(candidatePageId, page.getFreeSpace());
+                        bufferPool.markDirty(name, candidatePageId);
+                        visibilityMap.clear((int) candidatePageId); // a new (possibly uncommitted) tuple just landed here
+                        LOG.debug("Inserted at {}/{} via FSM", candidatePageId, slot);
+                        return new InsertResult(candidatePageId, slot);
                     }
                 }
+                // Concurrent insert consumed the space before our latch was granted;
+                // update FSM with the actual observed remaining space and retry.
+                fsm.update(candidatePageId, page.getFreeSpace());
             } finally {
                 page.getLatch().writeLock().unlock();
-                bufferPool.unpinPage(name, pageId);
+                bufferPool.unpinPage(name, candidatePageId);
             }
         }
 
@@ -144,6 +139,7 @@ public class HeapTable {
                 bufferPool.markDirty(name, candidatePageId);
                 visibilityMap.clear((int) candidatePageId); // a brand new page always starts NOT all-visible
                 lastPageId.compareAndSet(observedLast, candidatePageId);
+                fsm.registerNewPage(candidatePageId, newPage.getFreeSpace());
                 LOG.debug("Created new page {} for insertion", candidatePageId);
                 return new InsertResult(candidatePageId, slot);
             } finally {
@@ -217,6 +213,7 @@ public class HeapTable {
         page.getLatch().writeLock().lock();
         try {
             page.deleteTuple(slot);
+            fsm.update(pageId, page.getFreeSpace());
             bufferPool.markDirty(name, pageId);
         } finally {
             page.getLatch().writeLock().unlock();
@@ -236,6 +233,7 @@ public class HeapTable {
         try {
             result = page.updateTuple(slot, newData);
             if (result) {
+                fsm.update(pageId, page.getFreeSpace());
                 bufferPool.markDirty(name, pageId);
                 visibilityMap.clear((int) pageId); // e.g. an xmax was just set (deleteMvcc's tombstone) - visibility on this page is now snapshot-dependent
             }
@@ -262,6 +260,44 @@ public class HeapTable {
     
     public String getName() { return name; }
     public long getLastPageId() { return lastPageId.get(); }
+    public BufferPool getBufferPool() { return bufferPool; }
+
+    /** Returns the 2-level Free Space Map for this table. */
+    public FreeSpaceMap getFreeSpaceMap() {
+        return fsm;
+    }
+
+    /** Sets the 8-byte PageLSN (pd_lsn) in the page header under write latch. */
+    public void setPageLSN(long pageId, long lsn) {
+        SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+        page.getLatch().writeLock().lock();
+        try {
+            page.setPageLSN(lsn);
+            bufferPool.markDirty(name, pageId);
+        } finally {
+            page.getLatch().writeLock().unlock();
+            bufferPool.unpinPage(name, pageId);
+        }
+    }
+
+    /** Returns the 8-byte PageLSN (pd_lsn) from the page header under read latch. */
+    public long getPageLSN(long pageId) {
+        SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
+        page.getLatch().readLock().lock();
+        try {
+            return page.getPageLSN();
+        } finally {
+            page.getLatch().readLock().unlock();
+            bufferPool.unpinPage(name, pageId);
+        }
+    }
+
+    /** Closes the heap table and persists the Free Space Map to disk. */
+    public void close() {
+        if (fsm != null) {
+            fsm.close();
+        }
+    }
 
     // --- MVCC-aware API ---
     // These sit on top of the raw methods above rather than replacing them:
@@ -370,6 +406,7 @@ public class HeapTable {
                 }
                 if (anyReclaimed) {
                     page.defragment();
+                    fsm.update(pageId, page.getFreeSpace());
                     bufferPool.markDirty(name, pageId);
                     pagesCompacted++;
                 }

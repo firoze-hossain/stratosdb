@@ -28,6 +28,10 @@ public class DiskManager {
         this.fileSizes = new ConcurrentHashMap<>();
         ensureDirectoryExists();
     }
+
+    public String getDataDirectory() {
+        return dataDirectory;
+    }
     
     private void ensureDirectoryExists() {
         File dir = new File(dataDirectory);

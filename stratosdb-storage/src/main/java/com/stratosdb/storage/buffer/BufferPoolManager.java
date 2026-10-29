@@ -216,6 +216,11 @@ public class BufferPoolManager implements BufferPool {
     }
 
     @Override
+    public DiskManager getDiskManager() {
+        return diskManager;
+    }
+
+    @Override
     public int getCacheSize() {
         return pageCache.values().stream().mapToInt(Map::size).sum();
     }

@@ -14,5 +14,8 @@ public interface BufferPool {
     double getCacheHitRatio();
     int getCacheSize();
     long getTablePageCount(String tableName);
+    default com.stratosdb.storage.disk.DiskManager getDiskManager() {
+        return null;
+    }
     void close();
 }

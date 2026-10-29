@@ -194,7 +194,7 @@ public class WALManager {
      * limitation (see recover()'s javadoc) that became untenable once
      * transactions could span more than one statement.
      */
-    public void logInsert(String tableName, long xid, long pageId, int slot, byte[] tupleData) {
+    public long logInsert(String tableName, long xid, long pageId, int slot, byte[] tupleData) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(1024 + tupleData.length);
             buffer.putInt(OP_INSERT);
@@ -209,16 +209,17 @@ public class WALManager {
             buffer.putInt(tupleData.length);
             buffer.put(tupleData);
             
-            writeBuffer(buffer, false);
+            return writeBuffer(buffer, false);
         } catch (Exception e) {
             LOG.error("Failed to log insert", e);
+            return -1L;
         }
     }
     
     /**
      * Log a delete operation. xid: see logInsert's javadoc.
      */
-    public void logDelete(String tableName, long xid, long pageId, int slot) {
+    public long logDelete(String tableName, long xid, long pageId, int slot) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(256);
             buffer.putInt(OP_DELETE);
@@ -231,16 +232,17 @@ public class WALManager {
             buffer.putLong(pageId);
             buffer.putInt(slot);
             
-            writeBuffer(buffer, false);
+            return writeBuffer(buffer, false);
         } catch (Exception e) {
             LOG.error("Failed to log delete", e);
+            return -1L;
         }
     }
     
     /**
      * Log an update operation. xid: see logInsert's javadoc.
      */
-    public void logUpdate(String tableName, long xid, long pageId, int slot, byte[] oldData, byte[] newData) {
+    public long logUpdate(String tableName, long xid, long pageId, int slot, byte[] oldData, byte[] newData) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(1024 + oldData.length + newData.length);
             buffer.putInt(OP_UPDATE);
@@ -259,9 +261,10 @@ public class WALManager {
             buffer.putInt(newData.length);
             buffer.put(newData);
             
-            writeBuffer(buffer, false);
+            return writeBuffer(buffer, false);
         } catch (Exception e) {
             LOG.error("Failed to log update", e);
+            return -1L;
         }
     }
     
@@ -274,15 +277,16 @@ public class WALManager {
      * itself never needed this (it only cares whether a commit record
      * exists at all, not when) - this is purely additive for that path.
      */
-    public void logCommit(long transactionId) {
+    public long logCommit(long transactionId) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(24);
             buffer.putInt(OP_COMMIT);
             buffer.putLong(transactionId);
             buffer.putLong(System.currentTimeMillis());
-            writeBuffer(buffer, true);
+            return writeBuffer(buffer, true);
         } catch (Exception e) {
             LOG.error("Failed to log commit", e);
+            return -1L;
         }
     }
     
@@ -310,19 +314,12 @@ public class WALManager {
     }
     
     /**
-     * Write buffer to WAL
+     * Write buffer to WAL, returning the end LSN of the written record.
      */
-    private void writeBuffer(ByteBuffer buffer, boolean force) {
+    private long writeBuffer(ByteBuffer buffer, boolean force) {
         if (walChannel == null || !walChannel.isOpen()) {
-            // Already known to be closed - fail fast rather than attempting the write and
-            // logging a full stack trace, which would repeat on every subsequent call once
-            // the WAL is in this state (a real, previously-latent issue: once the channel
-            // closes for any reason mid-session - including a JVM-level ClosedByInterruptException
-            // if the thread performing a slow fsync is interrupted, e.g. by a test timeout on a real,
-            // slower disk - every later write silently degraded into repeated, expensive
-            // full-stack-trace logging instead of failing quietly).
             LOG.warn("WAL write skipped - channel is already closed");
-            return;
+            return -1L;
         }
         try {
             buffer.flip();
@@ -333,46 +330,26 @@ public class WALManager {
             if (sync && force) {
                 walChannel.force(false);
             }
+            return position + buffer.limit();
         } catch (Exception e) {
             LOG.error("Failed to write to WAL", e);
+            return -1L;
         }
     }
     
     /**
      * Recovery from WAL - redo pass.
      *
-     * Needs a DiskManager so replayed inserts/updates/deletes can actually be
-     * written back to pages on disk, not just parsed and discarded.
-     *
-     * Two passes, standard for a WAL that logs operations before knowing
-     * whether their transaction will commit:
+     * Fully idempotent and LSN-gated (ARIES-style redo):
      *   1. Scan the whole log once just to collect the set of xids with a
-     *      matching OP_COMMIT record - this is what makes redo transaction-
-     *      aware rather than blindly replaying everything (see below).
+     *      matching OP_COMMIT record.
      *   2. Scan again and replay only INSERT/UPDATE/DELETE records whose xid
-     *      is in that committed set. A transaction that crashed before
-     *      COMMIT leaves its operations logged but with no matching commit
-     *      record, so pass 2 correctly skips them - real atomicity, not
-     *      "redo everything and hope only committed work was logged."
-     *
-     * This directly replaces this method's previous, explicitly documented
-     * limitation ("redo cannot currently distinguish committed from never
-     * committed operations... real atomicity requires threading a
-     * transaction id through logInsert/logUpdate/logDelete") - that
-     * threading is now in place (see logInsert/logUpdate/logDelete), which
-     * is what makes this two-pass approach possible.
-     *
-     * Known limitation still open, stated plainly: not idempotent / not
-     * LSN-gated. Redo replays every committed record unconditionally. Pages
-     * are never stamped with the LSN that last modified them (pd_lsn in the
-     * page header exists but is never written), so if a page was already
-     * flushed before the crash, redo re-applies its writes on top and
-     * duplicates them. Safe for a log that only ever describes pages that
-     * were never flushed (true for a from-empty crash scenario); NOT safe
-     * as a general-purpose recovery routine yet. Fixing this properly means
-     * stamping each page write with its LSN and skipping WAL records whose
-     * LSN is <= the page's current pd_lsn on redo - standard ARIES-style
-     * redo, a separate piece of work from the transaction-awareness fixed here.
+     *      is in that committed set.
+     *   3. For each committed record, check the target page's PageLSN (pd_lsn):
+     *      If page.getPageLSN() >= recordLSN, the modification was already flushed
+     *      to disk before the crash; redo safely skips it to prevent duplicates.
+     *      If page.getPageLSN() < recordLSN, the modification is replayed,
+     *      the page is stamped with recordLSN, and marked dirty.
      */
     public void recover(com.stratosdb.storage.disk.DiskManager diskManager) {
         try {
@@ -407,12 +384,19 @@ public class WALManager {
                                    // by replaying inserts for this page in log order (see class javadoc)
                         int len = readInt();
                         byte[] tupleData = readBytes(len);
+                        long recordLSN = walChannel.position();
 
                         if (committedXids.contains(xid)) {
                             com.stratosdb.storage.page.SlottedPage page =
                                 loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
-                            page.insertTuple(tupleData);
-                            replayedOps++;
+                            if (page.getPageLSN() < recordLSN) {
+                                page.insertTuple(tupleData);
+                                page.setPageLSN(recordLSN);
+                                replayedOps++;
+                            } else {
+                                LOG.debug("Redo OP_INSERT skipped on {}:{} because pageLSN {} >= recordLSN {}",
+                                    tableName, pageId, page.getPageLSN(), recordLSN);
+                            }
                         }
                         break;
                     }
@@ -421,12 +405,19 @@ public class WALManager {
                         String tableName = readLengthPrefixedString();
                         long pageId = readLong();
                         int slot = readInt();
+                        long recordLSN = walChannel.position();
 
                         if (committedXids.contains(xid)) {
                             com.stratosdb.storage.page.SlottedPage page =
                                 loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
-                            page.deleteTuple(slot);
-                            replayedOps++;
+                            if (page.getPageLSN() < recordLSN) {
+                                page.deleteTuple(slot);
+                                page.setPageLSN(recordLSN);
+                                replayedOps++;
+                            } else {
+                                LOG.debug("Redo OP_DELETE skipped on {}:{} because pageLSN {} >= recordLSN {}",
+                                    tableName, pageId, page.getPageLSN(), recordLSN);
+                            }
                         }
                         break;
                     }
@@ -439,12 +430,19 @@ public class WALManager {
                         readBytes(oldLen); // old value kept for future undo support; unused by redo
                         int newLen = readInt();
                         byte[] newData = readBytes(newLen);
+                        long recordLSN = walChannel.position();
 
                         if (committedXids.contains(xid)) {
                             com.stratosdb.storage.page.SlottedPage page =
                                 loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
-                            page.updateTuple(slot, newData);
-                            replayedOps++;
+                            if (page.getPageLSN() < recordLSN) {
+                                page.updateTuple(slot, newData);
+                                page.setPageLSN(recordLSN);
+                                replayedOps++;
+                            } else {
+                                LOG.debug("Redo OP_UPDATE skipped on {}:{} because pageLSN {} >= recordLSN {}",
+                                    tableName, pageId, page.getPageLSN(), recordLSN);
+                            }
                         }
                         break;
                     }

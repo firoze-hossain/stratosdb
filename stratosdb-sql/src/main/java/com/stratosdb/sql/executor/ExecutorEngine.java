@@ -2359,7 +2359,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         // exact same wrapped bytes insertMvcc already computed and
         // stored, not a second, divergent computation of them.
         byte[] storedBytes = MVCCVisibility.wrap(data, txn.getXID(), MVCCVisibility.NO_XMAX);
-        walManager.logInsert(tableName, txn.getXID(), result.pageId, result.slot, storedBytes);
+        long lsn = walManager.logInsert(tableName, txn.getXID(), result.pageId, result.slot, storedBytes);
+        if (lsn > 0) table.setPageLSN(result.pageId, lsn);
         maintainIndexesOnWrite(tableName, tuple, result.pageId, result.slot);
         recordUndo(new UndoAction.UndoInsert(tableName, result.pageId, result.slot));
 
@@ -3830,7 +3831,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // javadoc): updateMvcc's own insertMvcc call wraps newPayload with MVCC metadata
             // before actually storing it; log that same wrapped form, not the raw payload.
             byte[] storedNewBytes = MVCCVisibility.wrap(newPayload, txn.getXID(), MVCCVisibility.NO_XMAX);
-            walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, storedNewBytes);
+            long lsn = walManager.logUpdate(stmt.tableName(), txn.getXID(), row.pageId(), row.slot(), oldPayload, storedNewBytes);
+            if (lsn > 0) {
+                table.setPageLSN(row.pageId(), lsn);
+                if (newVersion != null && newVersion.pageId != row.pageId()) {
+                    table.setPageLSN(newVersion.pageId, lsn);
+                }
+            }
             // A real, genuine concurrency limitation found by testing (not by
             // inspection), via a real pgbench-equivalent benchmark tool under real
             // concurrent load: a SELECT on one connection immediately following an
@@ -3907,7 +3914,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             boolean removed = table.deleteMvcc(row.pageId(), row.slot(), txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
             if (removed) {
-                walManager.logDelete(stmt.tableName(), txn.getXID(), row.pageId(), row.slot());
+                long lsn = walManager.logDelete(stmt.tableName(), txn.getXID(), row.pageId(), row.slot());
+                if (lsn > 0) table.setPageLSN(row.pageId(), lsn);
                 maintainIndexesOnDelete(stmt.tableName(), tuple, row.pageId(), row.slot());
                 recordUndo(new UndoAction.UndoDelete(stmt.tableName(), row.pageId(), row.slot()));
 
@@ -4740,11 +4748,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // unspecified duplicate-key resolution).
             maintainIndexesOnDelete(tableName, oldTuple, row.pageId(), row.slot());
             table.delete(row.pageId(), row.slot());
-            walManager.logDelete(tableName, xid, row.pageId(), row.slot());
+            long lsnDel = walManager.logDelete(tableName, xid, row.pageId(), row.slot());
+            if (lsnDel > 0) table.setPageLSN(row.pageId(), lsnDel);
 
             byte[] newStored = MVCCVisibility.wrap(newTuple.serialize(), xmin, xmax);
             HeapTable.InsertResult result = table.insert(newStored);
-            walManager.logInsert(tableName, xid, result.pageId, result.slot, newStored);
+            long lsnIns = walManager.logInsert(tableName, xid, result.pageId, result.slot, newStored);
+            if (lsnIns > 0) table.setPageLSN(result.pageId, lsnIns);
             maintainIndexesOnWrite(tableName, newTuple, result.pageId, result.slot);
         }
     }
