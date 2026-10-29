@@ -123,6 +123,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     // Store column names for each table
     private final Map<String, List<String>> tableColumns;
+
+    /**
+     * Deserializes a schema-less binary tuple, dynamically resolving its column names
+     * from the catalog schema (tableColumns).
+     */
+    private Tuple deserializeTuple(String tableName, byte[] data) {
+        if (data == null) return null;
+        List<String> schema = tableName != null ? tableColumns.get(tableName) : null;
+        return Tuple.deserialize(data, schema);
+    }
     /** tableName -> columnName -> its raw default expression text (a literal, or once SERIAL/sequences exist, a "nextval('seqname')" marker) - null/absent means no default, so an omitted column gets SQL NULL. */
     private final Map<String, Map<String, String>> tableColumnDefaults = new ConcurrentHashMap<>();
     /** tableName -> columnName -> its declared type text (e.g. "JSON", "VARCHAR", "INT[]") - didn't exist at all before this; needed so INSERT can tell a JSON/JSONB column apart from a plain VARCHAR one and validate/parse its incoming value accordingly. */
@@ -904,7 +914,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (table == null) return; // table was dropped mid-transaction - nothing left to undo
             byte[] stored = table.readTuple(u.pageId(), u.slot());
             if (stored == null) return;
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+            Tuple tuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(stored));
             table.update(u.pageId(), u.slot(), MVCCVisibility.withXmax(stored, myXid));
             maintainIndexesOnDelete(u.tableName(), tuple, u.pageId(), u.slot());
         } else if (action instanceof UndoAction.UndoDelete u) {
@@ -914,7 +924,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (stored == null) return;
             byte[] restored = MVCCVisibility.withXmax(stored, MVCCVisibility.NO_XMAX);
             table.update(u.pageId(), u.slot(), restored);
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(restored));
+            Tuple tuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(restored));
             maintainIndexesOnWrite(u.tableName(), tuple, u.pageId(), u.slot());
         } else if (action instanceof UndoAction.UndoUpdate u) {
             HeapTable table = tables.get(u.tableName());
@@ -923,12 +933,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (oldStored != null) {
                 byte[] restored = MVCCVisibility.withXmax(oldStored, MVCCVisibility.NO_XMAX);
                 table.update(u.oldPageId(), u.oldSlot(), restored);
-                Tuple oldTuple = Tuple.deserialize(MVCCVisibility.readPayload(restored));
+                Tuple oldTuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(restored));
                 maintainIndexesOnWrite(u.tableName(), oldTuple, u.oldPageId(), u.oldSlot());
             }
             byte[] newStored = table.readTuple(u.newPageId(), u.newSlot());
             if (newStored != null) {
-                Tuple newTuple = Tuple.deserialize(MVCCVisibility.readPayload(newStored));
+                Tuple newTuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(newStored));
                 table.update(u.newPageId(), u.newSlot(), MVCCVisibility.withXmax(newStored, myXid));
                 maintainIndexesOnDelete(u.tableName(), newTuple, u.newPageId(), u.newSlot());
             }
@@ -1916,7 +1926,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             Object value = findColumnValue(tuple, stmt.columnName());
             Long key = toIndexKey(value);
             if (key != null) {
@@ -1947,7 +1957,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             Long key = toIndexKey(findColumnValue(tuple, stmt.columnName()));
             if (key != null) {
                 index.observe(row.pageId(), key);
@@ -1976,7 +1986,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             Object value = findColumnValue(tuple, stmt.columnName());
             index.insert(value, new BTreePage.RID(row.pageId(), row.slot()));
             indexed++;
@@ -1997,7 +2007,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             Object value = findColumnValue(tuple, stmt.columnName());
             if (value != null) {
                 indexGinValue(index, value, new BTreePage.RID(row.pageId(), row.slot()));
@@ -2021,7 +2031,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             Long start = toIndexKey(findColumnValue(tuple, stmt.columnName()));
             Long end = toIndexKey(findColumnValue(tuple, stmt.columnName2()));
             if (start != null && end != null) {
@@ -2126,7 +2136,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         long rowCount = 0;
         for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-            Tuple tuple = Tuple.deserialize(raw);
+            Tuple tuple = deserializeTuple(stmt.tableName(), raw);
             rowCount++;
             if (columnNames == null) {
                 continue;
@@ -2546,7 +2556,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (stored == null || !MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
                     continue; // stale index entry (from an update/delete) or not visible to this snapshot
                 }
-                Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+                Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(stored));
                 if (!matchesWhere(tuple, stmt.where(), txn)) {
                     continue; // defensive re-check, keeps index-scan results identical to seq-scan results
                 }
@@ -2555,7 +2565,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         } else {
             List<byte[]> visibleRows = table.scanMvcc(txn.getSnapshot(), transactionManager);
             for (byte[] data : visibleRows) {
-                Tuple tuple = Tuple.deserialize(data);
+                Tuple tuple = deserializeTuple(stmt.tableName(), data);
                 if (!matchesWhere(tuple, stmt.where(), txn)) {
                     continue;
                 }
@@ -2705,7 +2715,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (stored == null || !MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(stored));
             if (!matchesWhere(tuple, stmt.where(), txn)) {
                 continue;
             }
@@ -2867,7 +2877,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     if (stored == null || !MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
                         continue;
                     }
-                    Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(stored));
+                    Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(stored));
                     if (!matchesWhere(tuple, stmt.where(), txn)) {
                         continue;
                     }
@@ -2961,7 +2971,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeWindowFunctionSelect(SelectStatement stmt, Transaction txn, HeapTable table) {
         List<Tuple> rows = new ArrayList<>();
         for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-            Tuple tuple = Tuple.deserialize(raw);
+            Tuple tuple = deserializeTuple(stmt.tableName(), raw);
             if (matchesWhere(tuple, stmt.where(), txn)) {
                 rows.add(tuple);
             }
@@ -3062,7 +3072,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         List<Tuple> filteredRows = new ArrayList<>();
         for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-            Tuple tuple = Tuple.deserialize(raw);
+            Tuple tuple = deserializeTuple(stmt.tableName(), raw);
             if (matchesWhere(tuple, stmt.where(), txn)) {
                 filteredRows.add(tuple);
             }
@@ -3264,7 +3274,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (table != null) {
             List<Tuple> rows = new ArrayList<>();
             for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-                rows.add(qualify(Tuple.deserialize(raw), name));
+                rows.add(qualify(deserializeTuple(name, raw), name));
             }
             return rows;
         }
@@ -3788,7 +3798,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 continue;
             }
             byte[] oldPayload = MVCCVisibility.readPayload(row.stored());
-            Tuple tuple = Tuple.deserialize(oldPayload);
+            Tuple tuple = deserializeTuple(stmt.tableName(), oldPayload);
             if (!matchesWhere(tuple, stmt.where(), txn)) {
                 continue;
             }
@@ -3796,7 +3806,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // Snapshot the old values BEFORE applying assignments - needed to
             // remove the old index entry by its actual current key, in case
             // an assignment changes the very column that's indexed.
-            Tuple oldTuple = Tuple.deserialize(oldPayload);
+            Tuple oldTuple = deserializeTuple(stmt.tableName(), oldPayload);
 
             for (Assignment assignment : stmt.assignments()) {
                 setColumnValue(tuple, assignment.column(), parseLiteral(assignment.value()));
@@ -3884,7 +3894,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             if (!matchesWhere(tuple, stmt.where(), txn)) {
                 continue;
             }
@@ -4255,7 +4265,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                 continue;
             }
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             List<Object> values = new ArrayList<>(targetColumns.size());
             for (String col : targetColumns) {
                 values.add(tuple.getValue(col));
@@ -4360,7 +4370,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
                     continue;
                 }
-                Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+                Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
                 List<Object> values = new ArrayList<>(targetColumns.size());
                 for (String col : targetColumns) {
                     values.add(tuple.getValue(col));
@@ -4720,7 +4730,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             long xmin = MVCCVisibility.readXmin(stored);
             long xmax = MVCCVisibility.readXmax(stored);
             byte[] payload = MVCCVisibility.readPayload(stored);
-            Tuple oldTuple = Tuple.deserialize(payload);
+            Tuple oldTuple = deserializeTuple(tableName, payload);
             Tuple newTuple = transformer.apply(oldTuple);
 
             // Same real, honestly-named concurrency limitation as executeUpdate's
@@ -5001,7 +5011,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         HeapTable table = tables.get(stmt.tableName());
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
-            Tuple tuple = Tuple.deserialize(MVCCVisibility.readPayload(row.stored()));
+            Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
             Object value = tuple.getValue(stmt.columnName());
             try {
                 convertValueToType(value, stmt.newDataType());
@@ -6169,7 +6179,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // this table (both "orders" and "customers" happen to have an
             // "id" column - without qualifying, a naive bare-name fallback
             // could resolve "customers.id" against orders' OWN id by mistake).
-            Tuple tuple = qualify(Tuple.deserialize(raw), subquery.tableName());
+            Tuple tuple = qualify(deserializeTuple(subquery.tableName(), raw), subquery.tableName());
             if (matchesWhere(tuple, subquery.where(), txn, outerRow)) {
                 tuples.add(project(tuple, subquery.columns()));
             }

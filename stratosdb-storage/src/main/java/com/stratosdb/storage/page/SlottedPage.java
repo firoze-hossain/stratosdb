@@ -7,7 +7,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Slotted page for heap tables
+ * Slotted page for heap tables.
+ *
+ * Implements slotted page storage with zero-copy accessors for MVCC tuple inspection
+ * (xmin, xmax, infomask, numColumns, column slices) directly from the page buffer
+ * without allocating or copying full Tuple objects into the Java heap.
  */
 public class SlottedPage extends Page {
     
@@ -76,6 +80,108 @@ public class SlottedPage extends Page {
         buf.position(tupleOffset);
         buf.get(tuple);
         return tuple;
+    }
+
+    /** Returns offset to tuple data on this page for the given slot, or -1 if invalid/deleted. */
+    public int getTupleOffset(int slot) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return -1;
+        short len = buf.getShort(itemOffset + 4);
+        if (len < 0) return -1;
+        return buf.getInt(itemOffset);
+    }
+
+    /** Returns tuple length for slot, or -1 if deleted/invalid. */
+    public short getTupleLength(int slot) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return -1;
+        return buf.getShort(itemOffset + 4);
+    }
+
+    /**
+     * Reads xmin directly from page buffer at slot's tuple header without instantiating a Tuple object.
+     */
+    public long readXmin(int slot) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return 0L;
+        short length = buf.getShort(itemOffset + 4);
+        if (length < 8) return 0L;
+        int tupleOffset = buf.getInt(itemOffset);
+        return buf.getLong(tupleOffset);
+    }
+
+    /**
+     * Reads xmax directly from page buffer at slot's tuple header without instantiating a Tuple object.
+     */
+    public long readXmax(int slot) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return 0L;
+        short length = buf.getShort(itemOffset + 4);
+        if (length < 16) return 0L;
+        int tupleOffset = buf.getInt(itemOffset);
+        return buf.getLong(tupleOffset + 8);
+    }
+
+    /**
+     * Updates xmax in-place directly in the slotted page buffer without allocating or reinserting.
+     */
+    public boolean setXmax(int slot, long newXmax) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return false;
+        short length = buf.getShort(itemOffset + 4);
+        if (length < 16) return false;
+        int tupleOffset = buf.getInt(itemOffset);
+        buf.putLong(tupleOffset + 8, newXmax);
+        setDirty(true);
+        return true;
+    }
+
+    /**
+     * Reads infomask directly from page buffer without object instantiation.
+     */
+    public short readInfomask(int slot) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return 0;
+        short length = buf.getShort(itemOffset + 4);
+        if (length < 20) return 0;
+        int tupleOffset = buf.getInt(itemOffset);
+        return buf.getShort(tupleOffset + 18);
+    }
+
+    /**
+     * Reads the number of columns directly from page buffer.
+     */
+    public int readNumColumns(int slot) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return 0;
+        short length = buf.getShort(itemOffset + 4);
+        if (length < 22) return 0;
+        int tupleOffset = buf.getInt(itemOffset);
+        return Short.toUnsignedInt(buf.getShort(tupleOffset + 20));
+    }
+
+    /**
+     * Checks if a column is NULL directly from the null_bitmap without deserializing the row.
+     */
+    public boolean isColumnNull(int slot, int colIndex) {
+        ByteBuffer buf = getBuffer();
+        int itemOffset = 24 + (slot * 6);
+        if (itemOffset >= buf.getShort(12)) return true;
+        short length = buf.getShort(itemOffset + 4);
+        if (length < 22) return true;
+        int tupleOffset = buf.getInt(itemOffset);
+        int numCols = Short.toUnsignedInt(buf.getShort(tupleOffset + 20));
+        if (colIndex < 0 || colIndex >= numCols) return true;
+        int bitmapStart = tupleOffset + 22;
+        byte b = buf.get(bitmapStart + (colIndex / 8));
+        return (b & (1 << (colIndex % 8))) == 0;
     }
     
     /**

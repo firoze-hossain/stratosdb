@@ -45,6 +45,14 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 public class MultiDatabaseEndToEndTest {
 
+    static {
+        try {
+            Class.forName("com.stratosdb.jdbc.StratosDriver");
+        } catch (ClassNotFoundException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
     private StdWireServer server;
     private int port;
 

@@ -48,7 +48,9 @@ public final class MVCCVisibility {
 
     /** Same payload, same xmin, new xmax - used to tombstone a version on delete/update. */
     public static byte[] withXmax(byte[] stored, long newXmax) {
-        return wrap(readPayload(stored), readXmin(stored), newXmax);
+        byte[] copy = stored.clone();
+        ByteBuffer.wrap(copy, 8, 8).putLong(newXmax);
+        return copy;
     }
 
     /**
