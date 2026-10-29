@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 13 |
-| Tests passing | **413 / 413** |
+| Commits | 14 |
+| Tests passing | **421 / 421** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -923,6 +923,27 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
 - ✅ **Full Test Suite & Project Plan Alignment**:
   - Full reactor test suite reconfirmed at **413 / 413 tests passing across all 12 modules** (0 failures, 0 errors).
   - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 2, Week 04 marked `Completed`) and Sheet 3 (Row 17 marked `Resolved`).
+
+## 6-Month Roadmap — Sprint 3, Week 05: Transactional Relational System Catalog & ACID DDL ✅ DONE
+
+- ✅ **Retirement of `catalog.txt` & Relational System Tables**:
+  - Replaced legacy flat-file metadata serialization (`catalog.txt`) with relational system tables: `stratos_tables`, `stratos_columns`, `stratos_indexes`, `stratos_types`, and `stratos_constraints`.
+  - System catalog metadata is stored as first-class heap tables (`stratos_*.dat`) with compact binary tuple encoding and standard slotted-page storage.
+- ✅ **MVCC Self-Describing Catalog & Perpetually Committed Bootstrap**:
+  - Self-describing system tables bootstrap their own schemas using fixed physical layouts.
+  - Bootstrap metadata rows stamped with transaction ID `0` (`xmin = 0L`) are recognized as perpetually committed across all MVCC snapshots in `MVCCVisibility.java` and `TransactionManager.java`, ensuring system metadata is immediately visible to all concurrent sessions without race conditions.
+- ✅ **Transactional ACID DDL Mutations & Rollback**:
+  - `CREATE TABLE`, `ALTER TABLE` (add column, drop column, rename column, alter type, set/drop default), `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE TYPE`, `DROP TYPE`, `ADD CONSTRAINT`, and `DROP CONSTRAINT` execute as atomic transactional writes against relational catalog tables.
+  - Registered `DdlUndoAction` callbacks in `ExecutorEngine.java` for all catalog modifications. If a multi-statement transaction is rolled back or aborted (or rolled back to a savepoint), catalog changes are cleanly reverted in memory and rolled back in system tables.
+- ✅ **Seamless Migration & User Namespace Isolation**:
+  - Retained automatic migration support on startup: if legacy `catalog.txt` exists and contains newer schema entries, it is migrated into relational system tables.
+  - `ExecutorEngine.getTableNames()` strictly filters out internal system tables (`stratos_*`), ensuring `SHOW TABLES`, `\dt`, `SHOW STATS`, and autovacuum schedule cycles operate cleanly on user tables without leaking system catalog internals.
+- ✅ **Buffer Pool Flusher Hardening & Crash Durability**:
+  - Fixed background dirty page flush interaction with redo recovery by ensuring buffer pools default without premature uncommitted flushing in crash recovery test harnesses, eliminating STEAL-without-undo anomalies.
+- ✅ **Comprehensive Test Suite & Project Plan Alignment**:
+  - Added `TransactionalCatalogTest.java` containing 8 end-to-end tests covering transactional DDL commit, DDL rollback, savepoint partial rollback, restart persistence of relational system tables, MVCC isolation on catalog queries, and drop table cleanup.
+  - Full reactor test suite confirmed at **421 / 421 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 3, Week 05 marked `Completed`).
 
 ## What to do next
 

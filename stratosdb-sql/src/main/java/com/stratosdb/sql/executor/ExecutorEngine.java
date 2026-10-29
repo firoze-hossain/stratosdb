@@ -3,6 +3,8 @@ package com.stratosdb.sql.executor;
 import com.stratosdb.common.exceptions.DeadlockException;
 import com.stratosdb.index.btree.BTreeIndex;
 import com.stratosdb.sql.ast.*;
+import com.stratosdb.sql.catalog.DdlUndoAction;
+import com.stratosdb.sql.catalog.SystemCatalog;
 import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
@@ -252,6 +254,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      */
     private final LinkedHashMap<String, String> catalogLines = new LinkedHashMap<>();
     private boolean loadingCatalog = false;
+    private final SystemCatalog systemCatalog;
 
     public ExecutorEngine(BufferPool bufferPool, WALManager walManager, TransactionManager transactionManager) {
         this(bufferPool, walManager, transactionManager, null);
@@ -268,7 +271,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         this.walManager = walManager;
         this.transactionManager = transactionManager;
         this.dataDirectory = dataDirectory;
+        this.systemCatalog = new SystemCatalog(bufferPool, transactionManager, dataDirectory);
+        this.systemCatalog.setUndoConsumer(new SystemCatalog.CatalogUndoConsumer() {
+            @Override
+            public void onInsert(String tableName, long pageId, int slot) {
+                recordUndo(new UndoAction.UndoInsert(tableName, pageId, slot));
+            }
+            @Override
+            public void onDelete(String tableName, long pageId, int slot) {
+                recordUndo(new UndoAction.UndoDelete(tableName, pageId, slot));
+            }
+        });
+        this.systemCatalog.init(tables, tableColumns, tableColumnTypes, tableColumnDefaults);
         loadCatalog();
+    }
+
+    public SystemCatalog getSystemCatalog() {
+        return systemCatalog;
     }
 
     /**
@@ -327,33 +346,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private void recordCatalogChange(Statement stmt, String sql) {
         if (dataDirectory == null) return; // no persistence configured
         if (stmt instanceof CreateTableStatement s) {
-            catalogLines.put("TABLE:" + s.tableName(), catalogEntry("TABLE", sql));
-            saveCatalog();
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
         } else if (stmt instanceof DropTableStatement s) {
-            catalogLines.remove("TABLE:" + s.tableName());
-            saveCatalog();
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
         } else if (stmt instanceof CreateViewStatement s) {
-            catalogLines.put("VIEW:" + s.viewName(), catalogEntry("VIEW", sql));
-            saveCatalog();
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
         } else if (stmt instanceof DropViewStatement s) {
-            catalogLines.remove("VIEW:" + s.viewName());
-            saveCatalog();
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
         } else if (stmt instanceof CreateIndexStatement s) {
-            catalogLines.put("INDEX:" + s.indexName(),
-                "INDEX|" + s.indexName() + "|" + s.tableName() + "|" + s.columnName() + "|" + s.indexType()
-                    + "|" + (s.columnName2() == null ? "" : s.columnName2()));
-            saveCatalog();
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
+        } else if (stmt instanceof CreateTypeStatement s) {
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
+        } else if (stmt instanceof DropTypeStatement s) {
+            // Retired from catalog.txt: handled transactionally by relational SystemCatalog
         } else if (stmt instanceof CreateSequenceStatement s) {
             catalogLines.put("SEQUENCE:" + s.name(), catalogEntry("SEQUENCE", sql));
             saveCatalog();
         } else if (stmt instanceof DropSequenceStatement s) {
             catalogLines.remove("SEQUENCE:" + s.name());
-            saveCatalog();
-        } else if (stmt instanceof CreateTypeStatement s) {
-            catalogLines.put("TYPE:" + s.typeName(), catalogEntry("TYPE", sql));
-            saveCatalog();
-        } else if (stmt instanceof DropTypeStatement s) {
-            catalogLines.remove("TYPE:" + s.typeName());
             saveCatalog();
         } else if (stmt instanceof AlterTableEnableRlsStatement s) {
             catalogLines.put("RLS:" + s.tableName(), catalogEntry("RLS", sql));
@@ -431,12 +441,28 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * partially-written file is ever visible under the real filename.
      */
     private void saveCatalog() {
-        if (loadingCatalog) return; // deferred to one final write at the end of loadCatalog - see its javadoc
+        if (loadingCatalog) return;
         java.io.File file = catalogFile();
         if (file == null) return;
         try {
+            List<String> linesToWrite = new ArrayList<>();
+            for (String line : catalogLines.values()) {
+                if (line.startsWith("TABLE:") || line.startsWith("INDEX:") || line.startsWith("VIEW:")
+                    || line.startsWith("TYPE:") || line.startsWith("CONSTRAINT:")
+                    || line.startsWith("TABLE|") || line.startsWith("INDEX|") || line.startsWith("VIEW|")
+                    || line.startsWith("TYPE|") || line.startsWith("CONSTRAINT|")) {
+                    continue;
+                }
+                linesToWrite.add(line);
+            }
+            if (linesToWrite.isEmpty()) {
+                if (file.exists()) {
+                    file.delete();
+                }
+                return;
+            }
             java.io.File tmp = new java.io.File(file.getParentFile(), file.getName() + ".tmp");
-            java.nio.file.Files.write(tmp.toPath(), catalogLines.values());
+            java.nio.file.Files.write(tmp.toPath(), linesToWrite);
             java.nio.file.Files.move(tmp.toPath(), file.toPath(),
                 java.nio.file.StandardCopyOption.ATOMIC_MOVE,
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
@@ -445,93 +471,158 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
     }
 
-    /**
-     * Runs once at construction. Tables and views replay their original
-     * DDL text through the normal execute() path - safe and idempotent
-     * because HeapTable already correctly adapts to an existing data file
-     * rather than assuming it's empty. Indexes reconstruct structurally
-     * (see catalogLines' javadoc) to avoid re-scanning and duplicating
-     * entries in an index file that already has them.
-     *
-     * The catalog file itself is NOT rewritten after each individual
-     * entry replays (see the loadingCatalog guard in saveCatalog) - doing
-     * that would mean an interruption partway through a large replay
-     * leaves the catalog file holding only the entries processed so far,
-     * silently losing every entry after that point. One save, after the
-     * whole replay succeeds, avoids that.
-     */
+    private boolean hasLegacyTableEntries(java.io.File file) {
+        try {
+            for (String line : java.nio.file.Files.readAllLines(file.toPath())) {
+                if (line.startsWith("TABLE|") || line.startsWith("TABLE:")) return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
     private void loadCatalog() {
-        java.io.File file = catalogFile();
-        if (file == null || !file.exists()) return;
+        if (dataDirectory == null) return;
         loadingCatalog = true;
+        try {
+            java.io.File catFile = catalogFile();
+            java.io.File sysTableFile = new java.io.File(dataDirectory, "stratos_tables.dat");
+            boolean legacyCatalogExists = catFile != null && catFile.exists();
+            boolean sysTablesExist = sysTableFile.exists() && sysTableFile.length() > 0;
+
+            if (legacyCatalogExists && hasLegacyTableEntries(catFile) && (!sysTablesExist || catFile.lastModified() >= sysTableFile.lastModified())) {
+                tables.clear();
+                tableColumns.clear();
+                tableColumnTypes.clear();
+                tableColumnDefaults.clear();
+                systemCatalog.init(tables, tableColumns, tableColumnTypes, tableColumnDefaults);
+                loadFromLegacyCatalog(catFile);
+            } else {
+                loadFromSystemCatalog();
+                if (legacyCatalogExists) {
+                    loadFromLegacyCatalog(catFile);
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to load schema catalog", e);
+        } finally {
+            loadingCatalog = false;
+        }
+    }
+
+    private void loadFromLegacyCatalog(java.io.File file) {
         try {
             for (String line : java.nio.file.Files.readAllLines(file.toPath())) {
                 if (line.isBlank()) continue;
                 try {
-                String[] parts = line.split("\\|", 2);
-                String kind = parts[0];
-                if (kind.equals("INDEX")) {
-                    String[] indexParts = parts[1].split("\\|", -1);
-                    String indexName = indexParts[0], tableName = indexParts[1], columnName = indexParts[2], type = indexParts[3];
-                    // A 6th field (columnName2, for multi-column GiST indexes) is a real,
-                    // separate fix from a later round - older, already-persisted catalog
-                    // files won't have it, so this stays backward compatible rather than
-                    // breaking on a shorter, pre-existing line.
-                    String columnName2 = indexParts.length > 4 && !indexParts[4].isEmpty() ? indexParts[4] : null;
-                    reconstructIndex(indexName, tableName, columnName, type);
-                    catalogLines.put("INDEX:" + indexName, line);
-                } else if (kind.equals("OWNER")) {
-                    // Pure metadata, not a real SQL statement - restored directly rather
-                    // than through execute(), the same way INDEX bypasses it above. Must
-                    // replay AFTER the table itself already exists (see this format's own
-                    // ordering guarantee: catalogLines is a LinkedHashMap and the catalog
-                    // file preserves insertion order, so OWNER always appears after its
-                    // own TABLE line, since executeCreateTable only ever writes both
-                    // together, in that order, in the same call).
-                    String[] ownerParts = parts[1].split("\\|", -1);
-                    String tableName = ownerParts[0], owner = ownerParts[1];
-                    tableOwners.put(tableName, owner);
-                    catalogLines.put("OWNER:" + tableName, line);
-                } else {
-                    // TABLE, VIEW, or SEQUENCE - parts[1] is the original raw
-                    // SQL text. Safe to replay verbatim for all three: a
-                    // table/sequence's constructor already correctly resumes
-                    // from whatever persisted state (heap file, watermark
-                    // file) already exists rather than assuming it's fresh.
-                    // execute() already records this back into catalogLines
-                    // via recordCatalogChange on success, so nothing extra
-                    // needed here beyond checking it actually worked.
-                    String unescapedSql = unescapeFromCatalogLine(parts[1]);
-                    QueryResult result = execute(unescapedSql);
-                    if (!result.isSuccess()) {
-                        LOG.error("Failed to replay catalog entry on startup: {} -> {}", unescapedSql, result.getError());
+                    String[] parts = line.split("\\|", 2);
+                    String kind = parts[0];
+                    if (kind.equals("INDEX")) {
+                        String[] indexParts = parts[1].split("\\|", -1);
+                        String indexName = indexParts[0], tableName = indexParts[1], columnName = indexParts[2], type = indexParts[3];
+                        String columnName2 = indexParts.length > 4 && !indexParts[4].isEmpty() ? indexParts[4] : null;
+                        if (!indexesByName.containsKey(indexName)) {
+                            reconstructIndex(indexName, tableName, columnName, type);
+                            catalogLines.put("INDEX:" + indexName, line);
+                            systemCatalog.insertIndex(indexName, tableName, columnName, columnName2, type, false, 0L);
+                        }
+                    } else if (kind.equals("OWNER")) {
+                        String[] ownerParts = parts[1].split("\\|", -1);
+                        String tableName = ownerParts[0], owner = ownerParts[1];
+                        tableOwners.put(tableName, owner);
+                        catalogLines.put("OWNER:" + tableName, line);
+                    } else {
+                        String unescapedSql = unescapeFromCatalogLine(parts[1]);
+                        try {
+                            Statement s = parser.parse(unescapedSql);
+                            if (s instanceof CreateTableStatement c && tables.containsKey(c.tableName())) {
+                                continue;
+                            }
+                            if (s instanceof CreateViewStatement c && views.containsKey(c.viewName())) {
+                                continue;
+                            }
+                            if (s instanceof CreateTypeStatement c && enumTypes.containsKey(c.typeName())) {
+                                continue;
+                            }
+                        } catch (Exception ignored) {}
+                        QueryResult result = execute(unescapedSql);
+                        if (!result.isSuccess()) {
+                            LOG.error("Failed to replay catalog entry on startup: {} -> {}", unescapedSql, result.getError());
+                        }
                     }
-                }
                 } catch (Exception e) {
-                    // Real, previously-latent bug found via a real, live
-                    // incident: a single corrupted or malformed catalog line
-                    // (see saveCatalog's own javadoc for how one could end up
-                    // on disk in the first place, before its own real,
-                    // atomic-write fix) used to abort loading of EVERY
-                    // remaining catalog entry too, not just the bad one - a
-                    // real, cascading data-loss multiplier, since a
-                    // database's other, perfectly valid tables would also
-                    // disappear on restart just because one, unrelated
-                    // table's own catalog line happened to be corrupted.
-                    // Isolating each line's own processing here means the
-                    // rest of a database's real schema still loads
-                    // correctly even when one entry genuinely can't be
-                    // recovered.
                     LOG.error("Failed to load catalog entry (skipping, rest of catalog still loads): {}", line, e);
                 }
             }
-            LOG.info("Schema catalog loaded: {} table(s)/view(s)/index(es)", catalogLines.size());
+            LOG.info("Schema catalog loaded: {} entry(ies)", catalogLines.size());
         } catch (Exception e) {
-            LOG.error("Failed to load schema catalog from {}", file, e);
-        } finally {
-            loadingCatalog = false;
+            LOG.error("Failed to read legacy catalog from {}", file, e);
         }
-        saveCatalog(); // one real write, now that loadingCatalog is false, reflecting everything that just replayed
+    }
+
+    private void loadFromSystemCatalog() {
+        systemCatalog.loadExistingCatalog(
+            tableLoaded -> {
+                String tableName = tableLoaded.tableName();
+                String ddl = tableLoaded.ddl();
+                String owner = tableLoaded.owner();
+                if (owner != null && !owner.isEmpty()) {
+                    tableOwners.put(tableName, owner);
+                    catalogLines.put("OWNER:" + tableName, "OWNER|" + tableName + "|" + owner);
+                }
+                if ("VIEW".equalsIgnoreCase(tableLoaded.tableType())) {
+                    if (ddl != null && !ddl.isEmpty()) {
+                        try {
+                            execute(ddl);
+                        } catch (Exception e) {
+                            LOG.error("Failed to restore view: {}", tableName, e);
+                        }
+                    }
+                } else {
+                    HeapTable table = new HeapTable(tableName, bufferPool);
+                    tables.put(tableName, table);
+                    tableColumns.put(tableName, new ArrayList<>());
+                    tableColumnTypes.put(tableName, new HashMap<>());
+                    tableColumnDefaults.put(tableName, new HashMap<>());
+                    if (ddl != null && !ddl.isEmpty()) {
+                        catalogLines.put("TABLE:" + tableName, catalogEntry("TABLE", ddl));
+                    }
+                }
+            },
+            columnLoaded -> {
+                String tableName = columnLoaded.tableName();
+                List<String> cols = tableColumns.computeIfAbsent(tableName, k -> new ArrayList<>());
+                if (!cols.contains(columnLoaded.columnName())) {
+                    cols.add(columnLoaded.columnName());
+                }
+                tableColumnTypes.computeIfAbsent(tableName, k -> new HashMap<>()).put(columnLoaded.columnName(), columnLoaded.dataType());
+                if (columnLoaded.defaultValue() != null && !columnLoaded.defaultValue().isEmpty()) {
+                    tableColumnDefaults.computeIfAbsent(tableName, k -> new HashMap<>()).put(columnLoaded.columnName(), columnLoaded.defaultValue());
+                }
+            },
+            indexLoaded -> {
+                reconstructIndex(indexLoaded.indexName(), indexLoaded.tableName(), indexLoaded.columnName(), indexLoaded.indexType());
+                catalogLines.put("INDEX:" + indexLoaded.indexName(),
+                    "INDEX|" + indexLoaded.indexName() + "|" + indexLoaded.tableName() + "|" + indexLoaded.columnName()
+                    + "|" + indexLoaded.indexType() + "|" + (indexLoaded.columnName2() != null ? indexLoaded.columnName2() : ""));
+            },
+            typeLoaded -> {
+                String vals = typeLoaded.values();
+                if (vals != null && !vals.isEmpty()) {
+                    Set<String> set = new LinkedHashSet<>(Arrays.asList(vals.split(",")));
+                    enumTypes.put(typeLoaded.typeName(), (LinkedHashSet<String>) set);
+                    catalogLines.put("TYPE:" + typeLoaded.typeName(), catalogEntry("TYPE", "CREATE TYPE " + typeLoaded.typeName() + " AS ENUM (" + vals + ");"));
+                }
+            },
+            constraintLoaded -> {
+                if ("PRIMARY KEY".equalsIgnoreCase(constraintLoaded.constraintType())) {
+                    String def = constraintLoaded.definition();
+                    if (def != null && !def.isEmpty()) {
+                        tablePrimaryKeys.put(constraintLoaded.tableName(), Arrays.asList(def.split(",")));
+                    }
+                }
+            }
+        );
+        LOG.info("Relational schema catalog loaded: {} table(s)/view(s)/index(es)", tables.size());
     }
 
     /** Recreates an index's in-memory registration and its BTreeIndex/HashIndex object WITHOUT rescanning the table - the index's own file already has every entry from before the restart. */
@@ -559,6 +650,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         Transaction transaction;
         boolean poisoned;
         List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
+        List<DdlUndoAction> ddlUndoActions = new ArrayList<>();
         /** The real, authenticated username for this session, set once via setCurrentUser() right after login - see its own javadoc. Null (the default for every session that never calls setCurrentUser, i.e. every caller using execute() directly) means unrestricted, matching this engine's own pre-existing behavior. */
         String currentUser;
         /**
@@ -580,7 +672,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private static final class Savepoint {
         final String name;
         final List<UndoAction> actions = new ArrayList<>();
-        Savepoint(String name) { this.name = name; }
+        final int ddlUndoStartIndex;
+        Savepoint(String name, int ddlUndoStartIndex) {
+            this.name = name;
+            this.ddlUndoStartIndex = ddlUndoStartIndex;
+        }
     }
 
     /**
@@ -617,6 +713,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!state.savepoints.isEmpty()) {
             state.savepoints.get(state.savepoints.size() - 1).actions.add(action);
         }
+    }
+
+    private void recordDdlUndo(DdlUndoAction action) {
+        SessionState state = session.get();
+        state.ddlUndoActions.add(action);
     }
 
     /**
@@ -725,12 +826,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         boolean explicit = state.transaction != null;
         Transaction txn = explicit ? state.transaction : transactionManager.begin();
         try {
-            QueryResult result = dispatch(stmt, txn);
+            QueryResult result = dispatch(stmt, txn, sql);
             recordTableStats(stmt, result);
 
             if (result.isSuccess()) {
                 recordCatalogChange(stmt, sql);
                 if (!explicit) {
+                    state.ddlUndoActions.clear();
                     walManager.logCommit(txn.getXID());
                     transactionManager.commit(txn);
                 }
@@ -738,6 +840,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             } else if (explicit) {
                 state.poisoned = true;
             } else {
+                systemCatalog.rollbackDdl(state.ddlUndoActions);
+                state.ddlUndoActions.clear();
                 transactionManager.abort(txn);
             }
             return result;
@@ -745,6 +849,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (explicit) {
                 state.poisoned = true;
             } else {
+                systemCatalog.rollbackDdl(state.ddlUndoActions);
+                state.ddlUndoActions.clear();
                 transactionManager.abort(txn);
             }
             LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
@@ -764,6 +870,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (explicit) {
                 state.poisoned = true;
             } else {
+                systemCatalog.rollbackDdl(state.ddlUndoActions);
+                state.ddlUndoActions.clear();
                 transactionManager.abort(txn);
             }
             LOG.warn("Statement failed (a known, expected validation failure, not a bug): {} - {}", sql, e.getMessage());
@@ -772,6 +880,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (explicit) {
                 state.poisoned = true;
             } else {
+                systemCatalog.rollbackDdl(state.ddlUndoActions);
+                state.ddlUndoActions.clear();
                 transactionManager.abort(txn);
             }
             LOG.error("Execution failed: {}", sql, e);
@@ -787,6 +897,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         state.transaction = transactionManager.begin();
         state.poisoned = false;
         state.savepoints.clear();
+        state.ddlUndoActions.clear();
         return QueryResult.success("BEGIN");
     }
 
@@ -798,12 +909,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (state.poisoned) {
             // Matches real Postgres: COMMIT on an already-aborted transaction
             // rolls it back instead - there is nothing valid left to commit.
+            systemCatalog.rollbackDdl(state.ddlUndoActions);
+            state.ddlUndoActions.clear();
             transactionManager.abort(state.transaction);
             state.transaction = null;
             state.poisoned = false;
             state.savepoints.clear();
             return QueryResult.error("Current transaction is aborted, rolled back instead of committed");
         }
+        state.ddlUndoActions.clear();
         walManager.logCommit(state.transaction.getXID());
         transactionManager.commit(state.transaction);
         state.transaction = null;
@@ -816,6 +930,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (state.transaction == null) {
             return QueryResult.error("No transaction in progress");
         }
+        systemCatalog.rollbackDdl(state.ddlUndoActions);
+        state.ddlUndoActions.clear();
         transactionManager.abort(state.transaction);
         state.transaction = null;
         state.poisoned = false;
@@ -827,7 +943,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (state.transaction == null) {
             return QueryResult.error("SAVEPOINT can only be used inside a transaction - BEGIN first");
         }
-        state.savepoints.add(new Savepoint(stmt.name()));
+        state.savepoints.add(new Savepoint(stmt.name(), state.ddlUndoActions.size()));
         return QueryResult.success("SAVEPOINT " + stmt.name());
     }
 
@@ -874,6 +990,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (idx == -1) {
             return QueryResult.error("No such savepoint: " + stmt.name());
         }
+
+        Savepoint target = state.savepoints.get(idx);
+        systemCatalog.rollbackSavepoint(state.ddlUndoActions, target.ddlUndoStartIndex);
 
         long myXid = state.transaction.getXID();
         // Undo every action from the most recently created savepoint back
@@ -965,8 +1084,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         session.remove();
     }
 
-    /** A snapshot of current table names - views are not included. Used by autovacuum to know what to vacuum. */
+    /** A snapshot of current user table names - system tables and views are not included. Used by autovacuum and wire protocol table listings. */
     public java.util.Set<String> getTableNames() {
+        return tables.keySet().stream()
+            .filter(t -> !SystemCatalog.isSystemTable(t))
+            .collect(java.util.stream.Collectors.toSet());
+    }
+
+    public java.util.Set<String> getAllTableNames() {
         return new java.util.HashSet<>(tables.keySet());
     }
 
@@ -1067,19 +1192,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn) throws DeadlockException {
+        return dispatch(stmt, txn, null);
+    }
+
+    private QueryResult dispatch(Statement stmt, Transaction txn, String sql) throws DeadlockException {
         if (readOnly && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
             return QueryResult.error("cannot execute statement in a read-only replica");
         }
         if (readOnly && stmt instanceof CopyStatement copyStmt && copyStmt.isFrom()) {
             return QueryResult.error("cannot execute COPY FROM in a read-only replica");
         }
-        if (stmt instanceof CreateTableStatement s) return executeCreateTable(s);
+        if (stmt instanceof CreateTableStatement s) return executeCreateTable(s, txn, sql);
         if (stmt instanceof CreateIndexStatement s) return executeCreateIndex(s, txn);
         if (stmt instanceof InsertStatement s) return executeInsert(s, txn);
         if (stmt instanceof SelectStatement s) return executeSelect(s, txn);
         if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn);
         if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
-        if (stmt instanceof DropTableStatement s) return executeDropTable(s);
+        if (stmt instanceof DropTableStatement s) return executeDropTable(s, txn);
         if (stmt instanceof CreateDatabaseStatement s) return executeCreateDatabase(s);
         if (stmt instanceof DropDatabaseStatement s) return executeDropDatabase(s);
         if (stmt instanceof ShowDatabasesStatement) return executeShowDatabases();
@@ -1092,10 +1221,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof AlterTableAddColumnStatement s) return executeAlterTableAddColumn(s, txn);
         if (stmt instanceof AlterTableDropColumnStatement s) return executeAlterTableDropColumn(s, txn);
         if (stmt instanceof AlterTableRenameColumnStatement s) return executeAlterTableRenameColumn(s, txn);
-        if (stmt instanceof AlterTableRenameTableStatement s) return executeAlterTableRenameTable(s);
+        if (stmt instanceof AlterTableRenameTableStatement s) return executeAlterTableRenameTable(s, txn);
         if (stmt instanceof AlterTableAlterColumnTypeStatement s) return executeAlterTableAlterColumnType(s, txn);
-        if (stmt instanceof AlterTableSetDefaultStatement s) return executeAlterTableSetDefault(s);
-        if (stmt instanceof AlterTableDropDefaultStatement s) return executeAlterTableDropDefault(s);
+        if (stmt instanceof AlterTableSetDefaultStatement s) return executeAlterTableSetDefault(s, txn);
+        if (stmt instanceof AlterTableDropDefaultStatement s) return executeAlterTableDropDefault(s, txn);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ShowStatsStatement) return executeShowStats();
         if (stmt instanceof ShowTableStatsStatement) return executeShowTableStats();
@@ -1112,14 +1241,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof PromoteStatement) {
             return QueryResult.error("PROMOTE must be run through a real client connection (a StdWireServer configured as a replica) - see StdWireServer.setReplicationClient's own javadoc");
         }
-        if (stmt instanceof CreateViewStatement s) return executeCreateView(s);
-        if (stmt instanceof DropViewStatement s) return executeDropView(s);
+        if (stmt instanceof CreateViewStatement s) return executeCreateView(s, txn, sql);
+        if (stmt instanceof DropViewStatement s) return executeDropView(s, txn);
         if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
         if (stmt instanceof RecursiveCteSelectStatement s) return executeRecursiveCteSelect(s, txn);
         if (stmt instanceof CreateSequenceStatement s) return executeCreateSequence(s);
         if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
-        if (stmt instanceof CreateTypeStatement s) return executeCreateType(s);
-        if (stmt instanceof DropTypeStatement s) return executeDropType(s);
+        if (stmt instanceof CreateTypeStatement s) return executeCreateType(s, txn);
+        if (stmt instanceof DropTypeStatement s) return executeDropType(s, txn);
         if (stmt instanceof AlterTableEnableRlsStatement s) return executeAlterTableEnableRls(s);
         if (stmt instanceof AlterTableDisableRlsStatement s) return executeAlterTableDisableRls(s);
         if (stmt instanceof AlterTableForceRlsStatement s) return executeAlterTableForceRls(s);
@@ -1303,20 +1432,51 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * simplification rather than a claim of exact behavioral parity.
      */
     private QueryResult executeCreateType(CreateTypeStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeCreateType(stmt, txn);
+    }
+
+    private QueryResult executeCreateType(CreateTypeStatement stmt, Transaction txn) {
         if (enumTypes.containsKey(stmt.typeName())) {
             return QueryResult.error("Type already exists: " + stmt.typeName());
         }
         if (stmt.enumValues().isEmpty()) {
             return QueryResult.error("CREATE TYPE ... AS ENUM requires at least one value");
         }
-        enumTypes.put(stmt.typeName(), new java.util.LinkedHashSet<>(stmt.enumValues()));
+        LinkedHashSet<String> values = new java.util.LinkedHashSet<>(stmt.enumValues());
+        enumTypes.put(stmt.typeName(), values);
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.insertType(stmt.typeName(), "ENUM", String.join(",", stmt.enumValues()), xid);
+        catalogLines.put("TYPE:" + stmt.typeName(), catalogEntry("TYPE", "CREATE TYPE " + stmt.typeName() + " AS ENUM (" + String.join(",", stmt.enumValues()) + ");"));
+        String typeName = stmt.typeName();
+        recordDdlUndo(() -> {
+            enumTypes.remove(typeName);
+            catalogLines.remove("TYPE:" + typeName);
+        });
         return QueryResult.success("Type created: " + stmt.typeName());
     }
 
     private QueryResult executeDropType(DropTypeStatement stmt) {
-        if (enumTypes.remove(stmt.typeName()) == null) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeDropType(stmt, txn);
+    }
+
+    private QueryResult executeDropType(DropTypeStatement stmt, Transaction txn) {
+        LinkedHashSet<String> oldValues = enumTypes.remove(stmt.typeName());
+        if (oldValues == null) {
             return QueryResult.error("Type not found: " + stmt.typeName());
         }
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.deleteType(stmt.typeName(), xid);
+        String typeName = stmt.typeName();
+        String oldCatalogLine = catalogLines.get("TYPE:" + typeName);
+        catalogLines.remove("TYPE:" + typeName);
+        recordDdlUndo(() -> {
+            enumTypes.put(typeName, oldValues);
+            if (oldCatalogLine != null) catalogLines.put("TYPE:" + typeName, oldCatalogLine);
+        });
         return QueryResult.success("Type dropped: " + stmt.typeName());
     }
 
@@ -1749,6 +1909,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeCreateTable(CreateTableStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeCreateTable(stmt, txn, null);
+    }
+
+    private QueryResult executeCreateTable(CreateTableStatement stmt, Transaction txn, String sql) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot create table with reserved system table name: " + stmt.tableName());
+        }
         if (tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table already exists: " + stmt.tableName());
         }
@@ -1837,9 +2006,30 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         tableColumns.put(stmt.tableName(), columns);
         tableColumnDefaults.put(stmt.tableName(), defaults);
         tableColumnTypes.put(stmt.tableName(), types);
-        if (!autoSequenceNames.isEmpty()) {
-            saveCatalog(); // one write covering every auto-created sequence's new catalog entry
+
+        String ddl = sql != null ? sql : regenerateTableDdlSql(stmt.tableName());
+        catalogLines.put("TABLE:" + stmt.tableName(), catalogEntry("TABLE", ddl));
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.insertTable(stmt.tableName(), "BASE TABLE", creatingUser, ddl, xid);
+        for (int i = 0; i < stmt.columns().size(); i++) {
+            ColumnDefinition col = stmt.columns().get(i);
+            systemCatalog.insertColumn(stmt.tableName(), col.name(), col.type(), i + 1, !col.primaryKey(), col.defaultValue(), xid);
         }
+        if (!primaryKeyColumns.isEmpty()) {
+            systemCatalog.insertConstraint(stmt.tableName() + "_pk", stmt.tableName(), "PRIMARY KEY", String.join(",", primaryKeyColumns), xid);
+        }
+
+        String createdTable = stmt.tableName();
+        recordDdlUndo(() -> {
+            tables.remove(createdTable);
+            tableColumns.remove(createdTable);
+            tableColumnDefaults.remove(createdTable);
+            tableColumnTypes.remove(createdTable);
+            tableOwners.remove(createdTable);
+            tablePrimaryKeys.remove(createdTable);
+            catalogLines.remove("TABLE:" + createdTable);
+            catalogLines.remove("OWNER:" + createdTable);
+        });
 
         return QueryResult.success("Table created: " + stmt.tableName());
     }
@@ -1907,13 +2097,35 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error(stmt.indexType() + " only supports a single column - only GIST uses a (start, end) pair");
         }
 
-        return switch (stmt.indexType()) {
+        QueryResult res = switch (stmt.indexType()) {
             case BRIN -> buildBrinIndex(stmt, table, txn);
             case BITMAP -> buildBitmapIndex(stmt, table, txn);
             case GIN -> buildGinIndex(stmt, table, txn);
             case GIST -> buildGistIndex(stmt, table, txn);
             case HASH, BTREE -> buildKeyValueIndex(stmt, table, txn);
         };
+        if (res.isSuccess()) {
+            long xid = txn != null ? txn.getXID() : 0L;
+            systemCatalog.insertIndex(stmt.indexName(), stmt.tableName(), stmt.columnName(), stmt.columnName2(), stmt.indexType().name(), false, xid);
+            String idxName = stmt.indexName();
+            String tblName = stmt.tableName();
+            catalogLines.put("INDEX:" + idxName,
+                "INDEX|" + idxName + "|" + tblName + "|" + stmt.columnName() + "|" + stmt.indexType()
+                + "|" + (stmt.columnName2() == null ? "" : stmt.columnName2()));
+            recordDdlUndo(() -> {
+                indexesByName.remove(idxName);
+                List<IndexEntry> entries = indexesByTable.get(tblName);
+                if (entries != null) {
+                    entries.removeIf(e -> e.indexName().equalsIgnoreCase(idxName));
+                }
+                brinIndexesByName.remove(idxName);
+                bitmapIndexesByName.remove(idxName);
+                ginIndexesByName.remove(idxName);
+                gistIndexesByName.remove(idxName);
+                catalogLines.remove("INDEX:" + idxName);
+            });
+        }
+        return res;
     }
 
     private QueryResult buildKeyValueIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
@@ -3932,20 +4144,59 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeDropTable(DropTableStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeDropTable(stmt, txn);
+    }
+
+    private QueryResult executeDropTable(DropTableStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot drop system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
 
-        tables.remove(stmt.tableName());
-        tableColumns.remove(stmt.tableName());
-        tableColumnTypes.remove(stmt.tableName());
-        tableColumnDefaults.remove(stmt.tableName());
-        tableOwners.remove(stmt.tableName());
-        tablePrivileges.remove(stmt.tableName());
-        tablePrimaryKeys.remove(stmt.tableName());
-        tableStatsRegistry.remove(stmt.tableName());
+        String tableName = stmt.tableName();
+        HeapTable oldTable = tables.get(tableName);
+        List<String> oldColumns = tableColumns.get(tableName) != null ? new ArrayList<>(tableColumns.get(tableName)) : null;
+        Map<String, String> oldTypes = tableColumnTypes.get(tableName) != null ? new HashMap<>(tableColumnTypes.get(tableName)) : null;
+        Map<String, String> oldDefaults = tableColumnDefaults.get(tableName) != null ? new HashMap<>(tableColumnDefaults.get(tableName)) : null;
+        String oldOwner = tableOwners.get(tableName);
+        List<String> oldPks = tablePrimaryKeys.get(tableName) != null ? new ArrayList<>(tablePrimaryKeys.get(tableName)) : null;
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
+        String oldOwnerLine = catalogLines.get("OWNER:" + tableName);
+
+        tables.remove(tableName);
+        tableColumns.remove(tableName);
+        tableColumnTypes.remove(tableName);
+        tableColumnDefaults.remove(tableName);
+        tableOwners.remove(tableName);
+        tablePrivileges.remove(tableName);
+        tablePrimaryKeys.remove(tableName);
+        tableStatsRegistry.remove(tableName);
+        catalogLines.remove("TABLE:" + tableName);
+        catalogLines.remove("OWNER:" + tableName);
+
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.deleteTable(tableName, xid);
+        systemCatalog.deleteColumns(tableName, xid);
+        systemCatalog.deleteIndexesForTable(tableName, xid);
+        systemCatalog.deleteConstraintsForTable(tableName, xid);
+
+        recordDdlUndo(() -> {
+            if (oldTable != null) tables.put(tableName, oldTable);
+            if (oldColumns != null) tableColumns.put(tableName, oldColumns);
+            if (oldTypes != null) tableColumnTypes.put(tableName, oldTypes);
+            if (oldDefaults != null) tableColumnDefaults.put(tableName, oldDefaults);
+            if (oldOwner != null) tableOwners.put(tableName, oldOwner);
+            if (oldPks != null) tablePrimaryKeys.put(tableName, oldPks);
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+            if (oldOwnerLine != null) catalogLines.put("OWNER:" + tableName, oldOwnerLine);
+        });
+
         return QueryResult.success("Table dropped: " + stmt.tableName());
     }
 
@@ -4677,8 +4928,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * list - a real, genuine correctness gap this method exists
      * specifically to avoid.
      */
-    private void regenerateTableDdl(String tableName) {
+    private String regenerateTableDdlSql(String tableName) {
         List<String> columns = tableColumns.get(tableName);
+        if (columns == null) return "";
         Map<String, String> types = tableColumnTypes.getOrDefault(tableName, Map.of());
         Map<String, String> defaults = tableColumnDefaults.getOrDefault(tableName, Map.of());
         StringBuilder sql = new StringBuilder("CREATE TABLE ").append(tableName).append(" (");
@@ -4692,8 +4944,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
         sql.append(")");
-        catalogLines.put("TABLE:" + tableName, catalogEntry("TABLE", sql.toString()));
-        saveCatalog();
+        return sql.toString();
+    }
+
+    private void regenerateTableDdl(String tableName) {
+        String sql = regenerateTableDdlSql(tableName);
+        catalogLines.put("TABLE:" + tableName, catalogEntry("TABLE", sql));
     }
 
     /**
@@ -4834,6 +5090,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeAlterTableAddColumn(AlterTableAddColumnStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
@@ -4843,6 +5102,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (columns.contains(stmt.columnName())) {
             return QueryResult.error("Column already exists: " + stmt.columnName());
         }
+
+        String tableName = stmt.tableName();
+        String colName = stmt.columnName();
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
 
         Object resolvedDefault = stmt.defaultValue() != null
             ? coerceForColumnType(stmt.columnName(), stmt.dataType(), resolveValue(stmt.defaultValue()))
@@ -4863,10 +5126,27 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             tableColumnDefaults.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.defaultValue());
         }
         regenerateTableDdl(stmt.tableName());
+
+        systemCatalog.insertColumn(tableName, colName, stmt.dataType(), columns.size(), true, stmt.defaultValue(), txn.getXID());
+        systemCatalog.updateTableDdl(tableName, regenerateTableDdlSql(tableName), txn.getXID());
+
+        recordDdlUndo(() -> {
+            List<String> cols = tableColumns.get(tableName);
+            if (cols != null) cols.remove(colName);
+            Map<String, String> types = tableColumnTypes.get(tableName);
+            if (types != null) types.remove(colName);
+            Map<String, String> defs = tableColumnDefaults.get(tableName);
+            if (defs != null) defs.remove(colName);
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+        });
+
         return QueryResult.success("Column added: " + stmt.columnName());
     }
 
     private QueryResult executeAlterTableDropColumn(AlterTableDropColumnStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
@@ -4879,6 +5159,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (columns.size() == 1) {
             return QueryResult.error("Cannot drop the only remaining column of table " + stmt.tableName());
         }
+
+        String tableName = stmt.tableName();
+        String colName = stmt.columnName();
+        int oldOrdinal = columns.indexOf(colName);
+        String oldType = tableColumnTypes.get(tableName) != null ? tableColumnTypes.get(tableName).get(colName) : "VARCHAR";
+        String oldDef = tableColumnDefaults.get(tableName) != null ? tableColumnDefaults.get(tableName).get(colName) : null;
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
 
         rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
             Tuple newTuple = new Tuple();
@@ -4896,6 +5183,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         Map<String, String> defaults = tableColumnDefaults.get(stmt.tableName());
         if (defaults != null) defaults.remove(stmt.columnName());
         regenerateTableDdl(stmt.tableName());
+
+        systemCatalog.deleteColumn(tableName, colName, txn.getXID());
+        systemCatalog.updateTableDdl(tableName, regenerateTableDdlSql(tableName), txn.getXID());
+
+        recordDdlUndo(() -> {
+            List<String> cols = tableColumns.get(tableName);
+            if (cols != null && !cols.contains(colName)) {
+                cols.add(Math.min(oldOrdinal, cols.size()), colName);
+            }
+            if (oldType != null) {
+                tableColumnTypes.computeIfAbsent(tableName, k -> new HashMap<>()).put(colName, oldType);
+            }
+            if (oldDef != null) {
+                tableColumnDefaults.computeIfAbsent(tableName, k -> new HashMap<>()).put(colName, oldDef);
+            }
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+        });
+
         return QueryResult.success("Column dropped: " + stmt.columnName());
     }
 
@@ -4913,6 +5218,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * EXTENSION's own note on functions still referencing it by name).
      */
     private QueryResult executeAlterTableRenameColumn(AlterTableRenameColumnStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
@@ -4925,6 +5233,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (columns.contains(stmt.newColumnName())) {
             return QueryResult.error("Column already exists: " + stmt.newColumnName());
         }
+
+        String tableName = stmt.tableName();
+        String oldName = stmt.oldColumnName();
+        String newName = stmt.newColumnName();
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
 
         rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
             Tuple newTuple = new Tuple();
@@ -4945,6 +5258,27 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             defaults.put(stmt.newColumnName(), defaults.remove(stmt.oldColumnName()));
         }
         regenerateTableDdl(stmt.tableName());
+
+        systemCatalog.renameColumn(tableName, oldName, newName, txn.getXID());
+        systemCatalog.updateTableDdl(tableName, regenerateTableDdlSql(tableName), txn.getXID());
+
+        recordDdlUndo(() -> {
+            List<String> cols = tableColumns.get(tableName);
+            if (cols != null) {
+                int pos = cols.indexOf(newName);
+                if (pos >= 0) cols.set(pos, oldName);
+            }
+            Map<String, String> colTypes = tableColumnTypes.get(tableName);
+            if (colTypes != null && colTypes.containsKey(newName)) {
+                colTypes.put(oldName, colTypes.remove(newName));
+            }
+            Map<String, String> defs = tableColumnDefaults.get(tableName);
+            if (defs != null && defs.containsKey(newName)) {
+                defs.put(oldName, defs.remove(newName));
+            }
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+        });
+
         return QueryResult.success("Column renamed: " + stmt.oldColumnName() + " -> " + stmt.newColumnName());
     }
 
@@ -4959,6 +5293,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * as ALTER TABLE ... RENAME COLUMN above.
      */
     private QueryResult executeAlterTableRenameTable(AlterTableRenameTableStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeAlterTableRenameTable(stmt, txn);
+    }
+
+    private QueryResult executeAlterTableRenameTable(AlterTableRenameTableStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.oldTableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.oldTableName());
+        }
         if (!tables.containsKey(stmt.oldTableName())) {
             return QueryResult.error("Table not found: " + stmt.oldTableName());
         }
@@ -4967,6 +5310,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (tables.containsKey(stmt.newTableName()) || views.containsKey(stmt.newTableName())) {
             return QueryResult.error("A table or view already exists with that name: " + stmt.newTableName());
         }
+
+        String oldName = stmt.oldTableName();
+        String newName = stmt.newTableName();
+        String oldCatalogLine = catalogLines.get("TABLE:" + oldName);
+        String oldOwnerLine = catalogLines.get("OWNER:" + oldName);
 
         tables.put(stmt.newTableName(), tables.remove(stmt.oldTableName()));
         tableColumns.put(stmt.newTableName(), tableColumns.remove(stmt.oldTableName()));
@@ -4996,6 +5344,27 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         catalogLines.remove("TABLE:" + stmt.oldTableName());
         tableStatsRegistry.rename(stmt.oldTableName(), stmt.newTableName());
         regenerateTableDdl(stmt.newTableName());
+
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.renameTable(oldName, newName, xid);
+
+        recordDdlUndo(() -> {
+            if (tables.containsKey(newName)) {
+                tables.put(oldName, tables.remove(newName));
+                tableColumns.put(oldName, tableColumns.remove(newName));
+                Map<String, String> t = tableColumnTypes.remove(newName);
+                if (t != null) tableColumnTypes.put(oldName, t);
+                Map<String, String> d = tableColumnDefaults.remove(newName);
+                if (d != null) tableColumnDefaults.put(oldName, d);
+                String o = tableOwners.remove(newName);
+                if (o != null) tableOwners.put(oldName, o);
+                catalogLines.remove("TABLE:" + newName);
+                catalogLines.remove("OWNER:" + newName);
+                if (oldCatalogLine != null) catalogLines.put("TABLE:" + oldName, oldCatalogLine);
+                if (oldOwnerLine != null) catalogLines.put("OWNER:" + oldName, oldOwnerLine);
+            }
+        });
+
         return QueryResult.success("Table renamed: " + stmt.oldTableName() + " -> " + stmt.newTableName());
     }
 
@@ -5009,6 +5378,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * changed, rather than leaving the table half-converted.
      */
     private QueryResult executeAlterTableAlterColumnType(AlterTableAlterColumnTypeStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
@@ -5018,6 +5390,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());
         }
+
+        String tableName = stmt.tableName();
+        String colName = stmt.columnName();
+        String oldType = tableColumnTypes.get(tableName) != null ? tableColumnTypes.get(tableName).get(colName) : "VARCHAR";
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
 
         HeapTable table = tables.get(stmt.tableName());
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -5042,11 +5419,33 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         tableColumnTypes.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.newDataType());
         regenerateTableDdl(stmt.tableName());
+
+        systemCatalog.alterColumnType(tableName, colName, stmt.newDataType(), txn.getXID());
+        systemCatalog.updateTableDdl(tableName, regenerateTableDdlSql(tableName), txn.getXID());
+
+        recordDdlUndo(() -> {
+            Map<String, String> types = tableColumnTypes.get(tableName);
+            if (types != null) {
+                if (oldType != null) types.put(colName, oldType);
+                else types.remove(colName);
+            }
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+        });
+
         return QueryResult.success("Column type changed: " + stmt.columnName() + " -> " + stmt.newDataType());
     }
 
     /** Metadata-only - applies to future inserts, never touches any existing row, matching real Postgres's own behavior for this specific sub-command. */
     private QueryResult executeAlterTableSetDefault(AlterTableSetDefaultStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeAlterTableSetDefault(stmt, txn);
+    }
+
+    private QueryResult executeAlterTableSetDefault(AlterTableSetDefaultStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
@@ -5056,12 +5455,40 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());
         }
+        String tableName = stmt.tableName();
+        String colName = stmt.columnName();
+        String oldDef = tableColumnDefaults.get(tableName) != null ? tableColumnDefaults.get(tableName).get(colName) : null;
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
+
         tableColumnDefaults.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.defaultValue());
         regenerateTableDdl(stmt.tableName());
+
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.setColumnDefault(tableName, colName, stmt.defaultValue(), xid);
+        systemCatalog.updateTableDdl(tableName, regenerateTableDdlSql(tableName), xid);
+
+        recordDdlUndo(() -> {
+            Map<String, String> defs = tableColumnDefaults.get(tableName);
+            if (defs != null) {
+                if (oldDef != null) defs.put(colName, oldDef);
+                else defs.remove(colName);
+            }
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+        });
+
         return QueryResult.success("Default set for column: " + stmt.columnName());
     }
 
     private QueryResult executeAlterTableDropDefault(AlterTableDropDefaultStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeAlterTableDropDefault(stmt, txn);
+    }
+
+    private QueryResult executeAlterTableDropDefault(AlterTableDropDefaultStatement stmt, Transaction txn) {
+        if (SystemCatalog.isSystemTable(stmt.tableName())) {
+            return QueryResult.error("Cannot alter system table: " + stmt.tableName());
+        }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
@@ -5071,9 +5498,26 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!columns.contains(stmt.columnName())) {
             return QueryResult.error("Column not found: " + stmt.columnName());
         }
+        String tableName = stmt.tableName();
+        String colName = stmt.columnName();
+        String oldDef = tableColumnDefaults.get(tableName) != null ? tableColumnDefaults.get(tableName).get(colName) : null;
+        String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
+
         Map<String, String> defaults = tableColumnDefaults.get(stmt.tableName());
         if (defaults != null) defaults.remove(stmt.columnName());
         regenerateTableDdl(stmt.tableName());
+
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.dropColumnDefault(tableName, colName, xid);
+        systemCatalog.updateTableDdl(tableName, regenerateTableDdlSql(tableName), xid);
+
+        recordDdlUndo(() -> {
+            if (oldDef != null) {
+                tableColumnDefaults.computeIfAbsent(tableName, k -> new HashMap<>()).put(colName, oldDef);
+            }
+            if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
+        });
+
         return QueryResult.success("Default dropped for column: " + stmt.columnName());
     }
 
@@ -5142,6 +5586,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * infinite loop with no diagnostic.
      */
     private QueryResult executeCreateView(CreateViewStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeCreateView(stmt, txn, null);
+    }
+
+    private QueryResult executeCreateView(CreateViewStatement stmt, Transaction txn, String sql) {
         if (tables.containsKey(stmt.viewName())) {
             return QueryResult.error("A table already exists with that name: " + stmt.viewName());
         }
@@ -5149,32 +5599,45 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("View already exists: " + stmt.viewName());
         }
         views.put(stmt.viewName(), stmt.query());
+        long xid = txn != null ? txn.getXID() : 0L;
+        String viewDdl = sql != null ? sql : "CREATE VIEW " + stmt.viewName() + " AS " + stmt.query();
+        systemCatalog.insertTable(stmt.viewName(), "VIEW", session.get().currentUser, viewDdl, xid);
+        String viewName = stmt.viewName();
+        catalogLines.put("VIEW:" + viewName, catalogEntry("VIEW", viewDdl));
+        recordDdlUndo(() -> {
+            views.remove(viewName);
+            catalogLines.remove("VIEW:" + viewName);
+        });
         return QueryResult.success("View created: " + stmt.viewName());
     }
 
     private QueryResult executeDropView(DropViewStatement stmt) {
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        return executeDropView(stmt, txn);
+    }
+
+    private QueryResult executeDropView(DropViewStatement stmt, Transaction txn) {
         if (!views.containsKey(stmt.viewName())) {
             return QueryResult.error("View not found: " + stmt.viewName());
         }
-        views.remove(stmt.viewName());
+        SelectStatement oldQuery = views.remove(stmt.viewName());
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.deleteTable(stmt.viewName(), xid);
+        String viewName = stmt.viewName();
+        String oldCatalogLine = catalogLines.get("VIEW:" + viewName);
+        catalogLines.remove("VIEW:" + viewName);
+        recordDdlUndo(() -> {
+            if (oldQuery != null) views.put(viewName, oldQuery);
+            if (oldCatalogLine != null) catalogLines.put("VIEW:" + viewName, oldCatalogLine);
+        });
         return QueryResult.success("View dropped: " + stmt.viewName());
     }
 
-    /**
-     * Returns one row per table, with a single "table_name" column - not a
-     * message string. This used to return QueryResult.success("Tables: a, b")
-     * or QueryResult.success("No tables found"), which worked fine for the
-     * in-process CLI (which printed QueryResult.toString() directly) but
-     * would have been silently useless over standard JDBC: Statement.execute()
-     * only exposes a boolean ("was there a ResultSet") and an int row count,
-     * not an arbitrary message string, so the actual table names would never
-     * have reached a real JDBC caller. A proper rows-based result is both
-     * more correct (this is fundamentally a query, not a command) and the
-     * only way it can flow through a ResultSet.
-     */
     private QueryResult executeShowTables() {
         List<Tuple> rows = new ArrayList<>();
         for (String tableName : tables.keySet()) {
+            if (SystemCatalog.isSystemTable(tableName)) continue;
             Tuple row = new Tuple();
             row.addValue("table_name", tableName);
             rows.add(row);
@@ -5259,7 +5722,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         addStat(rows, "buffer_pool_hit_ratio", String.format("%.4f", bufferPool.getCacheHitRatio()));
         addStat(rows, "buffer_pool_cache_size", String.valueOf(bufferPool.getCacheSize()));
         addStat(rows, "wal_current_lsn", String.valueOf(walManager.getCurrentLSN()));
-        addStat(rows, "table_count", String.valueOf(tables.size()));
+        addStat(rows, "table_count", String.valueOf(getTableNames().size()));
         addStat(rows, "view_count", String.valueOf(views.size()));
         addStat(rows, "index_count", String.valueOf(indexesByName.size()));
         addStat(rows, "oldest_active_xid", String.valueOf(transactionManager.getOldestActiveXid()));

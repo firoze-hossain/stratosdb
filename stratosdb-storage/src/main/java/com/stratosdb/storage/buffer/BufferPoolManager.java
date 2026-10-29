@@ -31,7 +31,7 @@ public class BufferPoolManager implements BufferPool {
     private long misses = 0;
 
     public BufferPoolManager(int maxPages, DiskManager diskManager) {
-        this(maxPages, diskManager, 100L, true);
+        this(maxPages, diskManager, 0L, false);
     }
 
     public BufferPoolManager(int maxPages, DiskManager diskManager, long flushIntervalMs, boolean startFlusher) {

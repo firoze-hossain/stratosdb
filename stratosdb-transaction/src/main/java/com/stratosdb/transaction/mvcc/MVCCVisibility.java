@@ -78,7 +78,7 @@ public final class MVCCVisibility {
         long xmin = readXmin(stored);
         long xmax = readXmax(stored);
 
-        boolean creatorVisible = (xmin == snapshot.getXid()) || definitelyCommittedBefore(xmin, snapshot, txnManager);
+        boolean creatorVisible = (xmin == 0L) || (xmin == snapshot.getXid()) || definitelyCommittedBefore(xmin, snapshot, txnManager);
         if (!creatorVisible) {
             return false;
         }

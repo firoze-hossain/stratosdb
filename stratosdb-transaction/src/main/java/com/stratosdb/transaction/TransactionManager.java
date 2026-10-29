@@ -207,9 +207,9 @@ public class TransactionManager {
         LOG.debug("Aborted transaction {}", tx.getXID());
     }
 
-    /** True iff xid committed (as opposed to still active, aborted, or unknown). */
+    /** True iff xid committed (as opposed to still active, aborted, or unknown). 0L is the bootstrap transaction. */
     public boolean isCommitted(long xid) {
-        return committedXids.contains(xid);
+        return xid == 0L || committedXids.contains(xid);
     }
 
     public boolean isActive(long xid) {
