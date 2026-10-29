@@ -117,6 +117,57 @@ public class PitrWalReplayer {
                     out.put(xid, ts);
                 }
                 case WALManager.OP_CHECKPOINT -> c.readLong();
+                case WALManager.OP_INDEX_INSERT -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readInt();
+                }
+                case WALManager.OP_INDEX_DELETE -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readInt();
+                }
+                case WALManager.OP_INDEX_SPLIT -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    boolean isLeaf = (c.readInt() == 1);
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    int rightCount = c.readInt();
+                    int rightBytes = isLeaf ? (rightCount * 20) : (rightCount * 8 + (rightCount + 1) * 8);
+                    c.skip(rightBytes);
+                    int leftCount = c.readInt();
+                    int leftBytes = isLeaf ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                    c.skip(leftBytes);
+                }
+                case WALManager.OP_INDEX_MERGE -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    boolean isLeaf = (c.readInt() == 1);
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readInt();
+                    c.readLong();
+                    int leftCount = c.readInt();
+                    int leftBytes = isLeaf ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                    c.skip(leftBytes);
+                    int parentKeyCount = c.readInt();
+                    int parentBytes = (parentKeyCount * 8) + ((parentKeyCount + 1) * 8);
+                    c.skip(parentBytes);
+                }
                 default -> {
                     LOG.warn("Unknown WAL record type {} during PITR pass 1 - stopping this segment's scan", opType);
                     return;
@@ -172,6 +223,57 @@ public class PitrWalReplayer {
                     c.readLong();
                 }
                 case WALManager.OP_CHECKPOINT -> c.readLong();
+                case WALManager.OP_INDEX_INSERT -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readInt();
+                }
+                case WALManager.OP_INDEX_DELETE -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readInt();
+                }
+                case WALManager.OP_INDEX_SPLIT -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    boolean isLeaf = (c.readInt() == 1);
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    int rightCount = c.readInt();
+                    int rightBytes = isLeaf ? (rightCount * 20) : (rightCount * 8 + (rightCount + 1) * 8);
+                    c.skip(rightBytes);
+                    int leftCount = c.readInt();
+                    int leftBytes = isLeaf ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                    c.skip(leftBytes);
+                }
+                case WALManager.OP_INDEX_MERGE -> {
+                    c.readLong();
+                    c.readLengthPrefixedString();
+                    boolean isLeaf = (c.readInt() == 1);
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readLong();
+                    c.readInt();
+                    c.readLong();
+                    int leftCount = c.readInt();
+                    int leftBytes = isLeaf ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                    c.skip(leftBytes);
+                    int parentKeyCount = c.readInt();
+                    int parentBytes = (parentKeyCount * 8) + ((parentKeyCount + 1) * 8);
+                    c.skip(parentBytes);
+                }
                 default -> {
                     LOG.warn("Unknown WAL record type {} during PITR pass 2 - stopping this segment's scan", opType);
                     return replayedOps;

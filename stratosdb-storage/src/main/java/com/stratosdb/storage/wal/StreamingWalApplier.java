@@ -186,6 +186,74 @@ public class StreamingWalApplier {
                 if (ts == null) return null;
                 return c.pos; // nothing to apply - a checkpoint is a marker, not a data change
             }
+            case WALManager.OP_INDEX_INSERT: {
+                Cursor c = new Cursor(pos);
+                Long xid = tryReadLong(buf, c);
+                String idxName = tryReadLengthPrefixedString(buf, c);
+                Long pageId = tryReadLong(buf, c);
+                Long key = tryReadLong(buf, c);
+                Long ridPageId = tryReadLong(buf, c);
+                Integer ridSlot = tryReadInt(buf, c);
+                if (xid == null || idxName == null || pageId == null || key == null || ridPageId == null || ridSlot == null) return null;
+                return c.pos;
+            }
+            case WALManager.OP_INDEX_DELETE: {
+                Cursor c = new Cursor(pos);
+                Long xid = tryReadLong(buf, c);
+                String idxName = tryReadLengthPrefixedString(buf, c);
+                Long pageId = tryReadLong(buf, c);
+                Long key = tryReadLong(buf, c);
+                Long ridPageId = tryReadLong(buf, c);
+                Integer ridSlot = tryReadInt(buf, c);
+                if (xid == null || idxName == null || pageId == null || key == null || ridPageId == null || ridSlot == null) return null;
+                return c.pos;
+            }
+            case WALManager.OP_INDEX_SPLIT: {
+                Cursor c = new Cursor(pos);
+                Long xid = tryReadLong(buf, c);
+                String idxName = tryReadLengthPrefixedString(buf, c);
+                Integer isLeaf = tryReadInt(buf, c);
+                Long pageId = tryReadLong(buf, c);
+                Long newPageId = tryReadLong(buf, c);
+                Long splitKey = tryReadLong(buf, c);
+                Long nextLeafPageId = tryReadLong(buf, c);
+                Long parentPageId = tryReadLong(buf, c);
+                Long newRootId = tryReadLong(buf, c);
+                Integer rightCount = tryReadInt(buf, c);
+                if (xid == null || idxName == null || isLeaf == null || pageId == null || newPageId == null ||
+                    splitKey == null || nextLeafPageId == null || parentPageId == null || newRootId == null || rightCount == null) return null;
+                int rightBytes = (isLeaf == 1) ? (rightCount * 20) : (rightCount * 8 + (rightCount + 1) * 8);
+                if (tryReadBytes(buf, c, rightBytes) == null) return null;
+                Integer leftCount = tryReadInt(buf, c);
+                if (leftCount == null) return null;
+                int leftBytes = (isLeaf == 1) ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                if (tryReadBytes(buf, c, leftBytes) == null) return null;
+                return c.pos;
+            }
+            case WALManager.OP_INDEX_MERGE: {
+                Cursor c = new Cursor(pos);
+                Long xid = tryReadLong(buf, c);
+                String idxName = tryReadLengthPrefixedString(buf, c);
+                Integer isLeaf = tryReadInt(buf, c);
+                Long parentPageId = tryReadLong(buf, c);
+                Long leftPageId = tryReadLong(buf, c);
+                Long rightPageId = tryReadLong(buf, c);
+                Long separatorKey = tryReadLong(buf, c);
+                Long rightNextLeafPageId = tryReadLong(buf, c);
+                Integer collapsedRoot = tryReadInt(buf, c);
+                Long newRootId = tryReadLong(buf, c);
+                Integer leftCount = tryReadInt(buf, c);
+                if (xid == null || idxName == null || isLeaf == null || parentPageId == null || leftPageId == null ||
+                    rightPageId == null || separatorKey == null || rightNextLeafPageId == null || collapsedRoot == null ||
+                    newRootId == null || leftCount == null) return null;
+                int leftBytes = (isLeaf == 1) ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                if (tryReadBytes(buf, c, leftBytes) == null) return null;
+                Integer parentKeyCount = tryReadInt(buf, c);
+                if (parentKeyCount == null) return null;
+                int parentBytes = (parentKeyCount * 8) + ((parentKeyCount + 1) * 8);
+                if (tryReadBytes(buf, c, parentBytes) == null) return null;
+                return c.pos;
+            }
             default: {
                 LOG.warn("Unknown WAL record type {} in replication stream - stopping this connection's apply loop", opType);
                 return buf.length; // consume everything remaining - the caller should close this connection

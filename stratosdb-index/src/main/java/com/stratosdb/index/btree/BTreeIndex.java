@@ -70,6 +70,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
     private final String indexName;
     private final BufferPool bufferPool;
+    private com.stratosdb.storage.wal.WALManager walManager;
     private long rootPageId;
     private long nextPageId;
     /**
@@ -100,8 +101,13 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private final java.util.concurrent.locks.ReadWriteLock lock = new java.util.concurrent.locks.ReentrantReadWriteLock();
 
     public BTreeIndex(String indexName, BufferPool bufferPool) {
+        this(indexName, bufferPool, null);
+    }
+
+    public BTreeIndex(String indexName, BufferPool bufferPool, com.stratosdb.storage.wal.WALManager walManager) {
         this.indexName = indexName;
         this.bufferPool = bufferPool;
+        this.walManager = walManager;
 
         long existingPages = bufferPool.getTablePageCount(indexName);
         if (existingPages <= 1) {
@@ -110,6 +116,14 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             loadMetadata();
         }
         this.nextPageId = Math.max(existingPages, INITIAL_ROOT_PAGE_ID + 1);
+    }
+
+    public com.stratosdb.storage.wal.WALManager getWalManager() {
+        return walManager;
+    }
+
+    public void setWalManager(com.stratosdb.storage.wal.WALManager walManager) {
+        this.walManager = walManager;
     }
 
     private void initializeNewIndex() {
@@ -122,8 +136,10 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         // decodes to a nonsense "next page" value once every later split
         // propagates it forward as "whatever the pre-split page's next was."
         root.setNextLeafPageId(-1);
+        root.setPageLSN(0L);
         bufferPool.markDirty(indexName, INITIAL_ROOT_PAGE_ID);
         bufferPool.unpinPage(indexName, INITIAL_ROOT_PAGE_ID);
+        bufferPool.flushPage(indexName, INITIAL_ROOT_PAGE_ID);
 
         this.rootPageId = INITIAL_ROOT_PAGE_ID;
         saveMetadata();
@@ -149,6 +165,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         meta.setDirty(true);
         bufferPool.markDirty(indexName, META_PAGE_ID);
         bufferPool.unpinPage(indexName, META_PAGE_ID);
+        bufferPool.flushPage(indexName, META_PAGE_ID);
     }
 
     private long allocatePageId() {
@@ -158,21 +175,30 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     // --- point insert ---
 
     /** Real, write-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
+    @Override
     public void insert(long key, BTreePage.RID rid) {
+        insert(0L, key, rid);
+    }
+
+    @Override
+    public void insert(long xid, long key, BTreePage.RID rid) {
         lock.writeLock().lock();
         try {
-            insertInternal(key, rid);
+            insertInternal(xid, key, rid);
         } finally {
             lock.writeLock().unlock();
         }
     }
 
-    private void insertInternal(long key, BTreePage.RID rid) {
-        SplitResult result = insertRecursive(rootPageId, key, rid);
+    private void insertInternal(long xid, long key, BTreePage.RID rid) {
+        SplitResult result = insertRecursive(xid, -1, rootPageId, key, rid);
         if (result != null) {
-            long newRootId = allocatePageId();
+            long newRootId = result.newRootId() != -1 ? result.newRootId() : allocatePageId();
             BTreePage newRoot = bufferPool.getPage(indexName, newRootId, BTreePage.FACTORY);
-            newRoot.setInternalContents(List.of(result.splitKey), List.of(rootPageId, result.newPageId));
+            newRoot.setInternalContents(List.of(result.splitKey()), List.of(rootPageId, result.newPageId()));
+            if (result.lsn() > 0) {
+                newRoot.setPageLSN(result.lsn());
+            }
             bufferPool.markDirty(indexName, newRootId);
             bufferPool.unpinPage(indexName, newRootId);
 
@@ -182,9 +208,13 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         }
     }
 
-    private record SplitResult(long splitKey, long newPageId) {}
+    private record SplitResult(long splitKey, long newPageId, long newRootId, long lsn) {
+        SplitResult(long splitKey, long newPageId) {
+            this(splitKey, newPageId, -1L, 0L);
+        }
+    }
 
-    private SplitResult insertRecursive(long pageId, long key, BTreePage.RID rid) {
+    private SplitResult insertRecursive(long xid, long parentPageId, long pageId, long key, BTreePage.RID rid) {
         BTreePage page = bufferPool.getPage(indexName, pageId, BTreePage.FACTORY);
 
         if (page.isLeaf()) {
@@ -197,6 +227,13 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             values.add(insertPos, rid);
 
             if (keys.size() <= BTreePage.MAX_LEAF_KEYS) {
+                long lsn = 0;
+                if (walManager != null) {
+                    lsn = walManager.logIndexInsert(indexName, xid, pageId, key, rid.pageId(), rid.slot());
+                }
+                if (lsn > 0) {
+                    page.setPageLSN(lsn);
+                }
                 page.setLeafContents(keys, values);
                 bufferPool.markDirty(indexName, pageId);
                 bufferPool.unpinPage(indexName, pageId);
@@ -211,20 +248,31 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             List<BTreePage.RID> leftValues = new ArrayList<>(values.subList(0, mid));
 
             long newPageId = allocatePageId();
+            long oldNext = page.getNextLeafPageId();
+            long splitKey = rightKeys.get(0);
+            long newRootId = (pageId == rootPageId) ? allocatePageId() : -1L;
+
+            long lsn = 0;
+            if (walManager != null) {
+                lsn = walManager.logIndexSplit(indexName, xid, true, pageId, newPageId,
+                    splitKey, oldNext, parentPageId, newRootId,
+                    rightKeys, rightValues, null, leftKeys, leftValues, null);
+            }
+
             BTreePage newLeaf = bufferPool.getPage(indexName, newPageId, BTreePage.FACTORY);
+            if (lsn > 0) newLeaf.setPageLSN(lsn);
             newLeaf.setLeafContents(rightKeys, rightValues);
-            newLeaf.setNextLeafPageId(page.getNextLeafPageId());
+            newLeaf.setNextLeafPageId(oldNext);
             bufferPool.markDirty(indexName, newPageId);
             bufferPool.unpinPage(indexName, newPageId);
 
+            if (lsn > 0) page.setPageLSN(lsn);
             page.setLeafContents(leftKeys, leftValues);
             page.setNextLeafPageId(newPageId);
             bufferPool.markDirty(indexName, pageId);
             bufferPool.unpinPage(indexName, pageId);
 
-            // The smallest key now in the new right leaf becomes the separator -
-            // "child to the right of this separator holds keys >= separator".
-            return new SplitResult(rightKeys.get(0), newPageId);
+            return new SplitResult(splitKey, newPageId, newRootId, lsn);
         }
 
         // Internal node.
@@ -233,7 +281,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         int childIdx = findChildIndex(keys, key);
         long childPageId = children.get(childIdx);
 
-        SplitResult childSplit = insertRecursive(childPageId, key, rid);
+        SplitResult childSplit = insertRecursive(xid, pageId, childPageId, key, rid);
         if (childSplit == null) {
             bufferPool.unpinPage(indexName, pageId);
             return null;
@@ -245,6 +293,9 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         newChildren.add(childIdx + 1, childSplit.newPageId());
 
         if (newKeys.size() <= BTreePage.MAX_INTERNAL_KEYS) {
+            if (childSplit.lsn() > 0) {
+                page.setPageLSN(childSplit.lsn());
+            }
             page.setInternalContents(newKeys, newChildren);
             bufferPool.markDirty(indexName, pageId);
             bufferPool.unpinPage(indexName, pageId);
@@ -263,16 +314,27 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         List<Long> rightChildren = new ArrayList<>(newChildren.subList(mid + 1, newChildren.size()));
 
         long newPageId = allocatePageId();
+        long newRootId = (pageId == rootPageId) ? allocatePageId() : -1L;
+
+        long lsn = 0;
+        if (walManager != null) {
+            lsn = walManager.logIndexSplit(indexName, xid, false, pageId, newPageId,
+                promotedKey, -1L, parentPageId, newRootId,
+                rightKeys, null, rightChildren, leftKeys, null, leftChildren);
+        }
+
         BTreePage newInternal = bufferPool.getPage(indexName, newPageId, BTreePage.FACTORY);
+        if (lsn > 0) newInternal.setPageLSN(lsn);
         newInternal.setInternalContents(rightKeys, rightChildren);
         bufferPool.markDirty(indexName, newPageId);
         bufferPool.unpinPage(indexName, newPageId);
 
+        if (lsn > 0) page.setPageLSN(lsn);
         page.setInternalContents(leftKeys, leftChildren);
         bufferPool.markDirty(indexName, pageId);
         bufferPool.unpinPage(indexName, pageId);
 
-        return new SplitResult(promotedKey, newPageId);
+        return new SplitResult(promotedKey, newPageId, newRootId, lsn);
     }
 
     /** child[i] holds keys < keys[i]; child[i+1] holds keys >= keys[i]. */
@@ -290,20 +352,25 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
      * Removes the exact (key, rid) pair. A no-op (not an error) if that
      * exact pair isn't present - matches the get-out-of-the-way semantics
      * of most delete APIs rather than forcing every caller to check
-     * existence first.
+     * existence first. Real, write-locked entry point.
      */
-    /** Real, write-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
+    @Override
     public void delete(long key, BTreePage.RID rid) {
+        delete(0L, key, rid);
+    }
+
+    @Override
+    public void delete(long xid, long key, BTreePage.RID rid) {
         lock.writeLock().lock();
         try {
-            deleteInternal(key, rid);
+            deleteInternal(xid, key, rid);
         } finally {
             lock.writeLock().unlock();
         }
     }
 
-    private void deleteInternal(long key, BTreePage.RID rid) {
-        deleteRecursive(rootPageId, key, rid);
+    private void deleteInternal(long xid, long key, BTreePage.RID rid) {
+        deleteRecursive(xid, rootPageId, key, rid);
 
         // If deletion propagated all the way up and left the root as an
         // internal node with zero keys (one remaining child), that child
@@ -321,7 +388,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     }
 
     /** Returns true if the page at pageId underflowed (below minimum, and not the root) after the delete. */
-    private boolean deleteRecursive(long pageId, long key, BTreePage.RID rid) {
+    private boolean deleteRecursive(long xid, long pageId, long key, BTreePage.RID rid) {
         BTreePage page = bufferPool.getPage(indexName, pageId, BTreePage.FACTORY);
 
         if (page.isLeaf()) {
@@ -341,6 +408,11 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             }
             keys.remove(removeIdx);
             values.remove(removeIdx);
+            long lsn = 0;
+            if (walManager != null) {
+                lsn = walManager.logIndexDelete(indexName, xid, pageId, key, rid.pageId(), rid.slot());
+            }
+            if (lsn > 0) page.setPageLSN(lsn);
             page.setLeafContents(keys, values);
             bufferPool.markDirty(indexName, pageId);
 
@@ -354,13 +426,13 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         int childIdx = findChildIndex(keys, key);
         long childPageId = children.get(childIdx);
 
-        boolean childUnderflowed = deleteRecursive(childPageId, key, rid);
+        boolean childUnderflowed = deleteRecursive(xid, childPageId, key, rid);
         if (!childUnderflowed) {
             bufferPool.unpinPage(indexName, pageId);
             return false;
         }
 
-        boolean selfUnderflowed = rebalanceChild(page, pageId, childIdx);
+        boolean selfUnderflowed = rebalanceChild(xid, page, pageId, childIdx);
         bufferPool.unpinPage(indexName, pageId);
         return selfUnderflowed;
     }
@@ -371,7 +443,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
      * and keeps the tree denser); only merge if neither sibling can lend.
      * Returns true if the parent itself now underflows as a result.
      */
-    private boolean rebalanceChild(BTreePage parent, long parentPageId, int childIdx) {
+    private boolean rebalanceChild(long xid, BTreePage parent, long parentPageId, int childIdx) {
         List<Long> parentKeys = new ArrayList<>(parent.getKeys());
         List<Long> parentChildren = new ArrayList<>(parent.getChildren());
         long childPageId = parentChildren.get(childIdx);
@@ -409,13 +481,13 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         if (childIdx > 0) {
             long leftId = parentChildren.get(childIdx - 1);
             BTreePage left = bufferPool.getPage(indexName, leftId, BTreePage.FACTORY);
-            mergeChildren(parent, parentKeys, parentChildren, childIdx - 1, left, childIdx, child);
+            mergeChildren(xid, parent, parentKeys, parentChildren, childIdx - 1, left, childIdx, child);
             bufferPool.unpinPage(indexName, childPageId);
             bufferPool.unpinPage(indexName, leftId);
         } else {
             long rightId = parentChildren.get(childIdx + 1);
             BTreePage right = bufferPool.getPage(indexName, rightId, BTreePage.FACTORY);
-            mergeChildren(parent, parentKeys, parentChildren, childIdx, child, childIdx + 1, right);
+            mergeChildren(xid, parent, parentKeys, parentChildren, childIdx, child, childIdx + 1, right);
             bufferPool.unpinPage(indexName, childPageId);
             bufferPool.unpinPage(indexName, rightId);
         }
@@ -517,15 +589,35 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
      * reclaimed, see this class's javadoc), removing the separator key
      * between them from the parent along with rightPage's child pointer.
      */
-    private void mergeChildren(BTreePage parent, List<Long> parentKeys, List<Long> parentChildren,
+    private void mergeChildren(long xid, BTreePage parent, List<Long> parentKeys, List<Long> parentChildren,
                                 int leftIdx, BTreePage leftPage, int rightIdx, BTreePage rightPage) {
         long separator = parentKeys.get(leftIdx);
 
+        List<Long> updatedParentKeys = new ArrayList<>(parentKeys);
+        List<Long> updatedParentChildren = new ArrayList<>(parentChildren);
+        updatedParentKeys.remove(leftIdx);
+        updatedParentChildren.remove(rightIdx);
+
+        boolean isCollapsed = (parent.getPageId() == rootPageId && updatedParentKeys.isEmpty());
+        long newRootId = isCollapsed ? leftPage.getPageId() : -1L;
+
+        long lsn = 0;
         if (leftPage.isLeaf()) {
             List<Long> mergedKeys = new ArrayList<>(leftPage.getKeys());
             List<BTreePage.RID> mergedValues = new ArrayList<>(leftPage.getLeafValues());
             mergedKeys.addAll(rightPage.getKeys());
             mergedValues.addAll(rightPage.getLeafValues());
+
+            if (walManager != null) {
+                lsn = walManager.logIndexMerge(indexName, xid, true, parent.getPageId(),
+                    leftPage.getPageId(), rightPage.getPageId(), separator,
+                    rightPage.getNextLeafPageId(), isCollapsed, newRootId,
+                    mergedKeys, mergedValues, null, updatedParentKeys, updatedParentChildren);
+            }
+            if (lsn > 0) {
+                leftPage.setPageLSN(lsn);
+                parent.setPageLSN(lsn);
+            }
             leftPage.setLeafContents(mergedKeys, mergedValues);
             leftPage.setNextLeafPageId(rightPage.getNextLeafPageId()); // skip the now-orphaned rightPage in the leaf chain
             bufferPool.markDirty(indexName, leftPage.getPageId());
@@ -535,6 +627,17 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             mergedKeys.add(separator); // the parent's separator comes down into the merged node
             mergedKeys.addAll(rightPage.getKeys());
             mergedChildren.addAll(rightPage.getChildren());
+
+            if (walManager != null) {
+                lsn = walManager.logIndexMerge(indexName, xid, false, parent.getPageId(),
+                    leftPage.getPageId(), rightPage.getPageId(), separator,
+                    -1L, isCollapsed, newRootId,
+                    mergedKeys, null, mergedChildren, updatedParentKeys, updatedParentChildren);
+            }
+            if (lsn > 0) {
+                leftPage.setPageLSN(lsn);
+                parent.setPageLSN(lsn);
+            }
             leftPage.setInternalContents(mergedKeys, mergedChildren);
             bufferPool.markDirty(indexName, leftPage.getPageId());
         }
@@ -542,12 +645,12 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         parentKeys.remove(leftIdx);
         parentChildren.remove(rightIdx);
         parent.setInternalContents(parentKeys, parentChildren);
+        bufferPool.markDirty(indexName, parent.getPageId());
     }
 
     // --- point search ---
 
-    /** Returns one matching RID, or null if the key isn't present. Use rangeScan for all matches of a duplicate key. */
-    /** Real, read-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
+    /** Returns one matching RID, or null if the key isn't present. Use rangeScan for all matches of a duplicate key. Real, read-locked entry point. */
     public BTreePage.RID search(long key) {
         lock.readLock().lock();
         try {
@@ -578,13 +681,27 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             pageId = childPageId;
             page = bufferPool.getPage(indexName, pageId, BTreePage.FACTORY);
         }
+        // Lehman-Yao B-link right sibling traversal if key > last key on this leaf
+        while (page.getNextLeafPageId() > 0) {
+            List<Long> keys = page.getKeys();
+            if (!keys.isEmpty() && key > keys.get(keys.size() - 1)) {
+                long nextId = page.getNextLeafPageId();
+                BTreePage next = bufferPool.getPage(indexName, nextId, BTreePage.FACTORY);
+                if (!next.getKeys().isEmpty() && key >= next.getKeys().get(0)) {
+                    bufferPool.unpinPage(indexName, page.getPageId());
+                    page = next;
+                    continue;
+                }
+                bufferPool.unpinPage(indexName, nextId);
+            }
+            break;
+        }
         return page;
     }
 
     // --- range scan ---
 
-    /** All RIDs with key in [fromKey, toKey], inclusive, in ascending key order. */
-    /** Real, read-locked entry point - see this class's own ReadWriteLock field javadoc for why. */
+    /** All RIDs with key in [fromKey, toKey], inclusive, in ascending key order. Real, read-locked entry point. */
     public List<BTreePage.RID> rangeScan(long fromKey, long toKey) {
         lock.readLock().lock();
         try {
@@ -629,5 +746,151 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
     public long getRootPageId() {
         return rootPageId;
+    }
+
+    /**
+     * Validates the structural consistency of the entire B+Tree:
+     * 1. Checks that root page exists and is valid.
+     * 2. Traverses from root to all leaves, verifying key ordering and child invariants.
+     * 3. Traverses the leaf chain via nextLeafPageId, verifying ascending key order across leaves.
+     * 4. Verifies there are zero orphan pointers (every leaf reachable from root is in the chain)
+     *    and zero broken links (the leaf chain reaches every leaf reachable from root, with no dangling next pointers).
+     *
+     * @return the total number of keys stored across the tree.
+     * @throws IllegalStateException if any structural inconsistency, broken link, or orphan pointer is detected.
+     */
+    public int validateTree() {
+        lock.readLock().lock();
+        try {
+            return validateTreeInternal();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private int validateTreeInternal() {
+        if (rootPageId <= 0) {
+            throw new IllegalStateException("Corrupt root page id: " + rootPageId);
+        }
+        BTreePage root = bufferPool.getPage(indexName, rootPageId, BTreePage.FACTORY);
+        java.util.Set<Long> pagesReachableFromRoot = new java.util.HashSet<>();
+        pagesReachableFromRoot.add(rootPageId);
+        java.util.Set<Long> leavesFromRoot = new java.util.HashSet<>();
+        long leftmostLeafId = -1;
+
+        if (root.isLeaf()) {
+            leavesFromRoot.add(rootPageId);
+            leftmostLeafId = rootPageId;
+            validateLeaf(root);
+            bufferPool.unpinPage(indexName, rootPageId);
+        } else {
+            validateInternalNode(root, pagesReachableFromRoot, leavesFromRoot);
+            bufferPool.unpinPage(indexName, rootPageId);
+            long currId = rootPageId;
+            while (true) {
+                BTreePage curr = bufferPool.getPage(indexName, currId, BTreePage.FACTORY);
+                if (curr.isLeaf()) {
+                    leftmostLeafId = currId;
+                    bufferPool.unpinPage(indexName, currId);
+                    break;
+                }
+                long firstChild = curr.getChildren().get(0);
+                bufferPool.unpinPage(indexName, currId);
+                currId = firstChild;
+            }
+        }
+
+        // Traverse leaf sibling chain starting from leftmost leaf
+        java.util.Set<Long> leavesInChain = new java.util.HashSet<>();
+        long currLeafId = leftmostLeafId;
+        Long previousMaxKey = null;
+        int totalKeys = 0;
+
+        while (currLeafId != -1) {
+            if (leavesInChain.contains(currLeafId)) {
+                throw new IllegalStateException("Cycle detected in leaf sibling links at page " + currLeafId);
+            }
+            leavesInChain.add(currLeafId);
+
+            BTreePage leaf = bufferPool.getPage(indexName, currLeafId, BTreePage.FACTORY);
+            if (!leaf.isLeaf()) {
+                bufferPool.unpinPage(indexName, currLeafId);
+                throw new IllegalStateException("Leaf chain node " + currLeafId + " is not marked as a leaf");
+            }
+            List<Long> keys = leaf.getKeys();
+            validateLeaf(leaf);
+
+            if (!keys.isEmpty()) {
+                if (previousMaxKey != null && keys.get(0) < previousMaxKey) {
+                    bufferPool.unpinPage(indexName, currLeafId);
+                    throw new IllegalStateException("Broken key ordering across leaf sibling chain: "
+                        + previousMaxKey + " followed by " + keys.get(0) + " on page " + currLeafId);
+                }
+                previousMaxKey = keys.get(keys.size() - 1);
+            }
+            totalKeys += keys.size();
+
+            long nextId = leaf.getNextLeafPageId();
+            bufferPool.unpinPage(indexName, currLeafId);
+            currLeafId = nextId;
+        }
+
+        // Verify zero orphan pointers and zero broken links
+        java.util.Set<Long> orphanFromRoot = new java.util.HashSet<>(leavesFromRoot);
+        orphanFromRoot.removeAll(leavesInChain);
+        if (!orphanFromRoot.isEmpty()) {
+            throw new IllegalStateException("Broken links detected: leaves reachable from root not in sibling chain: " + orphanFromRoot);
+        }
+
+        java.util.Set<Long> orphanInChain = new java.util.HashSet<>(leavesInChain);
+        orphanInChain.removeAll(leavesFromRoot);
+        if (!orphanInChain.isEmpty()) {
+            throw new IllegalStateException("Orphan pointers detected: leaves in sibling chain unreachable from root: " + orphanInChain);
+        }
+
+        return totalKeys;
+    }
+
+    private void validateInternalNode(BTreePage page, java.util.Set<Long> visitedPages, java.util.Set<Long> leaves) {
+        List<Long> keys = page.getKeys();
+        List<Long> children = page.getChildren();
+        if (children.size() != keys.size() + 1) {
+            throw new IllegalStateException("Internal page " + page.getPageId() + " has " + keys.size() + " keys but " + children.size() + " children");
+        }
+        for (int i = 1; i < keys.size(); i++) {
+            if (keys.get(i) < keys.get(i - 1)) {
+                throw new IllegalStateException("Internal page " + page.getPageId() + " keys not sorted: " + keys);
+            }
+        }
+        for (long childId : children) {
+            if (childId <= 0) {
+                throw new IllegalStateException("Invalid child page id " + childId + " in page " + page.getPageId());
+            }
+            if (visitedPages.contains(childId)) {
+                throw new IllegalStateException("Cycle or duplicate reference to child page " + childId);
+            }
+            visitedPages.add(childId);
+            BTreePage child = bufferPool.getPage(indexName, childId, BTreePage.FACTORY);
+            if (child.isLeaf()) {
+                leaves.add(childId);
+                validateLeaf(child);
+            } else {
+                validateInternalNode(child, visitedPages, leaves);
+            }
+            bufferPool.unpinPage(indexName, childId);
+        }
+    }
+
+    private void validateLeaf(BTreePage leaf) {
+        List<Long> keys = leaf.getKeys();
+        List<BTreePage.RID> values = leaf.getLeafValues();
+        if (keys.size() != values.size()) {
+            throw new IllegalStateException("Leaf page " + leaf.getPageId() + " key count " + keys.size() + " != value count " + values.size());
+        }
+        for (int i = 1; i < keys.size(); i++) {
+            if (keys.get(i) < keys.get(i - 1)) {
+                throw new IllegalStateException("Leaf page " + leaf.getPageId() + " keys not sorted: " + keys);
+            }
+        }
     }
 }

@@ -538,7 +538,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private void reconstructIndex(String indexName, String tableName, String columnName, String type) {
         com.stratosdb.index.KeyValueIndex index = type.equals("HASH")
             ? new com.stratosdb.index.hash.HashIndex(indexName, bufferPool)
-            : new BTreeIndex(indexName, bufferPool);
+            : new BTreeIndex(indexName, bufferPool, walManager);
         IndexEntry entry = new IndexEntry(indexName, tableName, columnName, index);
         indexesByName.put(indexName, entry);
         indexesByTable.computeIfAbsent(tableName, k -> new ArrayList<>()).add(entry);
@@ -1919,7 +1919,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult buildKeyValueIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
         com.stratosdb.index.KeyValueIndex index = stmt.indexType() == CreateIndexStatement.IndexType.HASH
             ? new com.stratosdb.index.hash.HashIndex(stmt.indexName(), bufferPool)
-            : new BTreeIndex(stmt.indexName(), bufferPool);
+            : new BTreeIndex(stmt.indexName(), bufferPool, walManager);
         int indexed = 0;
         int skippedNonNumeric = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {

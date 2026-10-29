@@ -16,7 +16,15 @@ import java.util.List;
 public interface KeyValueIndex {
     void insert(long key, BTreePage.RID rid);
 
+    default void insert(long xid, long key, BTreePage.RID rid) {
+        insert(key, rid);
+    }
+
     void delete(long key, BTreePage.RID rid);
+
+    default void delete(long xid, long key, BTreePage.RID rid) {
+        delete(key, rid);
+    }
 
     BTreePage.RID search(long key);
 

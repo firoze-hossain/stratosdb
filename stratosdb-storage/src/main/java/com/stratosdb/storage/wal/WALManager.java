@@ -1,6 +1,10 @@
 package com.stratosdb.storage.wal;
 
 import com.stratosdb.common.utils.ByteUtil;
+import com.stratosdb.storage.disk.DiskManager;
+import com.stratosdb.storage.page.BTreePage;
+import com.stratosdb.storage.page.Page;
+import com.stratosdb.storage.page.SlottedPage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -8,6 +12,9 @@ import java.io.File;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -130,6 +137,10 @@ public class WALManager {
     public static final int OP_COMMIT = 4;
     public static final int OP_ABORT = 5;
     public static final int OP_CHECKPOINT = 6;
+    public static final int OP_INDEX_INSERT = 7;
+    public static final int OP_INDEX_SPLIT = 8;
+    public static final int OP_INDEX_DELETE = 9;
+    public static final int OP_INDEX_MERGE = 10;
     
     public WALManager(String dataDirectory) {
         this.walDirectory = dataDirectory + "/wal";
@@ -312,6 +323,173 @@ public class WALManager {
             LOG.error("Failed to write checkpoint", e);
         }
     }
+
+    /**
+     * Log an index insert mutation (key and RID placed on a leaf page).
+     */
+    public long logIndexInsert(String indexName, long xid, long pageId, long key, long ridPageId, int ridSlot) {
+        try {
+            byte[] tableBytes = indexName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            ByteBuffer buffer = ByteBuffer.allocate(64 + tableBytes.length);
+            buffer.putInt(OP_INDEX_INSERT);
+            buffer.putLong(xid);
+            buffer.putInt(tableBytes.length);
+            buffer.put(tableBytes);
+            buffer.putLong(pageId);
+            buffer.putLong(key);
+            buffer.putLong(ridPageId);
+            buffer.putInt(ridSlot);
+            return writeBuffer(buffer, xid == 0L);
+        } catch (Exception e) {
+            LOG.error("Failed to log index insert", e);
+            return -1L;
+        }
+    }
+
+    /**
+     * Log an index delete mutation (key and RID removed from a leaf page).
+     */
+    public long logIndexDelete(String indexName, long xid, long pageId, long key, long ridPageId, int ridSlot) {
+        try {
+            byte[] tableBytes = indexName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            ByteBuffer buffer = ByteBuffer.allocate(64 + tableBytes.length);
+            buffer.putInt(OP_INDEX_DELETE);
+            buffer.putLong(xid);
+            buffer.putInt(tableBytes.length);
+            buffer.put(tableBytes);
+            buffer.putLong(pageId);
+            buffer.putLong(key);
+            buffer.putLong(ridPageId);
+            buffer.putInt(ridSlot);
+            return writeBuffer(buffer, xid == 0L);
+        } catch (Exception e) {
+            LOG.error("Failed to log index delete", e);
+            return -1L;
+        }
+    }
+
+    /**
+     * Log an index split mutation (leaf or internal node split, propagating to parent / new root).
+     */
+    public long logIndexSplit(String indexName, long xid, boolean isLeaf,
+                              long pageId, long newPageId, long splitKey,
+                              long nextLeafPageId, long parentPageId, long newRootId,
+                              List<Long> rightKeys, List<BTreePage.RID> rightValues, List<Long> rightChildren,
+                              List<Long> leftKeys, List<BTreePage.RID> leftValues, List<Long> leftChildren) {
+        try {
+            byte[] tableBytes = indexName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int rCount = rightKeys != null ? rightKeys.size() : 0;
+            int rightSize = isLeaf ? (rCount * 20) : (rCount * 8 + (rightChildren != null ? rightChildren.size() * 8 : 0));
+            int lCount = leftKeys != null ? leftKeys.size() : 0;
+            int leftSize = isLeaf ? (lCount * 20) : (lCount * 8 + (leftChildren != null ? leftChildren.size() * 8 : 0));
+
+            ByteBuffer buffer = ByteBuffer.allocate(256 + tableBytes.length + rightSize + leftSize);
+            buffer.putInt(OP_INDEX_SPLIT);
+            buffer.putLong(xid);
+            buffer.putInt(tableBytes.length);
+            buffer.put(tableBytes);
+            buffer.putInt(isLeaf ? 1 : 0);
+            buffer.putLong(pageId);
+            buffer.putLong(newPageId);
+            buffer.putLong(splitKey);
+            buffer.putLong(nextLeafPageId);
+            buffer.putLong(parentPageId);
+            buffer.putLong(newRootId);
+
+            buffer.putInt(rCount);
+            if (isLeaf) {
+                for (int i = 0; i < rCount; i++) {
+                    buffer.putLong(rightKeys.get(i));
+                    buffer.putLong(rightValues.get(i).pageId());
+                    buffer.putInt(rightValues.get(i).slot());
+                }
+            } else {
+                for (int i = 0; i < rCount; i++) buffer.putLong(rightKeys.get(i));
+                if (rightChildren != null) {
+                    for (long c : rightChildren) buffer.putLong(c);
+                }
+            }
+
+            buffer.putInt(lCount);
+            if (isLeaf) {
+                for (int i = 0; i < lCount; i++) {
+                    buffer.putLong(leftKeys.get(i));
+                    buffer.putLong(leftValues.get(i).pageId());
+                    buffer.putInt(leftValues.get(i).slot());
+                }
+            } else {
+                for (int i = 0; i < lCount; i++) buffer.putLong(leftKeys.get(i));
+                if (leftChildren != null) {
+                    for (long c : leftChildren) buffer.putLong(c);
+                }
+            }
+
+            return writeBuffer(buffer, true); // forced: split is a structural modification operation
+        } catch (Exception e) {
+            LOG.error("Failed to log index split", e);
+            return -1L;
+        }
+    }
+
+    /**
+     * Log an index merge mutation (leaf or internal node merge, collapsing empty nodes / root).
+     */
+    public long logIndexMerge(String indexName, long xid, boolean isLeaf,
+                              long parentPageId, long leftPageId, long rightPageId,
+                              long separatorKey, long rightNextLeafPageId,
+                              boolean collapsedRoot, long newRootId,
+                              List<Long> mergedKeys, List<BTreePage.RID> mergedValues, List<Long> mergedChildren,
+                              List<Long> parentKeys, List<Long> parentChildren) {
+        try {
+            byte[] tableBytes = indexName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int mCount = mergedKeys != null ? mergedKeys.size() : 0;
+            int leftSize = isLeaf ? (mCount * 20) : (mCount * 8 + (mergedChildren != null ? mergedChildren.size() * 8 : 0));
+            int pKeyCount = parentKeys != null ? parentKeys.size() : 0;
+            int pChildCount = parentChildren != null ? parentChildren.size() : 0;
+            int parentSize = pKeyCount * 8 + pChildCount * 8;
+
+            ByteBuffer buffer = ByteBuffer.allocate(256 + tableBytes.length + leftSize + parentSize);
+            buffer.putInt(OP_INDEX_MERGE);
+            buffer.putLong(xid);
+            buffer.putInt(tableBytes.length);
+            buffer.put(tableBytes);
+            buffer.putInt(isLeaf ? 1 : 0);
+            buffer.putLong(parentPageId);
+            buffer.putLong(leftPageId);
+            buffer.putLong(rightPageId);
+            buffer.putLong(separatorKey);
+            buffer.putLong(rightNextLeafPageId);
+            buffer.putInt(collapsedRoot ? 1 : 0);
+            buffer.putLong(newRootId);
+
+            buffer.putInt(mCount);
+            if (isLeaf) {
+                for (int i = 0; i < mCount; i++) {
+                    buffer.putLong(mergedKeys.get(i));
+                    buffer.putLong(mergedValues.get(i).pageId());
+                    buffer.putInt(mergedValues.get(i).slot());
+                }
+            } else {
+                for (int i = 0; i < mCount; i++) buffer.putLong(mergedKeys.get(i));
+                if (mergedChildren != null) {
+                    for (long c : mergedChildren) buffer.putLong(c);
+                }
+            }
+
+            buffer.putInt(pKeyCount);
+            if (parentKeys != null) {
+                for (long k : parentKeys) buffer.putLong(k);
+            }
+            if (parentChildren != null) {
+                for (long c : parentChildren) buffer.putLong(c);
+            }
+
+            return writeBuffer(buffer, true); // forced: merge is structural
+        } catch (Exception e) {
+            LOG.error("Failed to log index merge", e);
+            return -1L;
+        }
+    }
     
     /**
      * Write buffer to WAL, returning the end LSN of the written record.
@@ -367,7 +545,8 @@ public class WALManager {
                 }
             }
 
-            java.util.Map<String, com.stratosdb.storage.page.SlottedPage> dirtyPages = new java.util.HashMap<>();
+            java.util.Map<String, com.stratosdb.storage.page.Page> dirtyPages = new java.util.HashMap<>();
+            java.util.Set<String> recoveredIndexes = new java.util.HashSet<>();
             int replayedOps = 0;
 
             walChannel.position(0);
@@ -388,7 +567,7 @@ public class WALManager {
 
                         if (committedXids.contains(xid)) {
                             com.stratosdb.storage.page.SlottedPage page =
-                                loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
+                                loadOrGetDirtySlottedPage(diskManager, dirtyPages, tableName, pageId);
                             if (page.getPageLSN() < recordLSN) {
                                 page.insertTuple(tupleData);
                                 page.setPageLSN(recordLSN);
@@ -409,7 +588,7 @@ public class WALManager {
 
                         if (committedXids.contains(xid)) {
                             com.stratosdb.storage.page.SlottedPage page =
-                                loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
+                                loadOrGetDirtySlottedPage(diskManager, dirtyPages, tableName, pageId);
                             if (page.getPageLSN() < recordLSN) {
                                 page.deleteTuple(slot);
                                 page.setPageLSN(recordLSN);
@@ -434,7 +613,7 @@ public class WALManager {
 
                         if (committedXids.contains(xid)) {
                             com.stratosdb.storage.page.SlottedPage page =
-                                loadOrGetDirtyPage(diskManager, dirtyPages, tableName, pageId);
+                                loadOrGetDirtySlottedPage(diskManager, dirtyPages, tableName, pageId);
                             if (page.getPageLSN() < recordLSN) {
                                 page.updateTuple(slot, newData);
                                 page.setPageLSN(recordLSN);
@@ -443,6 +622,249 @@ public class WALManager {
                                 LOG.debug("Redo OP_UPDATE skipped on {}:{} because pageLSN {} >= recordLSN {}",
                                     tableName, pageId, page.getPageLSN(), recordLSN);
                             }
+                        }
+                        break;
+                    }
+                    case OP_INDEX_INSERT: {
+                        long xid = readLong();
+                        String indexName = readLengthPrefixedString();
+                        recoveredIndexes.add(indexName);
+                        long pageId = readLong();
+                        long key = readLong();
+                        long ridPageId = readLong();
+                        int ridSlot = readInt();
+                        long recordLSN = walChannel.position();
+
+                        if (xid == 0L || committedXids.contains(xid)) {
+                            BTreePage page = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, pageId);
+                            if (page.getPageLSN() < recordLSN) {
+                                List<Long> keys = new ArrayList<>(page.getKeys());
+                                List<BTreePage.RID> values = new ArrayList<>(page.getLeafValues());
+                                int idx = Collections.binarySearch(keys, key);
+                                int insertPos = idx >= 0 ? idx : -(idx + 1);
+                                boolean alreadyPresent = false;
+                                if (idx >= 0) {
+                                    for (int i = idx; i < keys.size() && keys.get(i) == key; i++) {
+                                        if (values.get(i).pageId() == ridPageId && values.get(i).slot() == ridSlot) {
+                                            alreadyPresent = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!alreadyPresent) {
+                                    keys.add(insertPos, key);
+                                    values.add(insertPos, new BTreePage.RID(ridPageId, ridSlot));
+                                    page.setLeafContents(keys, values);
+                                }
+                                page.setPageLSN(recordLSN);
+                                replayedOps++;
+                            } else {
+                                LOG.debug("Redo OP_INDEX_INSERT skipped on {}:{} because pageLSN {} >= recordLSN {}",
+                                    indexName, pageId, page.getPageLSN(), recordLSN);
+                            }
+                        }
+                        break;
+                    }
+                    case OP_INDEX_DELETE: {
+                        long xid = readLong();
+                        String indexName = readLengthPrefixedString();
+                        recoveredIndexes.add(indexName);
+                        long pageId = readLong();
+                        long key = readLong();
+                        long ridPageId = readLong();
+                        int ridSlot = readInt();
+                        long recordLSN = walChannel.position();
+
+                        if (xid == 0L || committedXids.contains(xid)) {
+                            BTreePage page = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, pageId);
+                            if (page.getPageLSN() < recordLSN) {
+                                List<Long> keys = new ArrayList<>(page.getKeys());
+                                List<BTreePage.RID> values = new ArrayList<>(page.getLeafValues());
+                                for (int i = 0; i < keys.size(); i++) {
+                                    if (keys.get(i) == key && values.get(i).pageId() == ridPageId && values.get(i).slot() == ridSlot) {
+                                        keys.remove(i);
+                                        values.remove(i);
+                                        page.setLeafContents(keys, values);
+                                        break;
+                                    }
+                                }
+                                page.setPageLSN(recordLSN);
+                                replayedOps++;
+                            } else {
+                                LOG.debug("Redo OP_INDEX_DELETE skipped on {}:{} because pageLSN {} >= recordLSN {}",
+                                    indexName, pageId, page.getPageLSN(), recordLSN);
+                            }
+                        }
+                        break;
+                    }
+                    case OP_INDEX_SPLIT: {
+                        long xid = readLong();
+                        String indexName = readLengthPrefixedString();
+                        recoveredIndexes.add(indexName);
+                        boolean isLeaf = (readInt() == 1);
+                        long pageId = readLong();
+                        long newPageId = readLong();
+                        long splitKey = readLong();
+                        long nextLeafPageId = readLong();
+                        long parentPageId = readLong();
+                        long newRootId = readLong();
+
+                        int rightCount = readInt();
+                        List<Long> rightKeys = new ArrayList<>(rightCount);
+                        List<BTreePage.RID> rightValues = isLeaf ? new ArrayList<>(rightCount) : null;
+                        List<Long> rightChildren = !isLeaf ? new ArrayList<>(rightCount + 1) : null;
+                        if (isLeaf) {
+                            for (int i = 0; i < rightCount; i++) {
+                                rightKeys.add(readLong());
+                                rightValues.add(new BTreePage.RID(readLong(), readInt()));
+                            }
+                        } else {
+                            for (int i = 0; i < rightCount; i++) {
+                                rightKeys.add(readLong());
+                            }
+                            for (int i = 0; i <= rightCount; i++) {
+                                rightChildren.add(readLong());
+                            }
+                        }
+
+                        int leftCount = readInt();
+                        List<Long> leftKeys = new ArrayList<>(leftCount);
+                        List<BTreePage.RID> leftValues = isLeaf ? new ArrayList<>(leftCount) : null;
+                        List<Long> leftChildren = !isLeaf ? new ArrayList<>(leftCount + 1) : null;
+                        if (isLeaf) {
+                            for (int i = 0; i < leftCount; i++) {
+                                leftKeys.add(readLong());
+                                leftValues.add(new BTreePage.RID(readLong(), readInt()));
+                            }
+                        } else {
+                            for (int i = 0; i < leftCount; i++) {
+                                leftKeys.add(readLong());
+                            }
+                            for (int i = 0; i <= leftCount; i++) {
+                                leftChildren.add(readLong());
+                            }
+                        }
+                        long recordLSN = walChannel.position();
+
+                        // Structural modifications are system operations: replayed unconditionally
+                        BTreePage originalPage = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, pageId);
+                        BTreePage newPage = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, newPageId);
+
+                        if (newPage.getPageLSN() < recordLSN || originalPage.getPageLSN() < recordLSN) {
+                            if (isLeaf) {
+                                newPage.setLeafContents(rightKeys, rightValues);
+                                newPage.setNextLeafPageId(nextLeafPageId);
+                                originalPage.setLeafContents(leftKeys, leftValues);
+                                originalPage.setNextLeafPageId(newPageId);
+                            } else {
+                                newPage.setInternalContents(rightKeys, rightChildren);
+                                originalPage.setInternalContents(leftKeys, leftChildren);
+                            }
+                            newPage.setPageLSN(recordLSN);
+                            originalPage.setPageLSN(recordLSN);
+
+                            if (newRootId != -1) {
+                                BTreePage newRoot = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, newRootId);
+                                newRoot.setInternalContents(List.of(splitKey), List.of(pageId, newPageId));
+                                newRoot.setPageLSN(recordLSN);
+
+                                Page meta = loadOrGetDirtyPage(diskManager, dirtyPages, indexName, 0);
+                                meta.getBuffer().putInt(24, 0x53545242); // META_MAGIC
+                                meta.getBuffer().putLong(28, newRootId);
+                                meta.setPageLSN(recordLSN);
+                            } else if (parentPageId != -1) {
+                                BTreePage parent = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, parentPageId);
+                                List<Long> pKeys = new ArrayList<>(parent.getKeys());
+                                List<Long> pChildren = new ArrayList<>(parent.getChildren());
+                                if (!pChildren.contains(newPageId)) {
+                                    int insertIdx = 0;
+                                    while (insertIdx < pKeys.size() && splitKey >= pKeys.get(insertIdx)) {
+                                        insertIdx++;
+                                    }
+                                    pKeys.add(insertIdx, splitKey);
+                                    pChildren.add(insertIdx + 1, newPageId);
+                                    parent.setInternalContents(pKeys, pChildren);
+                                    parent.setPageLSN(recordLSN);
+                                }
+                            }
+                            replayedOps++;
+                        }
+                        break;
+                    }
+                    case OP_INDEX_MERGE: {
+                        long xid = readLong();
+                        String indexName = readLengthPrefixedString();
+                        recoveredIndexes.add(indexName);
+                        boolean isLeaf = (readInt() == 1);
+                        long parentPageId = readLong();
+                        long leftPageId = readLong();
+                        long rightPageId = readLong();
+                        long separatorKey = readLong();
+                        long rightNextLeafPageId = readLong();
+                        boolean collapsedRoot = (readInt() == 1);
+                        long newRootId = readLong();
+
+                        int leftCount = readInt();
+                        List<Long> mergedKeys = new ArrayList<>(leftCount);
+                        List<BTreePage.RID> mergedValues = isLeaf ? new ArrayList<>(leftCount) : null;
+                        List<Long> mergedChildren = !isLeaf ? new ArrayList<>(leftCount + 1) : null;
+                        if (isLeaf) {
+                            for (int i = 0; i < leftCount; i++) {
+                                mergedKeys.add(readLong());
+                                mergedValues.add(new BTreePage.RID(readLong(), readInt()));
+                            }
+                        } else {
+                            for (int i = 0; i < leftCount; i++) {
+                                mergedKeys.add(readLong());
+                            }
+                            for (int i = 0; i <= leftCount; i++) {
+                                mergedChildren.add(readLong());
+                            }
+                        }
+
+                        int parentKeyCount = readInt();
+                        List<Long> parentKeys = new ArrayList<>(parentKeyCount);
+                        List<Long> parentChildren = new ArrayList<>(parentKeyCount + 1);
+                        for (int i = 0; i < parentKeyCount; i++) {
+                            parentKeys.add(readLong());
+                        }
+                        for (int i = 0; i <= parentKeyCount; i++) {
+                            parentChildren.add(readLong());
+                        }
+                        long recordLSN = walChannel.position();
+
+                        BTreePage leftPage = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, leftPageId);
+                        if (leftPage.getPageLSN() < recordLSN) {
+                            if (isLeaf) {
+                                leftPage.setLeafContents(mergedKeys, mergedValues);
+                                leftPage.setNextLeafPageId(rightNextLeafPageId);
+                            } else {
+                                leftPage.setInternalContents(mergedKeys, mergedChildren);
+                            }
+                            leftPage.setPageLSN(recordLSN);
+
+                            if (!collapsedRoot) {
+                                BTreePage parent = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, parentPageId);
+                                parent.setInternalContents(parentKeys, parentChildren);
+                                parent.setPageLSN(recordLSN);
+                            } else {
+                                Page meta = loadOrGetDirtyPage(diskManager, dirtyPages, indexName, 0);
+                                meta.getBuffer().putInt(24, 0x53545242);
+                                meta.getBuffer().putLong(28, newRootId);
+                                meta.setPageLSN(recordLSN);
+                            }
+
+                            BTreePage rightPage = loadOrGetDirtyBTreePage(diskManager, dirtyPages, indexName, rightPageId);
+                            rightPage.setLeaf(isLeaf);
+                            if (isLeaf) {
+                                rightPage.setLeafContents(List.of(), List.of());
+                                rightPage.setNextLeafPageId(-1);
+                            } else {
+                                rightPage.setInternalContents(List.of(), List.of(0L));
+                            }
+                            rightPage.setPageLSN(recordLSN);
+
+                            replayedOps++;
                         }
                         break;
                     }
@@ -463,9 +885,23 @@ public class WALManager {
                 }
             }
 
+            // Guarantee metadata page 0 is valid and durable for any recovered index
+            for (String idx : recoveredIndexes) {
+                com.stratosdb.storage.page.Page meta = loadOrGetDirtyPage(diskManager, dirtyPages, idx, 0);
+                int magic = meta.getBuffer().getInt(24);
+                if (magic != 0x53545242) {
+                    meta.getBuffer().putInt(24, 0x53545242);
+                    long curRoot = meta.getBuffer().getLong(28);
+                    if (curRoot <= 0) {
+                        meta.getBuffer().putLong(28, 1L);
+                    }
+                    meta.setDirty(true);
+                }
+            }
+
             // Flush every page touched during redo so it is durable on disk before
             // recovery is reported complete - redo that stays in memory isn't redo.
-            for (java.util.Map.Entry<String, com.stratosdb.storage.page.SlottedPage> entry : dirtyPages.entrySet()) {
+            for (java.util.Map.Entry<String, com.stratosdb.storage.page.Page> entry : dirtyPages.entrySet()) {
                 String tableName = entry.getKey().substring(0, entry.getKey().lastIndexOf(':'));
                 diskManager.writePage(tableName, entry.getValue());
             }
@@ -555,6 +991,61 @@ public class WALManager {
                 readLong(); // timestamp
                 return true;
             }
+            case OP_INDEX_INSERT: {
+                readLong(); // xid
+                readLengthPrefixedString(); // indexName
+                readLong(); // pageId
+                readLong(); // key
+                readLong(); // ridPageId
+                readInt(); // ridSlot
+                return true;
+            }
+            case OP_INDEX_DELETE: {
+                readLong(); // xid
+                readLengthPrefixedString(); // indexName
+                readLong(); // pageId
+                readLong(); // key
+                readLong(); // ridPageId
+                readInt(); // ridSlot
+                return true;
+            }
+            case OP_INDEX_SPLIT: {
+                readLong(); // xid
+                readLengthPrefixedString(); // indexName
+                boolean isLeaf = (readInt() == 1);
+                readLong(); // pageId
+                readLong(); // newPageId
+                readLong(); // splitKey
+                readLong(); // nextLeafPageId
+                readLong(); // parentPageId
+                readLong(); // newRootId
+                int rightCount = readInt();
+                int rightBytes = isLeaf ? (rightCount * 20) : (rightCount * 8 + (rightCount + 1) * 8);
+                readBytes(rightBytes);
+                int leftCount = readInt();
+                int leftBytes = isLeaf ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                readBytes(leftBytes);
+                return true;
+            }
+            case OP_INDEX_MERGE: {
+                readLong(); // xid
+                readLengthPrefixedString(); // indexName
+                boolean isLeaf = (readInt() == 1);
+                readLong(); // parentPageId
+                readLong(); // leftPageId
+                readLong(); // rightPageId
+                readLong(); // separatorKey
+                readLong(); // rightNextLeafPageId
+                readInt(); // collapsedRoot
+                readLong(); // newRootId
+                int leftCount = readInt();
+                int leftBytes = isLeaf ? (leftCount * 20) : (leftCount * 8 + (leftCount + 1) * 8);
+                readBytes(leftBytes);
+                int parentKeyCount = readInt();
+                int parentBytes = (parentKeyCount * 8) + ((parentKeyCount + 1) * 8);
+                readBytes(parentBytes);
+                return true;
+            }
             default: {
                 LOG.warn("Unknown WAL record type {} during pass 1 scan; stopping", opType);
                 walChannel.position(fileSize);
@@ -574,18 +1065,56 @@ public class WALManager {
             + "but nothing can be written back to disk. Use recover(DiskManager) instead.");
     }
 
-    private com.stratosdb.storage.page.SlottedPage loadOrGetDirtyPage(
+    private com.stratosdb.storage.page.Page loadOrGetDirtyPage(
             com.stratosdb.storage.disk.DiskManager diskManager,
-            java.util.Map<String, com.stratosdb.storage.page.SlottedPage> dirtyPages,
+            java.util.Map<String, com.stratosdb.storage.page.Page> dirtyPages,
             String tableName, long pageId) {
         String key = tableName + ":" + pageId;
-        return dirtyPages.computeIfAbsent(key, k -> {
-            com.stratosdb.storage.page.Page raw = diskManager.readPage(tableName, pageId);
-            com.stratosdb.storage.page.SlottedPage page = new com.stratosdb.storage.page.SlottedPage(pageId);
-            page.getBuffer().put(raw.getBytes());
-            page.getBuffer().flip();
-            return page;
-        });
+        return dirtyPages.computeIfAbsent(key, k -> diskManager.readPage(tableName, pageId));
+    }
+
+    private com.stratosdb.storage.page.SlottedPage loadOrGetDirtySlottedPage(
+            com.stratosdb.storage.disk.DiskManager diskManager,
+            java.util.Map<String, com.stratosdb.storage.page.Page> dirtyPages,
+            String tableName, long pageId) {
+        String key = tableName + ":" + pageId;
+        com.stratosdb.storage.page.Page page = dirtyPages.get(key);
+        if (page instanceof com.stratosdb.storage.page.SlottedPage sp) {
+            return sp;
+        }
+        if (page != null) {
+            com.stratosdb.storage.page.SlottedPage sp = new com.stratosdb.storage.page.SlottedPage(pageId);
+            sp.getBuffer().put(page.getBytes());
+            sp.getBuffer().flip();
+            dirtyPages.put(key, sp);
+            return sp;
+        }
+        com.stratosdb.storage.page.Page raw = diskManager.readPage(tableName, pageId);
+        com.stratosdb.storage.page.SlottedPage sp = new com.stratosdb.storage.page.SlottedPage(pageId);
+        sp.getBuffer().put(raw.getBytes());
+        sp.getBuffer().flip();
+        dirtyPages.put(key, sp);
+        return sp;
+    }
+
+    private com.stratosdb.storage.page.BTreePage loadOrGetDirtyBTreePage(
+            com.stratosdb.storage.disk.DiskManager diskManager,
+            java.util.Map<String, com.stratosdb.storage.page.Page> dirtyPages,
+            String indexName, long pageId) {
+        String key = indexName + ":" + pageId;
+        com.stratosdb.storage.page.Page page = dirtyPages.get(key);
+        if (page instanceof com.stratosdb.storage.page.BTreePage btp) {
+            return btp;
+        }
+        if (page != null) {
+            com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId, page.getBytes());
+            dirtyPages.put(key, btp);
+            return btp;
+        }
+        com.stratosdb.storage.page.Page raw = diskManager.readPage(indexName, pageId);
+        com.stratosdb.storage.page.BTreePage btp = new com.stratosdb.storage.page.BTreePage(pageId, raw.getBytes());
+        dirtyPages.put(key, btp);
+        return btp;
     }
 
     // --- exact-width WAL record readers ---

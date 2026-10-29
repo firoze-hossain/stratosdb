@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 10 |
-| Tests passing | **402 / 402** |
+| Commits | 12 |
+| Tests passing | **408 / 408** |
 | Main source | ~6,760 lines |
 | Test source | ~2,454 lines |
 
@@ -878,6 +878,31 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - All 6 real-forked JVM `SIGKILL` crash recovery tests continue to pass 100%.
   - Total reactor test suite reconfirmed at **402 / 402 tests passing across all 12 modules**.
   - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 1, Week 02 marked `Completed`) and Sheet 3 (Rows 8 and 11 marked `Resolved`).
+
+## 6-Month Roadmap — Sprint 2, Week 03: B+Tree WAL Logging & Redo ✅ DONE
+
+- ✅ **Index Mutation WAL Logging**:
+  - Implemented 4 dedicated index mutation opcodes in `WALManager.java`:
+    - `OP_INDEX_INSERT` (opcode 7): Records `(xid, indexName, pageId, key, ridPageId, ridSlot)`.
+    - `OP_INDEX_SPLIT` (opcode 8): Records structural leaf or internal page splits `(xid, indexName, isLeaf, pageId, newPageId, splitKey, nextLeafPageId, parentPageId, newRootId, rightKeys/values/children, leftKeys/values/children)`.
+    - `OP_INDEX_DELETE` (opcode 9): Records key removals `(xid, indexName, pageId, key, ridPageId, ridSlot)`.
+    - `OP_INDEX_MERGE` (opcode 10): Records node underflow merges and root collapse `(xid, indexName, isLeaf, parentPageId, leftPageId, rightPageId, separatorKey, rightNextLeafPageId, collapsedRoot, newRootId, mergedKeys/values/children, parentKeys/children)`.
+  - Integrated with streaming replication (`StreamingWalApplier.java`) and Point-in-Time Recovery replayer (`PitrWalReplayer.java`).
+- ✅ **B+Tree Page LSN (`pd_lsn`) Tracking**:
+  - Allocated 8-byte `pageLSN` in `BTreePage` header at offset 16 (repurposed from reserved header space, matching physical slotted-page LSN conventions).
+  - Stamped on every index page mutation and checked during crash recovery to guarantee idempotent redo.
+- ✅ **ARIES-Style Redo Replay for Indexes**:
+  - Extended `WALManager.recover(DiskManager diskManager)` to reconstruct both `SlottedPage` (heap tables) and `BTreePage` (indexes) directly from the WAL log.
+  - LSN-gated replay (`page.getPageLSN() < recordLSN`): unflushed modifications are replayed and updated to `recordLSN`, while modifications already durable on disk prior to the crash are skipped cleanly to prevent duplicate entries or corrupt node state.
+  - Hardened metadata durability: Page 0 (`META_MAGIC` + `rootPageId`) is synchronously flushed during index initialization and root updates, and automatically audited and repaired in `dirtyPages` during WAL recovery.
+- ✅ **Lehman-Yao B-link Right Sibling Traversal**:
+  - Added right sibling traversal (`descendToLeaf`) in `BTreeIndex.java` so concurrent or mid-split reads safely follow `nextLeafPageId` if a concurrent or uncompleted split shifted target keys rightward.
+- ✅ **Real SIGKILL Crash Recovery Verification**:
+  - Built `BTreeCrashHarnessMain.java` (forked JVM worker generating high-volume, multi-level splits) and `BTreeCrashRecoveryTest.java` which terminates the process mid-split via `process.destroyForcibly()` (`kill -9`).
+  - Added `BTreeIndex.validateTree()` which rigorously traverses the full tree hierarchy and leaf sibling linked-list, verifying sorted order, child counts, key bounds, and asserting zero orphan pointers and zero broken links.
+  - Added `BTreeWalLoggingTest.java` (5 unit tests covering insert, leaf split, delete, merge/root collapse, and LSN redo idempotency).
+  - Full reactor test suite reconfirmed at **408 / 408 tests passing across all 12 modules**.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 2, Week 03 marked `Completed`), Sheet 3 (Row 16 marked `Resolved`), and Sheet 5 (Row 6 marked `Passed (Week 3)`).
 
 ## What to do next
 

@@ -22,7 +22,7 @@ import java.util.List;
  *   [0]  int  isLeaf (1 = leaf, 0 = internal)
  *   [4]  int  keyCount
  *   [8]  long nextLeafPageId (-1 if none; unused/ignored for internal nodes)
- *   [16..24) reserved
+ *   [16] long pageLSN (Log Sequence Number of last modifying WAL record)
  *
  * Body, starting at HEADER_SIZE (24):
  *   keys: keyCount * long (8 bytes each), always kept sorted ascending
@@ -59,10 +59,22 @@ public class BTreePage extends Page {
         setLeaf(true);
         setKeyCount(0);
         setNextLeafPageId(-1);
+        setPageLSN(0L);
     }
 
     public BTreePage(long pageId, byte[] existingBytes) {
         super(pageId, existingBytes);
+    }
+
+    @Override
+    public long getPageLSN() {
+        return getBuffer().getLong(16);
+    }
+
+    @Override
+    public void setPageLSN(long lsn) {
+        getBuffer().putLong(16, lsn);
+        setDirty(true);
     }
 
     public boolean isLeaf() {
