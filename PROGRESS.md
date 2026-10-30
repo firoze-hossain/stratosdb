@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 98 |
-| Tests passing | **478 / 478** |
+| Commits | 99 |
+| Tests passing | **487 / 487** |
 | Main source | ~31,650 lines |
 | Test source | ~14,250 lines |
 
@@ -1118,6 +1118,52 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Sheet 2 (Row 13, Sprint 5 Week 09) marked `Completed`.
     - Sheet 3 (Row 21, Execution Architecture) marked `Resolved`.
     - Sheet 5 (Row 11, Heap Allocation during Sequential Scans) marked `Passed`.
+
+## Sprint 5 Week 10 — Streaming Join Operators (NestedLoopJoin, HashJoin, MergeJoin) & Outer Joins ✅ DONE
+
+- ✅ **SQL Grammar & AST Support for Outer Joins (`stratosdb-sql`)**:
+  - Added ANTLR lexer tokens: `LEFT`, `RIGHT`, `FULL`, `OUTER`, `CROSS`.
+  - Updated `joinClause` grammar rule in `StratosSQL.g4` to parse `[INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] | CROSS] JOIN tableName [AS alias]? ON col1 = col2`.
+  - Extended `JoinClause.java` with `JoinType` enum (`INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`), preserving 3-arg constructor for full backward compatibility.
+  - Updated `SqlParser.java` (`buildJoinClause`) to extract and populate `JoinType` on AST nodes.
+- ✅ **Volcano Streaming Join Operators (`stratosdb-sql/execution`)**:
+  - Implemented `NestedLoopJoinOperator`:
+    - Streams outer tuples and evaluates inner tuples against equi-join or arbitrary `BiPredicate<Tuple, Tuple>` conditions.
+    - Full support for `INNER`, `LEFT`, `RIGHT`, and `FULL` outer joins with null-padding on unmatched rows.
+  - Implemented `HashJoinOperator`:
+    - In-memory hash table on the build side with a streaming probe side, guaranteeing memory scales strictly with the build table size.
+    - For `LEFT JOIN`: builds hash table on the right side, streaming left table in $O(1)$ memory; unmatched left tuples emitted with NULL right columns.
+    - For `RIGHT JOIN`: builds hash table on the left side, streaming right table in $O(1)$ memory; unmatched right tuples emitted with NULL left columns.
+    - For `FULL JOIN`: builds hash table on the right side, tracks matched build tuples, streams left probe, then emits remaining unmatched right tuples with NULL left columns.
+    - Proper SQL NULL key semantics: null keys never match in equi-join and are properly null-padded in outer joins.
+  - Implemented `MergeJoinOperator`:
+    - Sort-merge join over presorted streams in lockstep with $O(1)$ memory.
+    - Handles duplicate keys in matching runs (buffering only the current equal-key run).
+    - Full support for `INNER`, `LEFT`, `RIGHT`, and `FULL` outer joins.
+  - Implemented `MemoryScanOperator`:
+    - Volcano operator adapter enabling pre-materialized rows (e.g. from CTEs or virtual catalog views) to stream seamlessly into join pipelines.
+  - Implemented `JoinUtils`:
+    - Centralized column lookup, key normalization, type-safe numeric/comparable comparison, and null-padded tuple construction (`merge`, `mergeWithNullRight`, `mergeWithNullLeft`, `qualifyColumns`).
+- ✅ **Execution Engine Streaming Join Pipeline (`ExecutorEngine.java`)**:
+  - Refactored `executeJoinedSelect` to construct Volcano physical join pipelines (`HashJoinOperator` / `LimitOperator` / `ProjectOperator` / `FilterOperator`).
+  - Added `resolveJoinSourceOperator`: automatically wraps table sequential scans with table qualification project operators and streams CTEs/virtual views via `MemoryScanOperator`.
+  - Preserved backward compatibility hooks `chooseJoinAlgorithm`, `hashJoin`, and `mergeJoin` for reflection-based test callers (`testPlannerRoutesLargeJoinsToMergeJoin`).
+  - Dual-mode `QueryResult` allows joined queries to stream row-by-row on demand or lazily materialize in `getRows()`.
+- ✅ **Comprehensive Test Suite & Verification (`StreamingJoinOperatorsTest.java`)**:
+  - 9 comprehensive unit, operator, and end-to-end integration tests:
+    - `testNestedLoopJoinInnerAndOuter`: standalone direct verification of `NestedLoopJoinOperator` across `INNER`, `LEFT`, `RIGHT`, and `FULL` outer joins.
+    - `testHashJoinAllJoinTypes`: standalone verification of `HashJoinOperator` across `INNER`, `LEFT`, `RIGHT`, and `FULL` outer joins.
+    - `testMergeJoinPresortedInputs`: presorted streaming merge join across `INNER`, `LEFT`, `RIGHT`, and `FULL` outer joins.
+    - `testMergeJoinDuplicateKeysRun`: verifies $M \times N$ cross product for duplicate keys in merge join.
+    - `testEndToEndSqlLeftJoin`: end-to-end SQL query testing `LEFT JOIN` with null padding for unmatched rows.
+    - `testEndToEndSqlRightJoin`: end-to-end SQL query testing `RIGHT JOIN` with null padding for unmatched rows.
+    - `testEndToEndSqlFullOuterJoin`: end-to-end SQL query testing `FULL OUTER JOIN` returning matched and unmatched rows from both tables.
+    - `testJoinedSelectWithWhereAndLimit`: verifies streaming join pipeline combined with `WHERE`, `LIMIT`, and `OFFSET`.
+    - `testHashJoinMemoryScalesWithBuildSideOnly`: large probe table (3,000 rows) joined with small build table (10 rows), verifying constant-memory streaming execution.
+  - Full reactor test suite verified at **487 / 487 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 14, Sprint 5 Week 10) marked `Completed`.
+    - Sheet 3 (Row 23, Join Types & Capabilities) marked `Resolved`.
 
 ## What to do next
 

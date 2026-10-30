@@ -788,7 +788,19 @@ public class SqlParser {
         List<StratosSQLParser.ColumnNameContext> columns = ctx.columnName();
         String leftColumn = columns.get(0).getText();
         String rightColumn = columns.get(1).getText();
-        return new JoinClause(tableName, leftColumn, rightColumn);
+        JoinClause.JoinType joinType = JoinClause.JoinType.INNER;
+        if (ctx.joinType() != null) {
+            if (ctx.joinType().LEFT() != null) {
+                joinType = JoinClause.JoinType.LEFT;
+            } else if (ctx.joinType().RIGHT() != null) {
+                joinType = JoinClause.JoinType.RIGHT;
+            } else if (ctx.joinType().FULL() != null) {
+                joinType = JoinClause.JoinType.FULL;
+            } else if (ctx.joinType().CROSS() != null) {
+                joinType = JoinClause.JoinType.CROSS;
+            }
+        }
+        return new JoinClause(tableName, leftColumn, rightColumn, joinType);
     }
 
     private DeleteStatement buildDelete(StratosSQLParser.DeleteContext ctx) {

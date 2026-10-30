@@ -203,7 +203,14 @@ returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
 select: SELECT selectList (FROM tableName (AS? IDENTIFIER)? joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? SEMICOLON?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: IDENTIFIER;
-joinClause: (INNER)? JOIN tableName ON columnName ASSIGN columnName;
+joinClause: (joinType)? JOIN tableName (AS? IDENTIFIER)? ON columnName ASSIGN columnName;
+
+joinType: INNER
+        | LEFT OUTER?
+        | RIGHT OUTER?
+        | FULL OUTER?
+        | CROSS
+        ;
 groupByList: columnName (COMMA columnName)*;
 havingClause: aggregateFunction ASSIGN literal
             | aggregateFunction GT literal
@@ -486,6 +493,11 @@ OVERLAPS: O V E R L A P S;
 CONTAINS: C O N T A I N S;
 JOIN: J O I N;
 INNER: I N N E R;
+LEFT: L E F T;
+RIGHT: R I G H T;
+FULL: F U L L;
+OUTER: O U T E R;
+CROSS: C R O S S;
 EXPLAIN: E X P L A I N;
 ANALYZE: A N A L Y Z E;
 VACUUM: V A C U U M;

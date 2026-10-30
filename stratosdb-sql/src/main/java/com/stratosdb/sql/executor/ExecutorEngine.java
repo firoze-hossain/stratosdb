@@ -3774,31 +3774,109 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * findColumnValue's suffix-match fallback.
      */
     private QueryResult executeJoinedSelect(SelectStatement stmt, Transaction txn) {
-        List<Tuple> current = resolveJoinSource(stmt.tableName(), txn);
-        if (current == null) {
+        PhysicalOperator sourceOp = resolveJoinSourceOperator(stmt.tableName(), txn);
+        if (sourceOp == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
+        PhysicalOperator currentOp = sourceOp;
         for (JoinClause join : stmt.joins()) {
-            List<Tuple> joinedRows = resolveJoinSource(join.tableName(), txn);
-            if (joinedRows == null) {
+            PhysicalOperator joinedOp = resolveJoinSourceOperator(join.tableName(), txn);
+            if (joinedOp == null) {
                 return QueryResult.error("Table not found: " + join.tableName());
             }
 
-            current = chooseJoinAlgorithm(current, join.leftColumn(), joinedRows, join.rightColumn());
+            currentOp = new HashJoinOperator(currentOp, joinedOp, join.leftColumn(), join.rightColumn(), join.joinType());
         }
 
-        List<Tuple> tuples = new ArrayList<>();
-        for (Tuple row : current) {
-            if (!matchesWhere(row, stmt.where(), txn)) {
-                continue;
+        if (stmt.where() != null) {
+            currentOp = new FilterOperator(currentOp, row -> matchesWhere(row, stmt.where(), txn));
+        }
+
+        List<String> outputColumns = determineJoinedOutputColumns(stmt, currentOp.getOutputColumns());
+        currentOp = new ProjectOperator(
+            currentOp,
+            row -> applyColumnAliases(project(row, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()),
+            outputColumns
+        );
+
+        if (stmt.limit() != null || stmt.offset() != null) {
+            long limit = parseLongOrDefault(stmt.limit(), -1);
+            long offset = parseLongOrDefault(stmt.offset(), 0);
+            if (limit >= 0 || offset > 0) {
+                currentOp = new LimitOperator(currentOp, limit, offset);
             }
-            tuples.add(project(row, stmt.columns()));
         }
 
-        tuples = applyLimitOffset(tuples, stmt.limit(), stmt.offset());
+        return QueryResult.success(currentOp, currentOp.getOutputColumns());
+    }
 
-        return QueryResult.success(tuples);
+    private PhysicalOperator resolveJoinSourceOperator(String name, Transaction txn) {
+        if (name == null) return null;
+        String stripped = name;
+        if (stripped.startsWith("\"") && stripped.endsWith("\"") && stripped.length() >= 2) {
+            stripped = stripped.substring(1, stripped.length() - 1);
+        }
+        if (stripped.toLowerCase(java.util.Locale.ROOT).startsWith("public.")) {
+            String candidate = stripped.substring("public.".length());
+            if (tables.containsKey(candidate)) {
+                stripped = candidate;
+            }
+        }
+
+        HeapTable table = tables.get(stripped);
+        if (table != null) {
+            List<String> rawCols = tableColumns.getOrDefault(stripped, List.of());
+            PhysicalOperator scan = new SeqScanOperator(
+                stripped,
+                table,
+                txn != null ? txn.getSnapshot() : null,
+                transactionManager,
+                rawCols,
+                this::deserializeTuple
+            );
+            List<String> qualCols = JoinUtils.qualifyColumns(rawCols, name);
+            return new ProjectOperator(scan, t -> JoinUtils.qualify(t, name), qualCols);
+        }
+
+        List<Tuple> resolvedRows = resolveJoinSource(name, txn);
+        if (resolvedRows != null) {
+            List<String> qualCols = resolvedRows.isEmpty()
+                ? List.of()
+                : resolvedRows.get(0).getColumnNames();
+            return new MemoryScanOperator(resolvedRows, qualCols);
+        }
+
+        return null;
+    }
+
+    private List<String> determineJoinedOutputColumns(SelectStatement stmt, List<String> joinedColumns) {
+        List<String> outputCols = new ArrayList<>();
+        if (stmt.columns() != null && !stmt.columns().isEmpty()) {
+            if ("*".equals(stmt.columns().get(0))) {
+                if (joinedColumns != null && !joinedColumns.isEmpty()) {
+                    outputCols.addAll(joinedColumns);
+                } else {
+                    outputCols.add("*");
+                }
+            } else {
+                List<String> cols = stmt.columns();
+                List<String> aliases = stmt.columnAliases();
+                for (int i = 0; i < cols.size(); i++) {
+                    if (aliases != null && i < aliases.size() && aliases.get(i) != null) {
+                        outputCols.add(aliases.get(i));
+                    } else {
+                        outputCols.add(cols.get(i));
+                    }
+                }
+            }
+        }
+        if (stmt.functionCalls() != null) {
+            for (FunctionCallItem call : stmt.functionCalls()) {
+                outputCols.add(call.displayName());
+            }
+        }
+        return outputCols;
     }
 
     /**
