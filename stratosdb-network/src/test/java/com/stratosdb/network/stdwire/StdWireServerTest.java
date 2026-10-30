@@ -559,6 +559,77 @@ class StdWireServerTest {
         assertTrue(output.contains("(2 rows)"), () -> "expected exactly 2 rows (the 2 tables, not the view), got:\n" + output);
     }
 
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void realPsqlBackslashDListsTablesAndViews() throws Exception {
+        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE employees (id INT, name VARCHAR)");
+            conn.query("CREATE VIEW active_emp AS SELECT * FROM employees");
+        }
+
+        String output = runPsql("\\d");
+        assertTrue(output.contains("employees"), () -> "expected \\d to list 'employees', got:\n" + output);
+        assertTrue(output.contains("active_emp"), () -> "expected \\d to list 'active_emp', got:\n" + output);
+        assertTrue(output.contains("view"), () -> "expected \\d to indicate 'view' type, got:\n" + output);
+        assertTrue(output.contains("table"), () -> "expected \\d to indicate 'table' type, got:\n" + output);
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void realPsqlBackslashDDescribeTable() throws Exception {
+        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE employees (id INT PRIMARY KEY, name VARCHAR, salary INT DEFAULT 50000)");
+            conn.query("CREATE INDEX idx_emp_name ON employees (name)");
+        }
+
+        String output = runPsql("\\d employees");
+        assertTrue(output.contains("id"), () -> "expected \\d employees to list column 'id', got:\n" + output);
+        assertTrue(output.contains("name"), () -> "expected \\d employees to list column 'name', got:\n" + output);
+        assertTrue(output.contains("salary"), () -> "expected \\d employees to list column 'salary', got:\n" + output);
+        assertTrue(output.contains("integer"), () -> "expected \\d employees to show type integer, got:\n" + output);
+        assertTrue(output.contains("character varying"), () -> "expected \\d employees to show type varchar, got:\n" + output);
+        assertTrue(output.contains("50000"), () -> "expected \\d employees to show default value 50000, got:\n" + output);
+        assertTrue(output.contains("idx_emp_name") || output.contains("employees_pkey"),
+            () -> "expected \\d employees to list indexes, got:\n" + output);
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void realPsqlBackslashLListsDatabases() throws Exception {
+        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+
+        String output = runPsql("\\l");
+        assertTrue(output.contains("stratos"), () -> "expected \\l to list database 'stratos', got:\n" + output);
+        assertTrue(output.contains("UTF8"), () -> "expected \\l to show encoding UTF8, got:\n" + output);
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void tabCompletionQueryReturnsMatchingRelations() throws Exception {
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE alpha_tbl (id INT)");
+            conn.query("CREATE TABLE beta_tbl (id INT)");
+
+            // Real query psql sends when completing: substring(pg_catalog.quote_ident(c.relname),1,1)='a'
+            String tabSql = "SELECT pg_catalog.quote_ident(c.relname) FROM pg_catalog.pg_class c " +
+                "WHERE c.relkind IN ('r', 'S', 'v', 'm', 'f', 'p') " +
+                "AND substring(pg_catalog.quote_ident(c.relname),1,1)='a' " +
+                "AND pg_catalog.pg_table_is_visible(c.oid) " +
+                "AND c.relnamespace != (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'pg_catalog') " +
+                "UNION ALL SELECT pg_catalog.quote_ident(n.nspname) || '.' FROM pg_catalog.pg_namespace n;";
+
+            QueryOutcome outcome = conn.query(tabSql);
+            assertTrue(outcome.rows.stream().anyMatch(r -> r.contains("alpha_tbl")),
+                "tab completion should include alpha_tbl");
+            assertFalse(outcome.rows.stream().anyMatch(r -> r.contains("beta_tbl")),
+                "tab completion with prefix 'a' must not include beta_tbl");
+        }
+    }
+
     private String runPsql(String sql) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
             "psql", "-h", "localhost", "-p", String.valueOf(port), "-U", "testuser", "-d", "testdb", "-c", sql

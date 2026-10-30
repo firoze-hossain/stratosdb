@@ -3,6 +3,8 @@ package com.stratosdb.network.stdwire;
 import com.stratosdb.core.StratosDB;
 import com.stratosdb.network.auth.ScramSha256;
 import com.stratosdb.network.auth.UserStore;
+import com.stratosdb.sql.catalog.PgCatalogViews;
+import com.stratosdb.sql.executor.ExecutorEngine;
 import com.stratosdb.sql.executor.QueryResult;
 import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.storage.page.Tuple;
@@ -412,7 +414,7 @@ public class StdWireServer {
 
     /** Returns the new inTransaction state after executing one statement. */
     private boolean executeAndRespond(String sql, DataInputStream in, DataOutputStream out, boolean inTransaction) throws IOException {
-        if (tryHandleTableListingQuery(sql, out)) {
+        if (tryHandleCatalogIntrospectionQuery(sql, out)) {
             return inTransaction; // a catalog-introspection query is never itself transaction control
         }
         if (tryHandleCopyStatement(sql, in, out)) {
@@ -473,47 +475,331 @@ public class StdWireServer {
     }
 
     /**
-     * Detects the specific query psql's `\dt` meta-command sends (captured
-     * from a real psql client - see PROGRESS.md) and, if matched,
-     * synthesizes a correct response directly from StratosDB's own real
-     * table metadata (ExecutorEngine.getTableNames()) - bypassing the
-     * normal SQL execution path entirely, since StratosDB's parser has no
-     * concept of `pg_catalog.pg_class`, `pg_namespace`, or any of the
-     * other real Postgres system-catalog machinery this query references.
-     *
-     * Scope, stated plainly: this recognizes the `\dt` pattern specifically
-     * (matching on the pg_class + pg_namespace signature any Postgres
-     * version's `\dt` uses), not general pg_catalog SQL. `\d TABLENAME`
-     * and `\l` are NOT handled here - `\d` needs a multi-query,
-     * OID-based lookup sequence (captured and confirmed materially more
-     * complex - see PROGRESS.md), and `\l` needs a "multiple databases"
-     * concept StratosDB doesn't have at all (this engine is one database
-     * per data directory). Implementing those properly is real further
-     * work, not attempted here rather than half-done and left to surprise
-     * someone later.
+     * Intercepts and synthesizes responses for psql meta-commands (\dt, \d, \d <tablename>, \l,
+     * and tab-completion) directly using StratosDB's metadata and PgCatalogViews emulation.
      */
-    private boolean tryHandleTableListingQuery(String sql, DataOutputStream out) throws IOException {
-        String normalized = sql.toLowerCase();
-        if (!normalized.contains("pg_catalog.pg_class") || !normalized.contains("pg_namespace")) {
-            return false;
+    private boolean tryHandleCatalogIntrospectionQuery(String sql, DataOutputStream out) throws IOException {
+        String normalized = sql.toLowerCase(java.util.Locale.ROOT);
+
+        // 1. \dt or \d (relation listing)
+        if (normalized.contains("pg_namespace") && (normalized.contains("pg_class") || normalized.contains("pg_catalog.pg_class"))) {
+            if (normalized.contains("relkind") && (normalized.contains("as \"schema\"") || normalized.contains("as \"name\"") || normalized.contains("as \"type\""))) {
+                int whereIdx = normalized.indexOf("where");
+                String whereClause = whereIdx != -1 ? normalized.substring(whereIdx) : "";
+                boolean includeViews = whereClause.contains("'v'") || whereClause.contains("'s'") || whereClause.contains("'m'");
+                List<StdWireMessages.Column> columns = List.of(
+                    new StdWireMessages.Column("Schema", 25, (short) -1),
+                    new StdWireMessages.Column("Name", 25, (short) -1),
+                    new StdWireMessages.Column("Type", 25, (short) -1),
+                    new StdWireMessages.Column("Owner", 25, (short) -1)
+                );
+                StdWireMessages.writeRowDescription(out, columns);
+
+                List<String[]> entries = new ArrayList<>();
+                for (String t : db().getExecutor().getTableNames()) {
+                    entries.add(new String[]{"public", t, "table", "stratos"});
+                }
+                if (includeViews) {
+                    for (String v : db().getExecutor().getViewNames()) {
+                        entries.add(new String[]{"public", v, "view", "stratos"});
+                    }
+                    for (String s : db().getExecutor().getSequenceNames()) {
+                        entries.add(new String[]{"public", s, "sequence", "stratos"});
+                    }
+                }
+                entries.sort(java.util.Comparator.comparing(a -> a[1]));
+                for (String[] entry : entries) {
+                    StdWireMessages.writeDataRow(out, List.of(entry[0], entry[1], entry[2], entry[3]));
+                }
+                StdWireMessages.writeCommandComplete(out, "SELECT " + entries.size());
+                return true;
+            }
         }
 
-        List<StdWireMessages.Column> columns = List.of(
-            new StdWireMessages.Column("Schema", 25, (short) -1),
-            new StdWireMessages.Column("Name", 25, (short) -1),
-            new StdWireMessages.Column("Type", 25, (short) -1),
-            new StdWireMessages.Column("Owner", 25, (short) -1)
-        );
-        StdWireMessages.writeRowDescription(out, columns);
+        // 2. \d <tablename> Step 1: OID lookup query
+        if (normalized.contains("operator(pg_catalog.~)") || (normalized.contains("c.relname") && normalized.contains("~") && normalized.contains("c.oid"))) {
+            String targetTable = extractRegexPattern(sql);
+            String matched = null;
+            if (targetTable != null) {
+                for (String t : db().getExecutor().getAllTableNames()) {
+                    if (t.equalsIgnoreCase(targetTable)) {
+                        matched = t;
+                        break;
+                    }
+                }
+                if (matched == null) {
+                    for (String v : db().getExecutor().getViewNames()) {
+                        if (v.equalsIgnoreCase(targetTable)) {
+                            matched = v;
+                            break;
+                        }
+                    }
+                }
+            }
 
-        java.util.List<String> tableNames = new java.util.ArrayList<>(db().getExecutor().getTableNames());
-        java.util.Collections.sort(tableNames);
-        for (String tableName : tableNames) {
-            StdWireMessages.writeDataRow(out, List.of("public", tableName, "table", "stratosdb"));
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("oid", 26, (short) 4),
+                new StdWireMessages.Column("nspname", 19, (short) 64),
+                new StdWireMessages.Column("relname", 19, (short) 64)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+
+            if (matched != null) {
+                int oid = PgCatalogViews.getRelationOid(matched);
+                StdWireMessages.writeDataRow(out, List.of(String.valueOf(oid), "public", matched));
+                StdWireMessages.writeCommandComplete(out, "SELECT 1");
+            } else {
+                StdWireMessages.writeCommandComplete(out, "SELECT 0");
+            }
+            return true;
         }
 
-        StdWireMessages.writeCommandComplete(out, "SELECT " + tableNames.size());
-        return true;
+        // 3. \d <tablename> Step 2: Table metadata
+        if (normalized.contains("relchecks") && normalized.contains("relhasindex")) {
+            int targetOid = extractOidFromWhere(sql);
+            String matched = findRelationByOid(targetOid);
+            boolean isView = matched != null && db().getExecutor().getViewNames().contains(matched);
+            boolean hasIndex = matched != null && !db().getExecutor().getIndexesForTable(matched).isEmpty();
+
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("relchecks", 23, (short) 4),
+                new StdWireMessages.Column("relkind", 18, (short) 1),
+                new StdWireMessages.Column("relhasindex", 16, (short) 1),
+                new StdWireMessages.Column("relhasrules", 16, (short) 1),
+                new StdWireMessages.Column("relhastriggers", 16, (short) 1),
+                new StdWireMessages.Column("relrowsecurity", 16, (short) 1),
+                new StdWireMessages.Column("relforcerowsecurity", 16, (short) 1),
+                new StdWireMessages.Column("relhasoids", 16, (short) 1),
+                new StdWireMessages.Column("relispartition", 16, (short) 1),
+                new StdWireMessages.Column("?column?", 25, (short) -1),
+                new StdWireMessages.Column("reltablespace", 26, (short) 4),
+                new StdWireMessages.Column("reloftype", 25, (short) -1),
+                new StdWireMessages.Column("relpersistence", 18, (short) 1),
+                new StdWireMessages.Column("relreplident", 18, (short) 1),
+                new StdWireMessages.Column("amname", 19, (short) 64)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+            if (matched != null) {
+                StdWireMessages.writeDataRow(out, List.of(
+                    "0", isView ? "v" : "r", hasIndex ? "t" : "f", "f", "f",
+                    "f", "f", "f", "f", "", "0", "", "p", "d", "heap"
+                ));
+                StdWireMessages.writeCommandComplete(out, "SELECT 1");
+            } else {
+                StdWireMessages.writeCommandComplete(out, "SELECT 0");
+            }
+            return true;
+        }
+
+        // 4. \d <tablename> Step 3: Column definitions
+        if (normalized.contains("pg_attribute") && normalized.contains("attname") && normalized.contains("format_type")) {
+            int targetOid = extractOidFromWhere(sql);
+            String matched = findRelationByOid(targetOid);
+
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("attname", 19, (short) 64),
+                new StdWireMessages.Column("format_type", 25, (short) -1),
+                new StdWireMessages.Column("pg_get_expr", 25, (short) -1),
+                new StdWireMessages.Column("attnotnull", 16, (short) 1),
+                new StdWireMessages.Column("attcollation", 19, (short) 64),
+                new StdWireMessages.Column("attidentity", 18, (short) 1),
+                new StdWireMessages.Column("attgenerated", 18, (short) 1)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+
+            int count = 0;
+            if (matched != null) {
+                List<String> cols = db().getExecutor().getTableColumns(matched);
+                if (cols != null) {
+                    Map<String, String> types = db().getExecutor().getTableColumnTypes(matched);
+                    Map<String, String> defaults = db().getExecutor().getTableColumnDefaults(matched);
+                    List<String> pks = db().getExecutor().getTablePrimaryKeys(matched);
+
+                    for (String col : cols) {
+                        String typeStr = types != null ? types.get(col) : "VARCHAR";
+                        int typOid = PgCatalogViews.getTypeOid(typeStr);
+                        String formattedType = PgCatalogViews.formatType(typOid);
+                        String defVal = defaults != null ? defaults.get(col) : null;
+                        boolean notNull = pks != null && pks.contains(col);
+
+                        StdWireMessages.writeDataRow(out, java.util.Arrays.asList(
+                            col, formattedType, defVal, notNull ? "t" : "f", null, "", ""
+                        ));
+                        count++;
+                    }
+                }
+            }
+            StdWireMessages.writeCommandComplete(out, "SELECT " + count);
+            return true;
+        }
+
+        // 5. \d <tablename> Step 4: Index query
+        if (normalized.contains("pg_index") && (normalized.contains("indisprimary") || normalized.contains("pg_get_indexdef"))) {
+            int targetOid = extractOidFromWhere(sql);
+            String matched = findRelationByOid(targetOid);
+
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("relname", 19, (short) 64),
+                new StdWireMessages.Column("indisprimary", 16, (short) 1),
+                new StdWireMessages.Column("indisunique", 16, (short) 1),
+                new StdWireMessages.Column("indisclustered", 16, (short) 1),
+                new StdWireMessages.Column("indisvalid", 16, (short) 1),
+                new StdWireMessages.Column("pg_get_indexdef", 25, (short) -1),
+                new StdWireMessages.Column("pg_get_constraintdef", 25, (short) -1),
+                new StdWireMessages.Column("contype", 18, (short) 1),
+                new StdWireMessages.Column("condeferrable", 16, (short) 1),
+                new StdWireMessages.Column("condeferred", 16, (short) 1),
+                new StdWireMessages.Column("indisreplident", 16, (short) 1),
+                new StdWireMessages.Column("reltablespace", 26, (short) 4)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+
+            int count = 0;
+            if (matched != null) {
+                List<ExecutorEngine.IndexMetadata> indexes = db().getExecutor().getIndexesForTable(matched);
+                for (ExecutorEngine.IndexMetadata idx : indexes) {
+                    boolean isPrimary = idx.isPrimary();
+                    boolean isUnique = idx.isUnique() || isPrimary;
+                    String indexDef = "CREATE INDEX " + idx.indexName() + " ON " + idx.tableName()
+                        + " USING " + idx.indexType().toLowerCase(java.util.Locale.ROOT) + " (" + idx.columnName() + ")";
+                    if (isPrimary) {
+                        indexDef = "CREATE UNIQUE INDEX " + idx.indexName() + " ON " + idx.tableName()
+                            + " USING btree (" + idx.columnName() + ")";
+                    }
+                    String conDef = isPrimary ? ("PRIMARY KEY (" + idx.columnName() + ")") : (isUnique ? ("UNIQUE (" + idx.columnName() + ")") : null);
+                    String conType = isPrimary ? "p" : (isUnique ? "u" : null);
+
+                    StdWireMessages.writeDataRow(out, java.util.Arrays.asList(
+                        idx.indexName(),
+                        isPrimary ? "t" : "f",
+                        isUnique ? "t" : "f",
+                        "f", "t",
+                        indexDef, conDef, conType, "f", "f", "f", "0"
+                    ));
+                    count++;
+                }
+            }
+            StdWireMessages.writeCommandComplete(out, "SELECT " + count);
+            return true;
+        }
+
+        // 6. Subsequent \d fallback queries (policies, triggers, publications, inherits, stats)
+        if (normalized.contains("pg_policy") || normalized.contains("pg_inherits")
+            || normalized.contains("pg_publication") || normalized.contains("pg_partitioned_table")
+            || normalized.contains("pg_statistic_ext") || normalized.contains("pg_trigger")) {
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("dummy", 25, (short) -1)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+            StdWireMessages.writeCommandComplete(out, "SELECT 0");
+            return true;
+        }
+
+        // 7. \l: Database listing
+        if (normalized.contains("pg_database") || normalized.contains("pg_catalog.pg_database")) {
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("Name", 19, (short) 64),
+                new StdWireMessages.Column("Owner", 19, (short) 64),
+                new StdWireMessages.Column("Encoding", 19, (short) 64),
+                new StdWireMessages.Column("Locale Provider", 25, (short) -1),
+                new StdWireMessages.Column("Collate", 19, (short) 64),
+                new StdWireMessages.Column("Ctype", 19, (short) 64),
+                new StdWireMessages.Column("ICU Locale", 19, (short) 64),
+                new StdWireMessages.Column("ICU Rules", 25, (short) -1),
+                new StdWireMessages.Column("Access privileges", 25, (short) -1)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+            StdWireMessages.writeDataRow(out, List.of(
+                "stratos", "stratos", "UTF8", "libc", "en_US.UTF-8", "en_US.UTF-8", "", "", ""
+            ));
+            StdWireMessages.writeCommandComplete(out, "SELECT 1");
+            return true;
+        }
+
+        // 8. Tab-completion in psql
+        if (normalized.contains("quote_ident(c.relname)") || normalized.contains("quote_ident(n.nspname)")
+            || (normalized.contains("pg_class") && normalized.contains("union all") && normalized.contains("pg_namespace"))) {
+            String prefix = extractTabCompletionPrefix(sql);
+
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("quote_ident", 25, (short) -1)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+
+            List<String> items = new ArrayList<>();
+            for (String t : db().getExecutor().getTableNames()) {
+                if (prefix == null || prefix.isEmpty() || t.toLowerCase(java.util.Locale.ROOT).startsWith(prefix.toLowerCase(java.util.Locale.ROOT))) {
+                    items.add(t);
+                }
+            }
+            for (String v : db().getExecutor().getViewNames()) {
+                if (prefix == null || prefix.isEmpty() || v.toLowerCase(java.util.Locale.ROOT).startsWith(prefix.toLowerCase(java.util.Locale.ROOT))) {
+                    items.add(v);
+                }
+            }
+            java.util.Collections.sort(items);
+            for (String item : items) {
+                StdWireMessages.writeDataRow(out, List.of(item));
+            }
+            StdWireMessages.writeCommandComplete(out, "SELECT " + items.size());
+            return true;
+        }
+
+        return false;
+    }
+
+    private String findRelationByOid(int oid) {
+        if (oid <= 0) return null;
+        for (String t : db().getExecutor().getAllTableNames()) {
+            if (PgCatalogViews.getRelationOid(t) == oid) {
+                return t;
+            }
+        }
+        for (String v : db().getExecutor().getViewNames()) {
+            if (PgCatalogViews.getRelationOid(v) == oid) {
+                return v;
+            }
+        }
+        return null;
+    }
+
+    private static int extractOidFromWhere(String sql) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?:c\\.oid|a\\.attrelid|indrelid)\\s*=\\s*'(\\d+)'").matcher(sql);
+        if (m.find()) {
+            try {
+                return Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {}
+        }
+        m = java.util.regex.Pattern.compile("(?:c\\.oid|a\\.attrelid|indrelid)\\s*=\\s*(\\d+)").matcher(sql);
+        if (m.find()) {
+            try {
+                return Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {}
+        }
+        return 0;
+    }
+
+    private static String extractRegexPattern(String sql) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("'\\^\\(?([^$)\"']+)\\)?\\$'").matcher(sql);
+        if (m.find()) {
+            return m.group(1);
+        }
+        int start = sql.indexOf("'");
+        if (start != -1) {
+            int end = sql.indexOf("'", start + 1);
+            if (end != -1) {
+                return sql.substring(start + 1, end).replace("^", "").replace("$", "").replace("(", "").replace(")", "");
+            }
+        }
+        return null;
+    }
+
+    private static String extractTabCompletionPrefix(String sql) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(",1,\\d+\\)\\s*=\\s*'([^']*)'").matcher(sql);
+        if (m.find()) {
+            return m.group(1);
+        }
+        return "";
     }
 
     /**

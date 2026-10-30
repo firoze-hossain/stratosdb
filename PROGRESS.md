@@ -1,15 +1,15 @@
 # StratosDB — Progress Tracker
 
-**Last verified:** July 25, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
+**Last verified:** October 30, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
 
 ## At a glance
 
 | | |
 |---|---|
-| Commits | 14 |
-| Tests passing | **421 / 421** |
-| Main source | ~6,760 lines |
-| Test source | ~2,454 lines |
+| Commits | 95 |
+| Tests passing | **431 / 431** |
+| Main source | ~30,845 lines |
+| Test source | ~13,830 lines |
 
 | Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. Last round: a complete, from-scratch rewrite of `stratosdb-jdbc` after discovering it spoke a dead, disconnected protocol the real, current server (`StdWireServer`) could never understand at all. This round: a direct continuation, from actually integrating a real GUI tool (DBNavigator) against the rewritten driver - a real, end-to-end test using DBNavigator's own unmodified `ConnectionProfile`/`JdbcClient` classes found two further, real gaps no driver-level test alone could have caught. First, a real URL-handling gap: the driver never parsed a real `?key=value` query string out of the connection URL (the same convention every other mainstream JDBC driver's URL already supports), so a tool embedding `ssl=true` there - as DBNavigator, like most tools, does - would have had it silently never reach the driver at all. Second, and more serious: `setReadOnly()` threw for any caller, and real connection pools - HikariCP among them, this is standard, widespread pool behavior - call it unconditionally on every fresh connection as part of their own standard setup, meaning a real pool could never even finish initializing against this driver, a silent, total failure invisible to every existing test. Both fixed, with a new, permanent regression test that drives the driver through a real `HikariDataSource` directly so this exact class of bug can't reappear unnoticed - verified conclusively by compiling DBNavigator's own real backend classes against a real HikariCP and Jackson and running real `CREATE TABLE`/`INSERT`/`SELECT` through a real pooled connection to a real, running server. Full regression suite reconfirmed at 374/374 (up from 373 - one new test) - see PROGRESS.md |
 
@@ -944,6 +944,38 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Added `TransactionalCatalogTest.java` containing 8 end-to-end tests covering transactional DDL commit, DDL rollback, savepoint partial rollback, restart persistence of relational system tables, MVCC isolation on catalog queries, and drop table cleanup.
   - Full reactor test suite confirmed at **421 / 421 tests passing across all 12 modules** (0 failures, 0 errors).
   - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 3, Week 05 marked `Completed`).
+
+## 6-Month Roadmap — Sprint 3, Week 06: pg_catalog & information_schema Emulation ✅ DONE
+
+- ✅ **Comprehensive Virtual Catalog Views Emulation (`PgCatalogViews.java`)**:
+  - Implemented virtual system views: `pg_class`, `pg_attribute`, `pg_type`, `pg_namespace`, `pg_index`, `pg_database`, `pg_am`, `pg_tables`, `pg_views`, `pg_indexes`, and `information_schema.tables`.
+  - Deterministic PostgreSQL OID mapping (`getRelationOid()`, `getIndexOid()`, `getTypeOid()`, `formatType()`), establishing reliable OIDs across relations, columns, data types, and namespaces.
+  - Dynamic generation of catalog rows from live database metadata (`ExecutorEngine.getTableNames()`, table column definitions, index descriptors, view queries, enum definitions, sequences).
+- ✅ **Query Engine & Executor Integration (`ExecutorEngine.java`)**:
+  - Transparent resolution and querying of `pg_catalog.*` and `information_schema.*` virtual views without requiring physical storage tables.
+  - Automatic `public.` prefix stripping and schema-qualified relation resolution.
+  - Factored out and implemented `executeAggregateSelectOverRows()`, enabling `COUNT(*)`, aggregates, and `GROUP BY` to operate seamlessly over virtual catalog views.
+  - Added function call and alias projection in `applyOuterQueryToRows()`.
+  - Enabled joined queries over virtual catalog views in `resolveJoinSource()`.
+  - Authorization pass-through: SELECT queries against system catalog views and tables are permitted without explicit grant checks.
+  - Implemented built-in catalog introspection functions: `format_type`, `pg_table_is_visible`, `pg_get_userbyid`, `pg_encoding_to_char`, `quote_ident`, `array_to_string`, `pg_get_expr`, `pg_get_indexdef`, and `pg_get_constraintdef`.
+- ✅ **PostgreSQL Wire Protocol Handler Upgrades (`StdWireServer.java`)**:
+  - Extended PostgreSQL wire protocol server to intercept and handle `psql` interactive introspection commands:
+    - `\dt`: List tables (filters out views and sequences using whereClause pattern inspection).
+    - `\d`: List relations (displays tables, views, and sequences).
+    - `\d <tablename>`: Full PostgreSQL 16 multi-query introspection sequence:
+      1. Regex OID lookup (`OPERATOR(pg_catalog.~)`).
+      2. Table metadata query (`relchecks`, `relkind`, `relhasindex`, `amname`).
+      3. Column definitions (`pg_attribute` with `format_type`, nullable flags, column defaults).
+      4. Index definitions (12 columns: `c2.relname`, `i.indisprimary`, `i.indisunique`, `i.indisclustered`, `i.indisvalid`, `pg_get_indexdef`, `pg_get_constraintdef`, `contype`, `condeferrable`, `condeferred`, `i.indisreplident`, `c2.reltablespace`).
+      5. Secondary introspection queries gracefully acknowledged with empty resultsets: `pg_stat_get_numscans`, `pg_statistic_ext`, `pg_publication`, `pg_inherits`, `pg_trigger`, `pg_policy`.
+    - `\l`: List databases (`pg_database` returning UTF8 and libc collations).
+    - Tab completion: Autocompletion queries against `pg_class` and `pg_namespace`.
+- ✅ **Comprehensive Test Suite & Real psql Verification**:
+  - Added `PgCatalogEmulationTest.java` (8 tests) verifying direct SQL execution on `pg_class`, `pg_attribute`, `pg_type`, `pg_namespace`, `pg_index`, `information_schema.tables`, `COUNT(*)` over system views, and catalog introspection functions.
+  - Added 4 integration tests in `StdWireServerTest.java` verifying real `psql` subprocess execution of `\d`, `\dt`, `\d <tablename>`, `\l`, and tab completion.
+  - Full reactor test suite verified at **431 / 431 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped due to optional external dependencies).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 3, Week 06 marked `Completed`).
 
 ## What to do next
 
