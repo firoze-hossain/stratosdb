@@ -29,4 +29,8 @@ public interface KeyValueIndex {
     BTreePage.RID search(long key);
 
     List<BTreePage.RID> searchAll(long key);
+
+    default boolean isUnique() {
+        return false;
+    }
 }

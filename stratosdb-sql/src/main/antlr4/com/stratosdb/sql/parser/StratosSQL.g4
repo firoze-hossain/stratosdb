@@ -100,8 +100,10 @@ plpgsqlExpr: plpgsqlExpr op=(STAR | DIVIDE) plpgsqlExpr                    #Plpg
            ;
 
 // DDL
-createTable: CREATE TABLE tableName LPAREN columnDef (COMMA columnDef)* (COMMA PRIMARY KEY LPAREN columnName (COMMA columnName)* RPAREN)? RPAREN SEMICOLON?;
-createIndex: CREATE INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
+createTable: CREATE TABLE tableName LPAREN (columnDef | tableConstraint) (COMMA (columnDef | tableConstraint))* RPAREN SEMICOLON?;
+tableConstraint: (CONSTRAINT constraintName)? (PRIMARY KEY | UNIQUE) LPAREN columnName (COMMA columnName)* RPAREN;
+constraintName: IDENTIFIER;
+createIndex: CREATE (UNIQUE)? INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
 createDatabase: CREATE DATABASE databaseName SEMICOLON?;
 dropDatabase: DROP DATABASE databaseName SEMICOLON?;
@@ -201,7 +203,13 @@ update: UPDATE tableName SET assignment (COMMA assignment)* (WHERE expression)? 
 delete: DELETE FROM tableName (WHERE expression)? SEMICOLON?;
 
 // Definitions
-columnDef: columnName dataType (NOT NULL)? (DEFAULT defaultValue)? (PRIMARY KEY)?;
+columnDef: columnName dataType columnConstraint*;
+columnConstraint: NOT NULL
+                | NULL
+                | PRIMARY KEY
+                | UNIQUE
+                | DEFAULT defaultValue
+                ;
 assignment: columnName ASSIGN literal;
 orderList: orderItem (COMMA orderItem)*;
 orderItem: columnName (ASC | DESC)?;
@@ -472,6 +480,8 @@ BEGIN: B E G I N;
 START: S T A R T;
 TRANSACTION: T R A N S A C T I O N;
 PRIMARY: P R I M A R Y;
+UNIQUE: U N I Q U E;
+CONSTRAINT: C O N S T R A I N T;
 RETURNING: R E T U R N I N G;
 KEY: K E Y;
 ISOLATION: I S O L A T I O N;

@@ -23,6 +23,10 @@ public class StratosDBException extends RuntimeException {
     public int getErrorCode() {
         return errorCode;
     }
+
+    public String getSqlState() {
+        return "XX000";
+    }
 }
 
 

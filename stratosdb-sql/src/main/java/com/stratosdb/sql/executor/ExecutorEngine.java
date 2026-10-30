@@ -1,6 +1,7 @@
 package com.stratosdb.sql.executor;
 
 import com.stratosdb.common.exceptions.DeadlockException;
+import com.stratosdb.common.exceptions.UniqueConstraintViolationException;
 import com.stratosdb.index.btree.BTreeIndex;
 import com.stratosdb.sql.ast.*;
 import com.stratosdb.sql.catalog.DdlUndoAction;
@@ -184,8 +185,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      */
     private final Map<String, SelectStatement> views = new ConcurrentHashMap<>();
 
-    /** One index (B+Tree or hash), and what it indexes. Only integer/long-valued columns are indexable (see toIndexKey). */
-    private record IndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.KeyValueIndex index) {}
+    /** One index (B+Tree or hash), and what it indexes. Supports UNIQUE and PRIMARY KEY enforcement. */
+    private record IndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.KeyValueIndex index, boolean isUnique, boolean isPrimary) {
+        public IndexEntry(String indexName, String tableName, String columnName, com.stratosdb.index.KeyValueIndex index) {
+            this(indexName, tableName, columnName, index, false, false);
+        }
+    }
 
     private final Map<String, IndexEntry> indexesByName;
     private final Map<String, List<IndexEntry>> indexesByTable;
@@ -601,10 +606,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
             },
             indexLoaded -> {
-                reconstructIndex(indexLoaded.indexName(), indexLoaded.tableName(), indexLoaded.columnName(), indexLoaded.indexType());
+                boolean isPrimary = indexLoaded.indexName().endsWith("_pkey") || tablePrimaryKeys.getOrDefault(indexLoaded.tableName(), List.of()).contains(indexLoaded.columnName());
+                reconstructIndex(indexLoaded.indexName(), indexLoaded.tableName(), indexLoaded.columnName(), indexLoaded.indexType(), indexLoaded.isUnique(), isPrimary);
                 catalogLines.put("INDEX:" + indexLoaded.indexName(),
                     "INDEX|" + indexLoaded.indexName() + "|" + indexLoaded.tableName() + "|" + indexLoaded.columnName()
-                    + "|" + indexLoaded.indexType() + "|" + (indexLoaded.columnName2() != null ? indexLoaded.columnName2() : ""));
+                    + "|" + indexLoaded.indexType() + "|" + (indexLoaded.columnName2() != null ? indexLoaded.columnName2() : "")
+                    + "|" + (indexLoaded.isUnique() ? "YES" : "NO"));
             },
             typeLoaded -> {
                 String vals = typeLoaded.values();
@@ -628,10 +635,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     /** Recreates an index's in-memory registration and its BTreeIndex/HashIndex object WITHOUT rescanning the table - the index's own file already has every entry from before the restart. */
     private void reconstructIndex(String indexName, String tableName, String columnName, String type) {
+        reconstructIndex(indexName, tableName, columnName, type, false, false);
+    }
+
+    private void reconstructIndex(String indexName, String tableName, String columnName, String type, boolean isUnique, boolean isPrimary) {
         com.stratosdb.index.KeyValueIndex index = type.equals("HASH")
             ? new com.stratosdb.index.hash.HashIndex(indexName, bufferPool)
-            : new BTreeIndex(indexName, bufferPool, walManager);
-        IndexEntry entry = new IndexEntry(indexName, tableName, columnName, index);
+            : new BTreeIndex(indexName, bufferPool, walManager, isUnique);
+        IndexEntry entry = new IndexEntry(indexName, tableName, columnName, index, isUnique, isPrimary);
         indexesByName.put(indexName, entry);
         indexesByTable.computeIfAbsent(tableName, k -> new ArrayList<>()).add(entry);
     }
@@ -652,6 +663,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         boolean poisoned;
         List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
         List<DdlUndoAction> ddlUndoActions = new ArrayList<>();
+        List<UndoAction> dmlUndoActions = new ArrayList<>();
         /** The real, authenticated username for this session, set once via setCurrentUser() right after login - see its own javadoc. Null (the default for every session that never calls setCurrentUser, i.e. every caller using execute() directly) means unrestricted, matching this engine's own pre-existing behavior. */
         String currentUser;
         /**
@@ -708,12 +720,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     private final ThreadLocal<SessionState> session = ThreadLocal.withInitial(SessionState::new);
 
-    /** Only tracks anything when at least one savepoint is currently active - ordinary statements outside a savepoint pay zero bookkeeping cost. */
     private void recordUndo(UndoAction action) {
         SessionState state = session.get();
+        state.dmlUndoActions.add(action);
         if (!state.savepoints.isEmpty()) {
             state.savepoints.get(state.savepoints.size() - 1).actions.add(action);
         }
+    }
+
+    private void abortTransaction(SessionState state, Transaction txn) {
+        if (txn == null) return;
+        long myXid = txn.getXID();
+        for (int j = state.dmlUndoActions.size() - 1; j >= 0; j--) {
+            undoAction(state.dmlUndoActions.get(j), myXid);
+        }
+        state.dmlUndoActions.clear();
+        systemCatalog.rollbackDdl(state.ddlUndoActions);
+        state.ddlUndoActions.clear();
+        transactionManager.abort(txn);
     }
 
     private void recordDdlUndo(DdlUndoAction action) {
@@ -782,6 +806,17 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return result;
     }
 
+    public QueryResult executeOrThrow(String sql) throws com.stratosdb.common.exceptions.StratosDBException {
+        QueryResult res = execute(sql);
+        if (!res.isSuccess()) {
+            if (res.getException() instanceof com.stratosdb.common.exceptions.StratosDBException sde) {
+                throw sde;
+            }
+            throw new com.stratosdb.common.exceptions.StratosDBException(res.getError());
+        }
+        return res;
+    }
+
     private QueryResult executeInternal(String sql) {
         if (parser.isEffectivelyEmpty(sql)) {
             // A comment-only or all-whitespace query is a real, valid no-op - the same
@@ -834,6 +869,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 recordCatalogChange(stmt, sql);
                 if (!explicit) {
                     state.ddlUndoActions.clear();
+                    state.dmlUndoActions.clear();
                     walManager.logCommit(txn.getXID());
                     transactionManager.commit(txn);
                 }
@@ -841,21 +877,25 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             } else if (explicit) {
                 state.poisoned = true;
             } else {
-                systemCatalog.rollbackDdl(state.ddlUndoActions);
-                state.ddlUndoActions.clear();
-                transactionManager.abort(txn);
+                abortTransaction(state, txn);
             }
             return result;
         } catch (DeadlockException e) {
             if (explicit) {
                 state.poisoned = true;
             } else {
-                systemCatalog.rollbackDdl(state.ddlUndoActions);
-                state.ddlUndoActions.clear();
-                transactionManager.abort(txn);
+                abortTransaction(state, txn);
             }
             LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
             return QueryResult.error("Deadlock detected, transaction aborted: " + e.getMessage());
+        } catch (UniqueConstraintViolationException e) {
+            if (explicit) {
+                state.poisoned = true;
+            } else {
+                abortTransaction(state, txn);
+            }
+            LOG.warn("Statement failed (unique constraint violation): {} - {}", sql, e.getMessage());
+            return QueryResult.error(e.getMessage(), e.getSqlState(), e);
         } catch (IllegalStateException | IllegalArgumentException e) {
             // A known, expected validation/limitation failure - the
             // established convention throughout this codebase for "this
@@ -871,9 +911,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (explicit) {
                 state.poisoned = true;
             } else {
-                systemCatalog.rollbackDdl(state.ddlUndoActions);
-                state.ddlUndoActions.clear();
-                transactionManager.abort(txn);
+                abortTransaction(state, txn);
             }
             LOG.warn("Statement failed (a known, expected validation failure, not a bug): {} - {}", sql, e.getMessage());
             return QueryResult.error(e.getMessage());
@@ -881,9 +919,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (explicit) {
                 state.poisoned = true;
             } else {
-                systemCatalog.rollbackDdl(state.ddlUndoActions);
-                state.ddlUndoActions.clear();
-                transactionManager.abort(txn);
+                abortTransaction(state, txn);
             }
             LOG.error("Execution failed: {}", sql, e);
             return QueryResult.error(e.getMessage());
@@ -910,15 +946,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (state.poisoned) {
             // Matches real Postgres: COMMIT on an already-aborted transaction
             // rolls it back instead - there is nothing valid left to commit.
-            systemCatalog.rollbackDdl(state.ddlUndoActions);
-            state.ddlUndoActions.clear();
-            transactionManager.abort(state.transaction);
+            abortTransaction(state, state.transaction);
             state.transaction = null;
             state.poisoned = false;
             state.savepoints.clear();
             return QueryResult.error("Current transaction is aborted, rolled back instead of committed");
         }
         state.ddlUndoActions.clear();
+        state.dmlUndoActions.clear();
         walManager.logCommit(state.transaction.getXID());
         transactionManager.commit(state.transaction);
         state.transaction = null;
@@ -931,9 +966,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (state.transaction == null) {
             return QueryResult.error("No transaction in progress");
         }
-        systemCatalog.rollbackDdl(state.ddlUndoActions);
-        state.ddlUndoActions.clear();
-        transactionManager.abort(state.transaction);
+        abortTransaction(state, state.transaction);
         state.transaction = null;
         state.poisoned = false;
         state.savepoints.clear();
@@ -1002,7 +1035,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         for (int i = state.savepoints.size() - 1; i >= idx; i--) {
             List<UndoAction> actions = state.savepoints.get(i).actions;
             for (int j = actions.size() - 1; j >= 0; j--) {
-                undoAction(actions.get(j), myXid);
+                UndoAction act = actions.get(j);
+                undoAction(act, myXid);
+                state.dmlUndoActions.remove(act);
             }
         }
         // Discard every savepoint created after the target; the target
@@ -1080,7 +1115,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         SessionState state = session.get();
         if (state.transaction != null) {
             LOG.warn("Session ending with an open transaction (xid={}) - rolling it back", state.transaction.getXID());
-            transactionManager.abort(state.transaction);
+            abortTransaction(state, state.transaction);
         }
         session.remove();
     }
@@ -1123,7 +1158,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         // 2. BTree / Hash indexes
         if (indexesByName != null) {
             for (IndexEntry entry : indexesByName.values()) {
-                map.put(entry.indexName(), new IndexMetadata(entry.indexName(), entry.tableName(), entry.columnName(), null, "BTREE", false, false));
+                map.put(entry.indexName(), new IndexMetadata(entry.indexName(), entry.tableName(), entry.columnName(), null, "BTREE", entry.isUnique(), entry.isPrimary()));
             }
         }
         // 3. BRIN
@@ -2100,10 +2135,58 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         systemCatalog.insertTable(stmt.tableName(), "BASE TABLE", creatingUser, ddl, xid);
         for (int i = 0; i < stmt.columns().size(); i++) {
             ColumnDefinition col = stmt.columns().get(i);
-            systemCatalog.insertColumn(stmt.tableName(), col.name(), col.type(), i + 1, !col.primaryKey(), col.defaultValue(), xid);
+            boolean isColPk = primaryKeyColumns.contains(col.name());
+            systemCatalog.insertColumn(stmt.tableName(), col.name(), col.type(), i + 1, !isColPk && !col.notNull(), col.defaultValue(), xid);
         }
         if (!primaryKeyColumns.isEmpty()) {
             systemCatalog.insertConstraint(stmt.tableName() + "_pk", stmt.tableName(), "PRIMARY KEY", String.join(",", primaryKeyColumns), xid);
+        }
+
+        // Create backing unique B+Tree indexes for PRIMARY KEY and UNIQUE constraints
+        List<String> createdIndexNames = new ArrayList<>();
+        if (!primaryKeyColumns.isEmpty()) {
+            for (String pkCol : primaryKeyColumns) {
+                String pkIdxName = stmt.tableName() + "_pkey";
+                if (primaryKeyColumns.size() > 1) {
+                    pkIdxName = stmt.tableName() + "_" + pkCol + "_pkey";
+                }
+                BTreeIndex pkIndex = new BTreeIndex(pkIdxName, bufferPool, walManager, true);
+                IndexEntry entry = new IndexEntry(pkIdxName, stmt.tableName(), pkCol, pkIndex, true, true);
+                indexesByName.put(pkIdxName, entry);
+                indexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
+                systemCatalog.insertIndex(pkIdxName, stmt.tableName(), pkCol, null, "BTREE", true, xid);
+                catalogLines.put("INDEX:" + pkIdxName, "INDEX|" + pkIdxName + "|" + stmt.tableName() + "|" + pkCol + "|BTREE||YES");
+                createdIndexNames.add(pkIdxName);
+            }
+        }
+
+        List<String> uniqueColumns = new ArrayList<>();
+        for (ColumnDefinition col : stmt.columns()) {
+            if (col.isUnique() && !uniqueColumns.contains(col.name()) && !primaryKeyColumns.contains(col.name())) {
+                uniqueColumns.add(col.name());
+            }
+        }
+        if (stmt.uniqueConstraints() != null) {
+            for (CreateTableStatement.TableConstraint tc : stmt.uniqueConstraints()) {
+                if ("UNIQUE".equalsIgnoreCase(tc.type())) {
+                    for (String col : tc.columns()) {
+                        if (!uniqueColumns.contains(col) && !primaryKeyColumns.contains(col)) {
+                            uniqueColumns.add(col);
+                        }
+                    }
+                }
+            }
+        }
+        for (String uqCol : uniqueColumns) {
+            String uqIdxName = stmt.tableName() + "_" + uqCol + "_key";
+            BTreeIndex uqIndex = new BTreeIndex(uqIdxName, bufferPool, walManager, true);
+            IndexEntry entry = new IndexEntry(uqIdxName, stmt.tableName(), uqCol, uqIndex, true, false);
+            indexesByName.put(uqIdxName, entry);
+            indexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
+            systemCatalog.insertIndex(uqIdxName, stmt.tableName(), uqCol, null, "BTREE", true, xid);
+            systemCatalog.insertConstraint(uqIdxName, stmt.tableName(), "UNIQUE", uqCol, xid);
+            catalogLines.put("INDEX:" + uqIdxName, "INDEX|" + uqIdxName + "|" + stmt.tableName() + "|" + uqCol + "|BTREE||YES");
+            createdIndexNames.add(uqIdxName);
         }
 
         String createdTable = stmt.tableName();
@@ -2114,6 +2197,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             tableColumnTypes.remove(createdTable);
             tableOwners.remove(createdTable);
             tablePrimaryKeys.remove(createdTable);
+            for (String idxName : createdIndexNames) {
+                indexesByName.remove(idxName);
+                catalogLines.remove("INDEX:" + idxName);
+            }
+            indexesByTable.remove(createdTable);
             catalogLines.remove("TABLE:" + createdTable);
             catalogLines.remove("OWNER:" + createdTable);
         });
@@ -2184,6 +2272,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error(stmt.indexType() + " only supports a single column - only GIST uses a (start, end) pair");
         }
 
+        if (stmt.isUnique()) {
+            Set<Object> seenValues = new HashSet<>();
+            for (HeapTable.PositionedRow row : table.scanPositioned()) {
+                if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                    continue;
+                }
+                Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
+                Object val = findColumnValue(tuple, stmt.columnName());
+                if (val != null) {
+                    if (!seenValues.add(val)) {
+                        return QueryResult.error("could not create unique index \"" + stmt.indexName() + "\": Table contains duplicate values (" + val + ")", "23505");
+                    }
+                }
+            }
+        }
+
         QueryResult res = switch (stmt.indexType()) {
             case BRIN -> buildBrinIndex(stmt, table, txn);
             case BITMAP -> buildBitmapIndex(stmt, table, txn);
@@ -2193,12 +2297,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         };
         if (res.isSuccess()) {
             long xid = txn != null ? txn.getXID() : 0L;
-            systemCatalog.insertIndex(stmt.indexName(), stmt.tableName(), stmt.columnName(), stmt.columnName2(), stmt.indexType().name(), false, xid);
+            systemCatalog.insertIndex(stmt.indexName(), stmt.tableName(), stmt.columnName(), stmt.columnName2(), stmt.indexType().name(), stmt.isUnique(), xid);
+            if (stmt.isUnique()) {
+                systemCatalog.insertConstraint(stmt.indexName(), stmt.tableName(), "UNIQUE", stmt.columnName(), xid);
+            }
             String idxName = stmt.indexName();
             String tblName = stmt.tableName();
             catalogLines.put("INDEX:" + idxName,
                 "INDEX|" + idxName + "|" + tblName + "|" + stmt.columnName() + "|" + stmt.indexType()
-                + "|" + (stmt.columnName2() == null ? "" : stmt.columnName2()));
+                + "|" + (stmt.columnName2() == null ? "" : stmt.columnName2())
+                + "|" + (stmt.isUnique() ? "YES" : "NO"));
             recordDdlUndo(() -> {
                 indexesByName.remove(idxName);
                 List<IndexEntry> entries = indexesByTable.get(tblName);
@@ -2218,7 +2326,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult buildKeyValueIndex(CreateIndexStatement stmt, HeapTable table, Transaction txn) {
         com.stratosdb.index.KeyValueIndex index = stmt.indexType() == CreateIndexStatement.IndexType.HASH
             ? new com.stratosdb.index.hash.HashIndex(stmt.indexName(), bufferPool)
-            : new BTreeIndex(stmt.indexName(), bufferPool, walManager);
+            : new BTreeIndex(stmt.indexName(), bufferPool, walManager, stmt.isUnique());
         int indexed = 0;
         int skippedNonNumeric = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
@@ -2236,7 +2344,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
 
-        IndexEntry entry = new IndexEntry(stmt.indexName(), stmt.tableName(), stmt.columnName(), index);
+        IndexEntry entry = new IndexEntry(stmt.indexName(), stmt.tableName(), stmt.columnName(), index, stmt.isUnique(), false);
         indexesByName.put(stmt.indexName(), entry);
         indexesByTable.computeIfAbsent(stmt.tableName(), k -> new ArrayList<>()).add(entry);
 
@@ -2638,6 +2746,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error(beforeError);
         }
 
+        // Validate PRIMARY KEY and UNIQUE constraints via backing unique indexes
+        checkUniqueConstraints(tableName, tuple, -1, -1, txn);
+
         byte[] data = tuple.serialize();
         HeapTable table = tables.get(tableName);
         HeapTable.InsertResult result = table.insertMvcc(data, txn.getXID());
@@ -2660,7 +2771,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         byte[] storedBytes = MVCCVisibility.wrap(data, txn.getXID(), MVCCVisibility.NO_XMAX);
         long lsn = walManager.logInsert(tableName, txn.getXID(), result.pageId, result.slot, storedBytes);
         if (lsn > 0) table.setPageLSN(result.pageId, lsn);
-        maintainIndexesOnWrite(tableName, tuple, result.pageId, result.slot);
+        try {
+            maintainIndexesOnWrite(tableName, tuple, result.pageId, result.slot);
+        } catch (UniqueConstraintViolationException ucve) {
+            table.update(result.pageId, result.slot, MVCCVisibility.withXmax(storedBytes, txn.getXID()));
+            throw ucve;
+        }
         recordUndo(new UndoAction.UndoInsert(tableName, result.pageId, result.slot));
 
         String afterError = fireTriggers(tableName, "AFTER", "INSERT", tuple, txn);
@@ -4114,11 +4230,75 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
     }
 
-    /** Only Integer/Long column values can be B+Tree keys right now - see executeCreateIndex's javadoc. */
+    /** Converts a column value to a 64-bit integer index key for B+Tree / Hash indexes. Supports numbers and strings (via 64-bit hash). */
     private Long toIndexKey(Object value) {
+        if (value == null) return null;
         if (value instanceof Integer i) return i.longValue();
         if (value instanceof Long l) return l;
+        if (value instanceof Short s) return s.longValue();
+        if (value instanceof Byte b) return b.longValue();
+        if (value instanceof String s) {
+            long hash = 0xcbf29ce484222325L;
+            for (int i = 0; i < s.length(); i++) {
+                hash ^= s.charAt(i);
+                hash *= 0x100000001b3L;
+            }
+            return hash;
+        }
         return null;
+    }
+
+    private void checkUniqueConstraints(String tableName, Tuple tuple, long currentTuplePageId, int currentTupleSlot, Transaction txn) {
+        List<IndexEntry> tableIndexes = indexesByTable.get(tableName);
+        if (tableIndexes == null) return;
+        for (IndexEntry idx : tableIndexes) {
+            if (!idx.isUnique()) continue;
+            Object val = findColumnValue(tuple, idx.columnName());
+            if (val == null) {
+                if (idx.isPrimary()) {
+                    throw new com.stratosdb.common.exceptions.StratosDBException(
+                        "null value in column \"" + idx.columnName() + "\" violates not-null constraint",
+                        com.stratosdb.common.constants.ErrorCodes.ERROR);
+                }
+                continue;
+            }
+
+            Long key = toIndexKey(val);
+            if (key == null) continue;
+
+            List<BTreePage.RID> existingRids = idx.index().searchAll(key);
+            if (existingRids != null && !existingRids.isEmpty()) {
+                HeapTable table = tables.get(tableName);
+                for (BTreePage.RID rid : existingRids) {
+                    if (rid.pageId() == currentTuplePageId && rid.slot() == currentTupleSlot) {
+                        continue;
+                    }
+                    if (table != null) {
+                        byte[] stored = table.readTuple(rid.pageId(), rid.slot());
+                        if (stored != null) {
+                            long xmin = MVCCVisibility.readXmin(stored);
+                            if (transactionManager.isAborted(xmin)) {
+                                continue;
+                            }
+                            long xmax = MVCCVisibility.readXmax(stored);
+                            if (xmax != MVCCVisibility.NO_XMAX && transactionManager.isCommitted(xmax)) {
+                                continue;
+                            }
+                            if (txn != null && xmax == txn.getXID()) {
+                                continue;
+                            }
+                            Tuple existingTuple = deserializeTuple(tableName, MVCCVisibility.readPayload(stored));
+                            Object existingVal = findColumnValue(existingTuple, idx.columnName());
+                            if (Objects.equals(val, existingVal)) {
+                                throw new UniqueConstraintViolationException(
+                                    tableName, idx.indexName(), val,
+                                    "duplicate key value violates unique constraint \"" + idx.indexName() + "\": Key (" + idx.columnName() + ")=(" + val + ") already exists.");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -4172,6 +4352,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (beforeError != null) {
                 return QueryResult.error(beforeError);
             }
+
+            // Validate unique constraints for the modified tuple
+            checkUniqueConstraints(stmt.tableName(), tuple, row.pageId(), row.slot(), txn);
 
             byte[] newPayload = tuple.serialize();
 
@@ -4315,6 +4498,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         tablePrivileges.remove(tableName);
         tablePrimaryKeys.remove(tableName);
         tableStatsRegistry.remove(tableName);
+        List<IndexEntry> droppedEntries = indexesByTable.remove(tableName);
+        if (droppedEntries != null) {
+            for (IndexEntry e : droppedEntries) {
+                indexesByName.remove(e.indexName());
+                catalogLines.remove("INDEX:" + e.indexName());
+            }
+        }
         catalogLines.remove("TABLE:" + tableName);
         catalogLines.remove("OWNER:" + tableName);
 

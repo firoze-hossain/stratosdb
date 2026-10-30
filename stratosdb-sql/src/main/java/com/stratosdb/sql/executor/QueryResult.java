@@ -27,21 +27,29 @@ public class QueryResult {
      * is a completely valid answer.
      */
     private final List<String> columnNames;
+    private final String sqlState;
+    private final Exception exception;
 
     private QueryResult(boolean success, String message, List<Tuple> rows, String error, List<String> columnNames) {
+        this(success, message, rows, error, columnNames, "XX000", null);
+    }
+
+    private QueryResult(boolean success, String message, List<Tuple> rows, String error, List<String> columnNames, String sqlState, Exception exception) {
         this.success = success;
         this.message = message;
         this.rows = rows;
         this.error = error;
         this.columnNames = columnNames;
+        this.sqlState = sqlState != null ? sqlState : (error != null ? "XX000" : null);
+        this.exception = exception;
     }
 
     public static QueryResult success(String message) {
-        return new QueryResult(true, message, null, null, null);
+        return new QueryResult(true, message, null, null, null, null, null);
     }
 
     public static QueryResult success(List<Tuple> rows) {
-        return new QueryResult(true, rows.size() + " rows", rows, null, null);
+        return new QueryResult(true, rows.size() + " rows", rows, null, null, null, null);
     }
 
     /**
@@ -52,11 +60,19 @@ public class QueryResult {
      * {@code rows} (if any) already uses.
      */
     public static QueryResult success(List<Tuple> rows, List<String> columnNames) {
-        return new QueryResult(true, rows.size() + " rows", rows, null, columnNames);
+        return new QueryResult(true, rows.size() + " rows", rows, null, columnNames, null, null);
     }
 
     public static QueryResult error(String error) {
-        return new QueryResult(false, null, null, error, null);
+        return new QueryResult(false, null, null, error, null, "XX000", null);
+    }
+
+    public static QueryResult error(String error, String sqlState) {
+        return new QueryResult(false, null, null, error, null, sqlState, null);
+    }
+
+    public static QueryResult error(String error, String sqlState, Exception exception) {
+        return new QueryResult(false, null, null, error, null, sqlState, exception);
     }
 
     public boolean isSuccess() { return success; }
@@ -64,6 +80,8 @@ public class QueryResult {
     public List<Tuple> getRows() { return rows; }
     public String getError() { return error; }
     public List<String> getColumnNames() { return columnNames; }
+    public String getSqlState() { return sqlState != null ? sqlState : (error != null ? "XX000" : null); }
+    public Exception getException() { return exception; }
 
     @Override
     public String toString() {

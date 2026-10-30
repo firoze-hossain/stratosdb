@@ -1,6 +1,7 @@
 package com.stratosdb.index.btree;
 
 import com.stratosdb.common.exceptions.StorageException;
+import com.stratosdb.common.exceptions.UniqueConstraintViolationException;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.page.BTreePage;
 import com.stratosdb.storage.page.Page;
@@ -45,6 +46,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private static final int META_MAGIC = 0x53545242; // "STRB"
     private static final int META_MAGIC_OFFSET = 24; // right after Page's base 24-byte header
     private static final int META_ROOT_OFFSET = 28;
+    private static final int META_FLAGS_OFFSET = 36;
 
     // A node below this many keys (and not the root, which is exempt) must
     // borrow from a sibling or merge. Using floor(max/2) rather than
@@ -78,6 +80,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private com.stratosdb.storage.wal.WALManager walManager;
     private long rootPageId;
     private long nextPageId;
+    private boolean unique;
     /**
      * A real, genuine bug found by testing, not by inspection: this class
      * had ZERO synchronization at all before this fix - every one of its
@@ -106,13 +109,22 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private final java.util.concurrent.locks.ReadWriteLock lock = new java.util.concurrent.locks.ReentrantReadWriteLock();
 
     public BTreeIndex(String indexName, BufferPool bufferPool) {
-        this(indexName, bufferPool, null);
+        this(indexName, bufferPool, null, false);
+    }
+
+    public BTreeIndex(String indexName, BufferPool bufferPool, boolean unique) {
+        this(indexName, bufferPool, null, unique);
     }
 
     public BTreeIndex(String indexName, BufferPool bufferPool, com.stratosdb.storage.wal.WALManager walManager) {
+        this(indexName, bufferPool, walManager, false);
+    }
+
+    public BTreeIndex(String indexName, BufferPool bufferPool, com.stratosdb.storage.wal.WALManager walManager, boolean unique) {
         this.indexName = indexName;
         this.bufferPool = bufferPool;
         this.walManager = walManager;
+        this.unique = unique;
 
         long existingPages = bufferPool.getTablePageCount(indexName);
         if (existingPages <= 1) {
@@ -121,6 +133,21 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             loadMetadata();
         }
         this.nextPageId = Math.max(existingPages, INITIAL_ROOT_PAGE_ID + 1);
+    }
+
+    @Override
+    public boolean isUnique() {
+        return unique;
+    }
+
+    public void setUnique(boolean unique) {
+        lock.writeLock().lock();
+        try {
+            this.unique = unique;
+            saveMetadata();
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     public com.stratosdb.storage.wal.WALManager getWalManager() {
@@ -159,14 +186,19 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             throw new StorageException("Index metadata page for '" + indexName + "' is missing or corrupt");
         }
         this.rootPageId = meta.getBuffer().getLong(META_ROOT_OFFSET);
+        int flags = meta.getBuffer().getInt(META_FLAGS_OFFSET);
+        if ((flags & 1) != 0) {
+            this.unique = true;
+        }
         bufferPool.unpinPage(indexName, META_PAGE_ID);
-        LOG.debug("Loaded B+Tree index '{}', root at page {}", indexName, rootPageId);
+        LOG.debug("Loaded B+Tree index '{}', root at page {}, unique={}", indexName, rootPageId, unique);
     }
 
     private void saveMetadata() {
         Page meta = bufferPool.getPage(indexName, META_PAGE_ID, RAW_PAGE_FACTORY);
         meta.getBuffer().putInt(META_MAGIC_OFFSET, META_MAGIC);
         meta.getBuffer().putLong(META_ROOT_OFFSET, rootPageId);
+        meta.getBuffer().putInt(META_FLAGS_OFFSET, unique ? 1 : 0);
         meta.setDirty(true);
         bufferPool.markDirty(indexName, META_PAGE_ID);
         bufferPool.unpinPage(indexName, META_PAGE_ID);
@@ -196,6 +228,14 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     }
 
     private void insertInternal(long xid, long key, BTreePage.RID rid) {
+        if (unique) {
+            BTreePage.RID existing = searchInternal(key);
+            if (existing != null) {
+                throw new UniqueConstraintViolationException(
+                    null, indexName, key,
+                    "duplicate key value violates unique constraint \"" + indexName + "\": Key (" + key + ") already exists.");
+            }
+        }
         SplitResult result = insertRecursive(xid, -1, rootPageId, key, rid);
         if (result != null) {
             long newRootId = result.newRootId() != -1 ? result.newRootId() : allocatePageId();

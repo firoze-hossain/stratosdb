@@ -56,6 +56,10 @@ public class StratosDB {
         return executor.execute(sql);
     }
 
+    public QueryResult executeOrThrow(String sql) throws com.stratosdb.common.exceptions.StratosDBException {
+        return executor.executeOrThrow(sql);
+    }
+
     /**
      * Call once per connection, right after real authentication succeeds -
      * see ExecutorEngine.setCurrentUser's own javadoc for the real

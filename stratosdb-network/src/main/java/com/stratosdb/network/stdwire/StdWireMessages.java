@@ -363,11 +363,15 @@ public final class StdWireMessages {
         writeMessage(out, 'I', buf -> {});
     }
 
-    /** A minimal but valid ErrorResponse - severity, SQLSTATE (always the generic "internal error" code, since this engine doesn't classify errors into real SQLSTATEs yet), and the message text. */
+    /** A minimal but valid ErrorResponse - severity, SQLSTATE, and the message text. */
     public static void writeErrorResponse(DataOutputStream out, String message) throws IOException {
+        writeErrorResponse(out, message, "XX000");
+    }
+
+    public static void writeErrorResponse(DataOutputStream out, String message, String sqlState) throws IOException {
         writeMessage(out, 'E', buf -> {
             buf.put((byte) 'S'); putCString(buf, "ERROR");
-            buf.put((byte) 'C'); putCString(buf, "XX000");
+            buf.put((byte) 'C'); putCString(buf, (sqlState == null || sqlState.isEmpty()) ? "XX000" : sqlState);
             buf.put((byte) 'M'); putCString(buf, message == null ? "unknown error" : message);
             buf.put((byte) 0);
         });

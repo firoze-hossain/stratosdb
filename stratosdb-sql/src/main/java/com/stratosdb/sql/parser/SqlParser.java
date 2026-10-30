@@ -349,6 +349,7 @@ public class SqlParser {
         String tableName = ctx.tableName().getText();
         String columnName = ctx.columnName(0).getText();
         String columnName2 = ctx.columnName().size() > 1 ? ctx.columnName(1).getText() : null;
+        boolean isUnique = ctx.UNIQUE() != null;
         CreateIndexStatement.IndexType indexType;
         if (ctx.HASH() != null) indexType = CreateIndexStatement.IndexType.HASH;
         else if (ctx.BRIN() != null) indexType = CreateIndexStatement.IndexType.BRIN;
@@ -356,7 +357,7 @@ public class SqlParser {
         else if (ctx.BITMAP() != null) indexType = CreateIndexStatement.IndexType.BITMAP;
         else if (ctx.GIST() != null) indexType = CreateIndexStatement.IndexType.GIST;
         else indexType = CreateIndexStatement.IndexType.BTREE; // default, matching Postgres's own convention
-        return new CreateIndexStatement(indexName, tableName, columnName, columnName2, indexType);
+        return new CreateIndexStatement(indexName, tableName, columnName, columnName2, indexType, isUnique);
     }
 
     /**
@@ -385,34 +386,51 @@ public class SqlParser {
         for (StratosSQLParser.ColumnDefContext colCtx : ctx.columnDef()) {
             String name = colCtx.columnName().getText();
             String type = colCtx.dataType().getText();
-            // A second real "parsed but discarded" bug found alongside
-            // INSERT's column-list one: NOT NULL and DEFAULT were both
-            // hardcoded away here (false / null) regardless of what the
-            // statement actually said, so neither ever reached the AST at
-            // all - not even a matter of the executor ignoring them.
-            boolean notNull = colCtx.NOT() != null;
-            String defaultValue = colCtx.defaultValue() != null ? colCtx.defaultValue().getText() : null;
-            // A real, inline column-level PRIMARY KEY ("id INT PRIMARY KEY") -
-            // found missing entirely (not even parseable) during a real, broad
-            // driver/ORM verification pass: virtually every serious ORM's own
-            // default DDL generation declares a primary key one way or the
-            // other, and this engine previously supported neither form at all.
-            boolean primaryKey = colCtx.PRIMARY() != null;
-            columns.add(new ColumnDefinition(name, type, notNull, defaultValue, primaryKey));
+            boolean notNull = false;
+            String defaultValue = null;
+            boolean primaryKey = false;
+            boolean isUnique = false;
+
+            if (colCtx.columnConstraint() != null) {
+                for (StratosSQLParser.ColumnConstraintContext cCtx : colCtx.columnConstraint()) {
+                    if (cCtx.NOT() != null) {
+                        notNull = true;
+                    }
+                    if (cCtx.PRIMARY() != null) {
+                        primaryKey = true;
+                        notNull = true;
+                    }
+                    if (cCtx.UNIQUE() != null) {
+                        isUnique = true;
+                    }
+                    if (cCtx.DEFAULT() != null && cCtx.defaultValue() != null) {
+                        defaultValue = cCtx.defaultValue().getText();
+                    }
+                }
+            }
+            columns.add(new ColumnDefinition(name, type, notNull, defaultValue, primaryKey, isUnique));
         }
 
-        // A real, standalone table-level PRIMARY KEY (col1, col2, ...) constraint
-        // clause - the OTHER real form virtually every serious ORM's own default
-        // DDL generation actually uses (SQLAlchemy's own default output writes
-        // this form even for a single-column primary key, never the inline one).
         List<String> primaryKeyColumns = new ArrayList<>();
-        if (ctx.PRIMARY() != null) {
-            for (StratosSQLParser.ColumnNameContext colNameCtx : ctx.columnName()) {
-                primaryKeyColumns.add(colNameCtx.getText());
+        List<CreateTableStatement.TableConstraint> tableConstraints = new ArrayList<>();
+
+        if (ctx.tableConstraint() != null) {
+            for (StratosSQLParser.TableConstraintContext tcCtx : ctx.tableConstraint()) {
+                String cName = tcCtx.constraintName() != null ? tcCtx.constraintName().getText() : null;
+                List<String> cols = new ArrayList<>();
+                for (StratosSQLParser.ColumnNameContext colNameCtx : tcCtx.columnName()) {
+                    cols.add(colNameCtx.getText());
+                }
+                if (tcCtx.PRIMARY() != null) {
+                    primaryKeyColumns.addAll(cols);
+                    tableConstraints.add(new CreateTableStatement.TableConstraint(cName, "PRIMARY KEY", cols));
+                } else if (tcCtx.UNIQUE() != null) {
+                    tableConstraints.add(new CreateTableStatement.TableConstraint(cName, "UNIQUE", cols));
+                }
             }
         }
 
-        return new CreateTableStatement(tableName, columns, primaryKeyColumns);
+        return new CreateTableStatement(tableName, columns, primaryKeyColumns, tableConstraints);
     }
 
     private InsertStatement buildInsert(StratosSQLParser.InsertContext ctx) {

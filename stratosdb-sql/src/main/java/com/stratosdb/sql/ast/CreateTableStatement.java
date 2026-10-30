@@ -11,4 +11,15 @@ import java.util.List;
  * combines both real sources when actually recording a table's own primary
  * key (see executeCreateTable).
  */
-public record CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns) implements Statement {}
+public record CreateTableStatement(
+    String tableName,
+    List<ColumnDefinition> columns,
+    List<String> primaryKeyColumns,
+    List<TableConstraint> uniqueConstraints
+) implements Statement {
+    public record TableConstraint(String name, String type, List<String> columns) {}
+
+    public CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns) {
+        this(tableName, columns, primaryKeyColumns, List.of());
+    }
+}

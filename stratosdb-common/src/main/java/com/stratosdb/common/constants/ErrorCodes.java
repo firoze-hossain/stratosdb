@@ -10,4 +10,5 @@ public class ErrorCodes {
     public static final int DEADLOCK = 201;
     public static final int STORAGE_ERROR = 300;
     public static final int PERMISSION_DENIED = 400;
+    public static final int UNIQUE_VIOLATION = 23505;
 }

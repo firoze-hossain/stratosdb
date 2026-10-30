@@ -1,5 +1,6 @@
 package com.stratosdb.index.btree;
 
+import com.stratosdb.common.exceptions.UniqueConstraintViolationException;
 import com.stratosdb.storage.buffer.BufferPoolManager;
 import com.stratosdb.storage.disk.DiskManager;
 import com.stratosdb.storage.page.BTreePage;
@@ -347,5 +348,95 @@ class BTreeIndexTest {
                 "key " + k + " must survive a close/reopen of the index");
         }
         assertEquals(2000, index2.rangeScan(0, 1999).size());
+    }
+
+    @Test
+    void uniqueIndexRejectsDuplicates() {
+        BTreeIndex index = new BTreeIndex("uq_test", newBufferPool(64), true);
+        assertTrue(index.isUnique());
+
+        index.insert(100L, new BTreePage.RID(1, 0));
+        index.insert(200L, new BTreePage.RID(2, 0));
+
+        // Attempting to insert duplicate key 100 must throw UniqueConstraintViolationException
+        UniqueConstraintViolationException ex = assertThrows(
+            UniqueConstraintViolationException.class,
+            () -> index.insert(100L, new BTreePage.RID(3, 0))
+        );
+        assertEquals("23505", ex.getSqlState());
+        assertTrue(ex.getMessage().contains("100"));
+
+        // Original entry must remain intact
+        assertEquals(new BTreePage.RID(1, 0), index.search(100L));
+
+        // After deletion, reinserting 100 must succeed
+        index.delete(100L, new BTreePage.RID(1, 0));
+        assertNull(index.search(100L));
+        assertDoesNotThrow(() -> index.insert(100L, new BTreePage.RID(4, 0)));
+        assertEquals(new BTreePage.RID(4, 0), index.search(100L));
+    }
+
+    @Test
+    void uniqueIndexPersistsUniqueFlagAcrossReopen() {
+        String name = "uq_persist";
+        DiskManager dm1 = new DiskManager(tempDir.toString());
+        BufferPoolManager bp1 = new BufferPoolManager(64, dm1);
+        BTreeIndex index1 = new BTreeIndex(name, bp1, true);
+        index1.insert(42L, new BTreePage.RID(1, 1));
+        bp1.close();
+
+        DiskManager dm2 = new DiskManager(tempDir.toString());
+        BufferPoolManager bp2 = new BufferPoolManager(64, dm2);
+        openPools.add(bp2);
+        BTreeIndex index2 = new BTreeIndex(name, bp2);
+        assertTrue(index2.isUnique(), "Index should retain isUnique flag across reloads");
+
+        assertThrows(
+            UniqueConstraintViolationException.class,
+            () -> index2.insert(42L, new BTreePage.RID(2, 2))
+        );
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void uniqueIndexConcurrentInserts() throws Exception {
+        BTreeIndex index = new BTreeIndex("uq_concurrent", newBufferPool(64), true);
+        int threadCount = 20;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+        java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(threadCount);
+        java.util.concurrent.atomic.AtomicInteger successes = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger violations = new java.util.concurrent.atomic.AtomicInteger();
+
+        List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threadCount; i++) {
+            final int slot = i;
+            futures.add(pool.submit(() -> {
+                try {
+                    barrier.await();
+                    index.insert(777L, new BTreePage.RID(10, slot));
+                    successes.incrementAndGet();
+                } catch (UniqueConstraintViolationException e) {
+                    violations.incrementAndGet();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        for (java.util.concurrent.Future<?> f : futures) {
+            f.get();
+        }
+        pool.shutdown();
+
+        assertEquals(1, successes.get(), "Exactly one concurrent thread must succeed in inserting the unique key");
+        assertEquals(threadCount - 1, violations.get(), "All other concurrent threads must throw UniqueConstraintViolationException");
+        assertEquals(1, index.searchAll(777L).size());
+    }
+
+    private BufferPoolManager newBufferPool(int poolSize) {
+        DiskManager dm = new DiskManager(tempDir.toString());
+        BufferPoolManager bp = new BufferPoolManager(poolSize, dm);
+        openPools.add(bp);
+        return bp;
     }
 }

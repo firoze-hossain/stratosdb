@@ -429,12 +429,13 @@ public class StdWireServer {
             result = db().execute(sql);
         } catch (Exception e) {
             LOG.warn("Statement failed unexpectedly: {}", sql, e);
-            StdWireMessages.writeErrorResponse(out, e.getMessage());
+            String sqlState = e instanceof com.stratosdb.common.exceptions.StratosDBException sde ? sde.getSqlState() : "XX000";
+            StdWireMessages.writeErrorResponse(out, e.getMessage(), sqlState);
             return inTransaction;
         }
 
         if (!result.isSuccess()) {
-            StdWireMessages.writeErrorResponse(out, result.getError());
+            StdWireMessages.writeErrorResponse(out, result.getError(), result.getSqlState());
             // A failed statement inside an explicit transaction leaves it open
             // but poisoned - ExecutorEngine already tracks that internally;
             // from the wire client's point of view it's still "in a transaction".

@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 96 |
-| Tests passing | **434 / 434** |
+| Commits | 97 |
+| Tests passing | **451 / 451** |
 | Main source | ~30,991 lines |
 | Test source | ~13,925 lines |
 
@@ -971,6 +971,45 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Added direct meta-command verification in `StdSqlTest.java` and `StdWireServerTest.java` verifying `\d`, `\dt`, `\d <tablename>`, `\l`, and tab completion.
   - Full reactor test suite verified at **434 / 434 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped due to optional external dependencies).
   - Updated `StratosDB_6Month_Project_Plan.xlsx` Sheet 2 (Sprint 3, Week 06 marked `Completed`).
+
+## 6-Month Roadmap — Sprint 4, Week 07: Primary Key & Unique Constraint Enforcement ✅ DONE
+
+- ✅ **Exceptions, SQLSTATEs & Wire Protocol Error Propagation (`UniqueConstraintViolationException.java`)**:
+  - Implemented `UniqueConstraintViolationException` (subclass of `StratosDBException`) carrying standard ANSI/ISO SQLSTATE `23505` (`unique_violation`) and standard error code `23505`.
+  - Enriched `QueryResult` with explicit SQLSTATE transmission and embedded exception reference.
+  - Updated `StdWireMessages`, `StdWireServer`, and `ExtendedProtocolHandler` to transmit `C` error field with SQLSTATE `23505` over wire protocol responses.
+- ✅ **Unique B+Tree Index Implementation (`BTreeIndex.java`)**:
+  - Added `isUnique()` to `KeyValueIndex` contract.
+  - Implemented `unique` index mode in `BTreeIndex` with durable metadata persistence in Page 0 header (`META_FLAGS_OFFSET = 36`).
+  - Implemented atomic duplicate validation inside the write lock during `insertInternal`, preventing race conditions during concurrent insertions.
+  - Added unit and concurrent race tests in `BTreeIndexTest` (30 tests passing, including 20 concurrent threads racing on identical keys).
+- ✅ **Grammar and SQL Parser Extensions (`StratosSQL.g4`, `SqlParser.java`)**:
+  - Added parser tokens and AST nodes for inline column constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`.
+  - Added support for table-level constraints: `[CONSTRAINT name] (PRIMARY KEY | UNIQUE) (col, ...)`.
+  - Added support for `CREATE [UNIQUE] INDEX ... ON table (col)`.
+- ✅ **Execution Engine Integration & MVCC Isolation (`ExecutorEngine.java`)**:
+  - Automatic creation of backing unique `BTreeIndex` instances for all declared `PRIMARY KEY` and `UNIQUE` constraints during `CREATE TABLE`.
+  - Automatic unique index creation and pre-validation against visible existing rows in `CREATE UNIQUE INDEX`.
+  - Implemented `checkUniqueConstraints` with full MVCC awareness: evaluates candidate unique keys, ignoring aborted transaction rows (`isAborted(xmin)`), committed deletes (`isCommitted(xmax)`), and self-row versions during non-key `UPDATE` statements.
+  - Integrated DML undo management (`abortTransaction`) on `ROLLBACK` and transaction failure, reversing heap updates and removing index entries via `maintainIndexesOnDelete`.
+- ✅ **Comprehensive Test Suite & Verification**:
+  - Created `ConstraintEnforcementTest.java` (14 comprehensive tests):
+    - Inline PRIMARY KEY duplicate rejection.
+    - Table-level PRIMARY KEY duplicate rejection.
+    - Inline UNIQUE column duplicate rejection.
+    - Table-level UNIQUE constraint duplicate rejection.
+    - Explicit named constraint syntax duplicate rejection.
+    - CREATE UNIQUE INDEX duplicate rejection.
+    - Pre-validation rejection when creating UNIQUE INDEX on existing duplicate data.
+    - UPDATE duplicate key rejection.
+    - UPDATE non-key column success without false self-collision.
+    - Key reinsertion after DELETE.
+    - Key reuse and index cleanup after transaction ROLLBACK.
+    - 20-thread concurrent race on PRIMARY KEY insertion (exactly 1 succeeds, 19 rejected with SQLSTATE 23505).
+    - 20-thread concurrent race on UNIQUE column insertion (exactly 1 succeeds, 19 rejected with SQLSTATE 23505).
+    - Real socket-level wire protocol verification of ErrorResponse message `'E'` with SQLSTATE `23505`.
+  - Full reactor test suite verified at **451 / 451 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sheet 2 (Row 11) marked `Completed`, Sheet 5 (Row 10) marked `Passed`, Sheet 3 (Row 24) updated to reflect implemented status.
 
 ## What to do next
 

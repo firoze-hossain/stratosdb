@@ -202,7 +202,7 @@ final class ExtendedProtocolHandler {
         QueryResult result = portal.result();
         if (!result.isSuccess()) {
             inErrorState = true;
-            StdWireMessages.writeErrorResponse(out, result.getError());
+            StdWireMessages.writeErrorResponse(out, result.getError(), result.getSqlState());
             out.flush();
             return inTransaction;
         }
