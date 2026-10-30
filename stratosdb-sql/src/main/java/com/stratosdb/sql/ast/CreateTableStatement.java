@@ -15,11 +15,17 @@ public record CreateTableStatement(
     String tableName,
     List<ColumnDefinition> columns,
     List<String> primaryKeyColumns,
-    List<TableConstraint> uniqueConstraints
+    List<TableConstraint> uniqueConstraints,
+    List<ForeignKeyDefinition> foreignKeys,
+    List<CheckConstraintDefinition> checkConstraints
 ) implements Statement {
     public record TableConstraint(String name, String type, List<String> columns) {}
 
     public CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns) {
-        this(tableName, columns, primaryKeyColumns, List.of());
+        this(tableName, columns, primaryKeyColumns, List.of(), List.of(), List.of());
+    }
+
+    public CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns, List<TableConstraint> uniqueConstraints) {
+        this(tableName, columns, primaryKeyColumns, uniqueConstraints, List.of(), List.of());
     }
 }

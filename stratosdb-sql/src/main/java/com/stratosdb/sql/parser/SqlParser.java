@@ -382,6 +382,8 @@ public class SqlParser {
     private CreateTableStatement buildCreateTable(StratosSQLParser.CreateTableContext ctx) {
         String tableName = ctx.tableName().getText();
         List<ColumnDefinition> columns = new ArrayList<>();
+        List<ForeignKeyDefinition> foreignKeys = new ArrayList<>();
+        List<CheckConstraintDefinition> checkConstraints = new ArrayList<>();
 
         for (StratosSQLParser.ColumnDefContext colCtx : ctx.columnDef()) {
             String name = colCtx.columnName().getText();
@@ -406,6 +408,27 @@ public class SqlParser {
                     if (cCtx.DEFAULT() != null && cCtx.defaultValue() != null) {
                         defaultValue = cCtx.defaultValue().getText();
                     }
+                    if (cCtx.REFERENCES() != null) {
+                        String fkName = cCtx.constraintName() != null ? cCtx.constraintName().getText() : tableName + "_" + name + "_fkey";
+                        String parentTable = cCtx.tableName().getText();
+                        List<String> parentCols = cCtx.columnName() != null ? List.of(cCtx.columnName().getText()) : List.of();
+                        ForeignKeyDefinition.ActionType onDelete = ForeignKeyDefinition.ActionType.RESTRICT;
+                        ForeignKeyDefinition.ActionType onUpdate = ForeignKeyDefinition.ActionType.RESTRICT;
+                        for (StratosSQLParser.FkActionContext actCtx : cCtx.fkAction()) {
+                            if (actCtx.DELETE() != null) {
+                                onDelete = parseFkActionType(actCtx.fkActionType());
+                            } else if (actCtx.UPDATE() != null) {
+                                onUpdate = parseFkActionType(actCtx.fkActionType());
+                            }
+                        }
+                        foreignKeys.add(new ForeignKeyDefinition(fkName, tableName, List.of(name), parentTable, parentCols, onDelete, onUpdate));
+                    }
+                    if (cCtx.CHECK() != null && cCtx.expression() != null) {
+                        String chkName = cCtx.constraintName() != null ? cCtx.constraintName().getText() : tableName + "_" + name + "_check";
+                        WhereExpr expr = buildWhereExpr(cCtx.expression());
+                        String exprSql = cCtx.expression().getText();
+                        checkConstraints.add(new CheckConstraintDefinition(chkName, exprSql, expr));
+                    }
                 }
             }
             columns.add(new ColumnDefinition(name, type, notNull, defaultValue, primaryKey, isUnique));
@@ -417,20 +440,65 @@ public class SqlParser {
         if (ctx.tableConstraint() != null) {
             for (StratosSQLParser.TableConstraintContext tcCtx : ctx.tableConstraint()) {
                 String cName = tcCtx.constraintName() != null ? tcCtx.constraintName().getText() : null;
-                List<String> cols = new ArrayList<>();
-                for (StratosSQLParser.ColumnNameContext colNameCtx : tcCtx.columnName()) {
-                    cols.add(colNameCtx.getText());
-                }
                 if (tcCtx.PRIMARY() != null) {
+                    List<String> cols = extractColumns(tcCtx.columnNameList(0));
                     primaryKeyColumns.addAll(cols);
                     tableConstraints.add(new CreateTableStatement.TableConstraint(cName, "PRIMARY KEY", cols));
                 } else if (tcCtx.UNIQUE() != null) {
+                    List<String> cols = extractColumns(tcCtx.columnNameList(0));
                     tableConstraints.add(new CreateTableStatement.TableConstraint(cName, "UNIQUE", cols));
+                } else if (tcCtx.FOREIGN() != null) {
+                    List<String> childCols = extractColumns(tcCtx.childCols);
+                    String fkName = cName != null ? cName : tableName + "_" + String.join("_", childCols) + "_fkey";
+                    String parentTable = tcCtx.tableName().getText();
+                    List<String> parentCols = tcCtx.parentCols != null ? extractColumns(tcCtx.parentCols) : List.of();
+                    ForeignKeyDefinition.ActionType onDelete = ForeignKeyDefinition.ActionType.RESTRICT;
+                    ForeignKeyDefinition.ActionType onUpdate = ForeignKeyDefinition.ActionType.RESTRICT;
+                    for (StratosSQLParser.FkActionContext actCtx : tcCtx.fkAction()) {
+                        if (actCtx.DELETE() != null) {
+                            onDelete = parseFkActionType(actCtx.fkActionType());
+                        } else if (actCtx.UPDATE() != null) {
+                            onUpdate = parseFkActionType(actCtx.fkActionType());
+                        }
+                    }
+                    foreignKeys.add(new ForeignKeyDefinition(fkName, tableName, childCols, parentTable, parentCols, onDelete, onUpdate));
+                } else if (tcCtx.CHECK() != null && tcCtx.expression() != null) {
+                    String chkName = cName != null ? cName : tableName + "_check";
+                    WhereExpr expr = buildWhereExpr(tcCtx.expression());
+                    String exprSql = tcCtx.expression().getText();
+                    checkConstraints.add(new CheckConstraintDefinition(chkName, exprSql, expr));
                 }
             }
         }
 
-        return new CreateTableStatement(tableName, columns, primaryKeyColumns, tableConstraints);
+        return new CreateTableStatement(tableName, columns, primaryKeyColumns, tableConstraints, foreignKeys, checkConstraints);
+    }
+
+    private List<String> extractColumns(StratosSQLParser.ColumnNameListContext ctx) {
+        List<String> cols = new ArrayList<>();
+        if (ctx != null && ctx.columnName() != null) {
+            for (StratosSQLParser.ColumnNameContext c : ctx.columnName()) {
+                cols.add(c.getText());
+            }
+        }
+        return cols;
+    }
+
+    private ForeignKeyDefinition.ActionType parseFkActionType(StratosSQLParser.FkActionTypeContext ctx) {
+        if (ctx == null) return ForeignKeyDefinition.ActionType.RESTRICT;
+        if (ctx.CASCADE() != null) return ForeignKeyDefinition.ActionType.CASCADE;
+        if (ctx.SET() != null) return ForeignKeyDefinition.ActionType.SET_NULL;
+        if (ctx.RESTRICT() != null) return ForeignKeyDefinition.ActionType.RESTRICT;
+        return ForeignKeyDefinition.ActionType.NO_ACTION;
+    }
+
+    public WhereExpr parseWhereExpression(String exprSql) {
+        if (exprSql == null || exprSql.isBlank()) return null;
+        CharStream charStream = CharStreams.fromString(exprSql);
+        StratosSQLLexer lexer = new StratosSQLLexer(charStream);
+        CommonTokenStream tokens = new CommonTokenStream(lexer);
+        StratosSQLParser parser = new StratosSQLParser(tokens);
+        return buildWhereExpr(parser.expression());
     }
 
     private InsertStatement buildInsert(StratosSQLParser.InsertContext ctx) {

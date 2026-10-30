@@ -101,7 +101,20 @@ plpgsqlExpr: plpgsqlExpr op=(STAR | DIVIDE) plpgsqlExpr                    #Plpg
 
 // DDL
 createTable: CREATE TABLE tableName LPAREN (columnDef | tableConstraint) (COMMA (columnDef | tableConstraint))* RPAREN SEMICOLON?;
-tableConstraint: (CONSTRAINT constraintName)? (PRIMARY KEY | UNIQUE) LPAREN columnName (COMMA columnName)* RPAREN;
+tableConstraint: (CONSTRAINT constraintName)? PRIMARY KEY LPAREN columnNameList RPAREN
+               | (CONSTRAINT constraintName)? UNIQUE LPAREN columnNameList RPAREN
+               | (CONSTRAINT constraintName)? FOREIGN KEY LPAREN childCols=columnNameList RPAREN REFERENCES tableName (LPAREN parentCols=columnNameList RPAREN)? fkAction*
+               | (CONSTRAINT constraintName)? CHECK LPAREN expression RPAREN
+               ;
+columnNameList: columnName (COMMA columnName)*;
+fkAction: ON DELETE fkActionType
+        | ON UPDATE fkActionType
+        ;
+fkActionType: CASCADE
+            | RESTRICT
+            | SET NULL
+            | NO ACTION
+            ;
 constraintName: IDENTIFIER;
 createIndex: CREATE (UNIQUE)? INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
 dropTable: DROP TABLE tableName SEMICOLON?;
@@ -209,6 +222,8 @@ columnConstraint: NOT NULL
                 | PRIMARY KEY
                 | UNIQUE
                 | DEFAULT defaultValue
+                | (CONSTRAINT constraintName)? REFERENCES tableName (LPAREN columnName RPAREN)? fkAction*
+                | (CONSTRAINT constraintName)? CHECK LPAREN expression RPAREN
                 ;
 assignment: columnName ASSIGN literal;
 orderList: orderItem (COMMA orderItem)*;
@@ -482,6 +497,12 @@ TRANSACTION: T R A N S A C T I O N;
 PRIMARY: P R I M A R Y;
 UNIQUE: U N I Q U E;
 CONSTRAINT: C O N S T R A I N T;
+FOREIGN: F O R E I G N;
+REFERENCES: R E F E R E N C E S;
+CASCADE: C A S C A D E;
+RESTRICT: R E S T R I C T;
+NO: N O;
+ACTION: A C T I O N;
 RETURNING: R E T U R N I N G;
 KEY: K E Y;
 ISOLATION: I S O L A T I O N;

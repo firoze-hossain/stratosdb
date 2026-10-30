@@ -7,9 +7,9 @@
 | | |
 |---|---|
 | Commits | 97 |
-| Tests passing | **451 / 451** |
-| Main source | ~30,991 lines |
-| Test source | ~13,925 lines |
+| Tests passing | **471 / 471** |
+| Main source | ~31,650 lines |
+| Test source | ~14,250 lines |
 
 | Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. Last round: a complete, from-scratch rewrite of `stratosdb-jdbc` after discovering it spoke a dead, disconnected protocol the real, current server (`StdWireServer`) could never understand at all. This round: a direct continuation, from actually integrating a real GUI tool (DBNavigator) against the rewritten driver - a real, end-to-end test using DBNavigator's own unmodified `ConnectionProfile`/`JdbcClient` classes found two further, real gaps no driver-level test alone could have caught. First, a real URL-handling gap: the driver never parsed a real `?key=value` query string out of the connection URL (the same convention every other mainstream JDBC driver's URL already supports), so a tool embedding `ssl=true` there - as DBNavigator, like most tools, does - would have had it silently never reach the driver at all. Second, and more serious: `setReadOnly()` threw for any caller, and real connection pools - HikariCP among them, this is standard, widespread pool behavior - call it unconditionally on every fresh connection as part of their own standard setup, meaning a real pool could never even finish initializing against this driver, a silent, total failure invisible to every existing test. Both fixed, with a new, permanent regression test that drives the driver through a real `HikariDataSource` directly so this exact class of bug can't reappear unnoticed - verified conclusively by compiling DBNavigator's own real backend classes against a real HikariCP and Jackson and running real `CREATE TABLE`/`INSERT`/`SELECT` through a real pooled connection to a real, running server. Full regression suite reconfirmed at 374/374 (up from 373 - one new test) - see PROGRESS.md |
 
@@ -1010,6 +1010,63 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Real socket-level wire protocol verification of ErrorResponse message `'E'` with SQLSTATE `23505`.
   - Full reactor test suite verified at **451 / 451 tests passing across all 12 modules** (0 failures, 0 errors).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sheet 2 (Row 11) marked `Completed`, Sheet 5 (Row 10) marked `Passed`, Sheet 3 (Row 24) updated to reflect implemented status.
+
+## Sprint 4 Week 08 — Foreign Key Referential Integrity Engine, Cascading Actions, NOT NULL & CHECK Constraints ✅ DONE
+
+- ✅ **Standard ANSI SQLSTATE Exceptions (`stratosdb-common`)**:
+  - Added constants to `ErrorCodes.java`:
+    - `NOT_NULL_VIOLATION = 23502`
+    - `FOREIGN_KEY_VIOLATION = 23503`
+    - `CHECK_VIOLATION = 23514`
+  - Created `ForeignKeyViolationException.java` with SQLSTATE `23503`.
+  - Created `NotNullViolationException.java` with SQLSTATE `23502`.
+  - Created `CheckViolationException.java` with SQLSTATE `23514`.
+- ✅ **Grammar and SQL Parser Extensions (`stratosdb-sql`)**:
+  - Added ANTLR tokens: `FOREIGN`, `REFERENCES`, `CASCADE`, `RESTRICT`, `NO`, `ACTION`.
+  - Added column constraint rules in `StratosSQL.g4` for `REFERENCES tableName [(col)] [fkAction*]` and `CHECK (expr)`.
+  - Added table constraint rules for `FOREIGN KEY (childCols) REFERENCES tableName [(parentCols)] [fkAction*]` and `CHECK (expr)`.
+  - Created AST records `ForeignKeyDefinition.java` (with `ActionType`: `CASCADE`, `RESTRICT`, `SET_NULL`, `NO_ACTION`) and `CheckConstraintDefinition.java`.
+  - Updated `SqlParser.java` to parse inline and table-level foreign keys, actions, and standalone CHECK expressions into AST structures.
+- ✅ **Execution Engine Referential Integrity & Constraint Enforcement (`ExecutorEngine.java`)**:
+  - Enforced `NOT NULL` constraints on `INSERT` and `UPDATE`, rejecting nulls with SQLSTATE `23502` (`NotNullViolationException`).
+  - Enforced `CHECK` constraints on `INSERT` and `UPDATE` with standard SQL 3-valued logic (`TRUE`, `FALSE`, `UNKNOWN`), allowing null operand values to pass and rejecting false evaluation with SQLSTATE `23514` (`CheckViolationException`).
+  - Enforced `FOREIGN KEY` constraints on child `INSERT` and `UPDATE`, rejecting orphan rows with SQLSTATE `23503` (`ForeignKeyViolationException`).
+  - Supported standard SQL `MATCH SIMPLE` behavior where NULL child foreign key column values are allowed when nullable.
+  - Accelerated foreign key existence checks via backing primary key / unique B+Tree indexes with full MVCC table scan fallback.
+  - Implemented referential integrity actions:
+    - `ON DELETE RESTRICT` / `NO ACTION` (default): blocks deletion of referenced parent rows with SQLSTATE `23503`.
+    - `ON DELETE CASCADE`: atomically deletes referencing child rows in the same transaction, supporting multi-level recursive cascading (e.g., grandparent -> parent -> child).
+    - `ON DELETE SET NULL`: atomically updates referencing child columns to NULL with constraint re-validation.
+    - `ON UPDATE CASCADE`: atomically updates referencing child rows when parent primary/unique key values change.
+    - `ON UPDATE SET NULL`: sets child foreign key columns to NULL when parent keys change.
+    - `ON UPDATE RESTRICT`: blocks parent key modifications when child references exist.
+    - `DROP TABLE` dependency check: rejects dropping a parent table when foreign key constraints in other tables depend on it (SQLSTATE `2BP01`).
+    - Integrated with DML undo actions (`UndoDelete`, `UndoUpdate`) and transaction rollbacks (`ROLLBACK` / `abortTransaction`), ensuring atomicity across cascading mutations.
+    - Persisted foreign keys, check expressions, and not null definitions into relational `SystemCatalog` (`stratos_constraints`), restoring them across database restarts.
+- ✅ **Comprehensive Test Suite & Verification (`ForeignKeyAndCheckConstraintTest.java`)**:
+  - 20 comprehensive unit, end-to-end, and socket wire protocol tests:
+    - NOT NULL constraint on INSERT (SQLSTATE 23502).
+    - NOT NULL constraint on UPDATE (SQLSTATE 23502).
+    - CHECK constraint on INSERT (SQLSTATE 23514).
+    - CHECK constraint nullable column NULL acceptance (3-valued logic).
+    - CHECK constraint on UPDATE (SQLSTATE 23514).
+    - Foreign key orphan insert blocked (SQLSTATE 23503).
+    - Foreign key nullable child allowed.
+    - Foreign key orphan update in child table blocked (SQLSTATE 23503).
+    - Foreign key ON DELETE RESTRICT by default blocks parent delete.
+    - Foreign key ON DELETE CASCADE deletes child rows atomically in same transaction.
+    - Foreign key multi-level cascading DELETE (grandparent -> parent -> child).
+    - Foreign key ON DELETE SET NULL updates child foreign key column to NULL.
+    - Foreign key ON UPDATE CASCADE cascades parent key change to child rows.
+    - Foreign key ON UPDATE SET NULL sets child foreign key column to NULL.
+    - Foreign key ON UPDATE RESTRICT blocks parent key change.
+    - Foreign key transaction ROLLBACK atomicity across cascading mutations.
+    - DROP TABLE blocked by dependent foreign key constraints.
+    - Table-level foreign key and check syntax execution.
+    - System catalog constraint restoration on database restart.
+    - Wire protocol socket test verifying ErrorResponse message `'E'` with SQLSTATEs `23502`, `23514`, and `23503`.
+  - Full reactor test suite verified at **471 / 471 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sheet 2 (Row 12) marked `Completed`, Sheet 5 (Row 9) marked `Passed`, Sheet 3 (Row 24) updated to reflect implemented status.
 
 ## What to do next
 

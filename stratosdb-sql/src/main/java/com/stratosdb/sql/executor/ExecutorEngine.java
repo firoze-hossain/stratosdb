@@ -59,6 +59,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * further work, named honestly rather than silently assumed.
      */
     private final Map<String, List<String>> tablePrimaryKeys = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> tableNotNullColumns = new ConcurrentHashMap<>();
+    private final Map<String, List<CheckConstraintDefinition>> tableCheckConstraints = new ConcurrentHashMap<>();
+    private final Map<String, List<ForeignKeyDefinition>> tableForeignKeys = new ConcurrentHashMap<>();
     private RoleCredentialSink roleCredentialSink;
 
     public record Role(String name, boolean login, boolean superuser) {}
@@ -604,6 +607,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (columnLoaded.defaultValue() != null && !columnLoaded.defaultValue().isEmpty()) {
                     tableColumnDefaults.computeIfAbsent(tableName, k -> new HashMap<>()).put(columnLoaded.columnName(), columnLoaded.defaultValue());
                 }
+                if (!columnLoaded.nullable()) {
+                    tableNotNullColumns.computeIfAbsent(tableName, k -> ConcurrentHashMap.newKeySet()).add(columnLoaded.columnName());
+                }
             },
             indexLoaded -> {
                 boolean isPrimary = indexLoaded.indexName().endsWith("_pkey") || tablePrimaryKeys.getOrDefault(indexLoaded.tableName(), List.of()).contains(indexLoaded.columnName());
@@ -622,10 +628,33 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
             },
             constraintLoaded -> {
-                if ("PRIMARY KEY".equalsIgnoreCase(constraintLoaded.constraintType())) {
-                    String def = constraintLoaded.definition();
+                String cType = constraintLoaded.constraintType();
+                String tableName = constraintLoaded.tableName();
+                String def = constraintLoaded.definition();
+                if ("PRIMARY KEY".equalsIgnoreCase(cType)) {
                     if (def != null && !def.isEmpty()) {
-                        tablePrimaryKeys.put(constraintLoaded.tableName(), Arrays.asList(def.split(",")));
+                        tablePrimaryKeys.put(tableName, Arrays.asList(def.split(",")));
+                    }
+                } else if ("CHECK".equalsIgnoreCase(cType)) {
+                    if (def != null && !def.isEmpty()) {
+                        try {
+                            WhereExpr expr = parser.parseWhereExpression(def);
+                            tableCheckConstraints.computeIfAbsent(tableName, k -> new ArrayList<>())
+                                .add(new CheckConstraintDefinition(constraintLoaded.constraintName(), def, expr));
+                        } catch (Exception e) {
+                            LOG.warn("Failed to restore CHECK constraint {}: {}", constraintLoaded.constraintName(), e.getMessage());
+                        }
+                    }
+                } else if ("FOREIGN KEY".equalsIgnoreCase(cType)) {
+                    if (def != null && !def.isEmpty()) {
+                        try {
+                            ForeignKeyDefinition fk = deserializeForeignKey(constraintLoaded.constraintName(), tableName, def);
+                            if (fk != null) {
+                                tableForeignKeys.computeIfAbsent(tableName, k -> new ArrayList<>()).add(fk);
+                            }
+                        } catch (Exception e) {
+                            LOG.warn("Failed to restore FOREIGN KEY constraint {}: {}", constraintLoaded.constraintName(), e.getMessage());
+                        }
                     }
                 }
             }
@@ -888,14 +917,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
             return QueryResult.error("Deadlock detected, transaction aborted: " + e.getMessage());
-        } catch (UniqueConstraintViolationException e) {
+        } catch (UniqueConstraintViolationException | com.stratosdb.common.exceptions.ForeignKeyViolationException
+                 | com.stratosdb.common.exceptions.CheckViolationException
+                 | com.stratosdb.common.exceptions.NotNullViolationException e) {
             if (explicit) {
                 state.poisoned = true;
             } else {
                 abortTransaction(state, txn);
             }
-            LOG.warn("Statement failed (unique constraint violation): {} - {}", sql, e.getMessage());
-            return QueryResult.error(e.getMessage(), e.getSqlState(), e);
+            LOG.warn("Statement failed (constraint violation): {} - {}", sql, e.getMessage());
+            return QueryResult.error(e.getMessage(), ((com.stratosdb.common.exceptions.StratosDBException) e).getSqlState(), e);
         } catch (IllegalStateException | IllegalArgumentException e) {
             // A known, expected validation/limitation failure - the
             // established convention throughout this codebase for "this
@@ -2190,6 +2221,49 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
 
         String createdTable = stmt.tableName();
+
+        Set<String> notNullCols = tableNotNullColumns.computeIfAbsent(createdTable, k -> ConcurrentHashMap.newKeySet());
+        for (ColumnDefinition col : stmt.columns()) {
+            if (col.notNull() || primaryKeyColumns.contains(col.name())) {
+                notNullCols.add(col.name());
+            }
+        }
+
+        if (stmt.checkConstraints() != null && !stmt.checkConstraints().isEmpty()) {
+            List<CheckConstraintDefinition> checks = tableCheckConstraints.computeIfAbsent(createdTable, k -> new ArrayList<>());
+            for (CheckConstraintDefinition chk : stmt.checkConstraints()) {
+                checks.add(chk);
+                systemCatalog.insertConstraint(chk.name(), createdTable, "CHECK", chk.expressionSql(), xid);
+            }
+        }
+
+        if (stmt.foreignKeys() != null && !stmt.foreignKeys().isEmpty()) {
+            List<ForeignKeyDefinition> fks = tableForeignKeys.computeIfAbsent(createdTable, k -> new ArrayList<>());
+            for (ForeignKeyDefinition fk : stmt.foreignKeys()) {
+                if (!tables.containsKey(fk.parentTable()) && !createdTable.equalsIgnoreCase(fk.parentTable())) {
+                    return QueryResult.error("referenced relation \"" + fk.parentTable() + "\" does not exist");
+                }
+                List<String> parentCols = fk.parentColumns();
+                if (parentCols == null || parentCols.isEmpty()) {
+                    List<String> parentPks = tablePrimaryKeys.get(fk.parentTable());
+                    if (parentPks == null || parentPks.isEmpty()) {
+                        if (createdTable.equalsIgnoreCase(fk.parentTable()) && !primaryKeyColumns.isEmpty()) {
+                            parentPks = primaryKeyColumns;
+                        }
+                    }
+                    if (parentPks == null || parentPks.isEmpty()) {
+                        return QueryResult.error("there is no primary key or unique constraint on relation \"" + fk.parentTable() + "\" for referenced columns");
+                    }
+                    parentCols = parentPks;
+                }
+                ForeignKeyDefinition normalizedFk = new ForeignKeyDefinition(
+                    fk.name(), createdTable, fk.childColumns(), fk.parentTable(), parentCols, fk.onDelete(), fk.onUpdate()
+                );
+                fks.add(normalizedFk);
+                systemCatalog.insertConstraint(normalizedFk.name(), createdTable, "FOREIGN KEY", serializeForeignKey(normalizedFk), xid);
+            }
+        }
+
         recordDdlUndo(() -> {
             tables.remove(createdTable);
             tableColumns.remove(createdTable);
@@ -2197,6 +2271,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             tableColumnTypes.remove(createdTable);
             tableOwners.remove(createdTable);
             tablePrimaryKeys.remove(createdTable);
+            tableNotNullColumns.remove(createdTable);
+            tableCheckConstraints.remove(createdTable);
+            tableForeignKeys.remove(createdTable);
             for (String idxName : createdIndexNames) {
                 indexesByName.remove(idxName);
                 catalogLines.remove("INDEX:" + idxName);
@@ -2745,6 +2822,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (beforeError != null) {
             return QueryResult.error(beforeError);
         }
+
+        // Validate NOT NULL constraints
+        checkNotNullConstraints(tableName, tuple);
+
+        // Validate CHECK constraints
+        checkCheckConstraints(tableName, tuple, txn);
+
+        // Validate FOREIGN KEY constraints
+        checkForeignKeyConstraintsOnInsertOrUpdate(tableName, tuple, txn);
 
         // Validate PRIMARY KEY and UNIQUE constraints via backing unique indexes
         checkUniqueConstraints(tableName, tuple, -1, -1, txn);
@@ -4256,9 +4342,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             Object val = findColumnValue(tuple, idx.columnName());
             if (val == null) {
                 if (idx.isPrimary()) {
-                    throw new com.stratosdb.common.exceptions.StratosDBException(
-                        "null value in column \"" + idx.columnName() + "\" violates not-null constraint",
-                        com.stratosdb.common.constants.ErrorCodes.ERROR);
+                    throw new com.stratosdb.common.exceptions.NotNullViolationException(
+                        tableName, idx.columnName(),
+                        "null value in column \"" + idx.columnName() + "\" of relation \"" + tableName + "\" violates not-null constraint");
                 }
                 continue;
             }
@@ -4298,6 +4384,399 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     }
                 }
             }
+        }
+    }
+
+    private void checkNotNullConstraints(String tableName, Tuple tuple) {
+        Set<String> notNulls = tableNotNullColumns.get(tableName);
+        if (notNulls == null || notNulls.isEmpty()) return;
+        for (String col : notNulls) {
+            Object val = findColumnValue(tuple, col);
+            if (val == null) {
+                throw new com.stratosdb.common.exceptions.NotNullViolationException(
+                    tableName, col,
+                    "null value in column \"" + col + "\" of relation \"" + tableName + "\" violates not-null constraint"
+                );
+            }
+        }
+    }
+
+    private void checkCheckConstraints(String tableName, Tuple tuple, Transaction txn) {
+        List<CheckConstraintDefinition> checks = tableCheckConstraints.get(tableName);
+        if (checks == null || checks.isEmpty()) return;
+        for (CheckConstraintDefinition chk : checks) {
+            if (chk.expression() != null) {
+                Boolean res = evaluateCheckThreeValued(tuple, chk.expression(), txn);
+                if (Boolean.FALSE.equals(res)) {
+                    throw new com.stratosdb.common.exceptions.CheckViolationException(
+                        tableName, chk.name(),
+                        "new row for relation \"" + tableName + "\" violates check constraint \"" + chk.name() + "\""
+                    );
+                }
+            }
+        }
+    }
+
+    private Boolean evaluateCheckThreeValued(Tuple row, WhereExpr expr, Transaction txn) {
+        if (expr instanceof WhereExpr.BooleanLiteral bool) {
+            return bool.value();
+        }
+        if (expr instanceof WhereExpr.And and) {
+            Boolean left = evaluateCheckThreeValued(row, and.left(), txn);
+            Boolean right = evaluateCheckThreeValued(row, and.right(), txn);
+            if (Boolean.FALSE.equals(left) || Boolean.FALSE.equals(right)) {
+                return false;
+            }
+            if (left == null || right == null) {
+                return null;
+            }
+            return left && right;
+        }
+        if (expr instanceof WhereExpr.Or or) {
+            Boolean left = evaluateCheckThreeValued(row, or.left(), txn);
+            Boolean right = evaluateCheckThreeValued(row, or.right(), txn);
+            if (Boolean.TRUE.equals(left) || Boolean.TRUE.equals(right)) {
+                return true;
+            }
+            if (left == null || right == null) {
+                return null;
+            }
+            return left || right;
+        }
+        if (expr instanceof WhereExpr.Not not) {
+            Boolean inner = evaluateCheckThreeValued(row, not.inner(), txn);
+            if (inner == null) return null;
+            return !inner;
+        }
+        if (expr instanceof WhereExpr.Comparison cmp) {
+            Object val = resolveColumnValue(row, cmp.column(), null);
+            if (val == null) {
+                return null;
+            }
+            WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), cmp.literal());
+            return evaluatePredicate(val.toString(), pred);
+        }
+        if (expr instanceof WhereExpr.ColumnComparison colCmp) {
+            Object left = resolveColumnValue(row, colCmp.leftColumn(), null);
+            Object right = resolveColumnValue(row, colCmp.rightColumn(), null);
+            if (left == null || right == null) {
+                return null;
+            }
+            return compareValues(left, colCmp.operator(), right);
+        }
+        if (expr instanceof WhereExpr.InList inList) {
+            Object val = resolveColumnValue(row, inList.column(), null);
+            if (val == null) return null;
+            boolean found = false;
+            for (String literalText : inList.values()) {
+                if (compareValues(val, "=", stripQuotes(literalText))) {
+                    found = true;
+                    break;
+                }
+            }
+            return inList.negated() != found;
+        }
+        try {
+            return evaluateWhereExpr(row, expr, txn, null);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void checkForeignKeyConstraintsOnInsertOrUpdate(String tableName, Tuple tuple, Transaction txn) {
+        List<ForeignKeyDefinition> fks = tableForeignKeys.get(tableName);
+        if (fks == null || fks.isEmpty()) return;
+
+        for (ForeignKeyDefinition fk : fks) {
+            List<String> childCols = fk.childColumns();
+            List<String> parentCols = fk.parentColumns();
+            if (childCols == null || childCols.isEmpty()) continue;
+
+            for (int i = 0; i < childCols.size(); i++) {
+                String childCol = childCols.get(i);
+                String parentCol = (parentCols != null && i < parentCols.size()) ? parentCols.get(i) : childCol;
+                Object val = findColumnValue(tuple, childCol);
+                if (val == null) {
+                    continue;
+                }
+                if (!parentRowExists(fk.parentTable(), parentCol, val, txn)) {
+                    throw new com.stratosdb.common.exceptions.ForeignKeyViolationException(
+                        tableName, fk.name(),
+                        "insert or update on table \"" + tableName + "\" violates foreign key constraint \"" + fk.name() + "\": Key (" + childCol + ")=(" + val + ") is not present in table \"" + fk.parentTable() + "\"."
+                    );
+                }
+            }
+        }
+    }
+
+    private boolean parentRowExists(String parentTable, String parentCol, Object value, Transaction txn) {
+        if (value == null) return true;
+        HeapTable pt = tables.get(parentTable);
+        if (pt == null) return false;
+
+        Long key = toIndexKey(value);
+        if (key != null) {
+            IndexEntry idx = findEqualityIndex(parentTable, parentCol);
+            if (idx != null && idx.index() instanceof BTreeIndex btree) {
+                List<BTreePage.RID> rids = btree.searchAll(key);
+                if (rids != null && !rids.isEmpty()) {
+                    for (BTreePage.RID rid : rids) {
+                        byte[] stored = pt.readTuple(rid.pageId(), rid.slot());
+                        if (stored != null) {
+                            if (MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
+                                Tuple pTuple = deserializeTuple(parentTable, MVCCVisibility.readPayload(stored));
+                                Object pVal = findColumnValue(pTuple, parentCol);
+                                if (Objects.equals(normalizeJoinKey(value), normalizeJoinKey(pVal))) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }
+                return false;
+            }
+        }
+
+        // Full MVCC table scan fallback
+        for (HeapTable.PositionedRow row : pt.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple pTuple = deserializeTuple(parentTable, MVCCVisibility.readPayload(row.stored()));
+            Object pVal = findColumnValue(pTuple, parentCol);
+            if (Objects.equals(normalizeJoinKey(value), normalizeJoinKey(pVal))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<ForeignKeyDefinition> getForeignKeysReferencingTable(String parentTable) {
+        List<ForeignKeyDefinition> result = new ArrayList<>();
+        for (Map.Entry<String, List<ForeignKeyDefinition>> entry : tableForeignKeys.entrySet()) {
+            for (ForeignKeyDefinition fk : entry.getValue()) {
+                if (parentTable.equalsIgnoreCase(fk.parentTable())) {
+                    result.add(fk);
+                }
+            }
+        }
+        return result;
+    }
+
+    private void handleParentRowDelete(String tableName, Tuple parentTuple, Transaction txn) throws DeadlockException {
+        List<ForeignKeyDefinition> referencingFks = getForeignKeysReferencingTable(tableName);
+        if (referencingFks.isEmpty()) return;
+
+        for (ForeignKeyDefinition fk : referencingFks) {
+            String childTable = fk.childTable();
+            HeapTable cTable = tables.get(childTable);
+            if (cTable == null) continue;
+
+            List<String> parentCols = fk.parentColumns();
+            List<String> childCols = fk.childColumns();
+
+            for (int i = 0; i < parentCols.size(); i++) {
+                String parentCol = parentCols.get(i);
+                String childCol = (i < childCols.size()) ? childCols.get(i) : parentCol;
+                Object parentVal = findColumnValue(parentTuple, parentCol);
+                if (parentVal == null) continue;
+
+                List<HeapTable.PositionedRow> matchingChildRows = new ArrayList<>();
+                List<Tuple> matchingChildTuples = new ArrayList<>();
+
+                for (HeapTable.PositionedRow crow : cTable.scanPositioned()) {
+                    if (!MVCCVisibility.isVisible(crow.stored(), txn.getSnapshot(), transactionManager)) {
+                        continue;
+                    }
+                    Tuple cTuple = deserializeTuple(childTable, MVCCVisibility.readPayload(crow.stored()));
+                    Object cVal = findColumnValue(cTuple, childCol);
+                    if (Objects.equals(normalizeJoinKey(cVal), normalizeJoinKey(parentVal))) {
+                        matchingChildRows.add(crow);
+                        matchingChildTuples.add(cTuple);
+                    }
+                }
+
+                if (matchingChildRows.isEmpty()) {
+                    continue;
+                }
+
+                ForeignKeyDefinition.ActionType action = fk.onDelete();
+                if (action == ForeignKeyDefinition.ActionType.RESTRICT || action == ForeignKeyDefinition.ActionType.NO_ACTION) {
+                    throw new com.stratosdb.common.exceptions.ForeignKeyViolationException(
+                        tableName, fk.name(),
+                        "update or delete on table \"" + tableName + "\" violates foreign key constraint \"" + fk.name() + "\" on table \"" + childTable + "\": Key (" + parentCol + ")=(" + parentVal + ") is still referenced from table \"" + childTable + "\"."
+                    );
+                } else if (action == ForeignKeyDefinition.ActionType.CASCADE) {
+                    for (int r = 0; r < matchingChildRows.size(); r++) {
+                        HeapTable.PositionedRow crow = matchingChildRows.get(r);
+                        Tuple cTuple = matchingChildTuples.get(r);
+                        cascadeDeleteChildRow(childTable, crow, cTuple, txn);
+                    }
+                } else if (action == ForeignKeyDefinition.ActionType.SET_NULL) {
+                    for (int r = 0; r < matchingChildRows.size(); r++) {
+                        HeapTable.PositionedRow crow = matchingChildRows.get(r);
+                        Tuple cTuple = matchingChildTuples.get(r);
+                        cascadeUpdateChildRow(childTable, childCol, null, crow, cTuple, txn);
+                    }
+                }
+            }
+        }
+    }
+
+    private void cascadeDeleteChildRow(String childTable, HeapTable.PositionedRow childRow, Tuple childTuple, Transaction txn) throws DeadlockException {
+        handleParentRowDelete(childTable, childTuple, txn);
+
+        HeapTable table = tables.get(childTable);
+        if (table == null) return;
+
+        boolean removed = table.deleteMvcc(childRow.pageId(), childRow.slot(), txn.getXID(),
+            txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
+        if (removed) {
+            long lsn = walManager.logDelete(childTable, txn.getXID(), childRow.pageId(), childRow.slot());
+            if (lsn > 0) table.setPageLSN(childRow.pageId(), lsn);
+            maintainIndexesOnDelete(childTable, childTuple, childRow.pageId(), childRow.slot());
+            recordUndo(new UndoAction.UndoDelete(childTable, childRow.pageId(), childRow.slot()));
+        }
+    }
+
+    private void handleParentRowUpdate(String tableName, Tuple oldTuple, Tuple newTuple, Transaction txn) throws DeadlockException {
+        List<ForeignKeyDefinition> referencingFks = getForeignKeysReferencingTable(tableName);
+        if (referencingFks.isEmpty()) return;
+
+        for (ForeignKeyDefinition fk : referencingFks) {
+            String childTable = fk.childTable();
+            HeapTable cTable = tables.get(childTable);
+            if (cTable == null) continue;
+
+            List<String> parentCols = fk.parentColumns();
+            List<String> childCols = fk.childColumns();
+
+            for (int i = 0; i < parentCols.size(); i++) {
+                String parentCol = parentCols.get(i);
+                String childCol = (i < childCols.size()) ? childCols.get(i) : parentCol;
+
+                Object oldVal = findColumnValue(oldTuple, parentCol);
+                Object newVal = findColumnValue(newTuple, parentCol);
+
+                if (Objects.equals(normalizeJoinKey(oldVal), normalizeJoinKey(newVal))) {
+                    continue;
+                }
+
+                List<HeapTable.PositionedRow> matchingChildRows = new ArrayList<>();
+                List<Tuple> matchingChildTuples = new ArrayList<>();
+
+                for (HeapTable.PositionedRow crow : cTable.scanPositioned()) {
+                    if (!MVCCVisibility.isVisible(crow.stored(), txn.getSnapshot(), transactionManager)) {
+                        continue;
+                    }
+                    Tuple cTuple = deserializeTuple(childTable, MVCCVisibility.readPayload(crow.stored()));
+                    Object cVal = findColumnValue(cTuple, childCol);
+                    if (Objects.equals(normalizeJoinKey(cVal), normalizeJoinKey(oldVal))) {
+                        matchingChildRows.add(crow);
+                        matchingChildTuples.add(cTuple);
+                    }
+                }
+
+                if (matchingChildRows.isEmpty()) {
+                    continue;
+                }
+
+                ForeignKeyDefinition.ActionType action = fk.onUpdate();
+                if (action == ForeignKeyDefinition.ActionType.RESTRICT || action == ForeignKeyDefinition.ActionType.NO_ACTION) {
+                    throw new com.stratosdb.common.exceptions.ForeignKeyViolationException(
+                        tableName, fk.name(),
+                        "update or delete on table \"" + tableName + "\" violates foreign key constraint \"" + fk.name() + "\" on table \"" + childTable + "\": Key (" + parentCol + ")=(" + oldVal + ") is still referenced from table \"" + childTable + "\"."
+                    );
+                } else if (action == ForeignKeyDefinition.ActionType.CASCADE) {
+                    for (int r = 0; r < matchingChildRows.size(); r++) {
+                        HeapTable.PositionedRow crow = matchingChildRows.get(r);
+                        Tuple cTuple = matchingChildTuples.get(r);
+                        cascadeUpdateChildRow(childTable, childCol, newVal, crow, cTuple, txn);
+                    }
+                } else if (action == ForeignKeyDefinition.ActionType.SET_NULL) {
+                    for (int r = 0; r < matchingChildRows.size(); r++) {
+                        HeapTable.PositionedRow crow = matchingChildRows.get(r);
+                        Tuple cTuple = matchingChildTuples.get(r);
+                        cascadeUpdateChildRow(childTable, childCol, null, crow, cTuple, txn);
+                    }
+                }
+            }
+        }
+    }
+
+    private void cascadeUpdateChildRow(String childTable, String childCol, Object newVal, HeapTable.PositionedRow childRow, Tuple oldChildTuple, Transaction txn) throws DeadlockException {
+        HeapTable table = tables.get(childTable);
+        if (table == null) return;
+
+        Tuple newChildTuple = deserializeTuple(childTable, MVCCVisibility.readPayload(childRow.stored()));
+        setColumnValue(newChildTuple, childCol, newVal);
+
+        checkNotNullConstraints(childTable, newChildTuple);
+        checkCheckConstraints(childTable, newChildTuple, txn);
+        checkForeignKeyConstraintsOnInsertOrUpdate(childTable, newChildTuple, txn);
+        checkUniqueConstraints(childTable, newChildTuple, childRow.pageId(), childRow.slot(), txn);
+
+        byte[] newPayload = newChildTuple.serialize();
+        HeapTable.InsertResult newVersion = table.updateMvcc(childRow.pageId(), childRow.slot(), newPayload, txn.getXID(),
+            txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
+        byte[] storedNewBytes = MVCCVisibility.wrap(newPayload, txn.getXID(), MVCCVisibility.NO_XMAX);
+        long lsn = walManager.logUpdate(childTable, txn.getXID(), childRow.pageId(), childRow.slot(), MVCCVisibility.readPayload(childRow.stored()), storedNewBytes);
+        if (lsn > 0) {
+            table.setPageLSN(childRow.pageId(), lsn);
+            if (newVersion != null && newVersion.pageId != childRow.pageId()) {
+                table.setPageLSN(newVersion.pageId, lsn);
+            }
+        }
+        maintainIndexesOnDelete(childTable, oldChildTuple, childRow.pageId(), childRow.slot());
+        maintainIndexesOnWrite(childTable, newChildTuple, newVersion.pageId, newVersion.slot);
+        recordUndo(new UndoAction.UndoUpdate(childTable, childRow.pageId(), childRow.slot(), newVersion.pageId, newVersion.slot));
+
+        handleParentRowUpdate(childTable, oldChildTuple, newChildTuple, txn);
+    }
+
+    private String serializeForeignKey(ForeignKeyDefinition fk) {
+        String childCols = String.join(",", fk.childColumns());
+        String parentCols = String.join(",", fk.parentColumns());
+        return childCols + "->" + fk.parentTable() + "(" + parentCols + ")"
+            + ":DELETE=" + fk.onDelete().name()
+            + ":UPDATE=" + fk.onUpdate().name();
+    }
+
+    private ForeignKeyDefinition deserializeForeignKey(String fkName, String childTable, String def) {
+        try {
+            int arrowIdx = def.indexOf("->");
+            if (arrowIdx < 0) return null;
+            String childColsStr = def.substring(0, arrowIdx).trim();
+            List<String> childCols = Arrays.asList(childColsStr.split(","));
+
+            int lparen = def.indexOf('(', arrowIdx);
+            int rparen = def.indexOf(')', lparen);
+            if (lparen < 0 || rparen < 0) return null;
+            String parentTable = def.substring(arrowIdx + 2, lparen).trim();
+            String parentColsStr = def.substring(lparen + 1, rparen).trim();
+            List<String> parentCols = Arrays.asList(parentColsStr.split(","));
+
+            ForeignKeyDefinition.ActionType onDelete = ForeignKeyDefinition.ActionType.RESTRICT;
+            ForeignKeyDefinition.ActionType onUpdate = ForeignKeyDefinition.ActionType.RESTRICT;
+
+            int delIdx = def.indexOf(":DELETE=");
+            if (delIdx >= 0) {
+                int endDel = def.indexOf(':', delIdx + 8);
+                String delStr = (endDel >= 0) ? def.substring(delIdx + 8, endDel) : def.substring(delIdx + 8);
+                onDelete = ForeignKeyDefinition.ActionType.valueOf(delStr.trim());
+            }
+            int updIdx = def.indexOf(":UPDATE=");
+            if (updIdx >= 0) {
+                int endUpd = def.indexOf(':', updIdx + 8);
+                String updStr = (endUpd >= 0) ? def.substring(updIdx + 8, endUpd) : def.substring(updIdx + 8);
+                onUpdate = ForeignKeyDefinition.ActionType.valueOf(updStr.trim());
+            }
+
+            return new ForeignKeyDefinition(fkName, childTable, childCols, parentTable, parentCols, onDelete, onUpdate);
+        } catch (Exception e) {
+            LOG.warn("Failed to parse foreign key definition '{}': {}", def, e.getMessage());
+            return null;
         }
     }
 
@@ -4353,6 +4832,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return QueryResult.error(beforeError);
             }
 
+            // Validate NOT NULL constraints
+            checkNotNullConstraints(stmt.tableName(), tuple);
+
+            // Validate CHECK constraints
+            checkCheckConstraints(stmt.tableName(), tuple, txn);
+
+            // Validate FOREIGN KEY constraints on child table
+            checkForeignKeyConstraintsOnInsertOrUpdate(stmt.tableName(), tuple, txn);
+
             // Validate unique constraints for the modified tuple
             checkUniqueConstraints(stmt.tableName(), tuple, row.pageId(), row.slot(), txn);
 
@@ -4400,6 +4888,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             maintainIndexesOnWrite(stmt.tableName(), tuple, newVersion.pageId, newVersion.slot);
             recordUndo(new UndoAction.UndoUpdate(stmt.tableName(), row.pageId(), row.slot(), newVersion.pageId, newVersion.slot));
 
+            // Handle cascading or restrict when parent key changes
+            handleParentRowUpdate(stmt.tableName(), oldTuple, tuple, txn);
+
             String afterError = fireTriggers(stmt.tableName(), "AFTER", "UPDATE", tuple, txn);
             if (afterError != null) {
                 return QueryResult.error(afterError);
@@ -4444,6 +4935,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return QueryResult.error(beforeError);
             }
 
+            handleParentRowDelete(stmt.tableName(), tuple, txn);
+
             boolean removed = table.deleteMvcc(row.pageId(), row.slot(), txn.getXID(),
                 txn.getSnapshot(), transactionManager, transactionManager.getLockManager());
             if (removed) {
@@ -4481,12 +4974,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (denied != null) return denied;
 
         String tableName = stmt.tableName();
+        List<ForeignKeyDefinition> referencingFks = getForeignKeysReferencingTable(tableName);
+        if (!referencingFks.isEmpty()) {
+            ForeignKeyDefinition fk = referencingFks.get(0);
+            return QueryResult.error("cannot drop table " + tableName + " because other objects depend on it\nDetail: constraint " + fk.name() + " on table " + fk.childTable() + " depends on table " + tableName, "2BP01");
+        }
         HeapTable oldTable = tables.get(tableName);
         List<String> oldColumns = tableColumns.get(tableName) != null ? new ArrayList<>(tableColumns.get(tableName)) : null;
         Map<String, String> oldTypes = tableColumnTypes.get(tableName) != null ? new HashMap<>(tableColumnTypes.get(tableName)) : null;
         Map<String, String> oldDefaults = tableColumnDefaults.get(tableName) != null ? new HashMap<>(tableColumnDefaults.get(tableName)) : null;
         String oldOwner = tableOwners.get(tableName);
         List<String> oldPks = tablePrimaryKeys.get(tableName) != null ? new ArrayList<>(tablePrimaryKeys.get(tableName)) : null;
+        Set<String> oldNotNulls = tableNotNullColumns.remove(tableName);
+        List<CheckConstraintDefinition> oldChecks = tableCheckConstraints.remove(tableName);
+        List<ForeignKeyDefinition> oldFks = tableForeignKeys.remove(tableName);
         String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
         String oldOwnerLine = catalogLines.get("OWNER:" + tableName);
 
@@ -4521,6 +5022,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (oldDefaults != null) tableColumnDefaults.put(tableName, oldDefaults);
             if (oldOwner != null) tableOwners.put(tableName, oldOwner);
             if (oldPks != null) tablePrimaryKeys.put(tableName, oldPks);
+            if (oldNotNulls != null) tableNotNullColumns.put(tableName, oldNotNulls);
+            if (oldChecks != null) tableCheckConstraints.put(tableName, oldChecks);
+            if (oldFks != null) tableForeignKeys.put(tableName, oldFks);
             if (oldCatalogLine != null) catalogLines.put("TABLE:" + tableName, oldCatalogLine);
             if (oldOwnerLine != null) catalogLines.put("OWNER:" + tableName, oldOwnerLine);
         });
@@ -5653,6 +6157,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (types != null) tableColumnTypes.put(stmt.newTableName(), types);
         Map<String, String> defaults = tableColumnDefaults.remove(stmt.oldTableName());
         if (defaults != null) tableColumnDefaults.put(stmt.newTableName(), defaults);
+        List<String> pks = tablePrimaryKeys.remove(stmt.oldTableName());
+        if (pks != null) tablePrimaryKeys.put(stmt.newTableName(), pks);
+        Set<String> notNulls = tableNotNullColumns.remove(stmt.oldTableName());
+        if (notNulls != null) tableNotNullColumns.put(stmt.newTableName(), notNulls);
+        List<CheckConstraintDefinition> checks = tableCheckConstraints.remove(stmt.oldTableName());
+        if (checks != null) tableCheckConstraints.put(stmt.newTableName(), checks);
+        List<ForeignKeyDefinition> fks = tableForeignKeys.remove(stmt.oldTableName());
+        if (fks != null) tableForeignKeys.put(stmt.newTableName(), fks);
 
         // Ownership and privileges are keyed by table name too - without migrating
         // them here, they'd become orphaned under the old name (and the renamed
@@ -5687,6 +6199,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (t != null) tableColumnTypes.put(oldName, t);
                 Map<String, String> d = tableColumnDefaults.remove(newName);
                 if (d != null) tableColumnDefaults.put(oldName, d);
+                if (pks != null) { tablePrimaryKeys.remove(newName); tablePrimaryKeys.put(oldName, pks); }
+                if (notNulls != null) { tableNotNullColumns.remove(newName); tableNotNullColumns.put(oldName, notNulls); }
+                if (checks != null) { tableCheckConstraints.remove(newName); tableCheckConstraints.put(oldName, checks); }
+                if (fks != null) { tableForeignKeys.remove(newName); tableForeignKeys.put(oldName, fks); }
                 String o = tableOwners.remove(newName);
                 if (o != null) tableOwners.put(oldName, o);
                 catalogLines.remove("TABLE:" + newName);

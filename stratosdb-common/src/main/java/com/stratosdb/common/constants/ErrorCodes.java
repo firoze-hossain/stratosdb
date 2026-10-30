@@ -11,4 +11,7 @@ public class ErrorCodes {
     public static final int STORAGE_ERROR = 300;
     public static final int PERMISSION_DENIED = 400;
     public static final int UNIQUE_VIOLATION = 23505;
+    public static final int NOT_NULL_VIOLATION = 23502;
+    public static final int FOREIGN_KEY_VIOLATION = 23503;
+    public static final int CHECK_VIOLATION = 23514;
 }
