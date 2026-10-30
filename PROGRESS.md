@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 97 |
-| Tests passing | **471 / 471** |
+| Commits | 98 |
+| Tests passing | **478 / 478** |
 | Main source | ~31,650 lines |
 | Test source | ~14,250 lines |
 
@@ -1067,6 +1067,57 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Wire protocol socket test verifying ErrorResponse message `'E'` with SQLSTATEs `23502`, `23514`, and `23503`.
   - Full reactor test suite verified at **471 / 471 tests passing across all 12 modules** (0 failures, 0 errors).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sheet 2 (Row 12) marked `Completed`, Sheet 5 (Row 9) marked `Passed`, Sheet 3 (Row 24) updated to reflect implemented status.
+
+## Sprint 5 Week 09 — Volcano Iterator Framework (Physical Operators) ✅ DONE
+
+- ✅ **Volcano Physical Operator Architecture (`stratosdb-sql`)**:
+  - Defined standard Volcano iterator model contract `PhysicalOperator`:
+    - `open()`: initializes the operator and opens child pipelines.
+    - `next(): TupleSlot`: advances and yields the next `TupleSlot` in $O(1)$ memory, returning empty slot on EOF.
+    - `close()`: releases iterators, page read latches, buffer pool pins, and recursively closes child pipelines.
+    - `getOutputColumns()`: reports output schema of the operator pipeline.
+  - Implemented `TupleSlot`: standard tuple carrier holding an active `Tuple` passing between physical operators, with empty/cleared state tracking and value accessors.
+  - Implemented `SeqScanOperator`:
+    - Streams table rows page-by-page directly from the buffer pool under page read latches via `HeapTable.iteratePositioned()`.
+    - Evaluates MVCC snapshot visibility row-by-row on demand without accumulating tables into intermediate `ArrayList<Tuple>`.
+    - Unpins each page immediately upon advancing to the next page or when closed.
+  - Implemented `IndexScanOperator`:
+    - Streams point equality and range scan candidate RIDs directly from `KeyValueIndex` / `BTreeIndex`.
+    - Reads visible heap tuples on demand; supports index-only scans for all-visible pages verified via `visibilityMap`.
+  - Implemented `FilterOperator`:
+    - Evaluates row-by-row filter predicates on its child operator's stream in $O(1)$ memory, skipping non-matching rows.
+  - Implemented `ProjectOperator`:
+    - Evaluates projection lists, expressions, and column aliases row-by-row on child tuples without intermediate list allocations.
+  - Implemented `LimitOperator`:
+    - Supports SQL `LIMIT` and `OFFSET` semantics.
+    - Eagerly skips `offset` rows on `open()`.
+    - Emits up to `limit` rows, then immediately signals EOF.
+    - Short-circuits execution: proactively closes child operator on reaching limit, immediately releasing buffer pool page pins and iterators without reading remaining table pages.
+- ✅ **Off-Heap Streaming Cursor & Buffer Pool Latch Management (`stratosdb-storage`)**:
+  - Implemented `PositionedRowIterator` (`Iterator<PositionedRow>`, `AutoCloseable`) in `HeapTable.java`.
+  - Added `iteratePositioned()`: latches and unpins each page one at a time as the iterator advances, guaranteeing strict $O(1)$ memory footprint during full table scans.
+  - Refactored `scanPositioned()` and `scanMvcc()` to delegate through `iteratePositioned()`.
+- ✅ **Execution Engine & Dual-Mode QueryResult Integration (`ExecutorEngine.java`, `QueryResult.java`)**:
+  - Integrated `buildPhysicalOperatorPipeline` into `executeSelect`, constructing Volcano operator trees (`LimitOperator` -> `ProjectOperator` -> `FilterOperator` -> `IndexScanOperator` / `SeqScanOperator`).
+  - Extended `QueryResult` to implement `Iterable<Tuple>` and `AutoCloseable`.
+  - Added streaming factory `QueryResult.success(PhysicalOperator, List<String>)` and `isStreaming()`.
+  - Supported dual-mode consumption:
+    - Streaming clients and loops consume rows one-by-one via `for (Tuple t : result)` or `result.iterator()` with $O(1)$ memory.
+    - Legacy callers and existing tests calling `result.getRows()` lazily drain and cache the operator stream, preserving 100% backward compatibility.
+- ✅ **Comprehensive Test Suite & Verification (`VolcanoIteratorFrameworkTest.java`)**:
+  - 7 comprehensive unit, physical operator, and end-to-end integration tests:
+    - `testTupleSlotOperations`: empty/non-empty slot, set, get, clear, size, and column value retrieval.
+    - `testPhysicalOperatorsDirectPipeline`: standalone direct wiring and verification of `SeqScanOperator`, `FilterOperator`, `ProjectOperator`, and `LimitOperator`.
+    - `testEndToEndSelectPipelineWithVolcanoStreaming`: end-to-end execution through `db.execute()`, verifying streaming `QueryResult`, operator pipeline hierarchy (`LimitOperator` root), projection with alias, and lazy materialization caching.
+    - `testIndexScanOperatorViaSelect`: point equality, range scan, and index-only scan execution via physical operator pipeline.
+    - `testVolcanoLimitShortCircuitExecution`: verifies `LIMIT 3` on a 1,000-row table stops immediately after 3 rows, short-circuiting and closing child scan early.
+    - `testStreamingSequentialScanConstantMemory`: streaming sequential scan over 2,000 rows row-by-row without materializing `List<Tuple>`.
+    - `testLimitAndOffsetCombinations`: edge cases including `LIMIT 0`, boundary offsets, and combined `LIMIT`/`OFFSET`.
+  - Full reactor test suite verified at **478 / 478 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 13, Sprint 5 Week 09) marked `Completed`.
+    - Sheet 3 (Row 21, Execution Architecture) marked `Resolved`.
+    - Sheet 5 (Row 11, Heap Allocation during Sequential Scans) marked `Passed`.
 
 ## What to do next
 

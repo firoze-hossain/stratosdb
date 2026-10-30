@@ -326,22 +326,102 @@ public class HeapTable {
     /** A scanned row together with its physical position, needed so callers can target UPDATE/DELETE at it. */
     public record PositionedRow(long pageId, int slot, byte[] stored) {}
 
+    public interface PositionedRowIterator extends java.util.Iterator<PositionedRow>, AutoCloseable {
+        @Override
+        void close();
+    }
+
+    /**
+     * Streams positioned rows page-by-page directly from the buffer pool under page read latches.
+     * Pages are latched and unpinned as the iterator advances, guaranteeing O(1) memory consumption.
+     */
+    public PositionedRowIterator iteratePositioned() {
+        return new PositionedRowIterator() {
+            private long currentPageId = 0;
+            private final long maxPageId = lastPageId.get();
+            private long activePageId = -1;
+            private SlottedPage currentPage = null;
+            private List<Integer> validSlots = null;
+            private int currentSlotIndex = 0;
+            private PositionedRow nextRow = null;
+            private boolean closed = false;
+
+            {
+                advance();
+            }
+
+            private void advance() {
+                if (closed) {
+                    nextRow = null;
+                    return;
+                }
+                while (true) {
+                    if (currentPage != null && validSlots != null && currentSlotIndex < validSlots.size()) {
+                        int slot = validSlots.get(currentSlotIndex++);
+                        byte[] stored = currentPage.readTuple(slot);
+                        if (stored != null) {
+                            nextRow = new PositionedRow(activePageId, slot, stored);
+                            return;
+                        }
+                        continue;
+                    }
+                    releaseCurrentPage();
+                    if (currentPageId > maxPageId) {
+                        nextRow = null;
+                        return;
+                    }
+                    activePageId = currentPageId;
+                    currentPage = (SlottedPage) bufferPool.getPage(name, activePageId);
+                    currentPage.getLatch().readLock().lock();
+                    validSlots = currentPage.getValidSlots();
+                    currentSlotIndex = 0;
+                    currentPageId++;
+                }
+            }
+
+            private void releaseCurrentPage() {
+                if (currentPage != null) {
+                    try {
+                        currentPage.getLatch().readLock().unlock();
+                        bufferPool.unpinPage(name, activePageId);
+                    } catch (Exception ignored) {
+                    }
+                    currentPage = null;
+                    validSlots = null;
+                    activePageId = -1;
+                }
+            }
+
+            @Override
+            public boolean hasNext() {
+                return nextRow != null;
+            }
+
+            @Override
+            public PositionedRow next() {
+                if (nextRow == null) throw new java.util.NoSuchElementException();
+                PositionedRow result = nextRow;
+                advance();
+                return result;
+            }
+
+            @Override
+            public void close() {
+                if (!closed) {
+                    closed = true;
+                    releaseCurrentPage();
+                    nextRow = null;
+                }
+            }
+        };
+    }
+
     /** Like scan(), but keeps (pageId, slot) around instead of returning bare payload bytes. */
     public List<PositionedRow> scanPositioned() {
         List<PositionedRow> results = new ArrayList<>();
-        for (long pageId = 0; pageId <= lastPageId.get(); pageId++) {
-            SlottedPage page = (SlottedPage) bufferPool.getPage(name, pageId);
-            page.getLatch().readLock().lock();
-            try {
-                for (int slot : page.getValidSlots()) {
-                    byte[] stored = page.readTuple(slot);
-                    if (stored != null) {
-                        results.add(new PositionedRow(pageId, slot, stored));
-                    }
-                }
-            } finally {
-                page.getLatch().readLock().unlock();
-                bufferPool.unpinPage(name, pageId);
+        try (PositionedRowIterator it = iteratePositioned()) {
+            while (it.hasNext()) {
+                results.add(it.next());
             }
         }
         return results;
@@ -356,9 +436,12 @@ public class HeapTable {
     /** Returns the payload bytes of every row version visible to this snapshot. */
     public List<byte[]> scanMvcc(Snapshot snapshot, TransactionManager txnManager) {
         List<byte[]> visible = new ArrayList<>();
-        for (PositionedRow row : scanPositioned()) {
-            if (MVCCVisibility.isVisible(row.stored(), snapshot, txnManager)) {
-                visible.add(MVCCVisibility.readPayload(row.stored()));
+        try (PositionedRowIterator it = iteratePositioned()) {
+            while (it.hasNext()) {
+                PositionedRow row = it.next();
+                if (MVCCVisibility.isVisible(row.stored(), snapshot, txnManager)) {
+                    visible.add(MVCCVisibility.readPayload(row.stored()));
+                }
             }
         }
         return visible;

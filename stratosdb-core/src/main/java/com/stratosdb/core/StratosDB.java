@@ -4,6 +4,7 @@ import com.stratosdb.sql.executor.ExecutorEngine;
 import com.stratosdb.sql.executor.QueryResult;
 import com.stratosdb.storage.buffer.BufferPoolManager;
 import com.stratosdb.storage.disk.DiskManager;
+import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.wal.WALManager;
 import com.stratosdb.transaction.TransactionManager;
 import org.slf4j.Logger;
@@ -197,6 +198,7 @@ public class StratosDB {
     public WALManager getWalManager() { return walManager; }
     public TransactionManager getTransactionManager() { return transactionManager; }
     public ExecutorEngine getExecutor() { return executor; }
+    public HeapTable getTable(String tableName) { return executor != null ? executor.getTable(tableName) : null; }
 
     /** Puts this instance into (or out of) real, enforced read-only replica mode - see ExecutorEngine's own READ_ONLY_SAFE_STATEMENTS javadoc. The real mechanism PROMOTE (see StdWireServer.tryHandlePromoteStatement) flips off when this instance stops following a primary and starts accepting writes as one. */
     public void setReadOnly(boolean readOnly) {
