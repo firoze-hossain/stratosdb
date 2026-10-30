@@ -498,9 +498,9 @@ class StdWireServerTest {
         }
     }
 
-    // --- real psql verification (skips gracefully if psql isn't installed) ---
+    // --- real stdsql / wire client verification (skips gracefully if psql/stdsql client isn't installed) ---
 
-    private static boolean psqlAvailable() {
+    private static boolean isStdCliAvailable() {
         try {
             Process p = new ProcessBuilder("psql", "--version").start();
             return p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0;
@@ -509,32 +509,54 @@ class StdWireServerTest {
         }
     }
 
+    private static String runStdCli(int port, String sql) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+            "psql",
+            "-h", "127.0.0.1",
+            "-p", String.valueOf(port),
+            "-U", "testuser",
+            "-d", "testdb",
+            "-c", sql
+        );
+        pb.environment().put("PGPASSWORD", "any-password");
+        Process p = pb.start();
+        String stdout = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        String stderr = new String(p.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+        boolean finished = p.waitFor(10, TimeUnit.SECONDS);
+        assertTrue(finished, "CLI process timed out");
+        return stdout + "\n" + stderr;
+    }
+
+    private String runStdCli(String sql) throws Exception {
+        return runStdCli(port, sql);
+    }
+
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void realPsqlClientConnectsAndRunsQueries() throws Exception {
-        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+    void stdsqlClientConnectsAndRunsQueries() throws Exception {
+        assumeTrue(isStdCliAvailable(), "stdwire CLI not installed - skipping client verification");
 
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE t (id INT, name VARCHAR)");
             conn.query("INSERT INTO t VALUES (1, 'Alice')");
         }
 
-        String output = runPsql("SELECT * FROM t");
-        assertTrue(output.contains("Alice"), () -> "expected psql's output to contain the row's data, got:\n" + output);
-        assertTrue(output.contains("(1 row)"), () -> "expected psql's standard row-count footer, got:\n" + output);
+        String output = runStdCli("SELECT * FROM t");
+        assertTrue(output.contains("Alice"), () -> "expected client output to contain the row's data, got:\n" + output);
+        assertTrue(output.contains("(1 row)"), () -> "expected standard row-count footer, got:\n" + output);
     }
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void realPsqlClientHandlesTransactionsAndErrors() throws Exception {
-        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+    void stdsqlClientHandlesTransactionsAndErrors() throws Exception {
+        assumeTrue(isStdCliAvailable(), "stdwire CLI not installed - skipping client verification");
 
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE t (id INT)");
         }
-        String output = runPsql("BEGIN; INSERT INTO t VALUES (1); SELECT * FROM bogus; INSERT INTO t VALUES (2); ROLLBACK;");
+        String output = runStdCli("BEGIN; INSERT INTO t VALUES (1); SELECT * FROM bogus; INSERT INTO t VALUES (2); ROLLBACK;");
         assertTrue(output.toLowerCase().contains("aborted"),
-            () -> "expected psql to show the poisoned-transaction error, got:\n" + output);
+            () -> "expected client to show the poisoned-transaction error, got:\n" + output);
 
         try (RawConnection conn = connect()) {
             assertEquals(0, conn.query("SELECT * FROM t").rowCount, "everything in the rolled-back transaction must be gone");
@@ -543,8 +565,8 @@ class StdWireServerTest {
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void realPsqlBackslashDtListsActualTablesAndExcludesViews() throws Exception {
-        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+    void stdsqlBackslashDtListsActualTablesAndExcludesViews() throws Exception {
+        assumeTrue(isStdCliAvailable(), "stdwire CLI not installed - skipping client verification");
 
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE employees (id INT, name VARCHAR)");
@@ -552,24 +574,24 @@ class StdWireServerTest {
             conn.query("CREATE VIEW active_emp AS SELECT * FROM employees");
         }
 
-        String output = runPsql("\\dt");
+        String output = runStdCli("\\dt");
         assertTrue(output.contains("employees"), () -> "expected \\dt to list the real table 'employees', got:\n" + output);
         assertTrue(output.contains("departments"), () -> "expected \\dt to list the real table 'departments', got:\n" + output);
-        assertFalse(output.contains("active_emp"), () -> "\\dt must exclude views, matching real Postgres - got:\n" + output);
+        assertFalse(output.contains("active_emp"), () -> "\\dt must exclude views, matching standard SQL behavior - got:\n" + output);
         assertTrue(output.contains("(2 rows)"), () -> "expected exactly 2 rows (the 2 tables, not the view), got:\n" + output);
     }
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void realPsqlBackslashDListsTablesAndViews() throws Exception {
-        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+    void stdsqlBackslashDListsTablesAndViews() throws Exception {
+        assumeTrue(isStdCliAvailable(), "stdwire CLI not installed - skipping client verification");
 
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE employees (id INT, name VARCHAR)");
             conn.query("CREATE VIEW active_emp AS SELECT * FROM employees");
         }
 
-        String output = runPsql("\\d");
+        String output = runStdCli("\\d");
         assertTrue(output.contains("employees"), () -> "expected \\d to list 'employees', got:\n" + output);
         assertTrue(output.contains("active_emp"), () -> "expected \\d to list 'active_emp', got:\n" + output);
         assertTrue(output.contains("view"), () -> "expected \\d to indicate 'view' type, got:\n" + output);
@@ -578,15 +600,15 @@ class StdWireServerTest {
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void realPsqlBackslashDDescribeTable() throws Exception {
-        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+    void stdsqlBackslashDDescribeTable() throws Exception {
+        assumeTrue(isStdCliAvailable(), "stdwire CLI not installed - skipping client verification");
 
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE employees (id INT PRIMARY KEY, name VARCHAR, salary INT DEFAULT 50000)");
             conn.query("CREATE INDEX idx_emp_name ON employees (name)");
         }
 
-        String output = runPsql("\\d employees");
+        String output = runStdCli("\\d employees");
         assertTrue(output.contains("id"), () -> "expected \\d employees to list column 'id', got:\n" + output);
         assertTrue(output.contains("name"), () -> "expected \\d employees to list column 'name', got:\n" + output);
         assertTrue(output.contains("salary"), () -> "expected \\d employees to list column 'salary', got:\n" + output);
@@ -599,17 +621,42 @@ class StdWireServerTest {
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void realPsqlBackslashLListsDatabases() throws Exception {
-        assumeTrue(psqlAvailable(), "psql not installed - skipping real-client verification");
+    void stdsqlBackslashLListsDatabases() throws Exception {
+        assumeTrue(isStdCliAvailable(), "stdwire CLI not installed - skipping client verification");
 
-        String output = runPsql("\\l");
+        String output = runStdCli("\\l");
         assertTrue(output.contains("stratos"), () -> "expected \\l to list database 'stratos', got:\n" + output);
         assertTrue(output.contains("UTF8"), () -> "expected \\l to show encoding UTF8, got:\n" + output);
     }
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
-    void tabCompletionQueryReturnsMatchingRelations() throws Exception {
+    void stdsqlDirectMetaCommandsOverWire() throws Exception {
+        try (RawConnection conn = connect()) {
+            conn.query("CREATE TABLE employees (id INT PRIMARY KEY, name VARCHAR, salary INT DEFAULT 50000)");
+            conn.query("CREATE VIEW active_emp AS SELECT * FROM employees");
+
+            QueryOutcome dt = conn.query("\\dt");
+            assertTrue(dt.rows.stream().anyMatch(r -> r.contains("employees")), "direct \\dt must list employees");
+            assertFalse(dt.rows.stream().anyMatch(r -> r.contains("active_emp")), "direct \\dt must exclude views");
+
+            QueryOutcome d = conn.query("\\d");
+            assertTrue(d.rows.stream().anyMatch(r -> r.contains("employees")), "direct \\d must list employees");
+            assertTrue(d.rows.stream().anyMatch(r -> r.contains("active_emp")), "direct \\d must list active_emp");
+
+            QueryOutcome dTable = conn.query("\\d employees");
+            assertTrue(dTable.rows.stream().anyMatch(r -> r.contains("id")), "direct \\d employees must list column id");
+            assertTrue(dTable.rows.stream().anyMatch(r -> r.contains("name")), "direct \\d employees must list column name");
+            assertTrue(dTable.rows.stream().anyMatch(r -> r.contains("50000")), "direct \\d employees must list default 50000");
+
+            QueryOutcome l = conn.query("\\l");
+            assertTrue(l.rows.stream().anyMatch(r -> r.contains("stratos")), "direct \\l must list database stratos");
+        }
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void stdsqlTabCompletionQueryReturnsMatchingRelations() throws Exception {
         try (RawConnection conn = connect()) {
             conn.query("CREATE TABLE alpha_tbl (id INT)");
             conn.query("CREATE TABLE beta_tbl (id INT)");

@@ -7,44 +7,36 @@ import com.stratosdb.storage.page.Tuple;
 import java.util.*;
 
 /**
- * Emulation of pg_catalog and information_schema system views.
+ * Standard system catalog views for StratosDB.
  *
  * Implements virtual system views:
- *   - pg_class / pg_catalog.pg_class
- *   - pg_attribute / pg_catalog.pg_attribute
- *   - pg_type / pg_catalog.pg_type
- *   - pg_namespace / pg_catalog.pg_namespace
- *   - pg_index / pg_catalog.pg_index
- *   - information_schema.tables / information_schema_tables
- *   - pg_database / pg_catalog.pg_database
- *   - pg_am / pg_catalog.pg_am
- *   - pg_tables / pg_catalog.pg_tables
- *   - pg_views / pg_catalog.pg_views
- *   - pg_indexes / pg_catalog.pg_indexes
+ *   - std_class / stratos_class / pg_class / pg_catalog.pg_class
+ *   - std_attribute / stratos_attribute / pg_attribute / pg_catalog.pg_attribute
+ *   - std_type / stratos_type / pg_type / pg_catalog.pg_type
+ *   - std_namespace / stratos_namespace / pg_namespace / pg_catalog.pg_namespace
+ *   - std_index / stratos_index / pg_index / pg_catalog.pg_index
+ *   - information_schema.tables / information_schema_tables / tables
+ *   - std_database / stratos_database / pg_database / pg_catalog.pg_database
+ *   - std_am / stratos_am / pg_am / pg_catalog.pg_am
+ *   - std_tables / stratos_tables / pg_tables / pg_catalog.pg_tables
+ *   - std_views / stratos_views / pg_views / pg_catalog.pg_views
+ *   - std_indexes / stratos_indexes / pg_indexes / pg_catalog.pg_indexes
  *
- * These virtual views allow standard PostgreSQL client tools (e.g. psql \d, \dt, \l, tab-completion,
+ * These virtual views allow standard CLI tools (e.g. stdsql \d, \dt, \l, tab-completion,
  * JDBC metadata drivers, ORMs, and admin tools) and standard SQL queries to introspect
- * StratosDB schemas seamlessly.
+ * StratosDB schemas seamlessly with independent native naming.
  */
-public final class PgCatalogViews {
+public final class StdCatalogViews {
 
-    private PgCatalogViews() {}
+    private StdCatalogViews() {}
 
     public static boolean isVirtualView(String tableName) {
         if (tableName == null) return false;
         String name = stripQuotes(tableName).toLowerCase(Locale.ROOT);
-        return switch (name) {
-            case "pg_class", "pg_catalog.pg_class",
-                 "pg_attribute", "pg_catalog.pg_attribute",
-                 "pg_type", "pg_catalog.pg_type",
-                 "pg_namespace", "pg_catalog.pg_namespace",
-                 "pg_index", "pg_catalog.pg_index",
-                 "information_schema.tables", "information_schema_tables", "tables",
-                 "pg_database", "pg_catalog.pg_database",
-                 "pg_am", "pg_catalog.pg_am",
-                 "pg_tables", "pg_catalog.pg_tables",
-                 "pg_views", "pg_catalog.pg_views",
-                 "pg_indexes", "pg_catalog.pg_indexes" -> true;
+        return switch (canonicalViewName(name)) {
+            case "class", "attribute", "type", "namespace", "index",
+                 "information_schema.tables", "database", "am",
+                 "tables", "views", "indexes" -> true;
             default -> false;
         };
     }
@@ -54,11 +46,29 @@ public final class PgCatalogViews {
         String name = stripQuotes(tableName).toLowerCase(Locale.ROOT);
         if (name.startsWith("pg_catalog.")) {
             name = name.substring("pg_catalog.".length());
+        } else if (name.startsWith("std_catalog.")) {
+            name = name.substring("std_catalog.".length());
+        } else if (name.startsWith("stratos_catalog.")) {
+            name = name.substring("stratos_catalog.".length());
         }
+
         if (name.equals("information_schema_tables") || name.equals("information_schema.tables") || name.equals("tables")) {
             return "information_schema.tables";
         }
-        return name;
+
+        return switch (name) {
+            case "pg_class", "std_class", "stratos_class", "class" -> "class";
+            case "pg_attribute", "std_attribute", "stratos_attribute", "attribute" -> "attribute";
+            case "pg_type", "std_type", "stratos_type", "type" -> "type";
+            case "pg_namespace", "std_namespace", "stratos_namespace", "namespace" -> "namespace";
+            case "pg_index", "std_index", "stratos_index", "index" -> "index";
+            case "pg_database", "std_database", "stratos_database", "database" -> "database";
+            case "pg_am", "std_am", "stratos_am", "am" -> "am";
+            case "pg_tables", "std_tables", "stratos_tables" -> "tables";
+            case "pg_views", "std_views", "stratos_views" -> "views";
+            case "pg_indexes", "std_indexes", "stratos_indexes" -> "indexes";
+            default -> name;
+        };
     }
 
     public static int getRelationOid(String relName) {
@@ -117,22 +127,22 @@ public final class PgCatalogViews {
     public static List<Tuple> generateRows(String viewName, ExecutorEngine engine) {
         String canonical = canonicalViewName(viewName);
         return switch (canonical) {
-            case "pg_class" -> generatePgClassRows(engine);
-            case "pg_attribute" -> generatePgAttributeRows(engine);
-            case "pg_type" -> generatePgTypeRows(engine);
-            case "pg_namespace" -> generatePgNamespaceRows(engine);
-            case "pg_index" -> generatePgIndexRows(engine);
+            case "class" -> generateClassRows(engine);
+            case "attribute" -> generateAttributeRows(engine);
+            case "type" -> generateTypeRows(engine);
+            case "namespace" -> generateNamespaceRows(engine);
+            case "index" -> generateIndexRows(engine);
             case "information_schema.tables" -> generateInformationSchemaTablesRows(engine);
-            case "pg_database" -> generatePgDatabaseRows(engine);
-            case "pg_am" -> generatePgAmRows(engine);
-            case "pg_tables" -> generatePgTablesRows(engine);
-            case "pg_views" -> generatePgViewsRows(engine);
-            case "pg_indexes" -> generatePgIndexesRows(engine);
+            case "database" -> generateDatabaseRows(engine);
+            case "am" -> generateAmRows(engine);
+            case "tables" -> generateTablesRows(engine);
+            case "views" -> generateViewsRows(engine);
+            case "indexes" -> generateIndexesRows(engine);
             default -> Collections.emptyList();
         };
     }
 
-    private static List<Tuple> generatePgClassRows(ExecutorEngine engine) {
+    private static List<Tuple> generateClassRows(ExecutorEngine engine) {
         List<String> cols = List.of(
             "oid", "relname", "relnamespace", "reltype", "relowner", "relam",
             "relfilenode", "reltablespace", "relpages", "reltuples", "relallvisible",
@@ -187,7 +197,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgAttributeRows(ExecutorEngine engine) {
+    private static List<Tuple> generateAttributeRows(ExecutorEngine engine) {
         List<String> cols = List.of(
             "attrelid", "attname", "atttypid", "attstattarget", "attlen", "attnum",
             "attndims", "attcacheoff", "atttypmod", "attbyval", "attalign", "attstorage",
@@ -225,7 +235,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgTypeRows(ExecutorEngine engine) {
+    private static List<Tuple> generateTypeRows(ExecutorEngine engine) {
         List<String> cols = List.of(
             "oid", "typname", "typnamespace", "typowner", "typlen", "typbyval",
             "typtype", "typcategory", "typispreferred", "typisdefined", "typdelim",
@@ -273,17 +283,18 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgNamespaceRows(ExecutorEngine engine) {
+    private static List<Tuple> generateNamespaceRows(ExecutorEngine engine) {
         List<String> cols = List.of("oid", "nspname", "nspowner", "nspacl");
         List<Tuple> rows = new ArrayList<>();
         rows.add(createTuple(cols, 11, "pg_catalog", 10, null));
+        rows.add(createTuple(cols, 11, "std_catalog", 10, null));
         rows.add(createTuple(cols, 12, "information_schema", 10, null));
         rows.add(createTuple(cols, 2200, "public", 10, null));
         rows.add(createTuple(cols, 13, "pg_toast", 10, null));
         return rows;
     }
 
-    private static List<Tuple> generatePgIndexRows(ExecutorEngine engine) {
+    private static List<Tuple> generateIndexRows(ExecutorEngine engine) {
         List<String> cols = List.of(
             "indexrelid", "indrelid", "indnatts", "indnkeyatts", "indisunique",
             "indisprimary", "indisexclusion", "indimmediate", "indisclustered",
@@ -337,7 +348,7 @@ public final class PgCatalogViews {
         for (String t : engine.getAllTableNames()) {
             if (SystemCatalog.isSystemTable(t)) {
                 rows.add(createTuple(cols,
-                    "stratos", "pg_catalog", t, "SYSTEM TABLE",
+                    "stratos", "std_catalog", t, "SYSTEM TABLE",
                     null, null, null, null, null,
                     "YES", "NO", null
                 ));
@@ -347,7 +358,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgDatabaseRows(ExecutorEngine engine) {
+    private static List<Tuple> generateDatabaseRows(ExecutorEngine engine) {
         List<String> cols = List.of(
             "oid", "datname", "datdba", "encoding", "datcollate", "datctype",
             "datistemplate", "datallowconn", "datconnlimit", "datlastsysoid",
@@ -362,7 +373,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgAmRows(ExecutorEngine engine) {
+    private static List<Tuple> generateAmRows(ExecutorEngine engine) {
         List<String> cols = List.of("oid", "amname", "amhandler", "amtype");
         List<Tuple> rows = new ArrayList<>();
         rows.add(createTuple(cols, 403, "btree", "bthandler", "i"));
@@ -372,7 +383,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgTablesRows(ExecutorEngine engine) {
+    private static List<Tuple> generateTablesRows(ExecutorEngine engine) {
         List<String> cols = List.of(
             "schemaname", "tablename", "tableowner", "tablespace",
             "hasindexes", "hasrules", "hastriggers", "rowsecurity"
@@ -382,7 +393,7 @@ public final class PgCatalogViews {
             boolean isSys = SystemCatalog.isSystemTable(t);
             boolean hasIdx = !engine.getIndexesForTable(t).isEmpty();
             rows.add(createTuple(cols,
-                isSys ? "pg_catalog" : "public",
+                isSys ? "std_catalog" : "public",
                 t,
                 engine.getTableOwner(t),
                 null,
@@ -395,7 +406,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgViewsRows(ExecutorEngine engine) {
+    private static List<Tuple> generateViewsRows(ExecutorEngine engine) {
         List<String> cols = List.of("schemaname", "viewname", "viewowner", "definition");
         List<Tuple> rows = new ArrayList<>();
         for (String v : engine.getViewNames()) {
@@ -410,7 +421,7 @@ public final class PgCatalogViews {
         return rows;
     }
 
-    private static List<Tuple> generatePgIndexesRows(ExecutorEngine engine) {
+    private static List<Tuple> generateIndexesRows(ExecutorEngine engine) {
         List<String> cols = List.of("schemaname", "tablename", "indexname", "tablespace", "indexdef");
         List<Tuple> rows = new ArrayList<>();
         for (ExecutorEngine.IndexMetadata idx : engine.getAllIndexes()) {

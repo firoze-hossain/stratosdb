@@ -4,7 +4,7 @@ import com.stratosdb.common.exceptions.DeadlockException;
 import com.stratosdb.index.btree.BTreeIndex;
 import com.stratosdb.sql.ast.*;
 import com.stratosdb.sql.catalog.DdlUndoAction;
-import com.stratosdb.sql.catalog.PgCatalogViews;
+import com.stratosdb.sql.catalog.StdCatalogViews;
 import com.stratosdb.sql.catalog.SystemCatalog;
 import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.storage.buffer.BufferPool;
@@ -2720,8 +2720,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
         if (table == null) {
-            if (PgCatalogViews.isVirtualView(stmt.tableName())) {
-                List<Tuple> virtualRows = PgCatalogViews.generateRows(stmt.tableName(), this);
+            if (StdCatalogViews.isVirtualView(stmt.tableName())) {
+                List<Tuple> virtualRows = StdCatalogViews.generateRows(stmt.tableName(), this);
                 if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()) {
                     return executeAggregateSelectOverRows(stmt, virtualRows, txn);
                 }
@@ -3630,8 +3630,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return rows;
         }
 
-        if (PgCatalogViews.isVirtualView(name)) {
-            List<Tuple> virtualRows = PgCatalogViews.generateRows(name, this);
+        if (StdCatalogViews.isVirtualView(name)) {
+            List<Tuple> virtualRows = StdCatalogViews.generateRows(name, this);
             List<Tuple> rows = new ArrayList<>();
             for (Tuple row : virtualRows) {
                 rows.add(qualify(row, name));
@@ -4807,7 +4807,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      *      engine's whole permission system not existing at all.
      */
     private boolean hasPrivilege(String tableName, String privilege) {
-        if ("SELECT".equalsIgnoreCase(privilege) && (SystemCatalog.isSystemTable(tableName) || PgCatalogViews.isVirtualView(tableName))) {
+        if ("SELECT".equalsIgnoreCase(privilege) && (SystemCatalog.isSystemTable(tableName) || StdCatalogViews.isVirtualView(tableName))) {
             return true;
         }
         String currentUser = session.get().currentUser;
@@ -6243,15 +6243,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             || lowerName.equals("set_config")
             || lowerName.equals("to_tsvector")
             || lowerName.equals("to_tsquery")
-            || lowerName.equals("format_type")
-            || lowerName.equals("pg_table_is_visible")
-            || lowerName.equals("pg_get_userbyid")
-            || lowerName.equals("pg_encoding_to_char")
+            || lowerName.equals("format_type") || lowerName.equals("std_format_type")
+            || lowerName.equals("table_is_visible") || lowerName.equals("std_table_is_visible") || lowerName.equals("pg_table_is_visible")
+            || lowerName.equals("get_userbyid") || lowerName.equals("std_get_userbyid") || lowerName.equals("pg_get_userbyid")
+            || lowerName.equals("encoding_to_char") || lowerName.equals("std_encoding_to_char") || lowerName.equals("pg_encoding_to_char")
             || lowerName.equals("quote_ident")
             || lowerName.equals("array_to_string")
-            || lowerName.equals("pg_get_expr")
-            || lowerName.equals("pg_get_indexdef")
-            || lowerName.equals("pg_get_constraintdef");
+            || lowerName.equals("get_expr") || lowerName.equals("std_get_expr") || lowerName.equals("pg_get_expr")
+            || lowerName.equals("get_indexdef") || lowerName.equals("std_get_indexdef") || lowerName.equals("pg_get_indexdef")
+            || lowerName.equals("get_constraintdef") || lowerName.equals("std_get_constraintdef") || lowerName.equals("pg_get_constraintdef");
     }
 
     private Object invokeBuiltinFunction(String lowerName, List<Object> argValues) {
@@ -6270,17 +6270,17 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (lowerName.equals("to_tsquery") && argValues.size() == 1) {
             return TextSearch.toTsQuery(String.valueOf(argValues.get(0)));
         }
-        if (lowerName.equals("format_type") && !argValues.isEmpty()) {
+        if ((lowerName.equals("format_type") || lowerName.equals("std_format_type")) && !argValues.isEmpty()) {
             int typId = parseNumber(argValues.get(0));
-            return PgCatalogViews.formatType(typId);
+            return StdCatalogViews.formatType(typId);
         }
-        if (lowerName.equals("pg_table_is_visible") && !argValues.isEmpty()) {
+        if ((lowerName.equals("table_is_visible") || lowerName.equals("std_table_is_visible") || lowerName.equals("pg_table_is_visible")) && !argValues.isEmpty()) {
             return true;
         }
-        if (lowerName.equals("pg_get_userbyid") && !argValues.isEmpty()) {
+        if ((lowerName.equals("get_userbyid") || lowerName.equals("std_get_userbyid") || lowerName.equals("pg_get_userbyid")) && !argValues.isEmpty()) {
             return "stratos";
         }
-        if (lowerName.equals("pg_encoding_to_char") && !argValues.isEmpty()) {
+        if ((lowerName.equals("encoding_to_char") || lowerName.equals("std_encoding_to_char") || lowerName.equals("pg_encoding_to_char")) && !argValues.isEmpty()) {
             return "UTF8";
         }
         if (lowerName.equals("quote_ident") && !argValues.isEmpty()) {
@@ -6289,13 +6289,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (lowerName.equals("array_to_string") && argValues.size() >= 2) {
             return "";
         }
-        if (lowerName.equals("pg_get_expr") && !argValues.isEmpty()) {
+        if ((lowerName.equals("get_expr") || lowerName.equals("std_get_expr") || lowerName.equals("pg_get_expr")) && !argValues.isEmpty()) {
             return String.valueOf(argValues.get(0));
         }
-        if (lowerName.equals("pg_get_indexdef") && !argValues.isEmpty()) {
+        if ((lowerName.equals("get_indexdef") || lowerName.equals("std_get_indexdef") || lowerName.equals("pg_get_indexdef")) && !argValues.isEmpty()) {
             return "CREATE INDEX ON table";
         }
-        if (lowerName.equals("pg_get_constraintdef") && !argValues.isEmpty()) {
+        if ((lowerName.equals("get_constraintdef") || lowerName.equals("std_get_constraintdef") || lowerName.equals("pg_get_constraintdef")) && !argValues.isEmpty()) {
             return "";
         }
         return null;

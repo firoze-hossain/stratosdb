@@ -135,6 +135,35 @@ class StdSqlTest {
         assertTrue(output.contains("NULL"), () -> "expected the NULL parameter to display as NULL in the subsequent SELECT, got:\n" + output);
     }
 
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void stdsqlExecutesBackslashCommands() throws Exception {
+        String output = runStdSql(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name VARCHAR, salary INT DEFAULT 50000)",
+            "CREATE TABLE departments (id INT)",
+            "CREATE VIEW active_emp AS SELECT * FROM employees",
+            "\\dt",
+            "\\d",
+            "\\d employees",
+            "\\l",
+            "\\q"
+        );
+
+        // \dt should list employees and departments, but not view active_emp
+        assertTrue(output.contains("employees"), () -> "expected \\dt to list table 'employees', got:\n" + output);
+        assertTrue(output.contains("departments"), () -> "expected \\dt to list table 'departments', got:\n" + output);
+
+        // \d should list view active_emp
+        assertTrue(output.contains("active_emp"), () -> "expected \\d to list view 'active_emp', got:\n" + output);
+
+        // \d employees should describe columns
+        assertTrue(output.contains("salary"), () -> "expected \\d employees to list 'salary', got:\n" + output);
+        assertTrue(output.contains("50000"), () -> "expected \\d employees to show default 50000, got:\n" + output);
+
+        // \l should list database
+        assertTrue(output.contains("stratos"), () -> "expected \\l to list database 'stratos', got:\n" + output);
+    }
+
     // --- SCRAM-SHA-256: stdsql must complete the real handshake against a
     // UserStore-protected server, not hang or silently ignore the challenge
     // (a real, previously-latent bug: this client used to ignore any 'R'

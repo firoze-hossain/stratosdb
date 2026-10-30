@@ -3,7 +3,7 @@ package com.stratosdb.network.stdwire;
 import com.stratosdb.core.StratosDB;
 import com.stratosdb.network.auth.ScramSha256;
 import com.stratosdb.network.auth.UserStore;
-import com.stratosdb.sql.catalog.PgCatalogViews;
+import com.stratosdb.sql.catalog.StdCatalogViews;
 import com.stratosdb.sql.executor.ExecutorEngine;
 import com.stratosdb.sql.executor.QueryResult;
 import com.stratosdb.sql.parser.SqlParser;
@@ -181,7 +181,7 @@ public class StdWireServer {
 
     private void handleConnection(Socket socket) {
         String remote = socket.getRemoteSocketAddress().toString();
-        LOG.debug("pg-wire client connected: {}", remote);
+        LOG.debug("stdwire client connected: {}", remote);
         com.stratosdb.sql.executor.SessionActivity activity = null;
         try (Socket s = socket;
              DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
@@ -265,9 +265,9 @@ public class StdWireServer {
                 out.flush();
             }
         } catch (IOException e) {
-            LOG.debug("pg-wire connection {} closed: {}", remote, e.getMessage());
+            LOG.debug("stdwire connection {} closed: {}", remote, e.getMessage());
         } catch (Throwable t) {
-            LOG.error("pg-wire connection unexpected error: {}", t.getMessage(), t);
+            LOG.error("stdwire connection unexpected error: {}", t.getMessage(), t);
         } finally {
             if (activity != null) {
                 db().getExecutor().getSessionActivityRegistry().unregister(activity);
@@ -275,7 +275,7 @@ public class StdWireServer {
             if (db() != null) {
                 db().closeSession();
             }
-            LOG.debug("pg-wire client disconnected: {}", remote);
+            LOG.debug("stdwire client disconnected: {}", remote);
         }
     }
 
@@ -300,7 +300,7 @@ public class StdWireServer {
         }
 
         Map<String, String> params = StdWireMessages.parseStartupParams(body, 4);
-        LOG.info("pg-wire startup: user={} database={} application_name={}",
+        LOG.info("stdwire startup: user={} database={} application_name={}",
             params.get("user"), params.get("database"), params.get("application_name"));
 
         if (cluster != null) {
@@ -342,7 +342,7 @@ public class StdWireServer {
         // makes GRANT/REVOKE mean anything once a role IS created, not a promise that
         // every connection is now locked down by default.
         db().setCurrentUser(params.get("user"));
-        StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB pg-wire compatibility layer)");
+        StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB stdwire compatibility layer)");
         StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
         StdWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");
         StdWireMessages.writeParameterStatus(out, "DateStyle", "ISO, MDY");
@@ -475,10 +475,85 @@ public class StdWireServer {
     }
 
     /**
-     * Intercepts and synthesizes responses for psql meta-commands (\dt, \d, \d <tablename>, \l,
-     * and tab-completion) directly using StratosDB's metadata and PgCatalogViews emulation.
+     * Intercepts and synthesizes responses for stdsql and standard wire meta-commands (\dt, \d, \d <tablename>, \l,
+     * and tab-completion) directly using StratosDB's metadata and StdCatalogViews.
      */
     private boolean tryHandleCatalogIntrospectionQuery(String sql, DataOutputStream out) throws IOException {
+        String trimmed = sql.trim();
+        if (trimmed.endsWith(";")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        }
+        String lowerCmd = trimmed.toLowerCase(java.util.Locale.ROOT);
+
+        // Direct stdsql meta-commands: \dt (list tables)
+        if (lowerCmd.equals("\\dt")) {
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("Schema", 25, (short) -1),
+                new StdWireMessages.Column("Name", 25, (short) -1),
+                new StdWireMessages.Column("Type", 25, (short) -1),
+                new StdWireMessages.Column("Owner", 25, (short) -1)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+            List<String[]> entries = new ArrayList<>();
+            for (String t : db().getExecutor().getTableNames()) {
+                entries.add(new String[]{"public", t, "table", "stratos"});
+            }
+            entries.sort(java.util.Comparator.comparing(a -> a[1]));
+            for (String[] entry : entries) {
+                StdWireMessages.writeDataRow(out, List.of(entry[0], entry[1], entry[2], entry[3]));
+            }
+            StdWireMessages.writeCommandComplete(out, "SELECT " + entries.size());
+            return true;
+        }
+
+        // Direct stdsql meta-commands: \d (list relations: tables, views, sequences)
+        if (lowerCmd.equals("\\d")) {
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("Schema", 25, (short) -1),
+                new StdWireMessages.Column("Name", 25, (short) -1),
+                new StdWireMessages.Column("Type", 25, (short) -1),
+                new StdWireMessages.Column("Owner", 25, (short) -1)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+            List<String[]> entries = new ArrayList<>();
+            for (String t : db().getExecutor().getTableNames()) {
+                entries.add(new String[]{"public", t, "table", "stratos"});
+            }
+            for (String v : db().getExecutor().getViewNames()) {
+                entries.add(new String[]{"public", v, "view", "stratos"});
+            }
+            for (String s : db().getExecutor().getSequenceNames()) {
+                entries.add(new String[]{"public", s, "sequence", "stratos"});
+            }
+            entries.sort(java.util.Comparator.comparing(a -> a[1]));
+            for (String[] entry : entries) {
+                StdWireMessages.writeDataRow(out, List.of(entry[0], entry[1], entry[2], entry[3]));
+            }
+            StdWireMessages.writeCommandComplete(out, "SELECT " + entries.size());
+            return true;
+        }
+
+        // Direct stdsql meta-commands: \l (list databases)
+        if (lowerCmd.equals("\\l")) {
+            List<StdWireMessages.Column> columns = List.of(
+                new StdWireMessages.Column("Name", 19, (short) 64),
+                new StdWireMessages.Column("Owner", 19, (short) 64),
+                new StdWireMessages.Column("Encoding", 19, (short) 64),
+                new StdWireMessages.Column("Collate", 19, (short) 64),
+                new StdWireMessages.Column("Ctype", 19, (short) 64)
+            );
+            StdWireMessages.writeRowDescription(out, columns);
+            StdWireMessages.writeDataRow(out, List.of("stratos", "stratos", "UTF8", "libc", "libc"));
+            StdWireMessages.writeCommandComplete(out, "SELECT 1");
+            return true;
+        }
+
+        // Direct stdsql meta-commands: \d <tablename>
+        if (lowerCmd.startsWith("\\d ") || lowerCmd.startsWith("\\d+ ")) {
+            String target = trimmed.substring(lowerCmd.startsWith("\\d+ ") ? 4 : 3).trim();
+            return handleDescribeRelationDirect(target, out);
+        }
+
         String normalized = sql.toLowerCase(java.util.Locale.ROOT);
 
         // 1. \dt or \d (relation listing)
@@ -545,7 +620,7 @@ public class StdWireServer {
             StdWireMessages.writeRowDescription(out, columns);
 
             if (matched != null) {
-                int oid = PgCatalogViews.getRelationOid(matched);
+                int oid = StdCatalogViews.getRelationOid(matched);
                 StdWireMessages.writeDataRow(out, List.of(String.valueOf(oid), "public", matched));
                 StdWireMessages.writeCommandComplete(out, "SELECT 1");
             } else {
@@ -617,8 +692,8 @@ public class StdWireServer {
 
                     for (String col : cols) {
                         String typeStr = types != null ? types.get(col) : "VARCHAR";
-                        int typOid = PgCatalogViews.getTypeOid(typeStr);
-                        String formattedType = PgCatalogViews.formatType(typOid);
+                        int typOid = StdCatalogViews.getTypeOid(typeStr);
+                        String formattedType = StdCatalogViews.formatType(typOid);
                         String defVal = defaults != null ? defaults.get(col) : null;
                         boolean notNull = pks != null && pks.contains(col);
 
@@ -751,16 +826,76 @@ public class StdWireServer {
     private String findRelationByOid(int oid) {
         if (oid <= 0) return null;
         for (String t : db().getExecutor().getAllTableNames()) {
-            if (PgCatalogViews.getRelationOid(t) == oid) {
+            if (StdCatalogViews.getRelationOid(t) == oid) {
                 return t;
             }
         }
         for (String v : db().getExecutor().getViewNames()) {
-            if (PgCatalogViews.getRelationOid(v) == oid) {
+            if (StdCatalogViews.getRelationOid(v) == oid) {
                 return v;
             }
         }
         return null;
+    }
+
+    private boolean handleDescribeRelationDirect(String targetTable, DataOutputStream out) throws IOException {
+        String matched = null;
+        for (String t : db().getExecutor().getAllTableNames()) {
+            if (t.equalsIgnoreCase(targetTable)) {
+                matched = t;
+                break;
+            }
+        }
+        if (matched == null) {
+            for (String v : db().getExecutor().getViewNames()) {
+                if (v.equalsIgnoreCase(targetTable)) {
+                    matched = v;
+                    break;
+                }
+            }
+        }
+
+        if (matched == null) {
+            StdWireMessages.writeErrorResponse(out, "Did not find any relation named \"" + targetTable + "\".");
+            return true;
+        }
+
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("Column", 19, (short) 64),
+            new StdWireMessages.Column("Type", 25, (short) -1),
+            new StdWireMessages.Column("Collation", 19, (short) 64),
+            new StdWireMessages.Column("Nullable", 16, (short) 1),
+            new StdWireMessages.Column("Default", 25, (short) -1)
+        );
+        StdWireMessages.writeRowDescription(out, columns);
+
+        List<String> colNames = db().getExecutor().getTableColumns(matched);
+        int count = 0;
+        if (colNames != null) {
+            Map<String, String> colTypes = db().getExecutor().getTableColumnTypes(matched);
+            Map<String, String> colDefaults = db().getExecutor().getTableColumnDefaults(matched);
+            List<String> pks = db().getExecutor().getTablePrimaryKeys(matched);
+
+            for (String col : colNames) {
+                String typeStr = colTypes != null ? colTypes.get(col) : "VARCHAR";
+                int typOid = StdCatalogViews.getTypeOid(typeStr);
+                String formattedType = StdCatalogViews.formatType(typOid);
+                boolean isPk = pks != null && pks.contains(col);
+                String defVal = colDefaults != null ? colDefaults.get(col) : null;
+
+                StdWireMessages.writeDataRow(out, java.util.Arrays.asList(
+                    col,
+                    formattedType,
+                    "",
+                    isPk ? "not null" : "",
+                    defVal != null ? defVal : ""
+                ));
+                count++;
+            }
+        }
+
+        StdWireMessages.writeCommandComplete(out, "SELECT " + count);
+        return true;
     }
 
     private static int extractOidFromWhere(String sql) {
