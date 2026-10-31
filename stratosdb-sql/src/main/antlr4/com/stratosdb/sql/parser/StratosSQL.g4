@@ -200,16 +200,19 @@ savepointName: IDENTIFIER;
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN (COMMA LPAREN valueList RPAREN)* returningClause? SEMICOLON?;
 returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
-select: SELECT selectList (FROM tableName (AS? IDENTIFIER)? joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? SEMICOLON?;
+select: SELECT selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? SEMICOLON?;
+tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: IDENTIFIER;
-joinClause: (joinType)? JOIN tableName (AS? IDENTIFIER)? ON columnName ASSIGN columnName;
+joinClause: (joinType)? JOIN tableSource ON columnName ASSIGN columnName;
 
 joinType: INNER
         | LEFT OUTER?
         | RIGHT OUTER?
         | FULL OUTER?
         | CROSS
+        | SEMI
+        | ANTI
         ;
 groupByList: columnName (COMMA columnName)*;
 havingClause: aggregateFunction ASSIGN literal
@@ -239,7 +242,7 @@ indexName: IDENTIFIER;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
-selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | functionCall (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
+selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | functionCall (AS alias)? | literal (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
 windowFunction: (ROW_NUMBER | RANK | DENSE_RANK) LPAREN RPAREN OVER LPAREN (PARTITION BY groupByList)? (ORDER BY orderList)? RPAREN;
 
 // Expressions
@@ -498,6 +501,8 @@ RIGHT: R I G H T;
 FULL: F U L L;
 OUTER: O U T E R;
 CROSS: C R O S S;
+SEMI: S E M I;
+ANTI: A N T I;
 EXPLAIN: E X P L A I N;
 ANALYZE: A N A L Y Z E;
 VACUUM: V A C U U M;

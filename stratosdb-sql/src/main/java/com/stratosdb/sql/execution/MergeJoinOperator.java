@@ -42,7 +42,11 @@ public class MergeJoinOperator implements PhysicalOperator {
         this.joinType = joinType != null ? joinType : JoinClause.JoinType.INNER;
         this.leftColumns = left != null ? left.getOutputColumns() : List.of();
         this.rightColumns = right != null ? right.getOutputColumns() : List.of();
-        this.outputColumns = JoinUtils.combineColumns(leftColumns, rightColumns);
+        if (this.joinType == JoinClause.JoinType.SEMI || this.joinType == JoinClause.JoinType.ANTI) {
+            this.outputColumns = List.copyOf(leftColumns);
+        } else {
+            this.outputColumns = JoinUtils.combineColumns(leftColumns, rightColumns);
+        }
     }
 
     @Override
@@ -69,6 +73,70 @@ public class MergeJoinOperator implements PhysicalOperator {
     @Override
     public TupleSlot next() {
         if (!open) {
+            slot.clear();
+            return slot;
+        }
+
+        if (joinType == JoinClause.JoinType.SEMI) {
+            while (currentLeft != null && currentRight != null) {
+                Object leftKey = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(currentLeft, leftColumn));
+                Object rightKey = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(currentRight, rightColumn));
+                if (leftKey == null) {
+                    currentLeft = advance(left);
+                    continue;
+                }
+                if (rightKey == null) {
+                    currentRight = advance(right);
+                    continue;
+                }
+                int cmp = JoinUtils.compareKeys(leftKey, rightKey);
+                if (cmp == 0) {
+                    Tuple emit = currentLeft;
+                    currentLeft = advance(left);
+                    slot.set(emit);
+                    return slot;
+                } else if (cmp < 0) {
+                    currentLeft = advance(left);
+                } else {
+                    currentRight = advance(right);
+                }
+            }
+            slot.clear();
+            return slot;
+        }
+
+        if (joinType == JoinClause.JoinType.ANTI) {
+            while (currentLeft != null) {
+                if (currentRight == null) {
+                    Tuple emit = currentLeft;
+                    currentLeft = advance(left);
+                    slot.set(emit);
+                    return slot;
+                }
+                Object leftKey = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(currentLeft, leftColumn));
+                Object rightKey = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(currentRight, rightColumn));
+                if (leftKey == null) {
+                    Tuple emit = currentLeft;
+                    currentLeft = advance(left);
+                    slot.set(emit);
+                    return slot;
+                }
+                if (rightKey == null) {
+                    currentRight = advance(right);
+                    continue;
+                }
+                int cmp = JoinUtils.compareKeys(leftKey, rightKey);
+                if (cmp < 0) {
+                    Tuple emit = currentLeft;
+                    currentLeft = advance(left);
+                    slot.set(emit);
+                    return slot;
+                } else if (cmp == 0) {
+                    currentLeft = advance(left);
+                } else {
+                    currentRight = advance(right);
+                }
+            }
             slot.clear();
             return slot;
         }

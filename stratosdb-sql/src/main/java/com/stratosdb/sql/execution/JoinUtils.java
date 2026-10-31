@@ -60,6 +60,19 @@ public final class JoinUtils {
             }
         }
 
+        if (columnName.matches("-?\\d+(\\.\\d+)?")) {
+            try {
+                if (columnName.contains(".")) {
+                    return Double.parseDouble(columnName);
+                } else {
+                    return Integer.parseInt(columnName);
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        if (columnName.startsWith("'") && columnName.endsWith("'") && columnName.length() >= 2) {
+            return columnName.substring(1, columnName.length() - 1);
+        }
+
         return null;
     }
 
@@ -100,6 +113,49 @@ public final class JoinUtils {
             qualified.add(col.startsWith(tableName + ".") ? col : (tableName + "." + col));
         }
         return qualified;
+    }
+
+    public static Tuple qualifyWithAlias(Tuple tuple, String alias) {
+        if (tuple == null || alias == null) return tuple;
+        Tuple qualified = new Tuple();
+        List<String> columnNames = tuple.getColumnNames();
+        for (int i = 0; i < columnNames.size(); i++) {
+            String name = columnNames.get(i);
+            String bare = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1) : name;
+            qualified.addValue(alias + "." + bare, tuple.getValue(i));
+        }
+        return qualified;
+    }
+
+    public static List<String> qualifyColumnsWithAlias(List<String> columns, String alias) {
+        if (columns == null || alias == null) return columns != null ? columns : List.of();
+        List<String> qualified = new ArrayList<>(columns.size());
+        for (String col : columns) {
+            String bare = col.contains(".") ? col.substring(col.lastIndexOf('.') + 1) : col;
+            qualified.add(alias + "." + bare);
+        }
+        return qualified;
+    }
+
+    public static Tuple unqualify(Tuple tuple) {
+        if (tuple == null) return null;
+        Tuple unqual = new Tuple();
+        List<String> columnNames = tuple.getColumnNames();
+        for (int i = 0; i < columnNames.size(); i++) {
+            String name = columnNames.get(i);
+            String bare = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1) : name;
+            unqual.addValue(bare, tuple.getValue(i));
+        }
+        return unqual;
+    }
+
+    public static List<String> unqualifyColumns(List<String> columns) {
+        if (columns == null) return List.of();
+        List<String> unqual = new ArrayList<>(columns.size());
+        for (String col : columns) {
+            unqual.add(col.contains(".") ? col.substring(col.lastIndexOf('.') + 1) : col);
+        }
+        return unqual;
     }
 
     public static Tuple merge(Tuple left, Tuple right) {

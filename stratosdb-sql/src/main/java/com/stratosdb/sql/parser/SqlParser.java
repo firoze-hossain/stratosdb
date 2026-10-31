@@ -686,7 +686,21 @@ public class SqlParser {
         // ExecutorEngine.executeSelect's own comment for how this is executed
         // (the select list's own expressions evaluated exactly once, with no table
         // to iterate at all, producing exactly one output row).
-        String tableName = ctx.tableName() != null ? ctx.tableName().getText() : null;
+        String tableName = null;
+        SelectStatement fromSubquery = null;
+        String tableAlias = null;
+
+        if (ctx.tableSource() != null) {
+            if (ctx.tableSource().tableName() != null) {
+                tableName = ctx.tableSource().tableName().getText();
+            }
+            if (ctx.tableSource().select() != null) {
+                fromSubquery = buildSelect(ctx.tableSource().select());
+            }
+            if (ctx.tableSource().alias() != null) {
+                tableAlias = ctx.tableSource().alias().getText();
+            }
+        }
         List<String> columns = new ArrayList<>();
         List<String> columnAliases = new ArrayList<>();
         List<AggregateCall> aggregates = new ArrayList<>();
@@ -706,6 +720,9 @@ public class SqlParser {
                     functionCalls.add(buildFunctionCallItem(itemCtx.functionCall(), alias));
                 } else if (itemCtx.columnName() != null) {
                     columns.add(itemCtx.columnName().getText());
+                    columnAliases.add(alias);
+                } else if (itemCtx.literal() != null) {
+                    columns.add(itemCtx.literal().getText());
                     columnAliases.add(alias);
                 } else {
                     // The `expression (AS alias)?` selectItem alternative - not really meaningful
@@ -744,7 +761,7 @@ public class SqlParser {
             }
         }
 
-        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems);
+        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias);
     }
 
     private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {
@@ -794,7 +811,22 @@ public class SqlParser {
     }
 
     private JoinClause buildJoinClause(StratosSQLParser.JoinClauseContext ctx) {
-        String tableName = ctx.tableName().getText();
+        String tableName = null;
+        SelectStatement subquery = null;
+        String tableAlias = null;
+
+        if (ctx.tableSource() != null) {
+            if (ctx.tableSource().tableName() != null) {
+                tableName = ctx.tableSource().tableName().getText();
+            }
+            if (ctx.tableSource().select() != null) {
+                subquery = buildSelect(ctx.tableSource().select());
+            }
+            if (ctx.tableSource().alias() != null) {
+                tableAlias = ctx.tableSource().alias().getText();
+            }
+        }
+
         List<StratosSQLParser.ColumnNameContext> columns = ctx.columnName();
         String leftColumn = columns.get(0).getText();
         String rightColumn = columns.get(1).getText();
@@ -808,9 +840,13 @@ public class SqlParser {
                 joinType = JoinClause.JoinType.FULL;
             } else if (ctx.joinType().CROSS() != null) {
                 joinType = JoinClause.JoinType.CROSS;
+            } else if (ctx.joinType().SEMI() != null) {
+                joinType = JoinClause.JoinType.SEMI;
+            } else if (ctx.joinType().ANTI() != null) {
+                joinType = JoinClause.JoinType.ANTI;
             }
         }
-        return new JoinClause(tableName, leftColumn, rightColumn, joinType);
+        return new JoinClause(tableName, leftColumn, rightColumn, joinType, subquery, tableAlias);
     }
 
     private DeleteStatement buildDelete(StratosSQLParser.DeleteContext ctx) {

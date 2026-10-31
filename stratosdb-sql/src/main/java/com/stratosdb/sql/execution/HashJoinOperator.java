@@ -51,10 +51,14 @@ public class HashJoinOperator implements PhysicalOperator {
         this.joinType = joinType != null ? joinType : JoinClause.JoinType.INNER;
         this.leftColumns = left != null ? left.getOutputColumns() : List.of();
         this.rightColumns = right != null ? right.getOutputColumns() : List.of();
-        this.outputColumns = JoinUtils.combineColumns(leftColumns, rightColumns);
+        if (this.joinType == JoinClause.JoinType.SEMI || this.joinType == JoinClause.JoinType.ANTI) {
+            this.outputColumns = List.copyOf(this.leftColumns);
+        } else {
+            this.outputColumns = JoinUtils.combineColumns(leftColumns, rightColumns);
+        }
 
         // For RIGHT JOIN, build side is left (so right streams as probe)
-        // For LEFT, FULL, and INNER joins, build side is right (so left streams as probe)
+        // For LEFT, FULL, INNER, SEMI, and ANTI joins, build side is right (so left streams as probe)
         this.buildOnLeft = (this.joinType == JoinClause.JoinType.RIGHT);
         this.buildSide = buildOnLeft ? left : right;
         this.probeSide = buildOnLeft ? right : left;
@@ -130,6 +134,30 @@ public class HashJoinOperator implements PhysicalOperator {
 
             currentProbeTuple = probeSlot.getTuple();
             Object probeKey = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(currentProbeTuple, probeColumn));
+
+            if (joinType == JoinClause.JoinType.SEMI) {
+                if (probeKey != null) {
+                    List<Tuple> matches = hashTable.get(probeKey);
+                    if (matches != null && !matches.isEmpty()) {
+                        slot.set(currentProbeTuple);
+                        return slot;
+                    }
+                }
+                continue;
+            }
+
+            if (joinType == JoinClause.JoinType.ANTI) {
+                if (probeKey == null) {
+                    slot.set(currentProbeTuple);
+                    return slot;
+                }
+                List<Tuple> matches = hashTable.get(probeKey);
+                if (matches == null || matches.isEmpty()) {
+                    slot.set(currentProbeTuple);
+                    return slot;
+                }
+                continue;
+            }
 
             if (probeKey == null) {
                 // NULL never matches in equi-join

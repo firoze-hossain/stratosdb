@@ -51,7 +51,11 @@ public class NestedLoopJoinOperator implements PhysicalOperator {
         this.joinType = joinType != null ? joinType : JoinClause.JoinType.INNER;
         this.leftColumns = left != null ? left.getOutputColumns() : List.of();
         this.rightColumns = right != null ? right.getOutputColumns() : List.of();
-        this.outputColumns = JoinUtils.combineColumns(leftColumns, rightColumns);
+        if (this.joinType == JoinClause.JoinType.SEMI || this.joinType == JoinClause.JoinType.ANTI) {
+            this.outputColumns = List.copyOf(leftColumns);
+        } else {
+            this.outputColumns = JoinUtils.combineColumns(leftColumns, rightColumns);
+        }
     }
 
     @Override
@@ -94,6 +98,44 @@ public class NestedLoopJoinOperator implements PhysicalOperator {
         }
 
         while (currentLeftTuple != null) {
+            if (joinType == JoinClause.JoinType.SEMI) {
+                boolean matched = false;
+                while (currentInnerIndex < innerRows.size()) {
+                    Tuple innerTuple = innerRows.get(currentInnerIndex++);
+                    if (condition == null || condition.test(currentLeftTuple, innerTuple)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                Tuple justEmitted = currentLeftTuple;
+                currentLeftTuple = advanceLeft();
+                currentInnerIndex = 0;
+                if (matched) {
+                    slot.set(justEmitted);
+                    return slot;
+                }
+                continue;
+            }
+
+            if (joinType == JoinClause.JoinType.ANTI) {
+                boolean matched = false;
+                while (currentInnerIndex < innerRows.size()) {
+                    Tuple innerTuple = innerRows.get(currentInnerIndex++);
+                    if (condition == null || condition.test(currentLeftTuple, innerTuple)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                Tuple justEmitted = currentLeftTuple;
+                currentLeftTuple = advanceLeft();
+                currentInnerIndex = 0;
+                if (!matched) {
+                    slot.set(justEmitted);
+                    return slot;
+                }
+                continue;
+            }
+
             while (currentInnerIndex < innerRows.size()) {
                 Tuple innerTuple = innerRows.get(currentInnerIndex);
                 int innerIdx = currentInnerIndex++;

@@ -10,17 +10,26 @@ import java.util.List;
  * raw text (e.g. "person0_.id") is still needed for real lookup against
  * the underlying tuple (see ExecutorEngine.findColumnValue) - the alias
  * only ever renames the OUTPUT column, after that real lookup already
- * happened (see ExecutorEngine.applyColumnAliases). Found missing
- * entirely during a real, broad driver/ORM verification pass: Hibernate's
- * own HQL-to-SQL translator always aliases every projected column
- * ("person0_.id AS id0_"), and the official JDBC driver then reads the
- * result set BACK by that exact alias name, not the original column.
+ * happened (see ExecutorEngine.applyColumnAliases).
+ *
+ * fromSubquery and tableAlias: support derived tables in FROM clause
+ * ("FROM (SELECT ...) AS dt") and table aliases ("FROM customers AS c").
  */
 public record SelectStatement(String tableName, List<String> columns, WhereExpr where,
                               String orderBy, String limit, String offset, List<JoinClause> joins,
                               List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
                               List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
-                              List<String> columnAliases, List<OrderItem> orderItems) implements Statement {
+                              List<String> columnAliases, List<OrderItem> orderItems,
+                              SelectStatement fromSubquery, String tableAlias) implements Statement {
+
+    public SelectStatement(String tableName, List<String> columns, WhereExpr where,
+                           String orderBy, String limit, String offset, List<JoinClause> joins,
+                           List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
+                           List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
+                           List<String> columnAliases, List<OrderItem> orderItems) {
+        this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
+             windowFunctions, functionCalls, columnAliases, orderItems, null, null);
+    }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
                            String orderBy, String limit, String offset, List<JoinClause> joins,
@@ -28,11 +37,37 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                            List<String> columnAliases) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, List.of());
+             windowFunctions, functionCalls, columnAliases, List.of(), null, null);
     }
 
     @Override
     public List<OrderItem> orderItems() {
         return orderItems != null ? orderItems : List.of();
+    }
+
+    public boolean isDerivedTable() {
+        return fromSubquery != null;
+    }
+
+    public String effectiveTableName() {
+        return tableAlias != null ? tableAlias : tableName;
+    }
+
+    public SelectStatement withWhere(WhereExpr newWhere) {
+        return new SelectStatement(tableName, columns, newWhere, orderBy, limit, offset, joins,
+                                   aggregates, groupBy, havingClause, windowFunctions, functionCalls,
+                                   columnAliases, orderItems, fromSubquery, tableAlias);
+    }
+
+    public SelectStatement withJoins(List<JoinClause> newJoins) {
+        return new SelectStatement(tableName, columns, where, orderBy, limit, offset, newJoins,
+                                   aggregates, groupBy, havingClause, windowFunctions, functionCalls,
+                                   columnAliases, orderItems, fromSubquery, tableAlias);
+    }
+
+    public SelectStatement withJoinsAndWhere(List<JoinClause> newJoins, WhereExpr newWhere) {
+        return new SelectStatement(tableName, columns, newWhere, orderBy, limit, offset, newJoins,
+                                   aggregates, groupBy, havingClause, windowFunctions, functionCalls,
+                                   columnAliases, orderItems, fromSubquery, tableAlias);
     }
 }

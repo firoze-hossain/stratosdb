@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 99 |
-| Tests passing | **497 / 497** |
+| Tests passing | **510 / 510** |
 | Main source | ~31,650 lines |
 | Test source | ~14,250 lines |
 
@@ -1209,6 +1209,57 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Full reactor test suite verified at **497 / 497 tests passing across all 12 modules** (0 failures, 0 errors).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 15, Sprint 6 Week 11) marked `Completed`.
+
+## Sprint 6 Week 12 — Query Engine (Subquery Unnesting & Decorrelation to Semi/Anti Joins & Derived Tables) ✅ DONE
+
+- ✅ **SQL Grammar & AST Support for Subqueries & Derived Tables (`stratosdb-sql`)**:
+  - Extended ANTLR grammar (`StratosSQL.g4`) to support derived subqueries in `FROM` clause and `JOIN` targets:
+    `tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;`
+    `joinClause: (joinType)? JOIN tableSource ON columnName ASSIGN columnName;`
+  - Added native `SEMI` and `ANTI` join types to `joinType` grammar and lexer tokens (`SEMI: S E M I;`, `ANTI: A N T I;`).
+  - Added support for literal constants in select projections (`SELECT 1`, `SELECT 'abc'`).
+  - Enhanced AST nodes:
+    - `JoinClause.java`: Added `JoinType.SEMI`, `JoinType.ANTI`, `SelectStatement subquery`, and `String tableAlias`, preserving legacy constructors for 100% backward compatibility.
+    - `SelectStatement.java`: Added `SelectStatement fromSubquery` and `String tableAlias`, with helper methods `isDerivedTable()`, `effectiveTableName()`, `withWhere()`, `withJoins()`, and `withJoinsAndWhere()`.
+    - `SqlParser.java`: Parsed derived subqueries, table aliases, and `SEMI`/`ANTI` join types across `buildSelect` and `buildJoinClause`.
+- ✅ **AST Planning Phase Subquery Unnesting & Decorrelation (`SubqueryDecorrelator.java`)**:
+  - Implemented `SubqueryDecorrelator`:
+    - Recursively inspects and flattens `AND` conjunctions in `WHERE` clause.
+    - Unnests correlated `EXISTS (SELECT ...)` predicates into `SEMI JOIN` against the inner table or subquery.
+    - Unnests correlated `NOT EXISTS (SELECT ...)` predicates into `ANTI JOIN` against the inner table or subquery.
+    - Unnests `col IN (SELECT ...)` predicates into `SEMI JOIN` on `col = inner_col`.
+    - Unnests `col NOT IN (SELECT ...)` predicates into `ANTI JOIN` on `col = inner_col`.
+    - Unnests correlated scalar subqueries (`col = (SELECT ...)`) into `SEMI JOIN`.
+    - Pre-evaluates and constant-folds uncorrelated scalar subqueries during the AST planning phase into direct literal comparisons.
+    - Automatically rewrites dummy subquery projections (e.g. `SELECT 1 FROM orders ...`) to project the join key (`targetCols`) on derived subqueries so hash join probe and build match seamlessly.
+- ✅ **Volcano Physical Join Operators Updated for Semi & Anti Joins (`HashJoinOperator`, `NestedLoopJoinOperator`, `MergeJoinOperator`)**:
+  - Updated all three Volcano join iterators:
+    - `SEMI JOIN`: Emits probe (outer) tuple at most once immediately upon encountering the first matching build tuple, short-circuiting further probe iterations. Output schema retains left columns.
+    - `ANTI JOIN`: Emits probe (outer) tuple if and only if no matching build tuple exists across the inner relation.
+    - Supports streaming execution with minimal memory footprint (scales only with build side hash table or presorted inputs).
+- ✅ **Execution Engine Pipeline Integration (`ExecutorEngine.java`)**:
+  - Integrated `SubqueryDecorrelator.decorrelate()` at the entry of `executeSelect()`.
+  - Added execution pipeline for derived tables in `FROM` clause (`resolveFromSourceOperator`) and derived subquery join targets (`resolveJoinSourceOperator`).
+  - Automatically unqualifies tuple column names on final projection when all joins are `SEMI` or `ANTI`, ensuring queries like `SELECT * FROM customers WHERE EXISTS (...)` preserve identical single-table output schema.
+- ✅ **Comprehensive Test Suite & Verification (`SubqueryUnnestingAndDecorrelationTest.java`)**:
+  - 13 comprehensive unit, operator, integration, and performance speedup tests:
+    - `testCorrelatedExistsUnnestingToSemiJoin`: verifies correlated `EXISTS` unnested to `SEMI JOIN` returning matching rows.
+    - `testCorrelatedNotExistsUnnestingToAntiJoin`: verifies correlated `NOT EXISTS` unnested to `ANTI JOIN`.
+    - `testInSubqueryUnnestingToSemiJoin`: verifies `IN (SELECT ...)` unnested to `SEMI JOIN`.
+    - `testNotInSubqueryUnnestingToAntiJoin`: verifies `NOT IN (SELECT ...)` unnested to `ANTI JOIN`.
+    - `testCorrelatedExistsWithSubqueryFilters`: verifies correlated `EXISTS` with filters in the inner subquery.
+    - `testCompoundWhereClauseUnnesting`: verifies compound `WHERE` with multiple predicates and subqueries.
+    - `testScalarSubqueryPreEvaluation`: verifies uncorrelated scalar subquery constant folding during AST planning.
+    - `testDerivedTableInFromClause`: verifies execution of derived subquery in `FROM` clause.
+    - `testDerivedTableWithAggregationInFromClause`: verifies derived subquery with `GROUP BY` and aggregation in `FROM`.
+    - `testDerivedTableAsJoinTarget`: verifies joining against a derived subquery target.
+    - `testExplicitSemiAndAntiJoinSyntax`: verifies direct SQL queries using explicit `SEMI JOIN` and `ANTI JOIN` syntax.
+    - `testPhysicalJoinOperatorsSemiAndAnti`: direct operator-level tests across `HashJoinOperator`, `NestedLoopJoinOperator`, and `MergeJoinOperator` for `SEMI` and `ANTI`.
+    - `testCorrelatedSubqueryPerformanceSpeedup50xTo100x`: benchmark comparing unnested Hash Join against O(N*M) nested loop evaluation over 1,500 outer rows and 1,500 inner rows, verifying **>50x speedup**.
+  - Full reactor test suite verified at **510 / 510 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 16, Sprint 6 Week 12) marked `Completed`.
+    - Sheet 3 (Row 23, Join Types & Capabilities) updated with SEMI/ANTI joins and subquery unnesting.
 
 ## What to do next
 

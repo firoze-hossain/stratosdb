@@ -9,6 +9,7 @@ import com.stratosdb.sql.catalog.StdCatalogViews;
 import com.stratosdb.sql.catalog.SystemCatalog;
 import com.stratosdb.sql.execution.*;
 import com.stratosdb.sql.parser.SqlParser;
+import com.stratosdb.sql.planner.SubqueryDecorrelator;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.page.BTreePage;
@@ -1163,6 +1164,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return new java.util.HashSet<>(tables.keySet());
     }
 
+    public Object evaluateScalarSubquery(SelectStatement subquery, Transaction txn) {
+        return evaluateScalarSubqueryValue(subquery, txn, null);
+    }
+
     public record IndexMetadata(String indexName, String tableName, String columnName, String columnName2, String indexType, boolean isUnique, boolean isPrimary) {}
 
     public List<IndexMetadata> getIndexesForTable(String tableName) {
@@ -1217,7 +1222,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     public List<String> getTableColumns(String tableName) {
-        return tableColumns.get(tableName);
+        if (tableName == null) return List.of();
+        String stripped = tableName;
+        if (stripped.startsWith("\"") && stripped.endsWith("\"") && stripped.length() >= 2) {
+            stripped = stripped.substring(1, stripped.length() - 1);
+        }
+        if (stripped.toLowerCase(java.util.Locale.ROOT).startsWith("public.")) {
+            stripped = stripped.substring("public.".length());
+        }
+        List<String> cols = tableColumns.get(stripped);
+        return cols != null ? cols : List.of();
     }
 
     public Map<String, String> getTableColumnTypes(String tableName) {
@@ -2886,7 +2900,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * at all" version, same spirit as the Week 3 plan called for.
      */
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn) {
-        if (stmt.tableName() == null) {
+        if (stmt.tableName() == null && stmt.fromSubquery() == null) {
             // A real, FROM-less SELECT ("SELECT version()", "SELECT 1") - see
             // SqlParser.buildSelect's own comment for why this exists at all.
             // There is no row to iterate, so the select list's own expressions
@@ -2900,15 +2914,56 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             Tuple projected = project(new Tuple(), stmt.columns(), stmt.functionCalls());
             return QueryResult.success(List.of(projected));
         }
-        // Real row-level security: narrows what this SELECT can see, on top
-        // of whatever WHERE clause it already had - see applyRowLevelSecurity's
-        // own javadoc for the full rule (multiple permissive policies OR'd,
-        // owner/superuser exemption, real default-deny when RLS is enabled
-        // but no policy applies at all).
-        stmt = new SelectStatement(stmt.tableName(), stmt.columns(),
-            applyRowLevelSecurity(stmt.tableName(), "SELECT", stmt.where()),
-            stmt.orderBy(), stmt.limit(), stmt.offset(), stmt.joins(), stmt.aggregates(), stmt.groupBy(),
-            stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases(), stmt.orderItems());
+
+        // Decorrelate & unnest subqueries during AST planning phase
+        stmt = SubqueryDecorrelator.decorrelate(stmt, this, txn);
+
+        if (stmt.tableName() != null) {
+            stmt = stmt.withWhere(applyRowLevelSecurity(stmt.tableName(), "SELECT", stmt.where()));
+        }
+
+        if (stmt.isDerivedTable()) {
+            final SelectStatement finalDerivedStmt = stmt;
+            if (finalDerivedStmt.joins() != null && !finalDerivedStmt.joins().isEmpty()) {
+                if (!finalDerivedStmt.windowFunctions().isEmpty()) {
+                    return QueryResult.error("Window functions combined with JOIN aren't supported yet");
+                }
+                return executeJoinedSelect(finalDerivedStmt, txn);
+            }
+
+            PhysicalOperator scanOp = resolveFromSourceOperator(finalDerivedStmt, txn);
+            PhysicalOperator currentOp = scanOp;
+
+            if (finalDerivedStmt.where() != null) {
+                currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, finalDerivedStmt.where(), txn));
+            }
+
+            boolean hasAggregates = !finalDerivedStmt.aggregates().isEmpty() || !finalDerivedStmt.groupBy().isEmpty();
+            if (hasAggregates) {
+                currentOp = new HashAggregateOperator(currentOp, finalDerivedStmt.groupBy(), finalDerivedStmt.aggregates(), finalDerivedStmt.havingClause());
+            } else {
+                List<String> outputColumns = determineOutputColumns(finalDerivedStmt, scanOp.getOutputColumns());
+                currentOp = new ProjectOperator(
+                    currentOp,
+                    tuple -> applyColumnAliases(project(tuple, finalDerivedStmt.columns(), finalDerivedStmt.functionCalls()), finalDerivedStmt.columns(), finalDerivedStmt.columnAliases()),
+                    outputColumns
+                );
+            }
+
+            if (finalDerivedStmt.orderItems() != null && !finalDerivedStmt.orderItems().isEmpty()) {
+                currentOp = new SortOperator(currentOp, finalDerivedStmt.orderItems(), SortOperator.DEFAULT_WORK_MEM_BYTES, finalDerivedStmt.columns(), finalDerivedStmt.columnAliases());
+            }
+
+            if (finalDerivedStmt.limit() != null || finalDerivedStmt.offset() != null) {
+                long limit = parseLongOrDefault(finalDerivedStmt.limit(), -1);
+                long offset = parseLongOrDefault(finalDerivedStmt.offset(), 0);
+                if (limit >= 0 || offset > 0) {
+                    currentOp = new LimitOperator(currentOp, limit, offset);
+                }
+            }
+
+            return QueryResult.success(currentOp, currentOp.getOutputColumns());
+        }
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             String tblName = stmt.tableName();
@@ -2980,12 +3035,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
-        QueryResult denied = requirePrivilege(stmt.tableName(), "SELECT");
-        if (denied != null) return denied;
+        if (stmt.tableName() != null) {
+            QueryResult denied = requirePrivilege(stmt.tableName(), "SELECT");
+            if (denied != null) return denied;
+        }
         if (stmt.joins() != null) {
             for (JoinClause join : stmt.joins()) {
-                QueryResult joinDenied = requirePrivilege(join.tableName(), "SELECT");
-                if (joinDenied != null) return joinDenied;
+                if (join.tableName() != null) {
+                    QueryResult joinDenied = requirePrivilege(join.tableName(), "SELECT");
+                    if (joinDenied != null) return joinDenied;
+                }
             }
         }
 
@@ -3816,16 +3875,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * findColumnValue's suffix-match fallback.
      */
     private QueryResult executeJoinedSelect(SelectStatement stmt, Transaction txn) {
-        PhysicalOperator sourceOp = resolveJoinSourceOperator(stmt.tableName(), txn);
+        PhysicalOperator sourceOp = resolveFromSourceOperator(stmt, txn);
         if (sourceOp == null) {
-            return QueryResult.error("Table not found: " + stmt.tableName());
+            return QueryResult.error("Table not found: " + stmt.effectiveTableName());
         }
 
         PhysicalOperator currentOp = sourceOp;
         for (JoinClause join : stmt.joins()) {
-            PhysicalOperator joinedOp = resolveJoinSourceOperator(join.tableName(), txn);
+            PhysicalOperator joinedOp = resolveJoinSourceOperator(join, txn);
             if (joinedOp == null) {
-                return QueryResult.error("Table not found: " + join.tableName());
+                return QueryResult.error("Table not found: " + join.effectiveTargetName());
             }
 
             currentOp = new HashJoinOperator(currentOp, joinedOp, join.leftColumn(), join.rightColumn(), join.joinType());
@@ -3839,10 +3898,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (hasAggregates) {
             currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(), stmt.havingClause());
         } else {
-            List<String> outputColumns = determineJoinedOutputColumns(stmt, currentOp.getOutputColumns());
+            boolean allSemiOrAnti = stmt.joins() != null && !stmt.joins().isEmpty() &&
+                stmt.joins().stream().allMatch(j -> j.joinType() == JoinClause.JoinType.SEMI || j.joinType() == JoinClause.JoinType.ANTI);
+
+            List<String> outputColumns = determineJoinedOutputColumns(stmt, currentOp.getOutputColumns(), allSemiOrAnti);
             currentOp = new ProjectOperator(
                 currentOp,
-                row -> applyColumnAliases(project(row, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()),
+                row -> {
+                    Tuple projected = applyColumnAliases(project(row, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases());
+                    return allSemiOrAnti ? JoinUtils.unqualify(projected) : projected;
+                },
                 outputColumns
             );
         }
@@ -3860,6 +3925,71 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
 
         return QueryResult.success(currentOp, currentOp.getOutputColumns());
+    }
+
+    private PhysicalOperator resolveFromSourceOperator(SelectStatement stmt, Transaction txn) {
+        if (stmt.isDerivedTable()) {
+            SelectStatement sub = stmt.fromSubquery();
+            QueryResult subResult = executeSelect(sub, txn);
+            if (!subResult.isSuccess()) {
+                throw new IllegalStateException("Derived table in FROM failed: " + subResult.getError());
+            }
+            String alias = stmt.tableAlias() != null ? stmt.tableAlias() : "dt";
+            if (subResult.getOperator() != null) {
+                PhysicalOperator subOp = subResult.getOperator();
+                List<String> qualCols = JoinUtils.qualifyColumnsWithAlias(subOp.getOutputColumns(), alias);
+                return new ProjectOperator(subOp, t -> JoinUtils.qualifyWithAlias(t, alias), qualCols);
+            }
+            List<Tuple> rows = subResult.getRows();
+            List<String> rawCols = (rows != null && !rows.isEmpty())
+                ? rows.get(0).getColumnNames()
+                : subResult.getColumnNames();
+            if (rawCols == null) rawCols = List.of();
+            List<String> qualCols = JoinUtils.qualifyColumnsWithAlias(rawCols, alias);
+            List<Tuple> qualRows = new ArrayList<>();
+            if (rows != null) {
+                for (Tuple t : rows) {
+                    qualRows.add(JoinUtils.qualifyWithAlias(t, alias));
+                }
+            }
+            return new MemoryScanOperator(qualRows, qualCols);
+        }
+        return resolveJoinSourceOperator(stmt.tableName(), stmt.tableAlias(), txn);
+    }
+
+    private PhysicalOperator resolveJoinSourceOperator(JoinClause join, Transaction txn) {
+        if (join.isSubquery()) {
+            SelectStatement sub = join.subquery();
+            QueryResult subResult = executeSelect(sub, txn);
+            if (!subResult.isSuccess()) {
+                throw new IllegalStateException("Subquery join target failed: " + subResult.getError());
+            }
+            String alias = join.tableAlias() != null ? join.tableAlias() : (join.tableName() != null ? join.tableName() : "subquery");
+            List<Tuple> rows = subResult.getRows();
+            List<String> rawCols = (rows != null && !rows.isEmpty())
+                ? rows.get(0).getColumnNames()
+                : subResult.getColumnNames();
+            if (rawCols == null) rawCols = List.of();
+            List<String> qualCols = JoinUtils.qualifyColumnsWithAlias(rawCols, alias);
+            List<Tuple> qualRows = new ArrayList<>();
+            if (rows != null) {
+                for (Tuple t : rows) {
+                    qualRows.add(JoinUtils.qualifyWithAlias(t, alias));
+                }
+            }
+            return new MemoryScanOperator(qualRows, qualCols);
+        }
+        return resolveJoinSourceOperator(join.tableName(), join.tableAlias(), txn);
+    }
+
+    private PhysicalOperator resolveJoinSourceOperator(String name, String alias, Transaction txn) {
+        PhysicalOperator op = resolveJoinSourceOperator(name, txn);
+        if (op == null) return null;
+        if (alias != null && !alias.equalsIgnoreCase(name)) {
+            List<String> qualCols = JoinUtils.qualifyColumnsWithAlias(op.getOutputColumns(), alias);
+            return new ProjectOperator(op, t -> JoinUtils.qualifyWithAlias(t, alias), qualCols);
+        }
+        return op;
     }
 
     private PhysicalOperator resolveJoinSourceOperator(String name, Transaction txn) {
@@ -3901,12 +4031,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return null;
     }
 
-    private List<String> determineJoinedOutputColumns(SelectStatement stmt, List<String> joinedColumns) {
+    private List<String> determineJoinedOutputColumns(SelectStatement stmt, List<String> joinedColumns, boolean allSemiOrAnti) {
         List<String> outputCols = new ArrayList<>();
         if (stmt.columns() != null && !stmt.columns().isEmpty()) {
             if ("*".equals(stmt.columns().get(0))) {
                 if (joinedColumns != null && !joinedColumns.isEmpty()) {
-                    outputCols.addAll(joinedColumns);
+                    if (allSemiOrAnti) {
+                        outputCols.addAll(JoinUtils.unqualifyColumns(joinedColumns));
+                    } else {
+                        outputCols.addAll(joinedColumns);
+                    }
                 } else {
                     outputCols.add("*");
                 }
@@ -7785,6 +7919,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
             }
         }
+
+        if (columnName.matches("-?\\d+(\\.\\d+)?")) {
+            try {
+                if (columnName.contains(".")) {
+                    return Double.parseDouble(columnName);
+                } else {
+                    return Integer.parseInt(columnName);
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        if (columnName.startsWith("'") && columnName.endsWith("'") && columnName.length() >= 2) {
+            return columnName.substring(1, columnName.length() - 1);
+        }
+
         return null;
     }
 
