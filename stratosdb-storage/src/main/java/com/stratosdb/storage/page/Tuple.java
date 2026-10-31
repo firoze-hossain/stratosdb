@@ -73,9 +73,47 @@ public class Tuple {
     }
     
     public Object getValue(String columnName) {
+        if (columnName == null) return null;
         int index = columnNames.indexOf(columnName);
         if (index >= 0 && index < values.size()) {
             return values.get(index);
+        }
+        for (int i = 0; i < columnNames.size(); i++) {
+            if (columnNames.get(i).equalsIgnoreCase(columnName)) {
+                return values.get(i);
+            }
+        }
+        if (!columnName.contains(".")) {
+            String suffix = "." + columnName.toLowerCase();
+            for (int i = 0; i < columnNames.size(); i++) {
+                if (columnNames.get(i).toLowerCase().endsWith(suffix)) {
+                    return values.get(i);
+                }
+            }
+        } else {
+            int dotIdx = columnName.lastIndexOf('.');
+            String prefix = columnName.substring(0, dotIdx).toLowerCase();
+            String unqualified = columnName.substring(dotIdx + 1).toLowerCase();
+            String suffix = "." + unqualified;
+
+            // First pass: match table prefix / alias (e.g. "d" matching "departments" or vice-versa)
+            for (int i = 0; i < columnNames.size(); i++) {
+                String c = columnNames.get(i).toLowerCase();
+                if (c.endsWith(suffix) && c.contains(".")) {
+                    String cPrefix = c.substring(0, c.lastIndexOf('.'));
+                    if (cPrefix.equals(prefix) || cPrefix.startsWith(prefix) || prefix.startsWith(cPrefix)) {
+                        return values.get(i);
+                    }
+                }
+            }
+
+            // Second pass: match plain/unqualified tuple column (e.g. "id" in a non-joined table)
+            for (int i = 0; i < columnNames.size(); i++) {
+                String c = columnNames.get(i);
+                if (!c.contains(".") && c.equalsIgnoreCase(unqualified)) {
+                    return values.get(i);
+                }
+            }
         }
         // Fallback for tuples deserialized without an explicit catalog schema (e.g. storage crash harness tests)
         if (columnNames.isEmpty()) {

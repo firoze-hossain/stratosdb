@@ -2908,7 +2908,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         stmt = new SelectStatement(stmt.tableName(), stmt.columns(),
             applyRowLevelSecurity(stmt.tableName(), "SELECT", stmt.where()),
             stmt.orderBy(), stmt.limit(), stmt.offset(), stmt.joins(), stmt.aggregates(), stmt.groupBy(),
-            stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases());
+            stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases(), stmt.orderItems());
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             String tblName = stmt.tableName();
@@ -2921,7 +2921,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     tblName = candidate;
                     stmt = new SelectStatement(tblName, stmt.columns(), stmt.where(), stmt.orderBy(),
                         stmt.limit(), stmt.offset(), stmt.joins(), stmt.aggregates(), stmt.groupBy(),
-                        stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases());
+                        stmt.havingClause(), stmt.windowFunctions(), stmt.functionCalls(), stmt.columnAliases(), stmt.orderItems());
                     table = tables.get(tblName);
                 }
             }
@@ -3063,13 +3063,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, stmt.where(), txn));
         }
 
-        // Apply ProjectOperator to evaluate expressions/projections and column aliases
-        List<String> outputColumns = determineOutputColumns(stmt, schemaCols);
-        currentOp = new ProjectOperator(
-            currentOp,
-            tuple -> applyColumnAliases(project(tuple, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()),
-            outputColumns
-        );
+        boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
+        if (hasAggregates) {
+            currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(), stmt.havingClause());
+        } else {
+            // Apply ProjectOperator to evaluate expressions/projections and column aliases
+            List<String> outputColumns = determineOutputColumns(stmt, schemaCols);
+            currentOp = new ProjectOperator(
+                currentOp,
+                tuple -> applyColumnAliases(project(tuple, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()),
+                outputColumns
+            );
+        }
+
+        // Apply SortOperator if ORDER BY is present
+        if (stmt.orderItems() != null && !stmt.orderItems().isEmpty()) {
+            currentOp = new SortOperator(currentOp, stmt.orderItems(), SortOperator.DEFAULT_WORK_MEM_BYTES, stmt.columns(), stmt.columnAliases());
+        }
 
         // Apply LimitOperator if LIMIT or OFFSET is specified
         if (stmt.limit() != null || stmt.offset() != null) {
@@ -3155,6 +3165,17 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult finishSimpleSelect(SelectStatement stmt, List<Tuple> tuples) {
+        if (stmt.orderItems() != null && !stmt.orderItems().isEmpty()) {
+            tuples.sort((t1, t2) -> {
+                for (OrderItem item : stmt.orderItems()) {
+                    Object v1 = SortAndAggregateUtils.resolveColumnValue(t1, item.column(), stmt.columns(), stmt.columnAliases());
+                    Object v2 = SortAndAggregateUtils.resolveColumnValue(t2, item.column(), stmt.columns(), stmt.columnAliases());
+                    int cmp = SortAndAggregateUtils.compareValues(v1, v2, item.ascending());
+                    if (cmp != 0) return cmp;
+                }
+                return 0;
+            });
+        }
         tuples = applyLimitOffset(tuples, stmt.limit(), stmt.offset());
         return QueryResult.success(tuples);
     }
@@ -3475,6 +3496,18 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
 
+        if (outer.orderItems() != null && !outer.orderItems().isEmpty()) {
+            filtered.sort((t1, t2) -> {
+                for (OrderItem item : outer.orderItems()) {
+                    Object v1 = SortAndAggregateUtils.resolveColumnValue(t1, item.column(), outer.columns(), outer.columnAliases());
+                    Object v2 = SortAndAggregateUtils.resolveColumnValue(t2, item.column(), outer.columns(), outer.columnAliases());
+                    int cmp = SortAndAggregateUtils.compareValues(v1, v2, item.ascending());
+                    if (cmp != 0) return cmp;
+                }
+                return 0;
+            });
+        }
+
         filtered = applyLimitOffset(filtered, outer.limit(), outer.offset());
 
         return QueryResult.success(filtered);
@@ -3658,17 +3691,26 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             resultRows.add(outputRow);
         }
 
+        if (stmt.orderItems() != null && !stmt.orderItems().isEmpty()) {
+            resultRows.sort((t1, t2) -> {
+                for (OrderItem item : stmt.orderItems()) {
+                    Object v1 = SortAndAggregateUtils.resolveColumnValue(t1, item.column(), stmt.columns(), stmt.columnAliases());
+                    Object v2 = SortAndAggregateUtils.resolveColumnValue(t2, item.column(), stmt.columns(), stmt.columnAliases());
+                    int cmp = SortAndAggregateUtils.compareValues(v1, v2, item.ascending());
+                    if (cmp != 0) return cmp;
+                }
+                return 0;
+            });
+        }
+
         resultRows = applyLimitOffset(resultRows, stmt.limit(), stmt.offset());
 
         return QueryResult.success(resultRows);
     }
 
     private QueryResult executeAggregateSelect(SelectStatement stmt, Transaction txn, HeapTable table) {
-        List<Tuple> rows = new ArrayList<>();
-        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-            rows.add(deserializeTuple(stmt.tableName(), raw));
-        }
-        return executeAggregateSelectOverRows(stmt, rows, txn);
+        PhysicalOperator pipeline = buildPhysicalOperatorPipeline(stmt, table, txn);
+        return QueryResult.success(pipeline, pipeline.getOutputColumns());
     }
 
     /** COUNT(col) excludes NULLs (standard SQL); COUNT(*) counts every row regardless. SUM/AVG of zero contributing rows is NULL, not zero - also standard. */
@@ -3793,12 +3835,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             currentOp = new FilterOperator(currentOp, row -> matchesWhere(row, stmt.where(), txn));
         }
 
-        List<String> outputColumns = determineJoinedOutputColumns(stmt, currentOp.getOutputColumns());
-        currentOp = new ProjectOperator(
-            currentOp,
-            row -> applyColumnAliases(project(row, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()),
-            outputColumns
-        );
+        boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
+        if (hasAggregates) {
+            currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(), stmt.havingClause());
+        } else {
+            List<String> outputColumns = determineJoinedOutputColumns(stmt, currentOp.getOutputColumns());
+            currentOp = new ProjectOperator(
+                currentOp,
+                row -> applyColumnAliases(project(row, stmt.columns(), stmt.functionCalls()), stmt.columns(), stmt.columnAliases()),
+                outputColumns
+            );
+        }
+
+        if (stmt.orderItems() != null && !stmt.orderItems().isEmpty()) {
+            currentOp = new SortOperator(currentOp, stmt.orderItems(), SortOperator.DEFAULT_WORK_MEM_BYTES, stmt.columns(), stmt.columnAliases());
+        }
 
         if (stmt.limit() != null || stmt.offset() != null) {
             long limit = parseLongOrDefault(stmt.limit(), -1);
@@ -7710,14 +7761,26 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
             }
         } else {
-            // The reverse direction: a QUALIFIED request ("orders.customer_id")
-            // against a PLAIN, unqualified tuple (customer_id) - the shape a
-            // correlated subquery predicate takes when compared against its
-            // own (non-joined) FROM table's scan, since only JOIN's qualify()
-            // actually prefixes column names; a plain table scan never does.
-            String unqualified = columnName.substring(columnName.lastIndexOf('.') + 1);
+            int dotIdx = columnName.lastIndexOf('.');
+            String prefix = columnName.substring(0, dotIdx).toLowerCase();
+            String unqualified = columnName.substring(dotIdx + 1).toLowerCase();
+            String suffix = "." + unqualified;
+
+            // First pass: match table prefix / alias (e.g. "d" matching "departments" or vice-versa)
             for (int i = 0; i < columnNames.size(); i++) {
-                if (columnNames.get(i).equalsIgnoreCase(unqualified)) {
+                String c = columnNames.get(i).toLowerCase();
+                if (c.endsWith(suffix) && c.contains(".")) {
+                    String cPrefix = c.substring(0, c.lastIndexOf('.'));
+                    if (cPrefix.equals(prefix) || cPrefix.startsWith(prefix) || prefix.startsWith(cPrefix)) {
+                        return tuple.getValue(i);
+                    }
+                }
+            }
+
+            // Second pass: match plain/unqualified tuple column (e.g. "id" in a non-joined table)
+            for (int i = 0; i < columnNames.size(); i++) {
+                String c = columnNames.get(i);
+                if (!c.contains(".") && c.equalsIgnoreCase(unqualified)) {
                     return tuple.getValue(i);
                 }
             }

@@ -734,7 +734,17 @@ public class SqlParser {
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
         String offset = ctx.offsetValue() != null ? ctx.offsetValue().getText() : null;
 
-        return new SelectStatement(tableName, columns, where, null, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases);
+        List<OrderItem> orderItems = new ArrayList<>();
+        String orderByText = null;
+        if (ctx.orderList() != null) {
+            orderByText = ctx.orderList().getText();
+            for (StratosSQLParser.OrderItemContext itemCtx : ctx.orderList().orderItem()) {
+                boolean ascending = itemCtx.DESC() == null;
+                orderItems.add(new OrderItem(itemCtx.columnName().getText(), ascending));
+            }
+        }
+
+        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems);
     }
 
     private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {

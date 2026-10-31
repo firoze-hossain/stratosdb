@@ -20,4 +20,19 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                               String orderBy, String limit, String offset, List<JoinClause> joins,
                               List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
                               List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
-                              List<String> columnAliases) implements Statement {}
+                              List<String> columnAliases, List<OrderItem> orderItems) implements Statement {
+
+    public SelectStatement(String tableName, List<String> columns, WhereExpr where,
+                           String orderBy, String limit, String offset, List<JoinClause> joins,
+                           List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
+                           List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
+                           List<String> columnAliases) {
+        this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
+             windowFunctions, functionCalls, columnAliases, List.of());
+    }
+
+    @Override
+    public List<OrderItem> orderItems() {
+        return orderItems != null ? orderItems : List.of();
+    }
+}

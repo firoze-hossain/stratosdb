@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 99 |
-| Tests passing | **487 / 487** |
+| Tests passing | **497 / 497** |
 | Main source | ~31,650 lines |
 | Test source | ~14,250 lines |
 
@@ -1164,6 +1164,51 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 14, Sprint 5 Week 10) marked `Completed`.
     - Sheet 3 (Row 23, Join Types & Capabilities) marked `Resolved`.
+
+## Sprint 6 Week 11 — Streaming Sort & Aggregation (SortOperator with External Merge Sort & HashAggregateOperator / StreamAggregateOperator) ✅ DONE
+
+- ✅ **SQL Grammar & AST Support for ORDER BY (`stratosdb-sql`)**:
+  - Enhanced `OrderItem.java` with `descending()` helper method.
+  - Extended `SelectStatement.java` with `List<OrderItem> orderItems`, preserving the 13-argument constructor for full backward compatibility.
+  - Updated `SqlParser.java` (`buildSelect`) to parse `ctx.orderList()` into `List<OrderItem>` and populate both `orderByText` and `orderItems`.
+- ✅ **Volcano Streaming Sort Operator with Spill-to-Disk External Merge Sort (`SortOperator.java`)**:
+  - Implemented `SortOperator`:
+    - Evaluates in-memory Dual-Pivot QuickSort / TimSort when input fits within `work_mem` (default 4MB or configurable threshold).
+    - If input exceeds `work_mem`, spills sorted runs to disk using compact binary tuple serialization (`Tuple.serialize()`).
+    - Merges runs via `PriorityQueue<RunReader>` in $K$-way external merge sort, streaming sorted tuples in $O(K)$ memory.
+    - Verified with **1,000,000 tuples** in streaming mode without triggering `OutOfMemoryError`.
+    - Guarantees idempotent cleanup: closes all file handles and deletes all temporary run files on `close()`.
+- ✅ **Streaming Aggregate Operators (`HashAggregateOperator.java`, `StreamAggregateOperator.java`)**:
+  - Implemented `GroupAccumulator`:
+    - Lightweight, stateful streaming accumulators for `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`.
+    - Computes running aggregates without retaining rows in memory.
+  - Implemented `HashAggregateOperator`:
+    - Volcano iterator operator computing `GROUP BY` and aggregate functions via in-memory hash table of `GroupAccumulator`s.
+    - Evaluates `HAVING` predicate filter against computed group aggregates.
+    - Emits single default row on empty tables without `GROUP BY` (`COUNT = 0`, `SUM = null`, etc.).
+  - Implemented `StreamAggregateOperator`:
+    - Volcano operator for pre-sorted inputs computing aggregates in strictly $O(1)$ memory.
+    - Emits finished group immediately whenever group-by key changes.
+- ✅ **Unified Volcano Execution Pipeline with Joins & Aggregates (`ExecutorEngine.java`)**:
+  - Seamlessly unified `executeJoinedSelect` and `buildPhysicalOperatorPipeline`:
+    - Queries combining `JOIN` + `WHERE` + `GROUP BY` + `HAVING` + `ORDER BY` + `LIMIT` compose end-to-end through Volcano physical operators.
+    - Enhanced `JoinUtils.findColumnValue`, `Tuple.getValue`, and `ExecutorEngine.findColumnValue` to handle table prefixes and table aliases across joins and correlated subqueries without collisions.
+    - Extended `finishSimpleSelect`, `applyOuterQueryToRows`, and `executeAggregateSelectOverRows` to support `ORDER BY`.
+- ✅ **Comprehensive Test Suite & Verification (`StreamingSortAndAggregationTest.java`)**:
+  - 10 comprehensive unit, operator, and end-to-end integration tests:
+    - `testSortOperatorInMemoryAscAndDesc`: in-memory sorting with multi-column order and NULLs handling.
+    - `testSortOperatorExternalMergeSortSpillToDisk`: forced disk spilling across multiple runs with low `work_mem`, verifying sorted order and temp file cleanup.
+    - `testSortOperator1MillionRowsNoOutOfMemory`: streams 1,000,000 rows through external merge sort with zero OOM error.
+    - `testHashAggregateOperatorFunctionsAndGroupBy`: verifies all five aggregate functions across multiple groups.
+    - `testHashAggregateOperatorHavingClause`: verifies `HAVING` filtering on aggregate results.
+    - `testStreamAggregateOperatorPresortedInputs`: presorted aggregation in $O(1)$ memory.
+    - `testSqlOrderByAndLimitOffset`: end-to-end SQL query testing `ORDER BY` combined with `LIMIT` and `OFFSET`.
+    - `testSqlGroupByCombinedWithJoins`: end-to-end SQL query verifying `GROUP BY` combined with `JOIN`, `HAVING`, and `ORDER BY`.
+    - `testSqlLeftJoinWithGroupBy`: `LEFT JOIN` combined with `GROUP BY`, testing unmatched row aggregation.
+    - `testSqlMultiTableJoinWithWhereGroupByHavingOrderByLimit`: multi-table join with full pipeline execution.
+  - Full reactor test suite verified at **497 / 497 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 15, Sprint 6 Week 11) marked `Completed`.
 
 ## What to do next
 

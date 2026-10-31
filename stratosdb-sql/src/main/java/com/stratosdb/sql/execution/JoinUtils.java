@@ -16,11 +16,15 @@ public final class JoinUtils {
     public static Object findColumnValue(Tuple tuple, String columnName) {
         if (tuple == null || columnName == null) return null;
         List<String> columnNames = tuple.getColumnNames();
+
+        // 1. Exact match (case-insensitive)
         for (int i = 0; i < columnNames.size(); i++) {
             if (columnNames.get(i).equalsIgnoreCase(columnName)) {
                 return tuple.getValue(i);
             }
         }
+
+        // 2. Unqualified request (e.g. "amount" matching "orders.amount")
         if (!columnName.contains(".")) {
             String suffix = "." + columnName.toLowerCase();
             for (int i = 0; i < columnNames.size(); i++) {
@@ -28,14 +32,34 @@ public final class JoinUtils {
                     return tuple.getValue(i);
                 }
             }
-        } else {
-            String unqualified = columnName.substring(columnName.lastIndexOf('.') + 1);
-            for (int i = 0; i < columnNames.size(); i++) {
-                if (columnNames.get(i).equalsIgnoreCase(unqualified)) {
+            return null;
+        }
+
+        // 3. Qualified request (e.g. "d.dept_id" or "orders.customer_id")
+        int dotIdx = columnName.lastIndexOf('.');
+        String prefix = columnName.substring(0, dotIdx).toLowerCase();
+        String unqualified = columnName.substring(dotIdx + 1).toLowerCase();
+        String suffix = "." + unqualified;
+
+        // Pass 3a: Match table prefix/alias (e.g. "d" vs "departments")
+        for (int i = 0; i < columnNames.size(); i++) {
+            String c = columnNames.get(i).toLowerCase();
+            if (c.endsWith(suffix) && c.contains(".")) {
+                String cPrefix = c.substring(0, c.lastIndexOf('.'));
+                if (cPrefix.equals(prefix) || cPrefix.startsWith(prefix) || prefix.startsWith(cPrefix)) {
                     return tuple.getValue(i);
                 }
             }
         }
+
+        // Pass 3b: Match plain/unqualified tuple column (e.g. "id" in a non-joined table)
+        for (int i = 0; i < columnNames.size(); i++) {
+            String c = columnNames.get(i);
+            if (!c.contains(".") && c.equalsIgnoreCase(unqualified)) {
+                return tuple.getValue(i);
+            }
+        }
+
         return null;
     }
 
