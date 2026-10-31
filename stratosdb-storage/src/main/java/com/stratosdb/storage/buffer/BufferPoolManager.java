@@ -105,22 +105,29 @@ public class BufferPoolManager implements BufferPool {
 
     @Override
     public <T extends Page> T getPage(String tableName, long pageId, com.stratosdb.storage.page.PageFactory<T> factory) {
-        // Check if in cache
-        Map<Long, Page> tablePages = pageCache.get(tableName);
-        if (tablePages != null && tablePages.containsKey(pageId)) {
-            @SuppressWarnings("unchecked")
-            T page = (T) tablePages.get(pageId);
-            pinPage(tableName, pageId);
-            hits++;
-            LOG.debug("Cache hit: {}/{}", tableName, pageId);
-            return page;
+        // Check if in cache under shared read lock to prevent race with eviction
+        globalLock.readLock().lock();
+        try {
+            Map<Long, Page> tablePages = pageCache.get(tableName);
+            if (tablePages != null) {
+                Page cached = tablePages.get(pageId);
+                if (cached != null) {
+                    pinPage(tableName, pageId);
+                    hits++;
+                    @SuppressWarnings("unchecked")
+                    T page = (T) cached;
+                    return page;
+                }
+            }
+        } finally {
+            globalLock.readLock().unlock();
         }
 
         // Cache miss - load from disk
         globalLock.writeLock().lock();
         try {
             // Double-check after acquiring write lock
-            tablePages = pageCache.get(tableName);
+            Map<Long, Page> tablePages = pageCache.get(tableName);
             if (tablePages != null && tablePages.containsKey(pageId)) {
                 @SuppressWarnings("unchecked")
                 T page = (T) tablePages.get(pageId);

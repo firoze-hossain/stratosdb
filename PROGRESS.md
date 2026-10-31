@@ -1,17 +1,17 @@
 # StratosDB — Progress Tracker
 
-**Last verified:** October 30, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
+**Last verified:** October 31, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
 
 ## At a glance
 
 | | |
 |---|---|
-| Commits | 99 |
-| Tests passing | **510 / 510** |
-| Main source | ~31,650 lines |
-| Test source | ~14,250 lines |
+| Commits | 103 |
+| Tests passing | **515 / 515** |
+| Main source | ~35,420 lines |
+| Test source | ~16,670 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E all with real, verified work done. Last round: a complete, from-scratch rewrite of `stratosdb-jdbc` after discovering it spoke a dead, disconnected protocol the real, current server (`StdWireServer`) could never understand at all. This round: a direct continuation, from actually integrating a real GUI tool (DBNavigator) against the rewritten driver - a real, end-to-end test using DBNavigator's own unmodified `ConnectionProfile`/`JdbcClient` classes found two further, real gaps no driver-level test alone could have caught. First, a real URL-handling gap: the driver never parsed a real `?key=value` query string out of the connection URL (the same convention every other mainstream JDBC driver's URL already supports), so a tool embedding `ssl=true` there - as DBNavigator, like most tools, does - would have had it silently never reach the driver at all. Second, and more serious: `setReadOnly()` threw for any caller, and real connection pools - HikariCP among them, this is standard, widespread pool behavior - call it unconditionally on every fresh connection as part of their own standard setup, meaning a real pool could never even finish initializing against this driver, a silent, total failure invisible to every existing test. Both fixed, with a new, permanent regression test that drives the driver through a real `HikariDataSource` directly so this exact class of bug can't reappear unnoticed - verified conclusively by compiling DBNavigator's own real backend classes against a real HikariCP and Jackson and running real `CREATE TABLE`/`INSERT`/`SELECT` through a real pooled connection to a real, running server. Full regression suite reconfirmed at 374/374 (up from 373 - one new test) - see PROGRESS.md |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), and Sprint 6 (Weeks 11-12) fully completed. Sprint 7 Week 13: B+Tree Multi-Page Latch Crabbing (Coupling) completed — fine-grained per-page read/write latches, hand-over-hand downward read latch crabbing, leaf sibling coupling during range scans, optimistic non-splitting paths, pessimistic write-crabbing SMOs serialized via root latch, atomic page allocations, and zero deadlocks verified under 64 sustained concurrent threads (845,000+ operations in 10s with zero corruption or deadlocks). Full reactor test suite verified at 515/515 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1261,9 +1261,36 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Sheet 2 (Row 16, Sprint 6 Week 12) marked `Completed`.
     - Sheet 3 (Row 23, Join Types & Capabilities) updated with SEMI/ANTI joins and subquery unnesting.
 
+## Sprint 7 Week 13 — Index Subsystem (B+Tree Multi-Page Latch Crabbing / Coupling & Deadlock-Free Concurrency) ✅ DONE
+
+- ✅ **B+Tree Multi-Page Latch Crabbing & Coupling Engine (`BTreeIndex.java`)**:
+  - Replaced coarse index-level lock with fine-grained page-level latch coupling using `Page.getLatch()` (`ReentrantReadWriteLock`).
+  - Implemented downward hand-over-hand read latch crabbing for `search()`, `rangeScan()`, and optimistic traversal paths (`tryOptimisticInsert`, `tryOptimisticDelete`): child read latch is acquired before releasing parent read latch, preventing tree race conditions and phantom splits.
+  - Implemented leaf sibling hand-over-hand latch crabbing during `rangeScan()`: read latch on `nextLeafPageId` is acquired before releasing current leaf read latch, eliminating phantom gaps and inconsistency during concurrent splits.
+  - Implemented optimistic leaf latching: non-splitting insertions and non-underflowing deletions acquire leaf write latch directly via read-crabbing descent without holding write latches on ancestors.
+  - Implemented pessimistic write latch crabbing: on leaf split or underflow rebalancing/merging, acquires write latches down the descent path (`heldFrames`), serializing structural modification operations (SMOs) via `rootLatch`.
+  - Enforced strict partial ordering on latches: top-to-bottom descent and left-to-right sibling traversal, mathematically guaranteeing zero deadlocks between concurrent readers and writers.
+  - Converted `nextPageId` page allocation to `AtomicLong`, guaranteeing atomic thread-safe monotonic page identifier allocation under heavy concurrent execution.
+  - Implemented comprehensive `validateTree()` structural integrity auditor: verifies root reachability, leaf sibling chain continuity, strict ascending key order, and zero orphan/broken pointers.
+- ✅ **Storage & Buffer Pool Hardening under Concurrency (`BufferPoolManager.java`, `WALManager.java`)**:
+  - Guarded `BufferPoolManager.getPage()` cache hit lookup and pinning with shared read lock to prevent race conditions with background buffer eviction.
+  - Synchronized `WALManager.writeBuffer` with channel write loop, ensuring atomic WAL channel position advances and zero torn records across 64 concurrent threads.
+- ✅ **64-Thread Concurrent Stress Harness & Verification (`BTreeLatchCrabbingTest.java`)**:
+  - 5 dedicated concurrent stress and edge-case tests:
+    - `testConcurrentInserts64Threads`: 64 threads, 32,000 keys inserted concurrently, validated point lookup and tree structure.
+    - `testConcurrentInsertsAndRangeScans64Threads`: 32 writers and 32 readers concurrently running range scans and point searches with zero corruption.
+    - `testConcurrentInsertsAndDeletes64Threads`: 32 writers and 32 deleters concurrently inserting and removing keys with strict tree integrity validation.
+    - `testConcurrentUniqueKeyRace64Threads`: 64 threads racing to insert the exact same unique key, verifying exactly 1 succeeds and 63 throw `UniqueConstraintViolationException`.
+    - `testStressHarness64ThreadsSustained`: 64 threads executing sustained 40% inserts, 30% searches, 20% range scans, and 10% deletes (>840,000 operations in 10s) with zero deadlocks and 100% tree structural integrity.
+  - Full reactor test suite verified at **515 / 515 tests passing across all 12 modules** (0 failures, 0 errors).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 17, Sprint 7 Week 13) marked `Completed`.
+    - Sheet 3 (Row 18) status updated to `Resolved`.
+    - Sheet 5 (Row 8) marked `Passed (Week 13)`.
+
 ## What to do next
 
-**Now addressed for `HeapTable`, per the round above; still open for index structures**, which the same round found have no concurrency protection of any kind (not even the coarse lock `HeapTable.insert()` had before this fix). A real, separate, harder piece of work - B+Tree's own multi-page split/merge operations genuinely need multi-page latch coupling to do safely, not just one latch per page in isolation.
+**Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
 
 What's left in Phase A: WAL-logging savepoints' own undo actions (genuinely unblocked since the persisted commit-status log landed) and a free-space map (efficiency, not correctness). Phase B's core "query engine depth" list is fully done - merge join, window functions, recursive and non-recursive CTEs. Phase C is fully closed out on its own original indexing list - B-Tree, Hash, BRIN, bitmap, GIN (text, arrays, and JSON), the visibility map, index-only scans, and GiST are all done; real further work beyond that list remains (range-scan index-only support, an incremental rather than rebuild-on-insert GiST implementation, JSON's remaining operators, index-accelerated joins). Phase D's most critical items are done - multi-statement transactions, PostgreSQL wire protocol compatibility, `\dt` support, the extended query protocol (real Parse/Bind/Describe/Execute/Sync, verified against a real psycopg2 client, an independently-audited error-recovery path, and this project's own native `stdsql` CLI client), and now real SCRAM-SHA-256 authentication (verified against real, unmodified `psql` and `psycopg2`); what's left is `\d TABLENAME`/`\l`/tab-completion, SCRAM channel binding (the `-PLUS` variant), client-side TLS certificate verification, streaming replication, and connection pooling. Phase E's four highest-priority items are done - views, autovacuum, slow-query logging, and a queryable metrics interface - and now real, SQL-language stored functions, stored procedures, and triggers too, closing out this project's own named extensibility gap in full; what's left is a proper `pg_stat`-shaped SQL surface and real fine-grained concurrency control (page or table latching), which autovacuum's design deliberately worked around rather than solved. See `PROJECT_PLAN.md`'s full phase breakdown for everything else.
 

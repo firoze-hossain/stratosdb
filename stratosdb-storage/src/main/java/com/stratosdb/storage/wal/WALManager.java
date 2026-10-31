@@ -494,7 +494,7 @@ public class WALManager {
     /**
      * Write buffer to WAL, returning the end LSN of the written record.
      */
-    private long writeBuffer(ByteBuffer buffer, boolean force) {
+    private synchronized long writeBuffer(ByteBuffer buffer, boolean force) {
         if (walChannel == null || !walChannel.isOpen()) {
             LOG.warn("WAL write skipped - channel is already closed");
             return -1L;
@@ -503,7 +503,9 @@ public class WALManager {
             buffer.flip();
             long position = currentLSN.getAndAdd(buffer.limit());
             walChannel.position(position);
-            walChannel.write(buffer);
+            while (buffer.hasRemaining()) {
+                walChannel.write(buffer);
+            }
             
             if (sync && force) {
                 walChannel.force(false);
