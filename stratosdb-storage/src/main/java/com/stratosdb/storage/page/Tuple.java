@@ -38,6 +38,7 @@ public class Tuple {
     private static final byte TAG_RANGE = 8;
     private static final byte TAG_TSVECTOR = 9;
     private static final byte TAG_TSQUERY = 10;
+    private static final byte TAG_BYTES = 11;
 
     private final List<Object> values;
     private final List<String> columnNames;
@@ -301,6 +302,26 @@ public class Tuple {
         } else if (value instanceof TsQuery tsQuery) {
             out.writeByte(TAG_TSQUERY);
             writeTsQueryExpr(out, tsQuery.root());
+        } else if (value instanceof byte[] bytes) {
+            out.writeByte(TAG_BYTES);
+            out.writeInt(bytes.length);
+            out.write(bytes);
+        } else if (value instanceof Short s) {
+            out.writeByte(TAG_INT);
+            out.writeInt(s.intValue());
+        } else if (value instanceof Float f) {
+            out.writeByte(TAG_DOUBLE);
+            out.writeDouble(f.doubleValue());
+        } else if (value instanceof java.sql.Timestamp ts) {
+            byte[] strBytes = ts.toString().getBytes(StandardCharsets.UTF_8);
+            out.writeByte(TAG_STRING);
+            out.writeInt(strBytes.length);
+            out.write(strBytes);
+        } else if (value instanceof java.time.temporal.TemporalAccessor) {
+            byte[] strBytes = value.toString().getBytes(StandardCharsets.UTF_8);
+            out.writeByte(TAG_STRING);
+            out.writeInt(strBytes.length);
+            out.write(strBytes);
         } else {
             throw new IllegalArgumentException("Unsupported type: " + value.getClass());
         }
@@ -514,6 +535,12 @@ public class Tuple {
             }
             case TAG_TSQUERY:
                 return new TsQuery(readTsQueryExpr(in));
+            case TAG_BYTES: {
+                int len = in.readInt();
+                byte[] bytes = new byte[len];
+                in.readFully(bytes);
+                return bytes;
+            }
             case TAG_NULL:
                 return null;
             default:
@@ -580,6 +607,12 @@ public class Tuple {
             }
             case 10:
                 return new TsQuery(readTsQueryExprLegacy(in));
+            case 11: {
+                int len = in.readInt();
+                byte[] bytes = new byte[len];
+                in.readFully(bytes);
+                return bytes;
+            }
             case -1:
                 return null;
             default:

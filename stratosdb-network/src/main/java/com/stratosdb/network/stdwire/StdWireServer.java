@@ -1116,6 +1116,15 @@ public class StdWireServer {
      * Converted back to real JSON text here instead.
      */
     String formatValueForWire(Object value) {
+        if (value instanceof byte[] bytes) {
+            StringBuilder sb = new StringBuilder(bytes.length * 2 + 2);
+            sb.append("\\x");
+            for (byte b : bytes) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        }
         if (value instanceof java.util.Map) {
             return com.stratosdb.sql.executor.JsonParser.toJsonText(value);
         }
@@ -1149,17 +1158,25 @@ public class StdWireServer {
 
     /** Infers a PostgreSQL type OID from the runtime value, since results here aren't backed by a declared-type catalog at the wire layer - good enough for clients to render results correctly, since everything is sent in text format regardless of the declared OID. */
     private int inferTypeOid(Object value) {
-        if (value instanceof Integer || value instanceof Long) return 23;   // int4
-        if (value instanceof Double || value instanceof Float) return 701;  // float8
+        if (value instanceof Short) return 21;                              // int2
+        if (value instanceof Integer) return 23;                            // int4
+        if (value instanceof Long) return 20;                               // int8
+        if (value instanceof Float) return 700;                             // float4
+        if (value instanceof Double) return 701;                            // float8
         if (value instanceof Boolean) return 16;                            // bool
+        if (value instanceof byte[]) return 17;                             // bytea
+        if (value instanceof java.sql.Timestamp) return 1114;               // timestamp
         return 25; // text - the safe default; text format means any value round-trips correctly as a string regardless of OID
     }
 
     private short inferTypeSize(Object value) {
+        if (value instanceof Short) return 2;
         if (value instanceof Integer) return 4;
         if (value instanceof Long) return 8;
+        if (value instanceof Float) return 4;
         if (value instanceof Double) return 8;
         if (value instanceof Boolean) return 1;
+        if (value instanceof java.sql.Timestamp) return 8;
         return -1; // variable-length
     }
 

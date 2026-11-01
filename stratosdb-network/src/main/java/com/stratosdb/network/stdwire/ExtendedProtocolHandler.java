@@ -6,7 +6,6 @@ import com.stratosdb.storage.page.Tuple;
 
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -20,28 +19,17 @@ import java.util.regex.Pattern;
  * exactly matching the protocol's own scoping (a prepared statement or
  * portal only ever means something to the connection that created it).
  *
- * The one real, honestly-stated simplification: this engine has no
- * native parameterized-query execution path and no query-planning phase
- * separate from running the statement, so Bind substitutes each bound
- * parameter as a properly quoted/escaped SQL literal directly into the
- * query text (see substituteParams), then EAGERLY executes it immediately
- * - not lazily at Execute time. That means Describe('P', ...) and
- * Execute can describe/return the statement's REAL, actual shape (this
- * engine has no partial/incremental execution to preserve anyway, so
- * nothing is lost by executing early), while Describe('S', ...) - before
- * any values are bound - has no real row shape to report yet and
- * honestly reports NoData rather than guessing. Every message here is a
- * real, distinct piece of the wire protocol, not a relabeled simple
- * query - only the "how is a parameter actually threaded into execution"
- * detail is simplified, and values remain properly escaped throughout,
- * so this stays SQL-injection-safe despite not being a native
- * parameterized path.
+ * Uses native parameterized query execution in ExecutorEngine without
+ * text query interpolation: parameter placeholders ($1, $2, ...) are
+ * evaluated directly against strongly typed values decoded from pgwire
+ * binary (format 1) or text (format 0) formats. This completely
+ * eliminates SQL injection surface.
  */
 final class ExtendedProtocolHandler {
     private static final Pattern PARAM_PLACEHOLDER = Pattern.compile("\\$(\\d+)");
 
-    private record PreparedStatement(String query, int paramCount) {}
-    private record Portal(String substitutedSql, QueryResult result) {}
+    private record PreparedStatement(String query, int paramCount, int[] paramTypeOids, List<String> targetColumnTypes) {}
+    private record Portal(String query, List<Object> params, QueryResult result) {}
 
     private final StratosDB db;
     private final StdWireServer server;
@@ -51,17 +39,9 @@ final class ExtendedProtocolHandler {
     /**
      * Set the moment any extended-protocol message fails - references a
      * prepared statement/portal that doesn't exist, or a Bind whose
-     * substituted query itself fails at execution. Real Postgres's own
-     * behavior, and the reason this exists: once one message in a
+     * query itself fails at execution. Once one message in a
      * pipelined Parse/Bind/.../Sync batch fails, every later message
-     * before the next Sync is skipped rather than acted on, so a stale
-     * portal or statement from an earlier, unrelated part of the session
-     * can never be silently picked up and executed in its place just
-     * because a later message happened to reuse the same name. A real,
-     * previously-latent gap found by testing this exact sequence - Bind
-     * fails, then Execute against a portal name that still had a valid,
-     * unrelated entry from earlier in the session - and returned that
-     * stale row instead of correctly doing nothing until Sync.
+     * before the next Sync is skipped rather than acted on.
      */
     private boolean inErrorState = false;
 
@@ -70,7 +50,7 @@ final class ExtendedProtocolHandler {
         this.server = server;
     }
 
-    /** Dispatches one extended-protocol message and returns the (possibly updated) inTransaction state - the same state threaded through the simple query path, since a Bind/Execute can just as easily run inside an explicit transaction as a simple 'Q' statement can. */
+    /** Dispatches one extended-protocol message and returns the (possibly updated) inTransaction state. */
     boolean handle(StdWireMessages.TypedMessage msg, DataOutputStream out, boolean inTransaction) throws IOException {
         if (inErrorState && msg.type() != 'S') {
             return inTransaction; // silently skipped - see inErrorState's own javadoc
@@ -107,7 +87,9 @@ final class ExtendedProtocolHandler {
     private void handleParse(StdWireMessages.TypedMessage msg, DataOutputStream out) throws IOException {
         StdWireMessages.ParseMessage parsed = StdWireMessages.readParseMessage(msg);
         int paramCount = countDistinctPlaceholders(parsed.query());
-        preparedStatements.put(parsed.statementName(), new PreparedStatement(parsed.query(), paramCount));
+        List<String> targetColTypes = inferTargetColumnTypes(parsed.query(), paramCount);
+        preparedStatements.put(parsed.statementName(),
+            new PreparedStatement(parsed.query(), paramCount, parsed.paramTypeOids(), targetColTypes));
         StdWireMessages.writeParseComplete(out);
         out.flush();
     }
@@ -122,32 +104,32 @@ final class ExtendedProtocolHandler {
             return inTransaction;
         }
 
-        String substituted = substituteParams(stmt.query(), bind.paramValues(), bind.paramFormatCodes());
+        List<Object> typedParams = new ArrayList<>();
+        byte[][] rawValues = bind.paramValues();
+        int[] formatCodes = bind.paramFormatCodes();
+        for (int i = 0; i < rawValues.length; i++) {
+            byte[] rawVal = rawValues[i];
+            int formatCode = (i < formatCodes.length) ? formatCodes[i] : 0;
+            int typeOid = (stmt.paramTypeOids() != null && i < stmt.paramTypeOids().length) ? stmt.paramTypeOids()[i] : 0;
+            String targetColType = (stmt.targetColumnTypes() != null && i < stmt.targetColumnTypes().size()) ? stmt.targetColumnTypes().get(i) : null;
+            Object typed = PgBinaryDecoder.decode(rawVal, formatCode, typeOid, targetColType);
+            typedParams.add(typed);
+        }
+
         QueryResult result;
         try {
-            result = db.execute(substituted);
+            result = db.execute(stmt.query(), typedParams);
         } catch (Exception e) {
             result = QueryResult.error(e.getMessage());
         }
-        portals.put(bind.portalName(), new Portal(substituted, result));
+        portals.put(bind.portalName(), new Portal(stmt.query(), typedParams, result));
         StdWireMessages.writeBindComplete(out);
         out.flush();
 
-        // No inErrorState=true here even when result failed: BindComplete was
-        // just sent, meaning Bind itself succeeded as a protocol operation - the
-        // eagerly-executed query's failure is stored on the portal and gets
-        // reported to the client later, via Describe (NoData) or Execute (the
-        // real ErrorResponse) - see this class's own javadoc on why execution
-        // happens this early. Marking the connection as errored before the
-        // client has even been told there's a problem would cause the message
-        // that's actually supposed to report it (Execute) to be silently
-        // skipped instead - a real regression caught by testing this exact
-        // "Bind succeeds, later Execute reports the real failure" sequence,
-        // not by inspection.
         if (result.isSuccess()) {
-            return server.updateTransactionState(substituted, inTransaction);
+            return server.updateTransactionState(stmt.query(), inTransaction);
         }
-        return inTransaction || server.isTransactionControl(substituted);
+        return inTransaction || server.isTransactionControl(stmt.query());
     }
 
     private void handleDescribe(StdWireMessages.TypedMessage msg, DataOutputStream out) throws IOException {
@@ -162,11 +144,16 @@ final class ExtendedProtocolHandler {
             }
             List<Integer> paramOids = new ArrayList<>();
             for (int i = 0; i < stmt.paramCount(); i++) {
-                paramOids.add(25); // Postgres OID 25 = text/unknown - see class javadoc, real types aren't tracked separately from execution
+                int oid = 0;
+                if (stmt.paramTypeOids() != null && i < stmt.paramTypeOids().length && stmt.paramTypeOids()[i] != 0) {
+                    oid = stmt.paramTypeOids()[i];
+                } else if (stmt.targetColumnTypes() != null && i < stmt.targetColumnTypes().size() && stmt.targetColumnTypes().get(i) != null) {
+                    oid = PgBinaryDecoder.oidFromColumnType(stmt.targetColumnTypes().get(i));
+                }
+                paramOids.add(oid != 0 ? oid : 25);
             }
             StdWireMessages.writeParameterDescription(out, paramOids);
-            // No row shape to honestly report before any values are bound and the
-            // statement actually runs - see class javadoc.
+            // No row shape to honestly report before any values are bound and the statement actually runs
             StdWireMessages.writeNoData(out);
         } else {
             Portal portal = portals.get(describe.name());
@@ -188,9 +175,6 @@ final class ExtendedProtocolHandler {
 
     private boolean handleExecute(StdWireMessages.TypedMessage msg, DataOutputStream out, boolean inTransaction) throws IOException {
         StdWireMessages.ExecuteMessage execute = StdWireMessages.readExecuteMessage(msg);
-        // execute.maxRows() is intentionally not honored - see class javadoc:
-        // this engine has no partial/cursor-based execution to limit against,
-        // and the portal's result was already fully computed at Bind time.
         Portal portal = portals.get(execute.portalName());
         if (portal == null) {
             inErrorState = true;
@@ -217,9 +201,9 @@ final class ExtendedProtocolHandler {
                 }
                 StdWireMessages.writeDataRow(out, values);
             }
-            StdWireMessages.writeCommandComplete(out, server.buildCommandTag(portal.substitutedSql(), rows.size()));
+            StdWireMessages.writeCommandComplete(out, server.buildCommandTag(portal.query(), rows.size()));
         } else {
-            StdWireMessages.writeCommandComplete(out, server.buildCommandTag(portal.substitutedSql(), server.extractAffectedCount(result.getMessage())));
+            StdWireMessages.writeCommandComplete(out, server.buildCommandTag(portal.query(), server.extractAffectedCount(result.getMessage())));
         }
         out.flush();
         return inTransaction;
@@ -236,7 +220,7 @@ final class ExtendedProtocolHandler {
         out.flush();
     }
 
-    /** The number of distinct $N placeholders in a query - not just a count of occurrences, since a well-formed parameterized query may reference the same parameter more than once (e.g. "WHERE a = $1 OR b = $1"). */
+    /** The number of distinct $N placeholders in a query. */
     private int countDistinctPlaceholders(String query) {
         Matcher matcher = PARAM_PLACEHOLDER.matcher(query);
         int max = 0;
@@ -246,115 +230,73 @@ final class ExtendedProtocolHandler {
         return max;
     }
 
-    /**
-     * Substitutes every $N placeholder in query with its corresponding
-     * bound parameter value from paramValues (1-indexed, matching the
-     * protocol's own convention) - see class javadoc for why this is
-     * text substitution into the query rather than a native parameterized
-     * execution path, and why that remains injection-safe.
-     */
-    private String substituteParams(String query, byte[][] paramValues, int[] paramFormatCodes) {
-        Matcher matcher = PARAM_PLACEHOLDER.matcher(query);
-        StringBuilder result = new StringBuilder();
-        int lastEnd = 0;
-        while (matcher.find()) {
-            result.append(query, lastEnd, matcher.start());
-            int paramIndex = Integer.parseInt(matcher.group(1)) - 1;
-            byte[] rawValue = (paramIndex >= 0 && paramIndex < paramValues.length) ? paramValues[paramIndex] : null;
-            int formatCode = (paramIndex >= 0 && paramIndex < paramFormatCodes.length) ? paramFormatCodes[paramIndex] : 0;
-            result.append(formatParamAsSqlLiteral(rawValue, formatCode));
-            lastEnd = matcher.end();
-        }
-        result.append(query.substring(lastEnd));
-        return result.toString();
-    }
-
-    /**
-     * Renders one bound parameter's raw bytes as a SQL literal: NULL for
-     * a SQL NULL, a bare token for something that parses as a number or
-     * a boolean (matching the grammar's own bare BOOLEAN_LITERAL/
-     * INTEGER_LITERAL/FLOAT_LITERAL tokens), and a properly quoted,
-     * escaped string literal otherwise - doubling any embedded single
-     * quote, the standard SQL escaping rule, so a value containing a
-     * quote can never break out of the literal it's placed into.
-     *
-     * formatCode 1 (binary) is now real, not ignored - found missing
-     * entirely during a real, broad driver/ORM verification pass: the
-     * real, official org.postgresql JDBC driver sends every setInt/
-     * setLong/setBoolean-bound parameter in BINARY format from its very
-     * first execution (not just after some "prepareThreshold" is
-     * reached, a real, wrong assumption corrected only by adding
-     * temporary diagnostic logging and reading the actual bytes, not by
-     * reasoning about the driver's own documented defaults). Before this
-     * fix, a binary parameter's own raw bytes (e.g. the 4 real bytes
-     * {0,0,0,1} for the integer 1) were read as if they were UTF-8 TEXT,
-     * producing a garbled string that then got quoted and inserted into
-     * the target column as-is - genuine, silent stored-data corruption,
-     * not just a display glitch, since a real int column could end up
-     * holding a string of near-unprintable bytes instead of the real
-     * integer.
-     *
-     * Decoded by real, known Postgres binary wire-format byte length,
-     * since the format code alone only says "binary," not which
-     * specific type: 1 byte -> boolean, 4 bytes -> a signed, big-endian
-     * int4, 8 bytes -> a signed, big-endian int8. A real, honestly-
-     * named ambiguity: int8 and float8 are both 8 bytes in Postgres's
-     * own binary wire format, and nothing at the Bind message level
-     * distinguishes them - int8 is treated as the default here since a
-     * bound integer id/count is a far more common case in real ORM-
-     * generated SQL than a bound 8-byte binary double; a real, separate,
-     * further piece of work would thread the target column's own
-     * declared type through from Parse time to resolve this correctly
-     * in every case, including binary float8. Any other byte length
-     * (or any decode failure) falls back to the original, UTF-8-text
-     * interpretation this method already used for every parameter
-     * before this fix, so no previously-working, real text-format case
-     * regresses.
-     */
-    private String formatParamAsSqlLiteral(byte[] rawValue, int formatCode) {
-        if (rawValue == null) {
-            return "NULL";
-        }
-        if (formatCode == 1) {
-            String decoded = tryDecodeBinary(rawValue);
-            if (decoded != null) {
-                return decoded;
-            }
-        }
-        String text = new String(rawValue, StandardCharsets.UTF_8);
-        if (text.equalsIgnoreCase("true") || text.equalsIgnoreCase("false")) {
-            return text.toLowerCase();
-        }
-        if (isNumericLiteral(text)) {
-            return text;
-        }
-        return "'" + text.replace("'", "''") + "'";
-    }
-
-    /** Returns a real SQL literal for a real, known binary encoding by byte length, or null when the length isn't one this implementation recognizes at all - see formatParamAsSqlLiteral's own javadoc for the full, honest reasoning. */
-    private String tryDecodeBinary(byte[] rawValue) {
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(rawValue).order(java.nio.ByteOrder.BIG_ENDIAN);
-        if (rawValue.length == 1) {
-            return rawValue[0] != 0 ? "true" : "false";
-        }
-        if (rawValue.length == 4) {
-            return String.valueOf(buf.getInt());
-        }
-        if (rawValue.length == 8) {
-            return String.valueOf(buf.getLong());
-        }
-        return null;
-    }
-
-    private boolean isNumericLiteral(String text) {
-        if (text.isEmpty()) {
-            return false;
+    private List<String> inferTargetColumnTypes(String query, int paramCount) {
+        List<String> types = new ArrayList<>(paramCount);
+        for (int i = 0; i < paramCount; i++) {
+            types.add(null);
         }
         try {
-            Double.parseDouble(text);
-            return true;
-        } catch (NumberFormatException e) {
-            return false;
+            com.stratosdb.sql.parser.SqlParser parser = new com.stratosdb.sql.parser.SqlParser();
+            com.stratosdb.sql.ast.Statement stmt = parser.parse(query);
+            if (stmt instanceof com.stratosdb.sql.ast.InsertStatement ins) {
+                String tbl = ins.tableName();
+                Map<String, String> colTypes = db.getTableColumnTypes(tbl);
+                List<String> cols = (ins.columns() != null && !ins.columns().isEmpty()) ? ins.columns() : db.getTableColumns(tbl);
+                for (List<String> row : ins.rows()) {
+                    for (int c = 0; c < row.size() && c < cols.size(); c++) {
+                        String val = row.get(c);
+                        if (val != null && val.startsWith("$") && val.length() > 1 && Character.isDigit(val.charAt(1))) {
+                            int idx = Integer.parseInt(val.substring(1)) - 1;
+                            if (idx >= 0 && idx < types.size()) {
+                                types.set(idx, colTypes.get(cols.get(c)));
+                            }
+                        }
+                    }
+                }
+            } else if (stmt instanceof com.stratosdb.sql.ast.UpdateStatement upd) {
+                String tbl = upd.tableName();
+                Map<String, String> colTypes = db.getTableColumnTypes(tbl);
+                for (com.stratosdb.sql.ast.Assignment a : upd.assignments()) {
+                    String val = a.value();
+                    if (val != null && val.startsWith("$") && val.length() > 1 && Character.isDigit(val.charAt(1))) {
+                        int idx = Integer.parseInt(val.substring(1)) - 1;
+                        if (idx >= 0 && idx < types.size()) {
+                            types.set(idx, colTypes.get(a.column()));
+                        }
+                    }
+                }
+                collectWhereParamTypes(upd.where(), colTypes, types);
+            } else if (stmt instanceof com.stratosdb.sql.ast.SelectStatement sel) {
+                if (sel.tableName() != null) {
+                    Map<String, String> colTypes = db.getTableColumnTypes(sel.tableName());
+                    collectWhereParamTypes(sel.where(), colTypes, types);
+                }
+            } else if (stmt instanceof com.stratosdb.sql.ast.DeleteStatement del) {
+                Map<String, String> colTypes = db.getTableColumnTypes(del.tableName());
+                collectWhereParamTypes(del.where(), colTypes, types);
+            }
+        } catch (Exception ignored) {}
+        return types;
+    }
+
+    private void collectWhereParamTypes(com.stratosdb.sql.ast.WhereExpr where, Map<String, String> colTypes, List<String> types) {
+        if (where == null || colTypes == null) return;
+        if (where instanceof com.stratosdb.sql.ast.WhereExpr.Comparison cmp) {
+            String lit = cmp.literal();
+            if (lit != null && lit.startsWith("$") && lit.length() > 1 && Character.isDigit(lit.charAt(1))) {
+                int idx = Integer.parseInt(lit.substring(1)) - 1;
+                if (idx >= 0 && idx < types.size()) {
+                    types.set(idx, colTypes.get(cmp.column()));
+                }
+            }
+        } else if (where instanceof com.stratosdb.sql.ast.WhereExpr.And and) {
+            collectWhereParamTypes(and.left(), colTypes, types);
+            collectWhereParamTypes(and.right(), colTypes, types);
+        } else if (where instanceof com.stratosdb.sql.ast.WhereExpr.Or or) {
+            collectWhereParamTypes(or.left(), colTypes, types);
+            collectWhereParamTypes(or.right(), colTypes, types);
+        } else if (where instanceof com.stratosdb.sql.ast.WhereExpr.Not not) {
+            collectWhereParamTypes(not.inner(), colTypes, types);
         }
     }
 }

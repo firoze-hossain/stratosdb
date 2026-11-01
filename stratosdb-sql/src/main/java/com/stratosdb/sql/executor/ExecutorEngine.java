@@ -27,6 +27,7 @@ import com.stratosdb.transaction.mvcc.MVCCVisibility;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -718,6 +719,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         Map<String, Long> lastNextvalBySequence = new java.util.HashMap<>();
         /** cteName -> its rows for THIS iteration of a recursive CTE's fixpoint (see executeRecursiveCteSelect) - resolved directly, bypassing query re-execution entirely, since a recursive CTE's self-reference must see specific, already-computed rows (the previous iteration's new ones), not a re-runnable query. */
         Map<String, List<Tuple>> materializedCteRows = new java.util.HashMap<>();
+        List<Object> currentParams = List.of();
     }
 
     private static final class Savepoint {
@@ -830,8 +832,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     public QueryResult execute(String sql) {
+        return execute(sql, List.of());
+    }
+
+    public QueryResult execute(String sql, List<Object> params) {
         long startNanos = System.nanoTime();
-        QueryResult result = executeInternal(sql);
+        QueryResult result = executeInternal(sql, params);
         long elapsedNanos = System.nanoTime() - startNanos;
         long rowCount = (result.isSuccess() && result.getRows() != null) ? result.getRows().size() : 0;
         queryStatsRegistry.record(sql, elapsedNanos, rowCount);
@@ -855,7 +861,43 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return res;
     }
 
+    private static String replaceQuestionMarks(String sql) {
+        if (sql == null || !sql.contains("?")) {
+            return sql;
+        }
+        StringBuilder sb = new StringBuilder(sql.length() + 16);
+        boolean inSingleQuotes = false;
+        boolean inDollarQuotes = false;
+        int paramIndex = 1;
+        int len = sql.length();
+        for (int i = 0; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDollarQuotes) {
+                if (inSingleQuotes && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    sb.append("''");
+                    i++;
+                    continue;
+                }
+                inSingleQuotes = !inSingleQuotes;
+                sb.append(c);
+            } else if (c == '$' && !inSingleQuotes && i + 1 < len && sql.charAt(i + 1) == '$') {
+                inDollarQuotes = !inDollarQuotes;
+                sb.append("$$");
+                i++;
+            } else if (c == '?' && !inSingleQuotes && !inDollarQuotes) {
+                sb.append('$').append(paramIndex++);
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     private QueryResult executeInternal(String sql) {
+        return executeInternal(sql, List.of());
+    }
+
+    private QueryResult executeInternal(String sql, List<Object> params) {
         if (parser.isEffectivelyEmpty(sql)) {
             // A comment-only or all-whitespace query is a real, valid no-op - the same
             // way real Postgres treats it - not a syntax error. Found while testing
@@ -866,103 +908,110 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // message type specifically).
             return QueryResult.success("OK");
         }
-        Statement stmt;
-        try {
-            stmt = parser.parse(sql);
-        } catch (Exception e) {
-            return QueryResult.error(e.getMessage());
-        }
-
-        if (stmt instanceof BeginStatement) {
-            return executeBegin();
-        }
-        if (stmt instanceof CommitStatement) {
-            return executeCommit();
-        }
-        if (stmt instanceof RollbackStatement) {
-            return executeRollback();
-        }
-        if (stmt instanceof RollbackToSavepointStatement s) {
-            return executeRollbackToSavepoint(s);
-        }
-
+        sql = replaceQuestionMarks(sql);
         SessionState state = session.get();
-        if (state.poisoned) {
-            return QueryResult.error("Current transaction is aborted, commands ignored until ROLLBACK");
-        }
-        if (stmt instanceof SavepointStatement s) {
-            return executeSavepoint(s, state);
-        }
-        if (stmt instanceof ReleaseSavepointStatement s) {
-            return executeReleaseSavepoint(s, state);
-        }
-
-        boolean explicit = state.transaction != null;
-        Transaction txn = explicit ? state.transaction : transactionManager.begin();
+        List<Object> oldParams = state.currentParams;
+        state.currentParams = params != null ? params : List.of();
         try {
-            QueryResult result = dispatch(stmt, txn, sql);
-            recordTableStats(stmt, result);
+            Statement stmt;
+            try {
+                stmt = parser.parse(sql);
+            } catch (Exception e) {
+                return QueryResult.error(e.getMessage());
+            }
 
-            if (result.isSuccess()) {
-                recordCatalogChange(stmt, sql);
-                if (!explicit) {
-                    state.ddlUndoActions.clear();
-                    state.dmlUndoActions.clear();
-                    walManager.logCommit(txn.getXID());
-                    transactionManager.commit(txn);
+            if (stmt instanceof BeginStatement) {
+                return executeBegin();
+            }
+            if (stmt instanceof CommitStatement) {
+                return executeCommit();
+            }
+            if (stmt instanceof RollbackStatement) {
+                return executeRollback();
+            }
+            if (stmt instanceof RollbackToSavepointStatement s) {
+                return executeRollbackToSavepoint(s);
+            }
+
+            if (state.poisoned) {
+                return QueryResult.error("Current transaction is aborted, commands ignored until ROLLBACK");
+            }
+            if (stmt instanceof SavepointStatement s) {
+                return executeSavepoint(s, state);
+            }
+            if (stmt instanceof ReleaseSavepointStatement s) {
+                return executeReleaseSavepoint(s, state);
+            }
+
+            boolean explicit = state.transaction != null;
+            Transaction txn = explicit ? state.transaction : transactionManager.begin();
+            try {
+                QueryResult result = dispatch(stmt, txn, sql, params);
+                recordTableStats(stmt, result);
+
+                if (result.isSuccess()) {
+                    recordCatalogChange(stmt, sql);
+                    if (!explicit) {
+                        state.ddlUndoActions.clear();
+                        state.dmlUndoActions.clear();
+                        walManager.logCommit(txn.getXID());
+                        transactionManager.commit(txn);
+                    }
+                    // else: stays open, part of the caller's explicit transaction until COMMIT/ROLLBACK
+                } else if (explicit) {
+                    state.poisoned = true;
+                } else {
+                    abortTransaction(state, txn);
                 }
-                // else: stays open, part of the caller's explicit transaction until COMMIT/ROLLBACK
-            } else if (explicit) {
-                state.poisoned = true;
-            } else {
-                abortTransaction(state, txn);
+                return result;
+            } catch (DeadlockException e) {
+                if (explicit) {
+                    state.poisoned = true;
+                } else {
+                    abortTransaction(state, txn);
+                }
+                LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
+                return QueryResult.error("Deadlock detected, transaction aborted: " + e.getMessage());
+            } catch (UniqueConstraintViolationException | com.stratosdb.common.exceptions.ForeignKeyViolationException
+                     | com.stratosdb.common.exceptions.CheckViolationException
+                     | com.stratosdb.common.exceptions.NotNullViolationException e) {
+                if (explicit) {
+                    state.poisoned = true;
+                } else {
+                    abortTransaction(state, txn);
+                }
+                LOG.warn("Statement failed (constraint violation): {} - {}", sql, e.getMessage());
+                return QueryResult.error(e.getMessage(), ((com.stratosdb.common.exceptions.StratosDBException) e).getSqlState(), e);
+            } catch (IllegalStateException | IllegalArgumentException e) {
+                // A known, expected validation/limitation failure - the
+                // established convention throughout this codebase for "this
+                // specific operation can't be done, here's why" (sequence not
+                // found, invalid JSON for a column, an unsupported subquery
+                // pattern like this one). The QueryResult.error(...) below is
+                // the real, intended way this surfaces to the caller - logging
+                // it is just for visibility, so a full ERROR-level stack trace
+                // here would be actively misleading: it looks like a crash in
+                // build/test output even though this is working exactly as
+                // designed. Real, unexpected errors are still caught (and
+                // logged in full) by the general Exception handler below.
+                if (explicit) {
+                    state.poisoned = true;
+                } else {
+                    abortTransaction(state, txn);
+                }
+                LOG.warn("Statement failed (a known, expected validation failure, not a bug): {} - {}", sql, e.getMessage());
+                return QueryResult.error(e.getMessage());
+            } catch (Exception e) {
+                if (explicit) {
+                    state.poisoned = true;
+                } else {
+                    abortTransaction(state, txn);
+                }
+                LOG.error("Execution failed: {}", sql, e);
+                return QueryResult.error(e.getMessage());
             }
-            return result;
-        } catch (DeadlockException e) {
-            if (explicit) {
-                state.poisoned = true;
-            } else {
-                abortTransaction(state, txn);
-            }
-            LOG.warn("Transaction {} aborted due to deadlock: {}", txn.getXID(), e.getMessage());
-            return QueryResult.error("Deadlock detected, transaction aborted: " + e.getMessage());
-        } catch (UniqueConstraintViolationException | com.stratosdb.common.exceptions.ForeignKeyViolationException
-                 | com.stratosdb.common.exceptions.CheckViolationException
-                 | com.stratosdb.common.exceptions.NotNullViolationException e) {
-            if (explicit) {
-                state.poisoned = true;
-            } else {
-                abortTransaction(state, txn);
-            }
-            LOG.warn("Statement failed (constraint violation): {} - {}", sql, e.getMessage());
-            return QueryResult.error(e.getMessage(), ((com.stratosdb.common.exceptions.StratosDBException) e).getSqlState(), e);
-        } catch (IllegalStateException | IllegalArgumentException e) {
-            // A known, expected validation/limitation failure - the
-            // established convention throughout this codebase for "this
-            // specific operation can't be done, here's why" (sequence not
-            // found, invalid JSON for a column, an unsupported subquery
-            // pattern like this one). The QueryResult.error(...) below is
-            // the real, intended way this surfaces to the caller - logging
-            // it is just for visibility, so a full ERROR-level stack trace
-            // here would be actively misleading: it looks like a crash in
-            // build/test output even though this is working exactly as
-            // designed. Real, unexpected errors are still caught (and
-            // logged in full) by the general Exception handler below.
-            if (explicit) {
-                state.poisoned = true;
-            } else {
-                abortTransaction(state, txn);
-            }
-            LOG.warn("Statement failed (a known, expected validation failure, not a bug): {} - {}", sql, e.getMessage());
-            return QueryResult.error(e.getMessage());
-        } catch (Exception e) {
-            if (explicit) {
-                state.poisoned = true;
-            } else {
-                abortTransaction(state, txn);
-            }
-            LOG.error("Execution failed: {}", sql, e);
-            return QueryResult.error(e.getMessage());
+        } finally {
+            state.currentParams = oldParams;
         }
     }
 
@@ -1379,10 +1428,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn) throws DeadlockException {
-        return dispatch(stmt, txn, null);
+        return dispatch(stmt, txn, null, List.of());
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn, String sql) throws DeadlockException {
+        return dispatch(stmt, txn, sql, List.of());
+    }
+
+    private QueryResult dispatch(Statement stmt, Transaction txn, String sql, List<Object> params) throws DeadlockException {
         if (readOnly && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
             return QueryResult.error("cannot execute statement in a read-only replica");
         }
@@ -1391,10 +1444,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if (stmt instanceof CreateTableStatement s) return executeCreateTable(s, txn, sql);
         if (stmt instanceof CreateIndexStatement s) return executeCreateIndex(s, txn);
-        if (stmt instanceof InsertStatement s) return executeInsert(s, txn);
-        if (stmt instanceof SelectStatement s) return executeSelect(s, txn);
-        if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn);
-        if (stmt instanceof DeleteStatement s) return executeDelete(s, txn);
+        if (stmt instanceof InsertStatement s) return executeInsert(s, txn, params);
+        if (stmt instanceof SelectStatement s) return executeSelect(s, txn, params);
+        if (stmt instanceof UpdateStatement s) return executeUpdate(s, txn, params);
+        if (stmt instanceof DeleteStatement s) return executeDelete(s, txn, params);
         if (stmt instanceof DropTableStatement s) return executeDropTable(s, txn);
         if (stmt instanceof CreateDatabaseStatement s) return executeCreateDatabase(s);
         if (stmt instanceof DropDatabaseStatement s) return executeDropDatabase(s);
@@ -1421,7 +1474,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof ShowParameterStatement s) return executeShowParameter(s);
         if (stmt instanceof SetParameterStatement s) return executeSetParameter(s);
         if (stmt instanceof ShowCatalogStatement) return executeShowCatalog();
-        if (stmt instanceof ExplainStatement s) return executeExplain(s);
+        if (stmt instanceof ExplainStatement s) return executeExplain(s, params);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
         if (stmt instanceof ReindexStatement s) return executeReindex(s, txn);
@@ -2329,12 +2382,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private static final java.util.Set<String> KNOWN_BUILTIN_TYPES = java.util.Set.of(
         "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "SERIAL", "BIGSERIAL",
         "VARCHAR", "TEXT", "CHAR", "BOOLEAN", "BOOL", "DATE", "TIME", "TIMESTAMP",
-        "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
+        "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "DOUBLEPRECISION", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
         "INET", "CIDR", "INT4RANGE", "DATERANGE", "TSVECTOR", "TSQUERY"
     );
 
     private boolean isKnownBuiltInType(String type) {
-        String bareKeyword = stripArraySuffix(type).replaceAll("\\(.*\\)", "").trim().toUpperCase();
+        String bareKeyword = stripArraySuffix(type).replaceAll("\\(.*\\)", "").replace(" ", "").trim().toUpperCase();
         return KNOWN_BUILTIN_TYPES.contains(bareKeyword);
     }
 
@@ -2970,6 +3023,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeInsert(InsertStatement stmt, Transaction txn) {
+        return executeInsert(stmt, txn, List.of());
+    }
+
+    private QueryResult executeInsert(InsertStatement stmt, Transaction txn, List<Object> params) {
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -2988,7 +3045,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 // crashing if it ever does.
                 Tuple fallback = new Tuple();
                 for (int i = 0; i < rowValues.size(); i++) {
-                    fallback.addValue("col" + i, resolveValue(rowValues.get(i)));
+                    fallback.addValue("col" + i, resolveLiteralOrParam(rowValues.get(i), params));
                 }
                 QueryResult result = finishInsert(stmt.tableName(), txn, fallback);
                 if (!result.isSuccess()) return result;
@@ -3014,7 +3071,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (!allColumns.contains(colName)) {
                     return QueryResult.error("Column not found: " + colName + " on table " + stmt.tableName());
                 }
-                Object resolved = resolveValue(rowValues.get(i));
+                Object resolved = resolveLiteralOrParam(rowValues.get(i), params);
                 givenValues.put(colName, coerceForColumnType(colName, columnTypes.get(colName), resolved));
             }
 
@@ -3143,18 +3200,28 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * at all" version, same spirit as the Week 3 plan called for.
      */
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn) {
+        return executeSelect(stmt, txn, session.get().currentParams);
+    }
+
+    private QueryResult executeSelect(SelectStatement stmt, Transaction txn, List<Object> params) {
         if (stmt.tableName() == null && stmt.fromSubquery() == null) {
-            // A real, FROM-less SELECT ("SELECT version()", "SELECT 1") - see
-            // SqlParser.buildSelect's own comment for why this exists at all.
-            // There is no row to iterate, so the select list's own expressions
-            // are evaluated exactly once, against an empty, dummy Tuple (correct
-            // for a zero-argument function call - the only real case this
-            // supports today; a FROM-less SELECT referencing an actual column
-            // name wouldn't make sense anyway, since there is no table for that
-            // name to resolve against), producing exactly one output row -
-            // matching real Postgres's own real semantics for a FROM-less
-            // SELECT (a genuine one-row, one-column-per-expression result).
-            Tuple projected = project(new Tuple(), stmt.columns(), stmt.functionCalls());
+            Tuple projected = new Tuple();
+            if (!stmt.columns().isEmpty()) {
+                for (int i = 0; i < stmt.columns().size(); i++) {
+                    String colExpr = stmt.columns().get(i);
+                    String colName = (stmt.columnAliases() != null && i < stmt.columnAliases().size() && stmt.columnAliases().get(i) != null)
+                        ? stmt.columnAliases().get(i)
+                        : colExpr;
+                    Object val = resolveLiteralOrParam(colExpr, params);
+                    projected.addValue(colName, val);
+                }
+            }
+            for (FunctionCallItem call : stmt.functionCalls()) {
+                Object result = nativeFunctions.containsKey(call.functionName())
+                    ? invokeNativeFunction(call.functionName(), resolveFunctionArgs(call, new Tuple()))
+                    : invokeFunction(call.functionName(), resolveFunctionArgs(call, new Tuple()));
+                projected.addValue(call.displayName(), result);
+            }
             return QueryResult.success(List.of(projected));
         }
 
@@ -3178,7 +3245,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             PhysicalOperator currentOp = scanOp;
 
             if (finalDerivedStmt.where() != null) {
-                currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, finalDerivedStmt.where(), txn));
+                currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, finalDerivedStmt.where(), txn, null, params));
             }
 
             boolean hasAggregates = !finalDerivedStmt.aggregates().isEmpty() || !finalDerivedStmt.groupBy().isEmpty();
@@ -3198,8 +3265,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
 
             if (finalDerivedStmt.limit() != null || finalDerivedStmt.offset() != null) {
-                long limit = parseLongOrDefault(finalDerivedStmt.limit(), -1);
-                long offset = parseLongOrDefault(finalDerivedStmt.offset(), 0);
+                long limit = parseLongOrDefault(finalDerivedStmt.limit(), params, -1);
+                long offset = parseLongOrDefault(finalDerivedStmt.offset(), params, 0);
                 if (limit >= 0 || offset > 0) {
                     currentOp = new LimitOperator(currentOp, limit, offset);
                 }
@@ -3318,12 +3385,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return finishSimpleSelect(stmt, brinResult);
         }
 
-        PhysicalOperator pipeline = buildPhysicalOperatorPipeline(stmt, table, txn);
+        PhysicalOperator pipeline = buildPhysicalOperatorPipeline(stmt, table, txn, params);
         return QueryResult.success(pipeline, pipeline.getOutputColumns());
     }
 
     private PhysicalOperator buildPhysicalOperatorPipeline(SelectStatement stmt, HeapTable table, Transaction txn) {
-        ScanPlan plan = planScan(stmt.tableName(), stmt.where());
+        return buildPhysicalOperatorPipeline(stmt, table, txn, session.get().currentParams);
+    }
+
+    private PhysicalOperator buildPhysicalOperatorPipeline(SelectStatement stmt, HeapTable table, Transaction txn, List<Object> params) {
+        ScanPlan plan = planScan(stmt.tableName(), stmt.where(), params);
         List<String> schemaCols = tableColumns.getOrDefault(stmt.tableName(), List.of());
         PhysicalOperator scanOp;
         if (plan.useIndex()) {
@@ -3362,7 +3433,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         // Apply FilterOperator if WHERE clause is present
         if (stmt.where() != null) {
-            currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, stmt.where(), txn));
+            currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, stmt.where(), txn, null, params));
         }
 
         boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
@@ -3385,8 +3456,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         // Apply LimitOperator if LIMIT or OFFSET is specified
         if (stmt.limit() != null || stmt.offset() != null) {
-            long limit = parseLongOrDefault(stmt.limit(), -1);
-            long offset = parseLongOrDefault(stmt.offset(), 0);
+            long limit = parseLongOrDefault(stmt.limit(), params, -1);
+            long offset = parseLongOrDefault(stmt.offset(), params, 0);
             if (limit >= 0 || offset > 0) {
                 currentOp = new LimitOperator(currentOp, limit, offset);
             }
@@ -3424,8 +3495,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return outputCols;
     }
 
-    private static long parseLongOrDefault(String str, long defaultVal) {
+    private long parseLongOrDefault(String str, long defaultVal) {
+        return parseLongOrDefault(str, session.get().currentParams, defaultVal);
+    }
+
+    private long parseLongOrDefault(String str, List<Object> params, long defaultVal) {
         if (str == null) return defaultVal;
+        if (isParamPlaceholder(str)) {
+            Object val = resolveParam(str, (params != null && !params.isEmpty()) ? params : session.get().currentParams);
+            if (val instanceof Number n) return n.longValue();
+            if (val != null) {
+                try {
+                    return Long.parseLong(val.toString().trim());
+                } catch (NumberFormatException ignored) {}
+            }
+            return defaultVal;
+        }
         try {
             return Long.parseLong(str.trim());
         } catch (NumberFormatException e) {
@@ -3564,7 +3649,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (bitmapEntry == null) {
                 return null;
             }
-            candidateRids = bitmapEntry.index().search(parseLiteral(cmp.literal()));
+            candidateRids = bitmapEntry.index().search(resolveLiteralOrParam(cmp.literal(), session.get().currentParams));
         } else if (stmt.where() instanceof WhereExpr.RangeOverlaps rangeOverlaps) {
             GistIndexEntry gistEntry = findGistIndex(stmt.tableName(), rangeOverlaps.startColumn(), rangeOverlaps.endColumn());
             if (gistEntry == null) {
@@ -4572,6 +4657,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     /** Reports which strategy planScan would pick, without running the query. */
     private QueryResult executeExplain(ExplainStatement stmt) {
+        return executeExplain(stmt, session.get().currentParams);
+    }
+
+    private QueryResult executeExplain(ExplainStatement stmt, List<Object> params) {
         SelectStatement select = stmt.select();
         if (!tables.containsKey(select.tableName())) {
             return QueryResult.error("Table not found: " + select.tableName());
@@ -4605,7 +4694,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 + " (no index acceleration for aggregate queries yet)");
         }
 
-        ScanPlan plan = planScan(select.tableName(), select.where());
+        ScanPlan plan = planScan(select.tableName(), select.where(), params);
         String costSuffix = plan.hasStatistics()
             ? String.format(" (cost=%.1f)", plan.estimatedCost())
             : " (no statistics - run ANALYZE for a cost-based choice)";
@@ -4651,6 +4740,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * when statistics are unavailable.
      */
     private ScanPlan planScan(String tableName, WhereExpr where) {
+        return planScan(tableName, where, session.get().currentParams);
+    }
+
+    private ScanPlan planScan(String tableName, WhereExpr where, List<Object> params) {
         TableStatistics stats = statistics.get(tableName);
         boolean hasStats = stats != null;
 
@@ -4658,7 +4751,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (cmp == null) {
             return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
-        WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), cmp.literal());
+        Object litObj = resolveLiteralOrParam(cmp.literal(), params);
+        String litStr = litObj != null ? litObj.toString() : cmp.literal();
+        WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), litStr);
         if (!pred.isNumeric()) {
             return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
@@ -5403,6 +5498,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * MVCC-filtered dead weight the way it was before.
      */
     private QueryResult executeUpdate(UpdateStatement stmt, Transaction txn) throws DeadlockException {
+        return executeUpdate(stmt, txn, session.get().currentParams);
+    }
+
+    private QueryResult executeUpdate(UpdateStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -5416,6 +5515,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         stmt = new UpdateStatement(stmt.tableName(), stmt.assignments(),
             applyRowLevelSecurity(stmt.tableName(), "UPDATE", stmt.where()));
 
+        Map<String, String> columnTypes = tableColumnTypes.get(stmt.tableName());
         int updated = 0;
         for (HeapTable.PositionedRow row : table.scanPositioned()) {
             if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
@@ -5423,7 +5523,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             byte[] oldPayload = MVCCVisibility.readPayload(row.stored());
             Tuple tuple = deserializeTuple(stmt.tableName(), oldPayload);
-            if (!matchesWhere(tuple, stmt.where(), txn)) {
+            if (!matchesWhere(tuple, stmt.where(), txn, null, params)) {
                 continue;
             }
 
@@ -5433,7 +5533,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             Tuple oldTuple = deserializeTuple(stmt.tableName(), oldPayload);
 
             for (Assignment assignment : stmt.assignments()) {
-                setColumnValue(tuple, assignment.column(), parseLiteral(assignment.value()));
+                Object val = resolveLiteralOrParam(assignment.value(), params);
+                String colType = (columnTypes != null) ? columnTypes.get(assignment.column()) : null;
+                setColumnValue(tuple, assignment.column(), coerceForColumnType(assignment.column(), colType, val));
             }
 
             QueryResult rlsWriteDenied = checkRowLevelSecurityWrite(stmt.tableName(), "UPDATE", tuple, txn);
@@ -5523,6 +5625,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * as MVCC-filtered dead weight forever.
      */
     private QueryResult executeDelete(DeleteStatement stmt, Transaction txn) throws DeadlockException {
+        return executeDelete(stmt, txn, session.get().currentParams);
+    }
+
+    private QueryResult executeDelete(DeleteStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -5540,7 +5646,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 continue;
             }
             Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(row.stored()));
-            if (!matchesWhere(tuple, stmt.where(), txn)) {
+            if (!matchesWhere(tuple, stmt.where(), txn, null, params)) {
                 continue;
             }
 
@@ -7858,31 +7964,39 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * my own table."
      */
     private boolean matchesWhere(Tuple tuple, WhereExpr where, Transaction txn) {
-        return matchesWhere(tuple, where, txn, null);
+        return matchesWhere(tuple, where, txn, null, session.get().currentParams);
     }
 
     private boolean matchesWhere(Tuple tuple, WhereExpr where, Transaction txn, Tuple outerRow) {
+        return matchesWhere(tuple, where, txn, outerRow, session.get().currentParams);
+    }
+
+    private boolean matchesWhere(Tuple tuple, WhereExpr where, Transaction txn, Tuple outerRow, List<Object> params) {
         if (where == null) {
             return true;
         }
-        return evaluateWhereExpr(tuple, where, txn, outerRow);
+        return evaluateWhereExpr(tuple, where, txn, outerRow, params);
     }
 
     private boolean evaluateWhereExpr(Tuple row, WhereExpr expr, Transaction txn, Tuple outerRow) {
+        return evaluateWhereExpr(row, expr, txn, outerRow, session.get().currentParams);
+    }
+
+    private boolean evaluateWhereExpr(Tuple row, WhereExpr expr, Transaction txn, Tuple outerRow, List<Object> params) {
         if (expr instanceof WhereExpr.BooleanLiteral bool) {
             return bool.value();
         }
         if (expr instanceof WhereExpr.And and) {
-            return evaluateWhereExpr(row, and.left(), txn, outerRow) && evaluateWhereExpr(row, and.right(), txn, outerRow);
+            return evaluateWhereExpr(row, and.left(), txn, outerRow, params) && evaluateWhereExpr(row, and.right(), txn, outerRow, params);
         }
         if (expr instanceof WhereExpr.Or or) {
-            return evaluateWhereExpr(row, or.left(), txn, outerRow) || evaluateWhereExpr(row, or.right(), txn, outerRow);
+            return evaluateWhereExpr(row, or.left(), txn, outerRow, params) || evaluateWhereExpr(row, or.right(), txn, outerRow, params);
         }
         if (expr instanceof WhereExpr.Not not) {
-            return !evaluateWhereExpr(row, not.inner(), txn, outerRow);
+            return !evaluateWhereExpr(row, not.inner(), txn, outerRow, params);
         }
         if (expr instanceof WhereExpr.Comparison cmp) {
-            return evaluateComparison(row, cmp, outerRow);
+            return evaluateComparison(row, cmp, outerRow, params);
         }
         if (expr instanceof WhereExpr.ColumnComparison colCmp) {
             Object left = resolveColumnValue(row, colCmp.leftColumn(), outerRow);
@@ -7891,14 +8005,17 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if (expr instanceof WhereExpr.Like like) {
             Object value = resolveColumnValue(row, like.column(), outerRow);
-            return value != null && matchesLikePattern(value.toString(), stripQuotes(like.pattern()));
+            Object patObj = resolveLiteralOrParam(like.pattern(), params);
+            String patStr = patObj != null ? patObj.toString() : stripQuotes(like.pattern());
+            return value != null && matchesLikePattern(value.toString(), patStr);
         }
         if (expr instanceof WhereExpr.Contains contains) {
             Object value = resolveColumnValue(row, contains.column(), outerRow);
             if (value == null) {
                 return false;
             }
-            String word = stripQuotes(contains.word());
+            Object wordObj = resolveLiteralOrParam(contains.word(), params);
+            String word = wordObj != null ? wordObj.toString() : stripQuotes(contains.word());
             return com.stratosdb.index.gin.GinIndex.tokenize(value.toString()).contains(word.toLowerCase());
         }
         if (expr instanceof WhereExpr.ArrayContains arrayContains) {
@@ -7906,7 +8023,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!(value instanceof List)) {
                 return false; // not an array column at all, or NULL - @> is false either way
             }
-            Object targetElement = parseLiteral(arrayContains.literalElement());
+            Object targetElement = resolveLiteralOrParam(arrayContains.literalElement(), params);
             for (Object element : (List<?>) value) {
                 if (java.util.Objects.equals(normalizeJoinKey(element), normalizeJoinKey(targetElement))) {
                     return true;
@@ -7919,7 +8036,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (!(value instanceof com.stratosdb.storage.page.TsVector vector)) {
                 return false; // not a real tsvector column at all, or NULL - @@ is false either way
             }
-            com.stratosdb.storage.page.TsQuery query = TextSearch.toTsQuery(stripQuotes(tsMatch.tsqueryLiteral()));
+            Object queryObj = resolveLiteralOrParam(tsMatch.tsqueryLiteral(), params);
+            String queryStr = queryObj != null ? queryObj.toString() : stripQuotes(tsMatch.tsqueryLiteral());
+            com.stratosdb.storage.page.TsQuery query = TextSearch.toTsQuery(queryStr);
             return query.matches(vector);
         }
         if (expr instanceof WhereExpr.EqZeroArgFunction eqFn) {
@@ -7945,7 +8064,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             if (extracted == null) {
                 return false; // key doesn't exist in this document, or its value is JSON null - either way, not equal to any comparison value
             }
-            String targetText = stripQuotes(jsonExtract.value());
+            Object targetObj = resolveLiteralOrParam(jsonExtract.value(), params);
+            String targetText = targetObj != null ? targetObj.toString() : stripQuotes(jsonExtract.value());
             // JSON scalars are stored as String/Double/Boolean (see JsonParser) -
             // compare as text, matching real Postgres's own ->>'key' semantics
             // (the "text" extraction operator, as opposed to -> which preserves
@@ -7960,8 +8080,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             long rowStart = ((Number) startValue).longValue();
             long rowEnd = ((Number) endValue).longValue();
-            long queryStart = ((Number) parseLiteral(rangeOverlaps.queryStartLiteral())).longValue();
-            long queryEnd = ((Number) parseLiteral(rangeOverlaps.queryEndLiteral())).longValue();
+            long queryStart = ((Number) resolveLiteralOrParam(rangeOverlaps.queryStartLiteral(), params)).longValue();
+            long queryEnd = ((Number) resolveLiteralOrParam(rangeOverlaps.queryEndLiteral(), params)).longValue();
             // Standard interval overlap test: [a,b] and [c,d] overlap iff a <= d AND c <= b.
             return rowStart <= queryEnd && queryStart <= rowEnd;
         }
@@ -7972,7 +8092,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             boolean found = false;
             for (String literalText : inList.values()) {
-                if (compareValues(value, "=", stripQuotes(literalText))) {
+                Object itemVal = resolveLiteralOrParam(literalText, params);
+                if (compareValues(value, "=", itemVal)) {
                     found = true;
                     break;
                 }
@@ -8005,17 +8126,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     /** Preserves a pre-existing, non-standard fallback: if the named column isn't found anywhere, an equality comparison still matches if ANY column in the row equals the literal. Ordering comparisons have no sensible version of this and simply don't match. */
     private boolean evaluateComparison(Tuple row, WhereExpr.Comparison cmp, Tuple outerRow) {
+        return evaluateComparison(row, cmp, outerRow, session.get().currentParams);
+    }
+
+    private boolean evaluateComparison(Tuple row, WhereExpr.Comparison cmp, Tuple outerRow, List<Object> params) {
+        Object literalVal = resolveLiteralOrParam(cmp.literal(), params);
         Object value = resolveColumnValue(row, cmp.column(), outerRow);
-        WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), cmp.literal());
         if (value != null) {
-            return evaluatePredicate(value.toString(), pred);
+            return compareValues(value, cmp.operator(), literalVal);
         }
-        if (!pred.operator().equals("=")) {
+        if (!cmp.operator().equals("=")) {
             return false;
         }
         for (int i = 0; i < row.size(); i++) {
             Object anyValue = row.getValue(i);
-            if (anyValue != null && evaluatePredicate(anyValue.toString(), pred)) {
+            if (anyValue != null && compareValues(anyValue, cmp.operator(), literalVal)) {
                 return true;
             }
         }
@@ -8070,6 +8195,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     /** Numeric-aware equality/ordering between two already-resolved values (as opposed to evaluatePredicate, which compares a resolved value against raw literal text). */
     private boolean compareValues(Object a, String operator, Object b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        if (a instanceof byte[] ba && b instanceof byte[] bb) {
+            return switch (operator) {
+                case "=" -> java.util.Arrays.equals(ba, bb);
+                case "!=" -> !java.util.Arrays.equals(ba, bb);
+                default -> false;
+            };
+        }
+        if (a instanceof Boolean ba && b instanceof Boolean bb) {
+            return switch (operator) {
+                case "=" -> ba.equals(bb);
+                case "!=" -> !ba.equals(bb);
+                default -> false;
+            };
+        }
         Double da = asNumberOrNull(a);
         Double db = asNumberOrNull(b);
         if (da != null && db != null) {
@@ -8341,12 +8483,89 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * untouched - only a JSON/JSONB column's own raw text input goes
      * through this parsing step.
      */
+    private Object resolveLiteralOrParam(String raw, List<Object> params) {
+        if (raw == null) return null;
+        if (isParamPlaceholder(raw)) {
+            List<Object> p = (params != null && !params.isEmpty()) ? params : session.get().currentParams;
+            return resolveParam(raw, p);
+        }
+        return resolveValue(raw);
+    }
+
+    private boolean isParamPlaceholder(String s) {
+        if (s == null) return false;
+        return s.equals("?") || (s.startsWith("$") && s.length() > 1 && Character.isDigit(s.charAt(1)));
+    }
+
+    private Object resolveParam(String placeholder, List<Object> params) {
+        if (params == null || params.isEmpty()) {
+            return null;
+        }
+        if (placeholder.equals("?")) {
+            return params.get(0);
+        }
+        if (placeholder.startsWith("$")) {
+            try {
+                int idx = Integer.parseInt(placeholder.substring(1));
+                if (idx >= 1 && idx <= params.size()) {
+                    return params.get(idx - 1);
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        return null;
+    }
+
+    private static byte[] decodeHex(String hex) {
+        String clean = hex;
+        if (clean.startsWith("\\x") || clean.startsWith("\\X")) {
+            clean = clean.substring(2);
+        } else if (clean.startsWith("x'") || clean.startsWith("X'")) {
+            clean = clean.substring(2, clean.length() - 1);
+        }
+        int len = clean.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(clean.charAt(i), 16) << 4)
+                                 + Character.digit(clean.charAt(i + 1), 16));
+        }
+        return data;
+    }
+
     private Object coerceForColumnType(String columnName, String declaredType, Object resolvedValue) {
-        if (declaredType == null || resolvedValue == null || !(resolvedValue instanceof String)) {
+        if (declaredType == null || resolvedValue == null) {
+            return resolvedValue;
+        }
+        String normalizedType = declaredType.trim().toUpperCase();
+        if (resolvedValue instanceof byte[]) {
+            return resolvedValue;
+        }
+        if (resolvedValue instanceof Number n) {
+            if (normalizedType.equals("SMALLINT") || normalizedType.equals("INT2")) {
+                return n.shortValue();
+            }
+            if (normalizedType.equals("INT") || normalizedType.equals("INTEGER") || normalizedType.equals("INT4") || normalizedType.equals("SERIAL")) {
+                return n.intValue();
+            }
+            if (normalizedType.equals("BIGINT") || normalizedType.equals("INT8") || normalizedType.equals("BIGSERIAL")) {
+                return n.longValue();
+            }
+            if (normalizedType.equals("FLOAT") || normalizedType.equals("FLOAT4") || normalizedType.equals("REAL")) {
+                return n.floatValue();
+            }
+            if (normalizedType.equals("DOUBLE") || normalizedType.equals("FLOAT8") || normalizedType.equals("NUMERIC") || normalizedType.equals("DECIMAL")) {
+                return n.doubleValue();
+            }
+        }
+        if (!(resolvedValue instanceof String)) {
             return resolvedValue;
         }
         String rawValue = (String) resolvedValue;
-        String normalizedType = declaredType.trim().toUpperCase();
+        if (normalizedType.equals("BYTEA") || normalizedType.equals("BLOB") || normalizedType.equals("BYTES")) {
+            if (rawValue.startsWith("\\x") || rawValue.startsWith("\\X") || rawValue.startsWith("x'") || rawValue.startsWith("X'")) {
+                return decodeHex(rawValue);
+            }
+            return rawValue.getBytes(StandardCharsets.UTF_8);
+        }
         if (normalizedType.equals("JSON") || normalizedType.equals("JSONB")) {
             try {
                 return JsonParser.parse(rawValue);

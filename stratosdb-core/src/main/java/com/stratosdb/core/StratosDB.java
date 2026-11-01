@@ -10,6 +10,8 @@ import com.stratosdb.transaction.TransactionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -55,6 +57,23 @@ public class StratosDB {
     public QueryResult execute(String sql) {
         LOG.debug("Executing: {}", sql);
         return executor.execute(sql);
+    }
+
+    public QueryResult execute(String sql, List<Object> params) {
+        LOG.debug("Executing with {} params: {}", params != null ? params.size() : 0, sql);
+        return executor.execute(sql, params);
+    }
+
+    public QueryResult execute(String sql, Object... params) {
+        return execute(sql, params != null ? java.util.Arrays.asList(params) : java.util.List.of());
+    }
+
+    public List<String> getTableColumns(String tableName) {
+        return executor != null ? executor.getTableColumns(tableName) : java.util.List.of();
+    }
+
+    public Map<String, String> getTableColumnTypes(String tableName) {
+        return executor != null ? executor.getTableColumnTypes(tableName) : java.util.Map.of();
     }
 
     public QueryResult executeOrThrow(String sql) throws com.stratosdb.common.exceptions.StratosDBException {

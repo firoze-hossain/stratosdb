@@ -303,7 +303,7 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | DATE | TIME | TIMESTAMP
         | DECIMAL (LPAREN INTEGER_LITERAL COMMA INTEGER_LITERAL RPAREN)?
         | NUMERIC (LPAREN INTEGER_LITERAL COMMA INTEGER_LITERAL RPAREN)?
-        | DOUBLE | FLOAT
+        | DOUBLE PRECISION? | FLOAT | REAL
         | BYTEA | BLOB
         | UUID
         | JSON | JSONB
@@ -319,7 +319,7 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | IDENTIFIER) (LBRACKET RBRACKET)?;
 
 // Literals
-literal: STRING_LITERAL | MINUS? INTEGER_LITERAL | MINUS? FLOAT_LITERAL | TRUE | FALSE | NULL;
+literal: STRING_LITERAL | MINUS? INTEGER_LITERAL | MINUS? FLOAT_LITERAL | TRUE | FALSE | NULL | PARAMETER;
 defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | NEXTVAL LPAREN STRING_LITERAL RPAREN;
 
 // Identifiers
@@ -327,8 +327,8 @@ tableName: (IDENTIFIER DOT)? (IDENTIFIER | TABLES | TYPE);
 typeName: IDENTIFIER;
 columnName: (IDENTIFIER DOT (IDENTIFIER DOT)?)? (IDENTIFIER | TYPE | TABLES | VIEW | INDEX | DEFAULT);
 alias: IDENTIFIER | STRING_LITERAL;
-limitValue: INTEGER_LITERAL;
-offsetValue: INTEGER_LITERAL;
+limitValue: INTEGER_LITERAL | PARAMETER;
+offsetValue: INTEGER_LITERAL | PARAMETER;
 
 // Lexer rules
 // TRUE/FALSE MUST be declared before IDENTIFIER (see IDENTIFIER's own
@@ -555,7 +555,9 @@ TIMESTAMP: T I M E S T A M P;
 DECIMAL: D E C I M A L;
 NUMERIC: N U M E R I C;
 DOUBLE: D O U B L E;
+PRECISION: P R E C I S I O N;
 FLOAT: F L O A T;
+REAL: R E A L;
 BYTEA: B Y T E A;
 BLOB: B L O B;
 UUID: U U I D;
@@ -598,6 +600,7 @@ IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
 STRING_LITERAL: '\'' ('\'\'' | ~['])* '\'';
 /** Postgres's own $$ ... $$ delimiter for a function body - lets the body contain semicolons, quotes, or anything else without conflicting with the surrounding statement's own delimiters. Non-greedy (.*?) so the FIRST closing $$ ends the body, not the last one in the whole remaining input. */
 DOLLAR_QUOTED_STRING: '$$' .*? '$$';
+PARAMETER: '$' [0-9]+ | '?';
 INTEGER_LITERAL: [0-9]+;
 FLOAT_LITERAL: [0-9]+ '.' [0-9]+;
 

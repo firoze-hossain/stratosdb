@@ -507,6 +507,88 @@ public final class StdWireMessages {
         });
     }
 
+    /** Bind with explicit parameter values and format codes (0=text, 1=binary). */
+    public static void writeBind(DataOutputStream out, String portalName, String statementName, byte[][] paramValues, int[] paramFormatCodes) throws IOException {
+        writeMessage(out, 'B', buf -> {
+            putCString(buf, portalName);
+            putCString(buf, statementName);
+            if (paramFormatCodes == null || paramFormatCodes.length == 0) {
+                buf.putShort((short) 0);
+            } else {
+                buf.putShort((short) paramFormatCodes.length);
+                for (int code : paramFormatCodes) {
+                    buf.putShort((short) code);
+                }
+            }
+            if (paramValues == null) {
+                buf.putShort((short) 0);
+            } else {
+                buf.putShort((short) paramValues.length);
+                for (byte[] v : paramValues) {
+                    if (v == null) {
+                        buf.putInt(-1);
+                    } else {
+                        buf.putInt(v.length);
+                        buf.put(v);
+                    }
+                }
+            }
+            buf.putShort((short) 0); // 0 result format codes = text format for every result column
+        });
+    }
+
+    // --- binary parameter encoder helpers ---
+
+    public static byte[] encodeInt2(short val) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(2).order(java.nio.ByteOrder.BIG_ENDIAN);
+        buf.putShort(val);
+        return buf.array();
+    }
+
+    public static byte[] encodeInt4(int val) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.BIG_ENDIAN);
+        buf.putInt(val);
+        return buf.array();
+    }
+
+    public static byte[] encodeInt8(long val) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.BIG_ENDIAN);
+        buf.putLong(val);
+        return buf.array();
+    }
+
+    public static byte[] encodeFloat4(float val) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.BIG_ENDIAN);
+        buf.putFloat(val);
+        return buf.array();
+    }
+
+    public static byte[] encodeFloat8(double val) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.BIG_ENDIAN);
+        buf.putDouble(val);
+        return buf.array();
+    }
+
+    public static byte[] encodeTimestamp(long pgMicros) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.BIG_ENDIAN);
+        buf.putLong(pgMicros);
+        return buf.array();
+    }
+
+    public static byte[] encodeTimestamp(java.time.Instant instant) {
+        long unixMicros = instant.getEpochSecond() * 1_000_000L + (instant.getNano() / 1_000L);
+        long pgMicros = unixMicros - PgBinaryDecoder.PG_EPOCH_MICROS;
+        return encodeTimestamp(pgMicros);
+    }
+
+    public static byte[] encodeBytea(byte[] bytes) {
+        return bytes;
+    }
+
+    public static byte[] encodeText(String text) {
+        return text != null ? text.getBytes(StandardCharsets.UTF_8) : null;
+    }
+
     public static void writeDescribe(DataOutputStream out, char targetType, String name) throws IOException {
         writeMessage(out, 'D', buf -> {
             buf.put((byte) targetType);

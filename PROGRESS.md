@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Commits | 106 |
-| Tests passing | **574 / 574** |
-| Main source | ~38,810 lines |
-| Test source | ~18,596 lines |
+| Commits | 107 |
+| Tests passing | **589 / 589** |
+| Main source | ~38,740 lines |
+| Test source | ~19,100 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), and Sprint 8 (Week 15: Statistics Engine ANALYZE 2.0; Week 16: Cost-Based Optimizer & Join Reordering with System-R Dynamic Programming Join Enumeration, PostgreSQL-aligned I/O and CPU Cost Modeling, and Access Path Selection) fully completed. Full reactor test suite verified at 574/574 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), and Sprint 9 (Week 17: Wire Protocol Native Binary Parameter Decoding and Parameterized Execution in Extended Protocol) fully completed. Full reactor test suite verified at 589/589 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1412,6 +1412,45 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 20, Sprint 8 Week 16) marked `Completed`.
     - Sheet 3 (Row 22, Cost-Based Optimizer / Join Reordering) marked `Resolved`.
+
+## Sprint 9 — Week 17: Wire Protocol Native Binary Parameter Decoding ✅ DONE
+
+- ✅ **Native pgwire Binary Format Decoding (`PgBinaryDecoder.java`)**:
+  - Implemented zero-copy, strongly typed decoding for PostgreSQL binary wire protocol formats (format code 1):
+    - `int2` (16-bit big-endian short)
+    - `int4` (32-bit big-endian integer)
+    - `int8` (64-bit big-endian long)
+    - `float4` (32-bit IEEE 754 float)
+    - `float8` (64-bit IEEE 754 double)
+    - `bool` (1-byte non-zero boolean)
+    - `bytea` (raw bytes `byte[]`)
+    - `text` / `varchar` (raw UTF-8 byte sequence)
+    - `timestamp` / `timestamptz` (64-bit microsecond offset from PostgreSQL epoch 2000-01-01 00:00:00 UTC, converted to epoch milliseconds)
+  - Also decodes text format (format code 0) into corresponding typed representations using target column type OIDs.
+- ✅ **Elimination of Text Query Interpolation & SQL Injection (`ExtendedProtocolHandler.java`)**:
+  - Removed string substitution hack (`substituteParams`, `formatParamAsSqlLiteral`), completely closing the SQL injection attack surface in prepared statements.
+  - In `handleParse`: parses SQL statement with AST parameter placeholder detection (`$1`, `$2`, `?`), infers expected column types and OIDs from table schema, and retains original parameterized query template.
+  - In `handleDescribe('S')`: emits ParameterDescription (`t`) message reporting inferred/declared parameter OIDs.
+  - In `handleBind`: decodes incoming parameter binary/text byte buffers into a strongly typed `List<Object> typedParams` using parameter format codes and inferred OIDs.
+  - Passes parameterized queries directly into the core engine via `db.execute(stmt.query(), typedParams)` and stores active execution state on the `Portal`.
+- ✅ **Engine-Level Parameterized Execution Support (`ExecutorEngine.java`, `StratosDB.java`, `Tuple.java`)**:
+  - Added native parameter execution API: `StratosDB.execute(String sql, List<Object> params)` and varargs overload `StratosDB.execute(String sql, Object... params)`.
+  - Added `replaceQuestionMarks(String sql)` converting unquoted `?` into numbered placeholders `$1`, `$2`, etc.
+  - Updated AST execution pipelines across `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and `EXPLAIN` to resolve placeholder references directly against `typedParams` without SQL string re-parsing or type degradation.
+  - Added raw `byte[]` storage support in `Tuple` (`TAG_BYTES = 11`), enabling native binary columns and hex literal decoding (`\x...`).
+  - Added `byte[]` comparison in `SortAndAggregateUtils.compareNonNull` and equality evaluation in `ExecutorEngine.compareValues`.
+  - Extended ANTLR grammar (`StratosSQL.g4`) with `PARAMETER` token (`'$' [0-9]+ | '?'`), `REAL`, and `DOUBLE PRECISION` data types.
+- ✅ **Wire Protocol Testing & Verification (`PgBinaryDecoderTest.java`, `PgBinaryParameterDecodingTest.java`)**:
+  - 11 unit tests in `PgBinaryDecoderTest`: verified binary decoding for int2, int4, int8, float4, float8, timestamp (with microsecond PG epoch conversion), bytea, text, booleans, and null handling.
+  - 4 end-to-end integration tests in `PgBinaryParameterDecodingTest`:
+    - Full binary parameterized INSERT and SELECT over extended wire protocol socket (Parse -> Bind with format code 1 -> Execute -> Sync).
+    - Timestamp binary decoding verifying PG epoch calculation and query retrieval.
+    - Raw byte array (`bytea`) binary parameter insertion and retrieval formatted as `\x...`.
+    - Verification that SQL injection payloads in binary parameters (`'; DROP TABLE ...`) are treated as pure data literals and cannot alter the SQL AST or schema.
+  - Full reactor test suite verified at **589 / 589 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 21, Sprint 9 Week 17) marked `Completed`.
+    - Sheet 3 (Row 25, Wire Protocol Completeness) marked `Resolved`.
 
 ## What to do next
 

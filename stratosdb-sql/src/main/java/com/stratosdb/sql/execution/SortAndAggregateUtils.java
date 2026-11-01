@@ -51,6 +51,9 @@ public final class SortAndAggregateUtils {
         if (a instanceof Boolean ba && b instanceof Boolean bb) {
             return Boolean.compare(ba, bb);
         }
+        if (a instanceof byte[] ba && b instanceof byte[] bb) {
+            return java.util.Arrays.compare(ba, bb);
+        }
         if (a instanceof Comparable ca && a.getClass().isAssignableFrom(b.getClass())) {
             return ca.compareTo(b);
         }
