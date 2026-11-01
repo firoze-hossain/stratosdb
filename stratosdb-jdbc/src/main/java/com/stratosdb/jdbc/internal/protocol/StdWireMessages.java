@@ -208,6 +208,12 @@ public final class StdWireMessages {
         out.flush();
     }
 
+    public static void writeSslRequest(DataOutputStream out) throws IOException {
+        out.writeInt(8);
+        out.writeInt(SSL_REQUEST_CODE);
+        out.flush();
+    }
+
     public static void writeAuthenticationOk(DataOutputStream out) throws IOException {
         writeMessage(out, 'R', buf -> buf.putInt(0));
     }

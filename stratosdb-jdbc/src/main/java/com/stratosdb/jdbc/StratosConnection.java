@@ -98,19 +98,29 @@ class StratosConnection implements InvocationHandler {
     }
 
     static Connection connect(String host, int port, String username, String password, String database, SSLContext sslContext) throws SQLException {
-        if (sslContext != null) {
-            // Honest, not silent: see this class's own javadoc for exactly why
-            // ssl=true cannot be honored against a real, current StratosDB
-            // server today - the real server unconditionally declines every
-            // SSL negotiation attempt, so pretending to proceed would either
-            // silently fall back to plaintext or hang forever on a
-            // negotiation the server will never accept.
-            throw new SQLException("StratosDB's real, current server does not support TLS yet "
-                + "(every SSL negotiation is declined - see StdWireServer's own startup handling). "
-                + "Connect without ssl=true for now.");
-        }
         try {
             Socket socket = new Socket(host, port);
+            if (sslContext != null) {
+                DataOutputStream rawOut = new DataOutputStream(socket.getOutputStream());
+                DataInputStream rawIn = new DataInputStream(socket.getInputStream());
+                StdWireMessages.writeSslRequest(rawOut);
+                int reply = rawIn.read();
+                if (reply == 'S') {
+                    javax.net.ssl.SSLSocketFactory sf = sslContext.getSocketFactory();
+                    javax.net.ssl.SSLSocket sslSocket = (javax.net.ssl.SSLSocket) sf.createSocket(socket, host, port, true);
+                    sslSocket.setUseClientMode(true);
+                    sslSocket.startHandshake();
+                    socket = sslSocket;
+                } else if (reply == 'N') {
+                    socket.close();
+                    throw new SQLException("StratosDB's real, current server does not support TLS yet "
+                        + "(every SSL negotiation is declined - see StdWireServer's own startup handling). "
+                        + "Connect without ssl=true for now.");
+                } else {
+                    socket.close();
+                    throw new SQLException("Unexpected response from server during SSL negotiation: " + reply);
+                }
+            }
             StratosConnection handler = new StratosConnection(socket, username, password, database);
             Connection proxy = (Connection) Proxy.newProxyInstance(
                 StratosConnection.class.getClassLoader(), new Class[]{Connection.class}, handler);

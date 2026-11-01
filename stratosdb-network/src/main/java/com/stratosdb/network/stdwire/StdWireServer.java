@@ -3,6 +3,9 @@ package com.stratosdb.network.stdwire;
 import com.stratosdb.core.StratosDB;
 import com.stratosdb.network.auth.ScramSha256;
 import com.stratosdb.network.auth.UserStore;
+import com.stratosdb.network.tls.StdSslEngineHandler;
+import com.stratosdb.network.tls.TlsConfig;
+import com.stratosdb.network.tls.TlsSupport;
 import com.stratosdb.sql.catalog.StdCatalogViews;
 import com.stratosdb.sql.executor.ExecutorEngine;
 import com.stratosdb.sql.executor.QueryResult;
@@ -11,9 +14,11 @@ import com.stratosdb.storage.page.Tuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.net.ssl.SSLContext;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +63,8 @@ public class StdWireServer {
     private final AtomicInteger nextPid = new AtomicInteger(1000);
     /** Non-null only when this server's own StratosDB instance is currently following a primary as a replica - see setReplicationClient's own javadoc and the new PROMOTE command below. */
     private volatile com.stratosdb.network.replication.ReplicationClient replicationClient;
+    private TlsConfig tlsConfig;
+    private volatile SSLContext sslContext;
 
     /** This connection's own thread's own currently-relevant database - the one, fixed instance in single-database mode, or whatever this thread most recently resolved via performStartup in cluster mode (correctly still the PREVIOUS connection's own database, or null, for a freshly-pooled thread that hasn't run performStartup yet this time around - callers that run before performStartup, like the defensive pre-startup closeSession() below, must handle a null result themselves). */
     private StratosDB db() {
@@ -80,17 +87,27 @@ public class StdWireServer {
     }
 
     public StdWireServer(int port, StratosDB db) {
-        this(port, db, null);
+        this(port, db, null, null);
     }
 
     public StdWireServer(int port, StratosDB db, UserStore userStore) {
+        this(port, db, userStore, null);
+    }
+
+    public StdWireServer(int port, StratosDB db, TlsConfig tlsConfig) {
+        this(port, db, null, tlsConfig);
+    }
+
+    public StdWireServer(int port, StratosDB db, UserStore userStore, TlsConfig tlsConfig) {
         this.port = port;
         this.fixedDb = db;
         this.cluster = null;
         this.userStore = userStore;
+        this.tlsConfig = tlsConfig;
         if (userStore != null) {
             wireRoleCredentialSink(db);
         }
+        initTls();
     }
 
     /**
@@ -105,26 +122,63 @@ public class StdWireServer {
      * connection then closed - for a name the cluster doesn't have.
      */
     public StdWireServer(int port, com.stratosdb.core.StratosCluster cluster) {
-        this(port, cluster, null);
+        this(port, cluster, null, null);
     }
 
     public StdWireServer(int port, com.stratosdb.core.StratosCluster cluster, UserStore userStore) {
+        this(port, cluster, userStore, null);
+    }
+
+    public StdWireServer(int port, com.stratosdb.core.StratosCluster cluster, TlsConfig tlsConfig) {
+        this(port, cluster, null, tlsConfig);
+    }
+
+    public StdWireServer(int port, com.stratosdb.core.StratosCluster cluster, UserStore userStore, TlsConfig tlsConfig) {
         this.port = port;
         this.fixedDb = null;
         this.cluster = cluster;
         this.userStore = userStore;
+        this.tlsConfig = tlsConfig;
         if (userStore != null) {
-            // Roles are cluster-wide in real PostgreSQL, not per-database objects -
-            // matched here: every database already in the cluster gets the same real
-            // credential sink wired at startup. A database created later via a real,
-            // live CREATE DATABASE gets the same wiring lazily, the first time any
-            // connection actually resolves it (see performStartup below) - simpler
-            // than giving StratosCluster its own separate "on database created" hook
-            // for what is, either way, an idempotent, harmless re-wiring.
             for (String name : cluster.listDatabaseNames()) {
                 wireRoleCredentialSink(cluster.getDatabase(name));
             }
         }
+        initTls();
+    }
+
+    private void initTls() {
+        if (tlsConfig != null && tlsConfig.isEnabled()) {
+            try {
+                this.sslContext = tlsConfig.getOrCreateSslContext();
+            } catch (Exception e) {
+                LOG.error("Failed to initialize TLS SSLContext", e);
+                throw new RuntimeException("TLS initialization failed", e);
+            }
+        } else {
+            this.sslContext = null;
+        }
+    }
+
+    public void setTlsConfig(TlsConfig tlsConfig) {
+        this.tlsConfig = tlsConfig;
+        initTls();
+    }
+
+    public TlsConfig getTlsConfig() {
+        return this.tlsConfig;
+    }
+
+    public SSLContext getSslContext() {
+        return this.sslContext;
+    }
+
+    public void setSslContext(SSLContext sslContext) {
+        this.sslContext = sslContext;
+        if (this.tlsConfig == null) {
+            this.tlsConfig = new TlsConfig();
+        }
+        this.tlsConfig.setSslContext(sslContext);
     }
 
     /**
@@ -183,30 +237,60 @@ public class StdWireServer {
         String remote = socket.getRemoteSocketAddress().toString();
         LOG.debug("stdwire client connected: {}", remote);
         com.stratosdb.sql.executor.SessionActivity activity = null;
-        try (Socket s = socket;
-             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
-             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
-
-            // Defensive: this thread is new per connection from the pool's own point of
-            // view, but a pooled thread may be reused across connections - MUST run
-            // before performStartup(), not after: performStartup() now calls
-            // db.setCurrentUser() as part of authentication (see its own comment below),
-            // and closeSession()'s own session.remove() would otherwise immediately wipe
-            // that back out again on the very next line, silently leaving every
-            // connection's own session with no current user at all - a real bug found
-            // and fixed while testing this real, end to end: a role's own GRANTed
-            // privileges appeared to do nothing at all over a real connection, because
-            // by the time a query actually ran, currentUser had already been reset to
-            // null right after being correctly set. In cluster mode, db() correctly
-            // still holds whatever database THIS pooled thread most recently served
-            // (ThreadLocal semantics) - or null, for a thread that has never served a
-            // connection at all yet, hence the null check (single-database mode's own
-            // fixedDb is never null, so this never skips anything there).
+        StdSslEngineHandler sslHandler = null;
+        try (Socket s = socket) {
             if (db() != null) {
                 db().closeSession();
             }
 
-            String username = performStartup(in, out);
+            InputStream rawIn = s.getInputStream();
+            OutputStream rawOut = s.getOutputStream();
+            DataInputStream rawDataIn = new DataInputStream(rawIn);
+            DataOutputStream rawDataOut = new DataOutputStream(rawOut);
+
+            byte[] initialPacket = StdWireMessages.readUntypedPacket(rawDataIn);
+            int code = readInt(initialPacket, 0);
+
+            InputStream inStream = rawIn;
+            OutputStream outStream = rawOut;
+            byte[] startupPacket;
+
+            if (code == StdWireMessages.SSL_REQUEST_CODE) {
+                if (sslContext != null && (tlsConfig == null || tlsConfig.isEnabled())) {
+                    StdWireMessages.writeSslOk(rawDataOut);
+                    sslHandler = new StdSslEngineHandler(s, rawIn, rawOut, sslContext, tlsConfig);
+                    sslHandler.performHandshake();
+                    if (tlsConfig != null && tlsConfig.getClientAuth() == TlsConfig.ClientAuth.NEED) {
+                        if (sslHandler.getPeerCertificate() == null) {
+                            LOG.warn("stdwire TLS connection from {} rejected: missing required client certificate", remote);
+                            s.close();
+                            return;
+                        }
+                    }
+                    inStream = sslHandler.getInputStream();
+                    outStream = sslHandler.getOutputStream();
+                    LOG.info("stdwire TLS connection established from {}: protocol={}, cipher={}, ALPN={}",
+                            remote, sslHandler.getSession().getProtocol(), sslHandler.getSession().getCipherSuite(), sslHandler.getApplicationProtocol());
+                } else {
+                    StdWireMessages.writeSslDecline(rawDataOut);
+                }
+
+                // Next message on the connection (either TLS or plaintext) is the StartupMessage
+                DataInputStream tempIn = new DataInputStream(inStream);
+                startupPacket = StdWireMessages.readUntypedPacket(tempIn);
+            } else {
+                if (tlsConfig != null && tlsConfig.isRequireTls()) {
+                    StdWireMessages.writeErrorResponse(rawDataOut, "FATAL: SSL connection is required by server configuration");
+                    rawDataOut.flush();
+                    return;
+                }
+                startupPacket = initialPacket;
+            }
+
+            DataInputStream in = new DataInputStream(new BufferedInputStream(inStream));
+            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(outStream));
+
+            String username = performStartup(startupPacket, in, out, sslHandler);
             if (username == null) {
                 return;
             }
@@ -275,23 +359,19 @@ public class StdWireServer {
             if (db() != null) {
                 db().closeSession();
             }
+            if (sslHandler != null) {
+                try {
+                    sslHandler.close();
+                } catch (Exception ignored) {}
+            }
             LOG.debug("stdwire client disconnected: {}", remote);
         }
     }
 
     /** Returns false if the connection should be closed (SSL request handled, then the client is expected to reconnect in plaintext, or the startup was malformed). */
     /** Returns the authenticated username on success, or null on failure (an ErrorResponse has already been sent in that case). A String return, not a boolean, specifically so the caller can register this connection's own SessionActivity (see SessionActivityRegistry) without needing any shared, cross-connection state to recover the username afterward - a plain instance field here would race across concurrent connections on this same, shared StdWireServer. */
-    private String performStartup(DataInputStream in, DataOutputStream out) throws IOException {
-        byte[] body = StdWireMessages.readUntypedPacket(in);
+    private String performStartup(byte[] body, DataInputStream in, DataOutputStream out, StdSslEngineHandler sslHandler) throws IOException {
         int code = readInt(body, 0);
-
-        if (code == StdWireMessages.SSL_REQUEST_CODE) {
-            StdWireMessages.writeSslDecline(out);
-            out.flush();
-            // A real client falls back to a plaintext StartupMessage next on the SAME connection.
-            body = StdWireMessages.readUntypedPacket(in);
-            code = readInt(body, 0);
-        }
 
         if (code != StdWireMessages.PROTOCOL_VERSION_3) {
             StdWireMessages.writeErrorResponse(out, "Only protocol version 3.0 is supported");
@@ -325,7 +405,25 @@ public class StdWireServer {
             }
         }
 
-        if (userStore != null) {
+        // Client certificate authentication (mTLS) if enabled
+        if (sslHandler != null && tlsConfig != null && tlsConfig.isClientCertAuth()) {
+            X509Certificate clientCert = sslHandler.getPeerCertificate();
+            if (clientCert == null) {
+                StdWireMessages.writeErrorResponse(out, "FATAL: client certificate is required for authentication");
+                out.flush();
+                return null;
+            }
+            String certCn = TlsSupport.extractCommonName(clientCert);
+            String requestedUser = params.get("user");
+            if (requestedUser != null && !requestedUser.isBlank() && !requestedUser.equalsIgnoreCase(certCn)) {
+                StdWireMessages.writeErrorResponse(out, "FATAL: certificate authentication failed for user \""
+                        + requestedUser + "\": certificate CN is \"" + certCn + "\"");
+                out.flush();
+                return null;
+            }
+            LOG.info("Client certificate authenticated: user={} CN={}", requestedUser, certCn);
+            StdWireMessages.writeAuthenticationOk(out);
+        } else if (userStore != null) {
             if (!performScramAuthentication(params.get("user"), in, out)) {
                 return null; // performScramAuthentication already sent the ErrorResponse
             }

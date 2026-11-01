@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Commits | 107 |
-| Tests passing | **589 / 589** |
-| Main source | ~38,740 lines |
-| Test source | ~19,100 lines |
+| Commits | 109 |
+| Tests passing | **598 / 598** |
+| Main source | ~39,450 lines |
+| Test source | ~19,450 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), and Sprint 9 (Week 17: Wire Protocol Native Binary Parameter Decoding and Parameterized Execution in Extended Protocol) fully completed. Full reactor test suite verified at 589/589 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), and Sprint 9 (Weeks 17-18: Native Binary Parameter Decoding and TLS/SSL Integration in StdWireServer) fully completed. Full reactor test suite verified at 598/598 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1451,6 +1451,52 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 21, Sprint 9 Week 17) marked `Completed`.
     - Sheet 3 (Row 25, Wire Protocol Completeness) marked `Resolved`.
+
+## Sprint 9 — Week 18: Security / Network — TLS/SSL Integration in StdWireServer ✅ DONE
+
+- ✅ **`SSLEngine` Handshake & State Machine (`StdSslEngineHandler.java`)**:
+  - Implemented non-blocking Java NIO `SSLEngine` state machine wrapping raw TCP socket streams in high-throughput encrypted I/O buffers (32 KB network buffer, 32 KB application buffer).
+  - Handles complete handshake cycle: `NEED_UNWRAP`, `NEED_WRAP`, `NEED_TASK` (with multi-threaded task runner delegating expensive asymmetric crypto), `FINISHED`, and `NOT_HANDSHAKING`.
+  - Dynamically unwraps TLS 1.3 records, handles mid-connection post-handshake wraps/unwraps (e.g., session ticket issuance, key updates), and provides stream termination with TLS `close_notify`.
+  - Exposes `getPeerCertificate()` extracting validated peer `X509Certificate` from TLS session for downstream identity verification.
+
+- ✅ **Configurable Keystore, Truststore & Protocols (`TlsConfig.java`, `TlsSupport.java`)**:
+  - Added comprehensive `TlsConfig` supporting `enabled`, `requireTls`, `keystorePath`, `keystorePassword`, `keystoreType` (PKCS12/JKS), `keyPassword`, `truststorePath`, `truststorePassword`, `truststoreType`, `protocols` (default `TLSv1.3`, `TLSv1.2`), `applicationProtocols` (ALPN), and `ClientAuth` mode (`NONE`, `WANT`, `NEED`).
+  - Added programmatic keystore/truststore loaders and keytool automation helpers in `TlsSupport.java`: `loadServerContext(...)`, `loadClientContext(...)`, `generateKeyStore(...)`, `exportCertificate(...)`, `importCertificate(...)`, and `extractCommonName(...)`.
+
+- ✅ **Wire Protocol SSL Negotiation & Enforced Security (`StdWireServer.java`, `StdWireMessages.java`)**:
+  - Intercepts 8-byte frontend startup packet: recognizes `SSLRequest` (`code = 80877103`).
+  - When TLS is enabled, responds with single-byte `'S'` (SSL OK) and immediately initiates server-side `SSLEngine` handshake. All subsequent communications (StartupMessage, SCRAM/trust authentication, queries, query results) operate over the negotiated TLS cipher suite.
+  - When TLS is disabled, responds with `'N'` and falls back to plaintext if permitted.
+  - Enforces `requireTls`: immediately terminates connections attempting plaintext startup when TLS is mandatory.
+  - Enforces `ClientAuth.NEED`: terminates connections where the client fails to present a trusted client certificate.
+
+- ✅ **ALPN (Application-Layer Protocol Negotiation)**:
+  - Supports ALPN application protocol negotiation via `SSLParameters.setApplicationProtocols(...)`, enabling clients and servers to explicitly agree on `"postgresql"` protocol.
+
+- ✅ **mTLS Client Certificate Authentication**:
+  - Integrated certificate-based authentication: parses subject DN (`CN`) from client certificate and verifies identity against requested database user.
+  - Bypasses password/SCRAM prompts when valid client certificate matches the username; rejects access if CN does not match requested user or if cert is invalid/untrusted.
+
+- ✅ **JDBC SSL/TLS Upgrade Support (`StratosConnection.java`, `StdWireMessages.java`)**:
+  - Upgraded JDBC driver connection initialization: sends `writeSslRequest`, handles `'S'` response, and wraps socket via `SSLSocketFactory.createSocket()` when configured with an `SSLContext`.
+
+- ✅ **Comprehensive Verification & Testing (`StdWireTlsIntegrationTest.java`)**:
+  - 9 end-to-end integration tests verifying every aspect of wire encryption:
+    1. `testTls13HandshakeAndEncryptedCommunication`: verifies TLS 1.3 handshake, DDL table creation, DML inserts, and parameterized queries over encrypted channel.
+    2. `testEncryptedTrafficVerificationWiresharkStyle`: raw byte capture tap verifying TLS record frames (`0x16` Handshake, `0x17` Application Data, `0x03, 0x03` TLS record version) and 0 plaintext leakage of sensitive payloads/SQL.
+    3. `testAlpnNegotiation`: verifies ALPN application protocol `"postgresql"`.
+    4. `testClientCertificateAuthenticationSuccess`: verifies mTLS with `ClientAuth.NEED` and cert `CN=alice`.
+    5. `testClientCertificateAuthenticationFailureMismatch`: verifies rejection when client cert CN does not match requested user.
+    6. `testClientCertificateRequiredNoCertFails`: verifies connection rejection when client cert is missing under `ClientAuth.NEED`.
+    7. `testSslDeclineWhenTlsDisabled`: verifies `'N'` response and plaintext fallback when TLS disabled.
+    8. `testRequireTlsEnforcement`: verifies rejection of plaintext connections when `requireTls = true`.
+    9. `testRealPsqlSslmodeRequireAndVerifyFull`: runs actual `/usr/bin/psql` with `sslmode=require` and `sslmode=verify-full` (with `sslrootcert`), verifying both connect and execute queries with exit code 0.
+  - Full reactor test suite verified at **598 / 598 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 22, Sprint 9 Week 18: TLS/SSL Integration in StdWireServer) marked `Completed`.
+    - Sheet 3 (Row 26, Wire Encryption (TLS/SSL)) marked `Resolved`.
+    - Sheet 5 (Row 13, Wire Protocol TLS 1.3 Encryption) marked `Passed (Week 18)`.
 
 ## What to do next
 
