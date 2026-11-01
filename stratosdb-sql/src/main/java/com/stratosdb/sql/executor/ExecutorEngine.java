@@ -10,6 +10,9 @@ import com.stratosdb.sql.catalog.SystemCatalog;
 import com.stratosdb.sql.execution.*;
 import com.stratosdb.sql.parser.SqlParser;
 import com.stratosdb.sql.planner.SubqueryDecorrelator;
+import com.stratosdb.sql.statistics.ColumnStatistics;
+import com.stratosdb.sql.statistics.StatisticsEngine;
+import com.stratosdb.sql.statistics.TableStatistics;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.page.BTreePage;
@@ -227,9 +230,6 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * will have the optimizer working from outdated row-count and
      * selectivity estimates until ANALYZE runs again.
      */
-    private record ColumnStatistics(long distinctCount, Double min, Double max) {}
-    private record TableStatistics(long rowCount, Map<String, ColumnStatistics> columnStats) {}
-
     private final Map<String, TableStatistics> statistics;
 
     /**
@@ -661,6 +661,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 }
             }
         );
+        Map<String, TableStatistics> loadedStats = systemCatalog.loadStatistics();
+        if (loadedStats != null && !loadedStats.isEmpty()) {
+            statistics.putAll(loadedStats);
+            LOG.info("Loaded statistics for {} table(s) from system catalog", loadedStats.size());
+        }
         LOG.info("Relational schema catalog loaded: {} table(s)/view(s)/index(es)", tables.size());
     }
 
@@ -1265,6 +1270,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     public Set<String> getSequenceNames() {
         return Collections.unmodifiableSet(sequences.keySet());
+    }
+
+    public Map<String, TableStatistics> getStatistics() {
+        return Collections.unmodifiableMap(statistics);
     }
 
     /**
@@ -2623,56 +2632,53 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * gap is real further work (Phase B), not hidden here.
      */
     private QueryResult executeAnalyze(AnalyzeStatement stmt, Transaction txn) {
-        HeapTable table = tables.get(stmt.tableName());
-        if (table == null) {
+        if (stmt.tableName() == null) {
+            List<String> analyzedTables = new ArrayList<>();
+            for (String tbl : new ArrayList<>(tables.keySet())) {
+                if (SystemCatalog.isSystemTable(tbl)) continue;
+                TableStatistics ts = analyzeSingleTable(tbl, txn);
+                if (ts != null) {
+                    analyzedTables.add(tbl);
+                }
+            }
+            return QueryResult.success("ANALYZE completed for " + analyzedTables.size() + " table(s): " + String.join(", ", analyzedTables));
+        }
+
+        TableStatistics stats = analyzeSingleTable(stmt.tableName(), txn);
+        if (stats == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
 
-        List<String> columnNames = tableColumns.get(stmt.tableName());
-        Map<String, Set<Object>> distinctValues = new HashMap<>();
-        Map<String, Double> minValues = new HashMap<>();
-        Map<String, Double> maxValues = new HashMap<>();
-        if (columnNames != null) {
-            for (String col : columnNames) {
-                distinctValues.put(col, new HashSet<>());
-            }
+        return QueryResult.success("Analyzed " + stmt.tableName() + ": " + stats.rowCount() + " row(s), "
+            + stats.columnStats().size() + " column(s)");
+    }
+
+    private TableStatistics analyzeSingleTable(String tableName, Transaction txn) {
+        HeapTable table = tables.get(tableName);
+        if (table == null) {
+            return null;
         }
 
-        long rowCount = 0;
-        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-            Tuple tuple = deserializeTuple(stmt.tableName(), raw);
-            rowCount++;
-            if (columnNames == null) {
-                continue;
-            }
-            for (String col : columnNames) {
-                Object value = findColumnValue(tuple, col);
-                if (value == null) {
-                    continue;
-                }
-                distinctValues.get(col).add(value);
-                if (value instanceof Number n) {
-                    double d = n.doubleValue();
-                    minValues.merge(col, d, Math::min);
-                    maxValues.merge(col, d, Math::max);
-                }
-            }
-        }
+        List<String> columnNames = tableColumns.get(tableName);
+        TableStatistics stats = StatisticsEngine.analyzeTable(
+            tableName,
+            table,
+            columnNames,
+            txn,
+            transactionManager,
+            bufferPool,
+            this::deserializeTuple,
+            this::findColumnValue
+        );
 
-        Map<String, ColumnStatistics> columnStats = new HashMap<>();
-        if (columnNames != null) {
-            for (String col : columnNames) {
-                columnStats.put(col, new ColumnStatistics(
-                    distinctValues.get(col).size(),
-                    minValues.get(col),
-                    maxValues.get(col)));
+        if (stats != null) {
+            statistics.put(tableName, stats);
+            long xid = txn != null ? txn.getXID() : 0L;
+            if (systemCatalog != null) {
+                systemCatalog.saveTableStatistics(stats, xid);
             }
         }
-
-        statistics.put(stmt.tableName(), new TableStatistics(rowCount, columnStats));
-
-        return QueryResult.success("Analyzed " + stmt.tableName() + ": " + rowCount + " row(s), "
-            + (columnNames != null ? columnNames.size() : 0) + " column(s)");
+        return stats;
     }
 
     /**
@@ -4702,19 +4708,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (colStats == null) {
             return stats.rowCount(); // no per-column stats - assume worst case (matches everything)
         }
-        if (operator.equals("=")) {
-            long distinct = Math.max(1, colStats.distinctCount());
-            return Math.max(1, stats.rowCount() / distinct);
-        }
-        if (colStats.min() == null || colStats.max() == null || colStats.max() <= colStats.min()) {
-            return stats.rowCount(); // no usable numeric range - assume worst case
-        }
-        double totalWidth = colStats.max() - colStats.min();
-        double rangeLo = Math.max(colStats.min(), lo == Long.MIN_VALUE ? colStats.min() : lo);
-        double rangeHi = Math.min(colStats.max(), hi == Long.MAX_VALUE ? colStats.max() : hi);
-        double rangeWidth = Math.max(0, rangeHi - rangeLo);
-        double selectivity = Math.min(1.0, rangeWidth / totalWidth);
-        return Math.max(1, (long) (stats.rowCount() * selectivity));
+        double selectivity = colStats.estimateSelectivity(operator, lo, hi);
+        return Math.max(1, Math.round(stats.rowCount() * selectivity));
     }
 
     /** For an equality predicate: prefers a hash index (O(1) vs O(log n)) when one exists on this column, else a B+Tree one. */
@@ -5527,6 +5522,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         systemCatalog.deleteColumns(tableName, xid);
         systemCatalog.deleteIndexesForTable(tableName, xid);
         systemCatalog.deleteConstraintsForTable(tableName, xid);
+        systemCatalog.deleteStatisticsForTable(tableName, xid);
+        statistics.remove(tableName);
 
         recordDdlUndo(() -> {
             if (oldTable != null) tables.put(tableName, oldTable);

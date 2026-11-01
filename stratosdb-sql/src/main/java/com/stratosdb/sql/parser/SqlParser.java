@@ -156,7 +156,8 @@ public class SqlParser {
         } else if (ctx.explain() != null) {
             return new ExplainStatement(buildSelect(ctx.explain().select()));
         } else if (ctx.analyze() != null) {
-            return new AnalyzeStatement(ctx.analyze().tableName().getText());
+            String tbl = ctx.analyze().tableName() != null ? ctx.analyze().tableName().getText() : null;
+            return new AnalyzeStatement(tbl);
         } else if (ctx.vacuum() != null) {
             return new VacuumStatement(ctx.vacuum().tableName().getText());
         } else if (ctx.reindexStatement() != null) {

@@ -36,7 +36,7 @@ public final class StdCatalogViews {
         return switch (canonicalViewName(name)) {
             case "class", "attribute", "type", "namespace", "index",
                  "information_schema.tables", "database", "am",
-                 "tables", "views", "indexes" -> true;
+                 "tables", "views", "indexes", "statistic" -> true;
             default -> false;
         };
     }
@@ -67,6 +67,7 @@ public final class StdCatalogViews {
             case "pg_tables", "std_tables", "stratos_tables" -> "tables";
             case "pg_views", "std_views", "stratos_views" -> "views";
             case "pg_indexes", "std_indexes", "stratos_indexes" -> "indexes";
+            case "pg_statistic", "std_statistic", "stratos_statistic", "statistic" -> "statistic";
             default -> name;
         };
     }
@@ -138,6 +139,7 @@ public final class StdCatalogViews {
             case "tables" -> generateTablesRows(engine);
             case "views" -> generateViewsRows(engine);
             case "indexes" -> generateIndexesRows(engine);
+            case "statistic" -> generateStatisticRows(engine);
             default -> Collections.emptyList();
         };
     }
@@ -161,9 +163,17 @@ public final class StdCatalogViews {
             int natts = tableCols != null ? tableCols.size() : 0;
             boolean hasIndex = !engine.getIndexesForTable(table).isEmpty();
 
+            int relpages = 1;
+            float reltuples = 0.0f;
+            com.stratosdb.sql.statistics.TableStatistics ts = engine.getStatistics() != null ? engine.getStatistics().get(table) : null;
+            if (ts != null) {
+                relpages = (int) Math.min(Integer.MAX_VALUE, ts.pageCount());
+                reltuples = (float) ts.rowCount();
+            }
+
             rows.add(createTuple(cols,
                 relOid, table, nspOid, relOid + 1, 10, 0,
-                relOid, 0, 1, 0.0f, 0,
+                relOid, 0, relpages, reltuples, 0,
                 0, hasIndex ? "t" : "f", "f", "p", "r",
                 natts, 0, "f", "f", "f",
                 "f", "f", "t", "d", "f"
@@ -432,6 +442,31 @@ public final class StdCatalogViews {
                     + " USING btree (" + idx.columnName() + ")";
             }
             rows.add(createTuple(cols, "public", idx.tableName(), idx.indexName(), null, def));
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateStatisticRows(ExecutorEngine engine) {
+        List<String> cols = SystemCatalog.STRATOS_STATISTIC_COLS;
+        List<Tuple> rows = new ArrayList<>();
+        if (engine.getStatistics() == null) return rows;
+
+        for (com.stratosdb.sql.statistics.TableStatistics ts : engine.getStatistics().values()) {
+            for (com.stratosdb.sql.statistics.ColumnStatistics cs : ts.columnStats().values()) {
+                rows.add(createTuple(cols,
+                    cs.tableName(),
+                    cs.columnName(),
+                    (int) Math.min(Integer.MAX_VALUE, cs.rowCount()),
+                    (int) Math.min(Integer.MAX_VALUE, cs.pageCount()),
+                    cs.nullFraction(),
+                    cs.avgWidth(),
+                    cs.distinctCount(),
+                    cs.mcv() != null ? cs.mcv().toJsonValues() : "[]",
+                    cs.mcv() != null ? cs.mcv().toJsonFrequencies() : "[]",
+                    cs.histogram() != null ? cs.histogram().toJson() : "[]",
+                    cs.correlation()
+                ));
+            }
         }
         return rows;
     }

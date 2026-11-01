@@ -185,7 +185,7 @@ dropTrigger: DROP TRIGGER triggerName ON tableName SEMICOLON?;
 triggerName: IDENTIFIER;
 triggerHandlerName: IDENTIFIER;
 explain: EXPLAIN select;
-analyze: ANALYZE tableName SEMICOLON?;
+analyze: ANALYZE (TABLE? tableName)? SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
 reindexStatement: REINDEX (TABLE tableName | INDEX indexName | tableName) SEMICOLON?;
 checkpointStatement: CHECKPOINT SEMICOLON?;

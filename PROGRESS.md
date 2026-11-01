@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Commits | 104 |
-| Tests passing | **536 / 536** |
-| Main source | ~36,035 lines |
-| Test source | ~17,585 lines |
+| Commits | 105 |
+| Tests passing | **561 / 561** |
+| Main source | ~37,735 lines |
+| Test source | ~18,135 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), and Sprint 7 (Weeks 13-14: B+Tree Multi-Page Latch Crabbing, Deadlock-Free Concurrency, Free-Page Management, Freelist Recycling & REINDEX TABLE/INDEX Defragmentation) fully completed. Full reactor test suite verified at 536/536 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), and Sprint 8 (Week 15: Statistics Engine ANALYZE 2.0 with HyperLogLog distinct values, Most Common Values (MCV), Equi-Depth Histograms, and stratos_statistic System Catalog Persistence) fully completed. Full reactor test suite verified at 561/561 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1325,6 +1325,51 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 18, Sprint 7 Week 14) marked `Completed`.
     - Sheet 3 (Row 19, Free-Space Reuse in Indexes) marked `Resolved`.
+
+## Sprint 8 Week 15 — Query Optimizer (Statistics Engine: ANALYZE 2.0 with HyperLogLog, MCV, Equi-Depth Histograms & stratos_statistic Persistence) ✅ DONE
+
+- ✅ **HyperLogLog Cardinality Estimator (`HyperLogLog.java`)**:
+  - Implemented 64-bit Flajolet HyperLogLog algorithm with $p=11$ ($m=2048$ registers) offering a standard error of $\approx 2.29\%$.
+  - Integrated 64-bit MurmurHash3 and Mix64 hashing supporting strings, numbers, booleans, and binary keys without hash collisions or large-cardinality saturation up to $10^{15}$ distinct values.
+  - Implemented small-range Linear Counting correction for low-cardinality datasets ($< 2.5 \cdot m$).
+  - Added binary serialization and deserialization (`toByteArray` and `fromByteArray`) and register merging (`merge(HyperLogLog)`).
+- ✅ **Most Common Values (MCV) Profiler (`MostCommonValues.java`)**:
+  - Exact frequency tracking for hot keys (top-$K \le 50$ values with cumulative frequency $\le 1.0$).
+  - Handles case-insensitive string lookups, numeric tolerance comparisons, and range frequency summation.
+  - JSON serialization (`toJsonValues()`, `toJsonFrequencies()`, `fromJson(...)`) using native `JsonParser`.
+- ✅ **Equi-Depth Histogram Engine (`EquiDepthHistogram.java`)**:
+  - Equal-depth bucket partitioning ($B \le 100$ boundaries) over non-MCV column data to handle clustered and non-uniform distributions.
+  - Implemented linear bucket boundary interpolation for continuous range queries (`<`, `<=`, `>`, `>=`, `BETWEEN`).
+  - JSON serialization (`toJson()`, `fromJson(...)`) for system catalog persistence.
+- ✅ **Column & Table Statistics with Realistic Selectivity (`ColumnStatistics.java`, `TableStatistics.java`, `StatisticsEngine.java`)**:
+  - Replaced uniform selectivity assumptions in optimizer with empirical probability formulas:
+    - Equality (`=`): Exact empirical MCV frequency if matched; remaining probability distributed uniformly across non-MCV distinct count estimated by HLL.
+    - Inequality (`!=`): $1.0 - \text{nullFrac} - \text{selectivity}(=)$.
+    - Null checks (`IS NULL` / `IS NOT NULL`): $\text{nullFrac}$ and $1.0 - \text{nullFrac}$.
+    - Range predicates: Combined MCV range contribution plus interpolated equi-depth histogram fraction on non-MCV values.
+  - `StatisticsEngine.analyzeTable`: single-pass heap scan computing row counts, page counts, null fraction, average serialized byte width, HLL distinct count, top-50 MCVs, equi-depth histograms, and Pearson physical correlation.
+- ✅ **System Catalog Persistence & StdCatalogViews (`SystemCatalog.java`, `StdCatalogViews.java`, `ExecutorEngine.java`)**:
+  - Durable catalog table `stratos_statistic` (`stratos_statistic.dat`) tracking `(table_name, column_name, row_count, page_count, null_frac, avg_width, n_distinct, most_common_vals, most_common_freqs, histogram_bounds, correlation)`.
+  - Automatic loading of all table statistics on database restart in `ExecutorEngine.loadFromSystemCatalog()`.
+  - Virtual catalog views: exposed `stratos_statistic` and `pg_statistic` in `StdCatalogViews`, and updated `pg_class` virtual view to populate `reltuples` and `relpages` from live `TableStatistics`.
+  - Automatic statistics cleanup on `DROP TABLE` and key remapping on `RENAME TABLE`.
+- ✅ **Grammar & Execution Support (`StratosSQL.g4`, `SqlParser.java`, `ExecutorEngine.java`)**:
+  - Added parser support for `ANALYZE;` (all tables), `ANALYZE tableName;`, and `ANALYZE TABLE tableName;`.
+  - Wired into `ExecutorEngine.planScan()` via `estimateMatchingRows()`: optimizer accurately selects between SeqScan and IndexScan based on actual data skew and histogram bounds.
+- ✅ **Unit & End-to-End Integration Suite (`HyperLogLogTest.java`, `EquiDepthHistogramTest.java`, `MostCommonValuesTest.java`, `ColumnStatisticsTest.java`, `StatisticsEngineEndToEndTest.java`)**:
+  - 18 unit tests in `stratosdb-sql`: verified empty HLL, linear counting, medium/large cardinality, duplicate insertion resilience, register merging, binary serialization round-trip, equi-depth clustering interpolation, MCV lookup, and range selectivities.
+  - 7 end-to-end integration tests in `stratosdb-testing`:
+    - Syntax variants (`ANALYZE;`, `ANALYZE t;`, `ANALYZE TABLE t;`).
+    - Skewed MCV distribution (70/20/10 split on country values).
+    - Null fraction and average width tracking.
+    - Clustered equi-depth histogram boundaries.
+    - Emulated catalog views (`pg_statistic`, `stratos_statistic`, and `pg_class` `reltuples`/`relpages`).
+    - Full durability and persistence across complete database shutdown and restart.
+    - Cleanup on `DROP TABLE`.
+  - Reactor test suite verified at **561 / 561 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 19, Sprint 8 Week 15) marked `Completed`.
+    - Sheet 3 (Row 22, Cost-Based Optimizer / Statistics Engine) marked `Resolved`.
 
 ## What to do next
 

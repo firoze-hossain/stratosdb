@@ -1,5 +1,9 @@
 package com.stratosdb.sql.catalog;
 
+import com.stratosdb.sql.statistics.ColumnStatistics;
+import com.stratosdb.sql.statistics.EquiDepthHistogram;
+import com.stratosdb.sql.statistics.MostCommonValues;
+import com.stratosdb.sql.statistics.TableStatistics;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.page.Tuple;
@@ -26,6 +30,7 @@ import java.util.function.Consumer;
  *   - stratos_indexes:     index_name, table_name, column_name, column_name_2, index_type, is_unique
  *   - stratos_types:       type_name, type_category, type_values
  *   - stratos_constraints: constraint_name, table_name, constraint_type, definition
+ *   - stratos_statistic:   table_name, column_name, row_count, page_count, null_frac, avg_width, n_distinct, most_common_vals, most_common_freqs, histogram_bounds, correlation
  *
  * DDL operations (CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, CREATE TYPE)
  * execute as transactional ACID writes against these system tables. When a transaction
@@ -40,6 +45,7 @@ public class SystemCatalog {
     public static final String TABLE_INDEXES = "stratos_indexes";
     public static final String TABLE_TYPES = "stratos_types";
     public static final String TABLE_CONSTRAINTS = "stratos_constraints";
+    public static final String TABLE_STATISTIC = "stratos_statistic";
 
     public static final List<String> STRATOS_TABLES_COLS = List.of(
         "table_id", "table_name", "table_type", "owner", "ddl"
@@ -95,6 +101,24 @@ public class SystemCatalog {
         "definition", "VARCHAR"
     );
 
+    public static final List<String> STRATOS_STATISTIC_COLS = List.of(
+        "table_name", "column_name", "row_count", "page_count", "null_frac", "avg_width", "n_distinct",
+        "most_common_vals", "most_common_freqs", "histogram_bounds", "correlation"
+    );
+    public static final Map<String, String> STRATOS_STATISTIC_TYPES = Map.ofEntries(
+        Map.entry("table_name", "VARCHAR"),
+        Map.entry("column_name", "VARCHAR"),
+        Map.entry("row_count", "INT"),
+        Map.entry("page_count", "INT"),
+        Map.entry("null_frac", "DOUBLE"),
+        Map.entry("avg_width", "INT"),
+        Map.entry("n_distinct", "DOUBLE"),
+        Map.entry("most_common_vals", "VARCHAR"),
+        Map.entry("most_common_freqs", "VARCHAR"),
+        Map.entry("histogram_bounds", "VARCHAR"),
+        Map.entry("correlation", "DOUBLE")
+    );
+
     public interface CatalogUndoConsumer {
         void onInsert(String tableName, long pageId, int slot);
         void onDelete(String tableName, long pageId, int slot);
@@ -111,6 +135,7 @@ public class SystemCatalog {
     private HeapTable indexesTable;
     private HeapTable typesTable;
     private HeapTable constraintsTable;
+    private HeapTable statisticTable;
 
     public SystemCatalog(BufferPool bufferPool, TransactionManager transactionManager, String dataDirectory) {
         this.bufferPool = bufferPool;
@@ -129,7 +154,8 @@ public class SystemCatalog {
                lower.equals(TABLE_COLUMNS) ||
                lower.equals(TABLE_INDEXES) ||
                lower.equals(TABLE_TYPES) ||
-               lower.equals(TABLE_CONSTRAINTS);
+               lower.equals(TABLE_CONSTRAINTS) ||
+               lower.equals(TABLE_STATISTIC);
     }
 
     public HeapTable getTablesTable() { return tablesTable; }
@@ -137,6 +163,7 @@ public class SystemCatalog {
     public HeapTable getIndexesTable() { return indexesTable; }
     public HeapTable getTypesTable() { return typesTable; }
     public HeapTable getConstraintsTable() { return constraintsTable; }
+    public HeapTable getStatisticTable() { return statisticTable; }
 
     /**
      * Initializes the relational system catalog: creates system HeapTables and bootstrap self-describing metadata.
@@ -150,25 +177,37 @@ public class SystemCatalog {
         this.indexesTable = new HeapTable(TABLE_INDEXES, bufferPool);
         this.typesTable = new HeapTable(TABLE_TYPES, bufferPool);
         this.constraintsTable = new HeapTable(TABLE_CONSTRAINTS, bufferPool);
+        this.statisticTable = new HeapTable(TABLE_STATISTIC, bufferPool);
 
         registerSystemTable(tables, tableColumns, tableColumnTypes, TABLE_TABLES, STRATOS_TABLES_COLS, STRATOS_TABLES_TYPES, tablesTable);
         registerSystemTable(tables, tableColumns, tableColumnTypes, TABLE_COLUMNS, STRATOS_COLUMNS_COLS, STRATOS_COLUMNS_TYPES, columnsTable);
         registerSystemTable(tables, tableColumns, tableColumnTypes, TABLE_INDEXES, STRATOS_INDEXES_COLS, STRATOS_INDEXES_TYPES, indexesTable);
         registerSystemTable(tables, tableColumns, tableColumnTypes, TABLE_TYPES, STRATOS_TYPES_COLS, STRATOS_TYPES_TYPES, typesTable);
         registerSystemTable(tables, tableColumns, tableColumnTypes, TABLE_CONSTRAINTS, STRATOS_CONSTRAINTS_COLS, STRATOS_CONSTRAINTS_TYPES, constraintsTable);
+        registerSystemTable(tables, tableColumns, tableColumnTypes, TABLE_STATISTIC, STRATOS_STATISTIC_COLS, STRATOS_STATISTIC_TYPES, statisticTable);
 
         // Bootstrap self-describing metadata if system tables are brand new
         if (tablesTable.scanPositioned().isEmpty()) {
             bootstrapSelfDescribingMetadata();
         } else {
-            // Find max table ID
-            int maxId = 5;
+            // Find max table ID and check if stratos_statistic is registered
+            int maxId = 6;
+            boolean hasStatisticTable = false;
             for (HeapTable.PositionedRow row : tablesTable.scanPositioned()) {
                 Tuple t = Tuple.deserialize(row.stored(), STRATOS_TABLES_COLS);
+                if (TABLE_STATISTIC.equalsIgnoreCase((String) t.getValue("table_name"))) {
+                    hasStatisticTable = true;
+                }
                 Object val = t.getValue("table_id");
                 if (val instanceof Number n) {
                     maxId = Math.max(maxId, n.intValue());
                 }
+            }
+            if (!hasStatisticTable) {
+                insertTableInternal(maxId + 1, TABLE_STATISTIC, "SYSTEM TABLE", "stratos",
+                    "CREATE TABLE stratos_statistic (table_name VARCHAR, column_name VARCHAR, row_count INT, page_count INT, null_frac DOUBLE, avg_width INT, n_distinct DOUBLE, most_common_vals VARCHAR, most_common_freqs VARCHAR, histogram_bounds VARCHAR, correlation DOUBLE);", 0L);
+                insertColumnsForTable(TABLE_STATISTIC, STRATOS_STATISTIC_COLS, STRATOS_STATISTIC_TYPES, 0L);
+                maxId++;
             }
             nextTableId.set(maxId + 1);
         }
@@ -195,14 +234,17 @@ public class SystemCatalog {
             "CREATE TABLE stratos_types (type_name VARCHAR, type_category VARCHAR, type_values VARCHAR);", xid);
         insertTableInternal(5, TABLE_CONSTRAINTS, "SYSTEM TABLE", "stratos",
             "CREATE TABLE stratos_constraints (constraint_name VARCHAR, table_name VARCHAR, constraint_type VARCHAR, definition VARCHAR);", xid);
+        insertTableInternal(6, TABLE_STATISTIC, "SYSTEM TABLE", "stratos",
+            "CREATE TABLE stratos_statistic (table_name VARCHAR, column_name VARCHAR, row_count INT, page_count INT, null_frac DOUBLE, avg_width INT, n_distinct DOUBLE, most_common_vals VARCHAR, most_common_freqs VARCHAR, histogram_bounds VARCHAR, correlation DOUBLE);", xid);
 
         insertColumnsForTable(TABLE_TABLES, STRATOS_TABLES_COLS, STRATOS_TABLES_TYPES, xid);
         insertColumnsForTable(TABLE_COLUMNS, STRATOS_COLUMNS_COLS, STRATOS_COLUMNS_TYPES, xid);
         insertColumnsForTable(TABLE_INDEXES, STRATOS_INDEXES_COLS, STRATOS_INDEXES_TYPES, xid);
         insertColumnsForTable(TABLE_TYPES, STRATOS_TYPES_COLS, STRATOS_TYPES_TYPES, xid);
         insertColumnsForTable(TABLE_CONSTRAINTS, STRATOS_CONSTRAINTS_COLS, STRATOS_CONSTRAINTS_TYPES, xid);
+        insertColumnsForTable(TABLE_STATISTIC, STRATOS_STATISTIC_COLS, STRATOS_STATISTIC_TYPES, xid);
 
-        nextTableId.set(6);
+        nextTableId.set(7);
     }
 
     private void insertColumnsForTable(String tableName, List<String> cols, Map<String, String> types, long xid) {
@@ -464,6 +506,35 @@ public class SystemCatalog {
                 }
             }
         }
+        if (statisticTable != null) {
+            for (HeapTable.PositionedRow row : statisticTable.scanPositioned()) {
+                Tuple tuple = Tuple.deserialize(row.stored(), STRATOS_STATISTIC_COLS);
+                if (oldName.equalsIgnoreCase((String) tuple.getValue("table_name"))) {
+                    if (tuple.getXmax() == 0L || (transactionManager != null && !transactionManager.isCommitted(tuple.getXmax()))) {
+                        byte[] tombstoned = MVCCVisibility.withXmax(row.stored(), xid);
+                        statisticTable.update(row.pageId(), row.slot(), tombstoned);
+                        if (undoConsumer != null && xid != 0L) {
+                            undoConsumer.onDelete(TABLE_STATISTIC, row.pageId(), row.slot());
+                        }
+
+                        Tuple newTuple = new Tuple();
+                        for (String col : STRATOS_STATISTIC_COLS) {
+                            if ("table_name".equals(col)) {
+                                newTuple.addValue(col, newName);
+                            } else {
+                                newTuple.addValue(col, tuple.getValue(col));
+                            }
+                        }
+                        newTuple.setXmin(xid);
+                        newTuple.setXmax(0L);
+                        HeapTable.InsertResult res = statisticTable.insertMvcc(newTuple.serialize(), xid);
+                        if (undoConsumer != null && xid != 0L) {
+                            undoConsumer.onInsert(TABLE_STATISTIC, res.pageId, res.slot);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     public void insertIndex(String indexName, String tableName, String col1, String col2, String type, boolean isUnique, long xid) {
@@ -606,6 +677,108 @@ public class SystemCatalog {
                 constraintsTable.update(row.pageId(), row.slot(), tombstoned);
             }
         }
+        if (statisticTable != null) {
+            for (HeapTable.PositionedRow row : statisticTable.scanPositioned()) {
+                Tuple tuple = Tuple.deserialize(row.stored(), STRATOS_STATISTIC_COLS);
+                String name = (String) tuple.getValue("table_name");
+                if (!isSystemTable(name)) {
+                    byte[] tombstoned = MVCCVisibility.withXmax(row.stored(), 1L);
+                    statisticTable.update(row.pageId(), row.slot(), tombstoned);
+                }
+            }
+        }
+    }
+
+    public void saveTableStatistics(TableStatistics stats, long xid) {
+        if (stats == null || statisticTable == null) return;
+        deleteStatisticsForTable(stats.tableName(), xid);
+        for (ColumnStatistics col : stats.columnStats().values()) {
+            insertStatisticRow(col, xid);
+        }
+    }
+
+    private void insertStatisticRow(ColumnStatistics col, long xid) {
+        Tuple tuple = new Tuple();
+        tuple.addValue("table_name", col.tableName());
+        tuple.addValue("column_name", col.columnName());
+        tuple.addValue("row_count", (int) Math.min(Integer.MAX_VALUE, col.rowCount()));
+        tuple.addValue("page_count", (int) Math.min(Integer.MAX_VALUE, col.pageCount()));
+        tuple.addValue("null_frac", col.nullFraction());
+        tuple.addValue("avg_width", col.avgWidth());
+        tuple.addValue("n_distinct", col.distinctCount());
+        tuple.addValue("most_common_vals", col.mcv() != null ? col.mcv().toJsonValues() : "[]");
+        tuple.addValue("most_common_freqs", col.mcv() != null ? col.mcv().toJsonFrequencies() : "[]");
+        tuple.addValue("histogram_bounds", col.histogram() != null ? col.histogram().toJson() : "[]");
+        tuple.addValue("correlation", col.correlation());
+        tuple.setXmin(xid);
+        tuple.setXmax(0L);
+        HeapTable.InsertResult res = statisticTable.insertMvcc(tuple.serialize(), xid);
+        if (undoConsumer != null && xid != 0L) {
+            undoConsumer.onInsert(TABLE_STATISTIC, res.pageId, res.slot);
+        }
+    }
+
+    public void deleteStatisticsForTable(String tableName, long xid) {
+        if (statisticTable == null) return;
+        for (HeapTable.PositionedRow row : statisticTable.scanPositioned()) {
+            Tuple tuple = Tuple.deserialize(row.stored(), STRATOS_STATISTIC_COLS);
+            if (tableName.equalsIgnoreCase((String) tuple.getValue("table_name"))) {
+                if (tuple.getXmax() == 0L || (transactionManager != null && !transactionManager.isCommitted(tuple.getXmax()))) {
+                    byte[] tombstoned = MVCCVisibility.withXmax(row.stored(), xid);
+                    statisticTable.update(row.pageId(), row.slot(), tombstoned);
+                    if (undoConsumer != null && xid != 0L) {
+                        undoConsumer.onDelete(TABLE_STATISTIC, row.pageId(), row.slot());
+                    }
+                }
+            }
+        }
+    }
+
+    public Map<String, TableStatistics> loadStatistics() {
+        if (statisticTable == null) return Map.of();
+        Map<String, Map<String, ColumnStatistics>> tableColMap = new HashMap<>();
+        Map<String, Long> tableRowCounts = new HashMap<>();
+        Map<String, Long> tablePageCounts = new HashMap<>();
+
+        for (HeapTable.PositionedRow row : statisticTable.scanPositioned()) {
+            Tuple tuple = Tuple.deserialize(row.stored(), STRATOS_STATISTIC_COLS);
+            if (!isRowVisible(tuple)) continue;
+
+            String tbl = (String) tuple.getValue("table_name");
+            String col = (String) tuple.getValue("column_name");
+            long rowCount = tuple.getValue("row_count") instanceof Number n ? n.longValue() : 0L;
+            long pageCount = tuple.getValue("page_count") instanceof Number n ? n.longValue() : 1L;
+            double nullFrac = tuple.getValue("null_frac") instanceof Number n ? n.doubleValue() : 0.0;
+            int avgWidth = tuple.getValue("avg_width") instanceof Number n ? n.intValue() : 4;
+            double nDistinct = tuple.getValue("n_distinct") instanceof Number n ? n.doubleValue() : 0.0;
+            String mcvValsJson = (String) tuple.getValue("most_common_vals");
+            String mcvFreqsJson = (String) tuple.getValue("most_common_freqs");
+            String histBoundsJson = (String) tuple.getValue("histogram_bounds");
+            double correlation = tuple.getValue("correlation") instanceof Number n ? n.doubleValue() : 0.0;
+
+            MostCommonValues mcv = MostCommonValues.fromJson(mcvValsJson, mcvFreqsJson);
+            EquiDepthHistogram hist = EquiDepthHistogram.fromJson(histBoundsJson);
+
+            Double min = !hist.isEmpty() ? hist.getBounds().get(0) : null;
+            Double max = !hist.isEmpty() ? hist.getBounds().get(hist.getBucketCount()) : null;
+
+            ColumnStatistics colStat = new ColumnStatistics(
+                tbl, col, rowCount, pageCount, nullFrac, avgWidth, nDistinct, mcv, hist, min, max, correlation
+            );
+
+            tableColMap.computeIfAbsent(tbl, k -> new HashMap<>()).put(col, colStat);
+            tableRowCounts.put(tbl, rowCount);
+            tablePageCounts.put(tbl, pageCount);
+        }
+
+        Map<String, TableStatistics> result = new HashMap<>();
+        for (Map.Entry<String, Map<String, ColumnStatistics>> entry : tableColMap.entrySet()) {
+            String tbl = entry.getKey();
+            long rc = tableRowCounts.getOrDefault(tbl, 0L);
+            long pc = tablePageCounts.getOrDefault(tbl, 1L);
+            result.put(tbl, new TableStatistics(tbl, rc, pc, entry.getValue()));
+        }
+        return result;
     }
 
     public String getTableDdl(String tableName) {
