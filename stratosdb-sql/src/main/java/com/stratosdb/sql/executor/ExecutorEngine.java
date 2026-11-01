@@ -13,6 +13,7 @@ import com.stratosdb.sql.planner.SubqueryDecorrelator;
 import com.stratosdb.sql.statistics.ColumnStatistics;
 import com.stratosdb.sql.statistics.StatisticsEngine;
 import com.stratosdb.sql.statistics.TableStatistics;
+import com.stratosdb.sql.optimizer.*;
 import com.stratosdb.storage.buffer.BufferPool;
 import com.stratosdb.storage.heap.HeapTable;
 import com.stratosdb.storage.page.BTreePage;
@@ -231,6 +232,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * selectivity estimates until ANALYZE runs again.
      */
     private final Map<String, TableStatistics> statistics;
+    private final CostModel costModel = new CostModel();
 
     /**
      * Where CREATE TABLE / CREATE INDEX / CREATE VIEW / their DROP
@@ -1274,6 +1276,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     public Map<String, TableStatistics> getStatistics() {
         return Collections.unmodifiableMap(statistics);
+    }
+
+    public CostModel getCostModel() {
+        return costModel;
     }
 
     /**
@@ -4112,19 +4118,30 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * findColumnValue's suffix-match fallback.
      */
     private QueryResult executeJoinedSelect(SelectStatement stmt, Transaction txn) {
-        PhysicalOperator sourceOp = resolveFromSourceOperator(stmt, txn);
-        if (sourceOp == null) {
-            return QueryResult.error("Table not found: " + stmt.effectiveTableName());
+        PhysicalOperator currentOp;
+        PlanNode optimizedPlan = null;
+        if (SystemROptimizer.canOptimize(stmt, statistics)) {
+            SystemROptimizer optimizer = new SystemROptimizer(costModel);
+            optimizedPlan = optimizer.optimize(stmt, statistics, tableColumns, this::resolveIndexInfo);
         }
 
-        PhysicalOperator currentOp = sourceOp;
-        for (JoinClause join : stmt.joins()) {
-            PhysicalOperator joinedOp = resolveJoinSourceOperator(join, txn);
-            if (joinedOp == null) {
-                return QueryResult.error("Table not found: " + join.effectiveTargetName());
+        if (optimizedPlan != null) {
+            currentOp = optimizedPlan.buildOperator(this, txn);
+        } else {
+            PhysicalOperator sourceOp = resolveFromSourceOperator(stmt, txn);
+            if (sourceOp == null) {
+                return QueryResult.error("Table not found: " + stmt.effectiveTableName());
             }
 
-            currentOp = new HashJoinOperator(currentOp, joinedOp, join.leftColumn(), join.rightColumn(), join.joinType());
+            currentOp = sourceOp;
+            for (JoinClause join : stmt.joins()) {
+                PhysicalOperator joinedOp = resolveJoinSourceOperator(join, txn);
+                if (joinedOp == null) {
+                    return QueryResult.error("Table not found: " + join.effectiveTargetName());
+                }
+
+                currentOp = new HashJoinOperator(currentOp, joinedOp, join.leftColumn(), join.rightColumn(), join.joinType());
+            }
         }
 
         if (stmt.where() != null) {
@@ -4561,6 +4578,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
 
         if (select.joins() != null && !select.joins().isEmpty()) {
+            if (SystemROptimizer.canOptimize(select, statistics)) {
+                SystemROptimizer optimizer = new SystemROptimizer(costModel);
+                PlanNode plan = optimizer.optimize(select, statistics, tableColumns, this::resolveIndexInfo);
+                if (plan instanceof JoinPlanNode joinPlan) {
+                    return QueryResult.success(joinPlan.toCompactString());
+                } else if (plan != null) {
+                    return QueryResult.success(plan.explain(""));
+                }
+            }
+
             StringBuilder sb = new StringBuilder("Hash Join: Seq Scan on ").append(select.tableName());
             for (JoinClause join : select.joins()) {
                 if (!tables.containsKey(join.tableName())) {
@@ -4692,12 +4719,91 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private double costSeqScan(TableStatistics stats) {
-        return stats.rowCount() * SEQ_SCAN_ROW_COST;
+        return costModel.costSeqScan(stats);
     }
 
     private double costIndexScan(TableStatistics stats, String column, String operator, long lo, long hi) {
-        long estimatedRows = estimateMatchingRows(stats, column, operator, lo, hi);
-        return INDEX_STARTUP_COST + estimatedRows * INDEX_ROW_COST;
+        ColumnStatistics colStats = stats != null ? stats.columnStats().get(column) : null;
+        return costModel.costIndexScan(stats, column, operator, lo, hi, colStats);
+    }
+
+    public PhysicalOperator buildScanOperator(String tableName,
+                                             String tableAlias,
+                                             boolean isIndexScan,
+                                             String indexName,
+                                             String indexColumn,
+                                             Long loKey,
+                                             Long hiKey,
+                                             WhereExpr filterWhere,
+                                             Transaction txn) {
+        HeapTable table = tables.get(tableName);
+        List<String> rawCols = tableColumns.getOrDefault(tableName, List.of());
+        PhysicalOperator scanOp;
+
+        if (table == null) {
+            return resolveJoinSourceOperator(tableName, tableAlias, txn);
+        }
+
+        if (isIndexScan && (indexName != null || indexColumn != null)) {
+            IndexEntry idx = indexName != null ? indexesByName.get(indexName) : null;
+            if (idx == null && indexColumn != null) {
+                idx = findEqualityIndex(tableName, indexColumn);
+                if (idx == null) idx = findRangeCapableIndex(tableName, indexColumn);
+            }
+            if (idx != null) {
+                boolean isEqualityScan = loKey != null && loKey.equals(hiKey);
+                scanOp = new IndexScanOperator(
+                    tableName,
+                    table,
+                    txn != null ? txn.getSnapshot() : null,
+                    transactionManager,
+                    idx.index(),
+                    loKey != null ? loKey : Long.MIN_VALUE,
+                    hiKey != null ? hiKey : Long.MAX_VALUE,
+                    isEqualityScan,
+                    idx.columnName(),
+                    rawCols,
+                    this::deserializeTuple,
+                    false
+                );
+            } else {
+                scanOp = new SeqScanOperator(
+                    tableName,
+                    table,
+                    txn != null ? txn.getSnapshot() : null,
+                    transactionManager,
+                    rawCols,
+                    this::deserializeTuple
+                );
+            }
+        } else {
+            scanOp = new SeqScanOperator(
+                tableName,
+                table,
+                txn != null ? txn.getSnapshot() : null,
+                transactionManager,
+                rawCols,
+                this::deserializeTuple
+            );
+        }
+
+        if (filterWhere != null) {
+            scanOp = new FilterOperator(scanOp, t -> matchesWhere(t, filterWhere, txn));
+        }
+
+        String effName = tableAlias != null ? tableAlias : tableName;
+        List<String> qualCols = JoinUtils.qualifyColumnsWithAlias(rawCols, effName);
+        return new ProjectOperator(scanOp, t -> JoinUtils.qualifyWithAlias(t, effName), qualCols);
+    }
+
+    private SystemROptimizer.IndexInfo resolveIndexInfo(String tableName, String columnName, boolean equalityOnly) {
+        IndexEntry idx = equalityOnly
+            ? findEqualityIndex(tableName, columnName)
+            : findRangeCapableIndex(tableName, columnName);
+        if (idx == null) return null;
+        boolean isHash = idx.index() instanceof com.stratosdb.index.hash.HashIndex;
+        boolean isBTree = idx.index() instanceof BTreeIndex;
+        return new SystemROptimizer.IndexInfo(idx.indexName(), idx.tableName(), idx.columnName(), idx.isUnique(), isBTree, isHash);
     }
 
     private long estimateMatchingRows(TableStatistics stats, String column, String operator, long lo, long hi) {

@@ -20,4 +20,8 @@ public record TableStatistics(
     public TableStatistics(long rowCount, Map<String, ColumnStatistics> columnStats) {
         this("", rowCount, 1L, columnStats);
     }
+
+    public TableStatistics(long rowCount, long pageCount, Map<String, ColumnStatistics> columnStats) {
+        this("", rowCount, pageCount, columnStats);
+    }
 }

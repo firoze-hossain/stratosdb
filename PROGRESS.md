@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Commits | 105 |
-| Tests passing | **561 / 561** |
-| Main source | ~37,735 lines |
-| Test source | ~18,135 lines |
+| Commits | 106 |
+| Tests passing | **574 / 574** |
+| Main source | ~38,810 lines |
+| Test source | ~18,596 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), and Sprint 8 (Week 15: Statistics Engine ANALYZE 2.0 with HyperLogLog distinct values, Most Common Values (MCV), Equi-Depth Histograms, and stratos_statistic System Catalog Persistence) fully completed. Full reactor test suite verified at 561/561 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), and Sprint 8 (Week 15: Statistics Engine ANALYZE 2.0; Week 16: Cost-Based Optimizer & Join Reordering with System-R Dynamic Programming Join Enumeration, PostgreSQL-aligned I/O and CPU Cost Modeling, and Access Path Selection) fully completed. Full reactor test suite verified at 574/574 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1370,6 +1370,48 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 19, Sprint 8 Week 15) marked `Completed`.
     - Sheet 3 (Row 22, Cost-Based Optimizer / Statistics Engine) marked `Resolved`.
+
+## Sprint 8 — Week 16: Cost-Based Optimizer & Join Reordering ✅ DONE
+
+- ✅ **PostgreSQL / System-R Aligned Cost Model (`CostModel.java`)**:
+  - Implemented physical hardware parameters:
+    - `seq_page_cost = 1.0`: baseline sequential disk block read cost.
+    - `random_page_cost = 4.0`: random access cost for unclustered heap seeks and B+Tree tree descent.
+    - `cpu_tuple_cost = 0.01`: CPU processing and emission cost per tuple.
+    - `cpu_index_tuple_cost = 0.005`: index tuple comparison and evaluation overhead.
+    - `cpu_operator_cost = 0.0025`: WHERE predicate comparison and hash bucket lookup cost.
+  - Implemented cost estimation formulas:
+    - `costSeqScan`: `pages * seq_page_cost + rows * cpu_tuple_cost`.
+    - `costIndexScan`: startup traversal cost (`random_page_cost`) + random heap tuple reads bounded by table pages (`min(pages, estRows) * random_page_cost`) + index/heap CPU costs (`estRows * (cpu_tuple_cost + cpu_index_tuple_cost)`).
+    - `costHashJoin`: builds hash table on smaller relation with bucket allocation CPU (`buildRows * (cpu_operator_cost * 2)`), streaming probe (`probeRows * cpu_operator_cost`), and match tuple emission (`outRows * cpu_tuple_cost`).
+    - `costMergeJoin`: sorted input stream merge cost (`(leftRows + rightRows) * cpu_operator_cost + outRows * cpu_tuple_cost`).
+    - `costNestedLoopJoin`: nested inner loop evaluation (`leftRows * rightCost + leftRows * rightRows * cpu_operator_cost + outRows * cpu_tuple_cost`).
+- ✅ **Physical Plan Representation Hierarchy (`PlanNode.java`, `ScanPlanNode.java`, `JoinPlanNode.java`)**:
+  - `PlanNode`: interface defining plan metadata (`getCost`, `getEstimatedRows`, `getOutputColumns`, `getCoveredTables`), structured `explain` formatting, and physical operator factory `buildOperator(ExecutorEngine, Transaction)`.
+  - `ScanPlanNode`: access path plan node for base relations (either sequential scan or index scan with B+Tree/Hash index bounds).
+  - `JoinPlanNode`: multi-table join plan node capturing join operator type (Hash Join, Merge Join, Nested Loop Join), inner/outer children, equi-join predicates, cost, cardinality, and hierarchical/compact explain representations.
+- ✅ **System-R Dynamic Programming Join Optimizer (`SystemROptimizer.java`, `JoinPredicate.java`)**:
+  - Bitmask memoization for optimal subplans ($S \subset \{R_1, \dots, R_k\}$):
+    - **Size 1 (Base Access Paths)**: selects between `IndexScanOperator` and `SeqScanOperator` by evaluating single-table WHERE predicates, column statistics, index capabilities (equality vs range), and comparing `costIndexScan` vs `costSeqScan`.
+    - **Size 2 to $K$ (Join Enumeration)**: enumerates non-empty disjoint subplan partitions $(S_1, S_2)$ with symmetry elimination ($S_1 < S_2$), evaluates connecting equi-join edges (`JoinPredicate`), calculates join selectivity via MCV/distinct cardinalities ($1 / \max(NDist_1, NDist_2)$), and selects optimal join physical operator and build/probe orientation (e.g. smaller relation as hash join build side).
+    - **Cartesian Product Pruning**: detects connected subgraphs and strictly prunes cross-products whenever connected join paths exist.
+- ✅ **Execution Engine Integration & Backward Compatibility (`ExecutorEngine.java`, `TableStatistics.java`)**:
+  - Added `CostModel` to `ExecutorEngine` with accessors and index resolution callback (`resolveIndexInfo`).
+  - Wired `SystemROptimizer` into `executeJoinedSelect(...)` and `executeExplain(...)`:
+    - When persistent statistics exist (via `ANALYZE`), dynamic programming determines optimal join tree order, join operator algorithm, and access paths.
+    - When statistics are absent, seamlessly preserves original heuristic execution and explain formatting for complete backward compatibility.
+- ✅ **Comprehensive Unit & End-to-End Integration Suite (`CostModelTest.java`, `SystemROptimizerTest.java`, `CostBasedOptimizerEndToEndTest.java`)**:
+  - 6 unit tests in `CostModelTest`: validated cost parameters, sequential scan formula, index scan high-selectivity preference, index scan low-selectivity fallback to seq scan, and hash join smaller build side preference.
+  - 3 unit tests in `SystemROptimizerTest`: validated 2-table hash join build side selection, 3-table join reordering ($A \bowtie B \bowtie C$), and access path selection.
+  - 4 end-to-end integration tests in `CostBasedOptimizerEndToEndTest`:
+    - Cost-based index scan vs sequential scan selection based on predicate selectivity.
+    - 3-table join reordering ($A \bowtie B \bowtie C$ with 500, 50, and 5 rows) choosing optimal join order and reporting `cost=` and `rows=` in EXPLAIN.
+    - Multi-table join combined with WHERE filter, GROUP BY, and aggregate functions (`SUM`, `COUNT`).
+    - Point lookup index scan selection on filtered table in join queries.
+  - Full reactor test suite verified at **574 / 574 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 20, Sprint 8 Week 16) marked `Completed`.
+    - Sheet 3 (Row 22, Cost-Based Optimizer / Join Reordering) marked `Resolved`.
 
 ## What to do next
 
