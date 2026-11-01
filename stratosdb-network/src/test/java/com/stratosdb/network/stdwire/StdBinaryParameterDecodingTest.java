@@ -11,7 +11,6 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -20,7 +19,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-public class PgBinaryParameterDecodingTest {
+public class StdBinaryParameterDecodingTest {
 
     @TempDir
     Path tempDir;
@@ -186,13 +185,13 @@ public class PgBinaryParameterDecodingTest {
             // Describe statement 'S'
             List<Integer> oids = conn.describeStatement("stmt1");
             assertEquals(3, oids.size());
-            assertEquals(PgBinaryDecoder.OID_INT4, oids.get(0));     // id is INT -> 23
-            assertEquals(PgBinaryDecoder.OID_FLOAT8, oids.get(1));   // reading is DOUBLE PRECISION -> 701
-            assertEquals(PgBinaryDecoder.OID_BYTEA, oids.get(2));    // raw_data is BYTEA -> 17
+            assertEquals(StdBinaryDecoder.OID_INT4, oids.get(0));     // id is INT -> 23
+            assertEquals(StdBinaryDecoder.OID_FLOAT8, oids.get(1));   // reading is DOUBLE PRECISION -> 701
+            assertEquals(StdBinaryDecoder.OID_BYTEA, oids.get(2));    // raw_data is BYTEA -> 17
         }
     }
 
-    // --- Raw test connection helper supporting binary pgwire extended protocol ---
+    // --- Raw test connection helper supporting binary standard wire extended protocol ---
 
     private static final class QueryOutcome {
         final List<String> columnNames;

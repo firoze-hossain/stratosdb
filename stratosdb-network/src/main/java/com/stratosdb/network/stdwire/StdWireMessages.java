@@ -577,8 +577,8 @@ public final class StdWireMessages {
 
     public static byte[] encodeTimestamp(java.time.Instant instant) {
         long unixMicros = instant.getEpochSecond() * 1_000_000L + (instant.getNano() / 1_000L);
-        long pgMicros = unixMicros - PgBinaryDecoder.PG_EPOCH_MICROS;
-        return encodeTimestamp(pgMicros);
+        long wireMicros = unixMicros - StdBinaryDecoder.EPOCH_DIFF_MICROS;
+        return encodeTimestamp(wireMicros);
     }
 
     public static byte[] encodeBytea(byte[] bytes) {

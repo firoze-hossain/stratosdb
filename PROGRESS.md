@@ -1415,8 +1415,8 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
 
 ## Sprint 9 — Week 17: Wire Protocol Native Binary Parameter Decoding ✅ DONE
 
-- ✅ **Native pgwire Binary Format Decoding (`PgBinaryDecoder.java`)**:
-  - Implemented zero-copy, strongly typed decoding for PostgreSQL binary wire protocol formats (format code 1):
+- ✅ **Native Wire Binary Format Decoding (`StdBinaryDecoder.java`)**:
+  - Implemented zero-copy, strongly typed decoding for wire protocol binary parameter formats (format code 1):
     - `int2` (16-bit big-endian short)
     - `int4` (32-bit big-endian integer)
     - `int8` (64-bit big-endian long)
@@ -1425,7 +1425,7 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - `bool` (1-byte non-zero boolean)
     - `bytea` (raw bytes `byte[]`)
     - `text` / `varchar` (raw UTF-8 byte sequence)
-    - `timestamp` / `timestamptz` (64-bit microsecond offset from PostgreSQL epoch 2000-01-01 00:00:00 UTC, converted to epoch milliseconds)
+    - `timestamp` / `timestamptz` (64-bit microsecond offset from standard epoch 2000-01-01 00:00:00 UTC, converted to epoch milliseconds)
   - Also decodes text format (format code 0) into corresponding typed representations using target column type OIDs.
 - ✅ **Elimination of Text Query Interpolation & SQL Injection (`ExtendedProtocolHandler.java`)**:
   - Removed string substitution hack (`substituteParams`, `formatParamAsSqlLiteral`), completely closing the SQL injection attack surface in prepared statements.
@@ -1440,9 +1440,9 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Added raw `byte[]` storage support in `Tuple` (`TAG_BYTES = 11`), enabling native binary columns and hex literal decoding (`\x...`).
   - Added `byte[]` comparison in `SortAndAggregateUtils.compareNonNull` and equality evaluation in `ExecutorEngine.compareValues`.
   - Extended ANTLR grammar (`StratosSQL.g4`) with `PARAMETER` token (`'$' [0-9]+ | '?'`), `REAL`, and `DOUBLE PRECISION` data types.
-- ✅ **Wire Protocol Testing & Verification (`PgBinaryDecoderTest.java`, `PgBinaryParameterDecodingTest.java`)**:
-  - 11 unit tests in `PgBinaryDecoderTest`: verified binary decoding for int2, int4, int8, float4, float8, timestamp (with microsecond PG epoch conversion), bytea, text, booleans, and null handling.
-  - 4 end-to-end integration tests in `PgBinaryParameterDecodingTest`:
+- ✅ **Wire Protocol Testing & Verification (`StdBinaryDecoderTest.java`, `StdBinaryParameterDecodingTest.java`)**:
+  - 11 unit tests in `StdBinaryDecoderTest`: verified binary decoding for int2, int4, int8, float4, float8, timestamp (with microsecond epoch conversion), bytea, text, booleans, and null handling.
+  - 4 end-to-end integration tests in `StdBinaryParameterDecodingTest`:
     - Full binary parameterized INSERT and SELECT over extended wire protocol socket (Parse -> Bind with format code 1 -> Execute -> Sync).
     - Timestamp binary decoding verifying PG epoch calculation and query retrieval.
     - Raw byte array (`bytea`) binary parameter insertion and retrieval formatted as `\x...`.

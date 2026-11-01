@@ -7,24 +7,24 @@ import java.sql.Timestamp;
 import java.time.Instant;
 
 /**
- * Decodes PostgreSQL wire protocol parameters (both binary format code 1 and text format code 0)
+ * Decodes standard wire protocol parameters (both binary format code 1 and text format code 0)
  * directly into strongly-typed Java values.
  *
- * Supports native pgwire binary formats:
+ * Supports native standard wire binary formats:
  * - int2 (short, 2 bytes big-endian)
  * - int4 (int, 4 bytes big-endian)
  * - int8 (long, 8 bytes big-endian)
  * - float4 (float, 4 bytes big-endian IEEE 754)
  * - float8 (double, 8 bytes big-endian IEEE 754)
- * - timestamp / timestamptz (8 bytes big-endian, microseconds since PostgreSQL epoch 2000-01-01 00:00:00 UTC)
+ * - timestamp / timestamptz (8 bytes big-endian, microseconds since standard epoch 2000-01-01 00:00:00 UTC)
  * - bytea (raw bytes as-is)
  * - text / varchar (UTF-8 bytes)
  * - bool (1 byte, 0 = false, non-zero = true)
  */
-public final class PgBinaryDecoder {
+public final class StdBinaryDecoder {
 
-    /** PostgreSQL epoch is 2000-01-01 00:00:00 UTC. Unix epoch difference is 946_684_800_000_000 microseconds (10,957 days). */
-    public static final long PG_EPOCH_MICROS = 946_684_800_000_000L;
+    /** Standard epoch is 2000-01-01 00:00:00 UTC. Unix epoch difference is 946_684_800_000_000 microseconds (10,957 days). */
+    public static final long EPOCH_DIFF_MICROS = 946_684_800_000_000L;
 
     public static final int OID_BOOL = 16;
     public static final int OID_BYTEA = 17;
@@ -39,14 +39,14 @@ public final class PgBinaryDecoder {
     public static final int OID_TIMESTAMP = 1114;
     public static final int OID_TIMESTAMPTZ = 1184;
 
-    private PgBinaryDecoder() {}
+    private StdBinaryDecoder() {}
 
     /**
-     * Decodes raw parameter bytes sent in pgwire Bind message into a typed Object.
+     * Decodes raw parameter bytes sent in wire Bind message into a typed Object.
      *
      * @param rawValue raw parameter bytes (null means SQL NULL)
      * @param formatCode 0 for text, 1 for binary
-     * @param typeOid PostgreSQL type OID (0 if unspecified by client)
+     * @param typeOid wire type OID (0 if unspecified by client)
      * @param targetColumnType declared schema column type name (e.g. "INT4", "BYTEA", etc.), or null if unknown
      * @return strongly-typed Java object (Integer, Long, Short, Float, Double, Boolean, byte[], Timestamp, String, or null)
      */
@@ -93,8 +93,8 @@ public final class PgBinaryDecoder {
                 return buf.getDouble();
             }
             case OID_TIMESTAMP, OID_TIMESTAMPTZ -> {
-                long pgMicros = buf.getLong();
-                long unixMicros = pgMicros + PG_EPOCH_MICROS;
+                long wireMicros = buf.getLong();
+                long unixMicros = wireMicros + EPOCH_DIFF_MICROS;
                 long unixMillis = Math.floorDiv(unixMicros, 1000L);
                 int nanoAdjustment = (int) (Math.floorMod(unixMicros, 1000L) * 1000);
                 Instant instant = Instant.ofEpochMilli(unixMillis).plusNanos(nanoAdjustment);
@@ -115,8 +115,8 @@ public final class PgBinaryDecoder {
                     if (norm.equals("DOUBLE") || norm.equals("FLOAT8") || norm.equals("NUMERIC") || norm.equals("DECIMAL") || norm.startsWith("DOUBLE")) return buf.getDouble();
                     if (norm.equals("BOOLEAN") || norm.equals("BOOL")) return raw.length > 0 && raw[0] != 0;
                     if (norm.equals("TIMESTAMP") || norm.equals("TIMESTAMPTZ")) {
-                        long pgMicros = buf.getLong();
-                        long unixMicros = pgMicros + PG_EPOCH_MICROS;
+                        long wireMicros = buf.getLong();
+                        long unixMicros = wireMicros + EPOCH_DIFF_MICROS;
                         long unixMillis = Math.floorDiv(unixMicros, 1000L);
                         int nanoAdjustment = (int) (Math.floorMod(unixMicros, 1000L) * 1000);
                         return Timestamp.from(Instant.ofEpochMilli(unixMillis).plusNanos(nanoAdjustment));

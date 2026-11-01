@@ -112,7 +112,7 @@ final class ExtendedProtocolHandler {
             int formatCode = (i < formatCodes.length) ? formatCodes[i] : 0;
             int typeOid = (stmt.paramTypeOids() != null && i < stmt.paramTypeOids().length) ? stmt.paramTypeOids()[i] : 0;
             String targetColType = (stmt.targetColumnTypes() != null && i < stmt.targetColumnTypes().size()) ? stmt.targetColumnTypes().get(i) : null;
-            Object typed = PgBinaryDecoder.decode(rawVal, formatCode, typeOid, targetColType);
+            Object typed = StdBinaryDecoder.decode(rawVal, formatCode, typeOid, targetColType);
             typedParams.add(typed);
         }
 
@@ -148,7 +148,7 @@ final class ExtendedProtocolHandler {
                 if (stmt.paramTypeOids() != null && i < stmt.paramTypeOids().length && stmt.paramTypeOids()[i] != 0) {
                     oid = stmt.paramTypeOids()[i];
                 } else if (stmt.targetColumnTypes() != null && i < stmt.targetColumnTypes().size() && stmt.targetColumnTypes().get(i) != null) {
-                    oid = PgBinaryDecoder.oidFromColumnType(stmt.targetColumnTypes().get(i));
+                    oid = StdBinaryDecoder.oidFromColumnType(stmt.targetColumnTypes().get(i));
                 }
                 paramOids.add(oid != 0 ? oid : 25);
             }
