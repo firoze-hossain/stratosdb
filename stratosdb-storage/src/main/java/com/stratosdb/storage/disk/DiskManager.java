@@ -188,6 +188,26 @@ public class DiskManager {
             throw new StorageException("Failed to delete table: " + tableName);
         }
     }
+
+    /**
+     * Truncate a table file to the specified number of pages.
+     */
+    public void truncateTable(String tableName, long newPageCount) {
+        try {
+            String fileName = getTableFileName(tableName);
+            FileChannel channel = getFileChannel(fileName);
+            synchronized (channel) {
+                long newSize = Math.max(0, newPageCount * PageConstants.PAGE_SIZE);
+                channel.truncate(newSize);
+                channel.force(true);
+                fileSizes.put(fileName, newSize);
+            }
+            LOG.debug("Truncated table {} to {} pages", tableName, newPageCount);
+        } catch (Exception e) {
+            LOG.error("Failed to truncate table {} to {} pages", tableName, newPageCount, e);
+            throw new StorageException("Failed to truncate table: " + tableName);
+        }
+    }
     
     /**
      * Check if a table exists

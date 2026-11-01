@@ -1409,6 +1409,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof ExplainStatement s) return executeExplain(s);
         if (stmt instanceof AnalyzeStatement s) return executeAnalyze(s, txn);
         if (stmt instanceof VacuumStatement s) return executeVacuum(s);
+        if (stmt instanceof ReindexStatement s) return executeReindex(s, txn);
         if (stmt instanceof CheckpointStatement) return executeCheckpoint();
         if (stmt instanceof PromoteStatement) {
             return QueryResult.error("PROMOTE must be run through a real client connection (a StdWireServer configured as a replica) - see StdWireServer.setReplicationClient's own javadoc");
@@ -2699,6 +2700,236 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         return QueryResult.success("Vacuumed " + stmt.tableName() + ": reclaimed "
             + result.reclaimedVersions() + " dead row version(s) across " + result.pagesCompacted() + " page(s)");
+    }
+
+    private QueryResult executeReindex(ReindexStatement stmt, Transaction txn) {
+        if (stmt.targetType() == ReindexStatement.TargetType.TABLE) {
+            String tableName = stmt.targetName();
+            HeapTable table = tables.get(tableName);
+            if (table == null) {
+                return QueryResult.error("Table not found: " + tableName);
+            }
+
+            int reindexedCount = 0;
+
+            // 1. Rebuild BTree / Hash indexes
+            List<IndexEntry> tableIndexes = indexesByTable.get(tableName);
+            if (tableIndexes != null) {
+                for (IndexEntry entry : new ArrayList<>(tableIndexes)) {
+                    reindexKeyValueIndex(tableName, entry, table, txn);
+                    reindexedCount++;
+                }
+            }
+
+            // 2. Rebuild BRIN indexes
+            List<BrinIndexEntry> brinIndexes = brinIndexesByTable.get(tableName);
+            if (brinIndexes != null) {
+                for (BrinIndexEntry entry : new ArrayList<>(brinIndexes)) {
+                    reindexBrinIndex(tableName, entry, table, txn);
+                    reindexedCount++;
+                }
+            }
+
+            // 3. Rebuild Bitmap indexes
+            List<BitmapIndexEntry> bitmapIndexes = bitmapIndexesByTable.get(tableName);
+            if (bitmapIndexes != null) {
+                for (BitmapIndexEntry entry : new ArrayList<>(bitmapIndexes)) {
+                    reindexBitmapIndex(tableName, entry, table, txn);
+                    reindexedCount++;
+                }
+            }
+
+            // 4. Rebuild GIN indexes
+            List<GinIndexEntry> ginIndexes = ginIndexesByTable.get(tableName);
+            if (ginIndexes != null) {
+                for (GinIndexEntry entry : new ArrayList<>(ginIndexes)) {
+                    reindexGinIndex(tableName, entry, table, txn);
+                    reindexedCount++;
+                }
+            }
+
+            // 5. Rebuild GiST indexes
+            List<GistIndexEntry> gistIndexes = gistIndexesByTable.get(tableName);
+            if (gistIndexes != null) {
+                for (GistIndexEntry entry : new ArrayList<>(gistIndexes)) {
+                    reindexGistIndex(tableName, entry, table, txn);
+                    reindexedCount++;
+                }
+            }
+
+            return QueryResult.success("REINDEX TABLE " + tableName + " completed: " + reindexedCount + " index(es) rebuilt");
+        } else {
+            String indexName = stmt.targetName();
+
+            IndexEntry entry = indexesByName.get(indexName);
+            if (entry != null) {
+                HeapTable table = tables.get(entry.tableName());
+                if (table != null) {
+                    reindexKeyValueIndex(entry.tableName(), entry, table, txn);
+                    return QueryResult.success("REINDEX INDEX " + indexName + " completed");
+                }
+            }
+
+            BrinIndexEntry brinEntry = brinIndexesByName.get(indexName);
+            if (brinEntry != null) {
+                HeapTable table = tables.get(brinEntry.tableName());
+                if (table != null) {
+                    reindexBrinIndex(brinEntry.tableName(), brinEntry, table, txn);
+                    return QueryResult.success("REINDEX INDEX " + indexName + " completed");
+                }
+            }
+
+            BitmapIndexEntry bitmapEntry = bitmapIndexesByName.get(indexName);
+            if (bitmapEntry != null) {
+                HeapTable table = tables.get(bitmapEntry.tableName());
+                if (table != null) {
+                    reindexBitmapIndex(bitmapEntry.tableName(), bitmapEntry, table, txn);
+                    return QueryResult.success("REINDEX INDEX " + indexName + " completed");
+                }
+            }
+
+            GinIndexEntry ginEntry = ginIndexesByName.get(indexName);
+            if (ginEntry != null) {
+                HeapTable table = tables.get(ginEntry.tableName());
+                if (table != null) {
+                    reindexGinIndex(ginEntry.tableName(), ginEntry, table, txn);
+                    return QueryResult.success("REINDEX INDEX " + indexName + " completed");
+                }
+            }
+
+            GistIndexEntry gistEntry = gistIndexesByName.get(indexName);
+            if (gistEntry != null) {
+                HeapTable table = tables.get(gistEntry.tableName());
+                if (table != null) {
+                    reindexGistIndex(gistEntry.tableName(), gistEntry, table, txn);
+                    return QueryResult.success("REINDEX INDEX " + indexName + " completed");
+                }
+            }
+
+            return QueryResult.error("Index not found: " + indexName);
+        }
+    }
+
+    private void reindexKeyValueIndex(String tableName, IndexEntry entry, HeapTable table, Transaction txn) {
+        if (entry.index() instanceof BTreeIndex btree) {
+            List<BTreeIndex.IndexRecord> liveEntries = new ArrayList<>();
+            for (HeapTable.PositionedRow row : table.scanPositioned()) {
+                if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                    continue;
+                }
+                Tuple tuple = deserializeTuple(tableName, MVCCVisibility.readPayload(row.stored()));
+                Object value = findColumnValue(tuple, entry.columnName());
+                Long key = toIndexKey(value);
+                if (key != null) {
+                    liveEntries.add(new BTreeIndex.IndexRecord(key, new BTreePage.RID(row.pageId(), row.slot())));
+                }
+            }
+            btree.rebuild(liveEntries);
+        } else if (entry.index() instanceof com.stratosdb.index.hash.HashIndex) {
+            bufferPool.truncateTable(entry.indexName(), 0);
+            com.stratosdb.index.hash.HashIndex newHash = new com.stratosdb.index.hash.HashIndex(entry.indexName(), bufferPool);
+            for (HeapTable.PositionedRow row : table.scanPositioned()) {
+                if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                    continue;
+                }
+                Tuple tuple = deserializeTuple(tableName, MVCCVisibility.readPayload(row.stored()));
+                Object value = findColumnValue(tuple, entry.columnName());
+                Long key = toIndexKey(value);
+                if (key != null) {
+                    newHash.insert(key, new BTreePage.RID(row.pageId(), row.slot()));
+                }
+            }
+            IndexEntry updated = new IndexEntry(entry.indexName(), entry.tableName(), entry.columnName(), newHash, entry.isUnique(), entry.isPrimary());
+            indexesByName.put(entry.indexName(), updated);
+            List<IndexEntry> list = indexesByTable.get(tableName);
+            if (list != null) {
+                int idx = list.indexOf(entry);
+                if (idx >= 0) list.set(idx, updated);
+            }
+        }
+    }
+
+    private void reindexBrinIndex(String tableName, BrinIndexEntry entry, HeapTable table, Transaction txn) {
+        com.stratosdb.index.brin.BrinIndex newBrin = new com.stratosdb.index.brin.BrinIndex(entry.indexName());
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = deserializeTuple(tableName, MVCCVisibility.readPayload(row.stored()));
+            Long key = toIndexKey(findColumnValue(tuple, entry.columnName()));
+            if (key != null) {
+                newBrin.observe(row.pageId(), key);
+            }
+        }
+        BrinIndexEntry updated = new BrinIndexEntry(entry.indexName(), entry.tableName(), entry.columnName(), newBrin);
+        brinIndexesByName.put(entry.indexName(), updated);
+        List<BrinIndexEntry> list = brinIndexesByTable.get(tableName);
+        if (list != null) {
+            int idx = list.indexOf(entry);
+            if (idx >= 0) list.set(idx, updated);
+        }
+    }
+
+    private void reindexBitmapIndex(String tableName, BitmapIndexEntry entry, HeapTable table, Transaction txn) {
+        com.stratosdb.index.bitmap.BitmapIndex newBitmap = new com.stratosdb.index.bitmap.BitmapIndex(entry.indexName());
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = deserializeTuple(tableName, MVCCVisibility.readPayload(row.stored()));
+            Object value = findColumnValue(tuple, entry.columnName());
+            newBitmap.insert(value, new BTreePage.RID(row.pageId(), row.slot()));
+        }
+        BitmapIndexEntry updated = new BitmapIndexEntry(entry.indexName(), entry.tableName(), entry.columnName(), newBitmap);
+        bitmapIndexesByName.put(entry.indexName(), updated);
+        List<BitmapIndexEntry> list = bitmapIndexesByTable.get(tableName);
+        if (list != null) {
+            int idx = list.indexOf(entry);
+            if (idx >= 0) list.set(idx, updated);
+        }
+    }
+
+    private void reindexGinIndex(String tableName, GinIndexEntry entry, HeapTable table, Transaction txn) {
+        com.stratosdb.index.gin.GinIndex newGin = new com.stratosdb.index.gin.GinIndex(entry.indexName());
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = deserializeTuple(tableName, MVCCVisibility.readPayload(row.stored()));
+            Object value = findColumnValue(tuple, entry.columnName());
+            if (value != null) {
+                indexGinValue(newGin, value, new BTreePage.RID(row.pageId(), row.slot()));
+            }
+        }
+        GinIndexEntry updated = new GinIndexEntry(entry.indexName(), entry.tableName(), entry.columnName(), newGin);
+        ginIndexesByName.put(entry.indexName(), updated);
+        List<GinIndexEntry> list = ginIndexesByTable.get(tableName);
+        if (list != null) {
+            int idx = list.indexOf(entry);
+            if (idx >= 0) list.set(idx, updated);
+        }
+    }
+
+    private void reindexGistIndex(String tableName, GistIndexEntry entry, HeapTable table, Transaction txn) {
+        com.stratosdb.index.gist.GistIntervalIndex newGist = new com.stratosdb.index.gist.GistIntervalIndex(entry.indexName());
+        for (HeapTable.PositionedRow row : table.scanPositioned()) {
+            if (!MVCCVisibility.isVisible(row.stored(), txn.getSnapshot(), transactionManager)) {
+                continue;
+            }
+            Tuple tuple = deserializeTuple(tableName, MVCCVisibility.readPayload(row.stored()));
+            Long start = toIndexKey(findColumnValue(tuple, entry.startColumn()));
+            Long end = toIndexKey(findColumnValue(tuple, entry.endColumn()));
+            if (start != null && end != null) {
+                newGist.insert(start, end, new BTreePage.RID(row.pageId(), row.slot()));
+            }
+        }
+        GistIndexEntry updated = new GistIndexEntry(entry.indexName(), entry.tableName(), entry.startColumn(), entry.endColumn(), newGist);
+        gistIndexesByName.put(entry.indexName(), updated);
+        List<GistIndexEntry> list = gistIndexesByTable.get(tableName);
+        if (list != null) {
+            int idx = list.indexOf(entry);
+            if (idx >= 0) list.set(idx, updated);
+        }
     }
 
     /**

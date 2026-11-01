@@ -275,6 +275,41 @@ public class BufferPoolManager implements BufferPool {
     }
 
     @Override
+    public void truncateTable(String tableName, long newPageCount) {
+        globalLock.writeLock().lock();
+        try {
+            Map<Long, Page> tablePages = pageCache.get(tableName);
+            if (tablePages != null) {
+                Map<Long, Integer> pins = pinCounts.get(tableName);
+                tablePages.keySet().removeIf(pid -> {
+                    if (pid >= newPageCount) {
+                        if (pins != null) {
+                            pins.remove(pid);
+                        }
+                        return true;
+                    }
+                    return false;
+                });
+            }
+            diskManager.truncateTable(tableName, newPageCount);
+        } finally {
+            globalLock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public void dropTable(String tableName) {
+        globalLock.writeLock().lock();
+        try {
+            pageCache.remove(tableName);
+            pinCounts.remove(tableName);
+            diskManager.deleteTable(tableName);
+        } finally {
+            globalLock.writeLock().unlock();
+        }
+    }
+
+    @Override
     public DiskManager getDiskManager() {
         return diskManager;
     }

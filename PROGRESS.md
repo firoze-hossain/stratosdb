@@ -1,17 +1,17 @@
 # StratosDB — Progress Tracker
 
-**Last verified:** October 31, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
+**Last verified:** November 1, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
 
 ## At a glance
 
 | | |
 |---|---|
-| Commits | 103 |
-| Tests passing | **515 / 515** |
-| Main source | ~35,420 lines |
-| Test source | ~16,670 lines |
+| Commits | 104 |
+| Tests passing | **536 / 536** |
+| Main source | ~36,035 lines |
+| Test source | ~17,585 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), and Sprint 6 (Weeks 11-12) fully completed. Sprint 7 Week 13: B+Tree Multi-Page Latch Crabbing (Coupling) completed — fine-grained per-page read/write latches, hand-over-hand downward read latch crabbing, leaf sibling coupling during range scans, optimistic non-splitting paths, pessimistic write-crabbing SMOs serialized via root latch, atomic page allocations, and zero deadlocks verified under 64 sustained concurrent threads (845,000+ operations in 10s with zero corruption or deadlocks). Full reactor test suite verified at 515/515 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), and Sprint 7 (Weeks 13-14: B+Tree Multi-Page Latch Crabbing, Deadlock-Free Concurrency, Free-Page Management, Freelist Recycling & REINDEX TABLE/INDEX Defragmentation) fully completed. Full reactor test suite verified at 536/536 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1287,6 +1287,44 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Sheet 2 (Row 17, Sprint 7 Week 13) marked `Completed`.
     - Sheet 3 (Row 18) status updated to `Resolved`.
     - Sheet 5 (Row 8) marked `Passed (Week 13)`.
+
+## Sprint 7 Week 14 — Index Subsystem (Free-Page Management, B+Tree Freelist Recycling & REINDEX TABLE Defragmentation) ✅ DONE
+
+- ✅ **Free-Page Freelist & Zero-Waste Page Recycling (`BTreeIndex.java`)**:
+  - Tracked persistent freelist metadata on Page 0 (metadata page): `freeListHead` (offset 40) and `freePageCount` (offset 48).
+  - Formatted deallocated pages with `FREE_PAGE_MAGIC` (`0x46524545`) at offset 24 and singly linked `nextFreePageId` pointer at offset 28.
+  - Page frees wired into `mergeChildren` (reclaiming right sibling page on underflow merge) and `pessimisticDelete` (reclaiming collapsed root page).
+  - Wired into `allocatePageId()`: pops from persistent freelist head when available, cleans page to empty leaf layout, and recycles page ID before monotonically expanding the index file.
+  - Crash-safe freelist loading & sanitization in `loadMetadata()`: walks freelist chain upon startup to validate page magic and detect cycle or uncommitted page allocation races, repairing state cleanly.
+  - Structural tree verification extended in `validateTreeInternal()`: checks freelist count, absence of cycles, valid free page magics, and guarantees zero collision between active tree pages and freelist pages.
+- ✅ **Physical Compaction & Storage Truncation (`DiskManager.java`, `BufferPoolManager.java`)**:
+  - Added `DiskManager.truncateTable(tableName, newPageCount)`: truncates underlying `FileChannel` to exact byte boundary (`newPageCount * PAGE_SIZE`) and executes `force(true)` fsync.
+  - Added `BufferPool.truncateTable(tableName, newPageCount)` and `dropTable(tableName)`: evicts cached pages at or above `newPageCount` and truncates physical file.
+  - Implemented `BTreeIndex.rebuild(records)` and `defragment()`: reads active sorted index entries, repacks into densely packed contiguous pages, resets freelist, and physically truncates index disk file via `BufferPool.truncateTable`.
+- ✅ **SQL Grammar, AST, and REINDEX Execution (`StratosSQL.g4`, `ReindexStatement.java`, `ExecutorEngine.java`)**:
+  - Added SQL grammar rules and AST for `REINDEX TABLE <tableName>`, `REINDEX <tableName>` (PostgreSQL shorthand), and `REINDEX INDEX <indexName>`.
+  - Implemented `ExecutorEngine.executeReindex`:
+    - Reindexes BTree indexes (via sorted live entry extraction and in-place `rebuild` defragmentation).
+    - Reindexes Hash indexes (truncates existing buckets and re-hashes all visible tuples).
+    - Reindexes BRIN indexes (re-summarizes block ranges across visible table pages).
+    - Reindexes Bitmap indexes (rebuilds bit vectors per distinct attribute).
+    - Reindexes GIN indexes (re-extracts lexemes/elements from arrays and JSON).
+    - Reindexes GiST indexes (rebuilds bounding box / interval ranges).
+- ✅ **Unit, Integration, & Continuous Churn Verification (`BTreeFreePageManagementTest.java`, `ReindexTableEndToEndTest.java`)**:
+  - `BTreeFreePageManagementTest` (7/7 tests passing):
+    - `testPageFreedOnMerge`: verifies page pushed to freelist and `freePageCount` incremented on sibling merge.
+    - `testRootCollapsedPageFreed`: verifies collapsed root page pushed to freelist.
+    - `testFreePageRecycledOnSplit`: verifies recycled page allocated on subsequent split without growing index file size.
+    - `testFreelistPersistenceAcrossReopen`: verifies freelist head and chain persist across index close and reopen.
+    - `testIndexDefragmentationReclaimsPhysicalFile`: verifies `defragment()` physically truncates disk file.
+    - `testConcurrentInsertDeleteChurnFreelistIntegrity`: 8 threads performing concurrent churn maintaining freelist invariants.
+    - `testIndexFileSizeStabilizationUnderContinuousChurn`: 50 continuous cycles of 10,000 insert/delete churn proving index file size stabilizes and stops endlessly growing.
+  - `ReindexTableEndToEndTest` (6/6 tests passing):
+    - Tested `REINDEX TABLE` with BTree indexes, multiple mixed indexes (BTree + Hash + BRIN), all syntax variants, error cases, and physical disk file space reclamation after heavy delete workloads.
+  - Reactor test suite verified at **536 / 536 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 18, Sprint 7 Week 14) marked `Completed`.
+    - Sheet 3 (Row 19, Free-Space Reuse in Indexes) marked `Resolved`.
 
 ## What to do next
 

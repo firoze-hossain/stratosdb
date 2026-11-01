@@ -159,6 +159,8 @@ public class SqlParser {
             return new AnalyzeStatement(ctx.analyze().tableName().getText());
         } else if (ctx.vacuum() != null) {
             return new VacuumStatement(ctx.vacuum().tableName().getText());
+        } else if (ctx.reindexStatement() != null) {
+            return buildReindex(ctx.reindexStatement());
         } else if (ctx.checkpointStatement() != null) {
             return new CheckpointStatement();
         } else if (ctx.promoteStatement() != null) {
@@ -916,5 +918,15 @@ public class SqlParser {
             }
         }
         return privileges;
+    }
+
+    private Statement buildReindex(StratosSQLParser.ReindexStatementContext ctx) {
+        if (ctx.INDEX() != null) {
+            return new ReindexStatement(ReindexStatement.TargetType.INDEX, ctx.indexName().getText());
+        } else if (ctx.TABLE() != null) {
+            return new ReindexStatement(ReindexStatement.TargetType.TABLE, ctx.tableName().getText());
+        } else {
+            return new ReindexStatement(ReindexStatement.TargetType.TABLE, ctx.tableName().getText());
+        }
     }
 }

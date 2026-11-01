@@ -41,6 +41,12 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private static final int META_MAGIC_OFFSET = 24; // right after Page's base 24-byte header
     private static final int META_ROOT_OFFSET = 28;
     private static final int META_FLAGS_OFFSET = 36;
+    private static final int META_FREE_HEAD_OFFSET = 40;
+    private static final int META_FREE_COUNT_OFFSET = 48;
+
+    private static final int FREE_PAGE_MAGIC = 0x46524545; // "FREE"
+    private static final int FREE_PAGE_MAGIC_OFFSET = 24;
+    private static final int FREE_PAGE_NEXT_OFFSET = 28;
 
     private static final int MIN_LEAF_KEYS = BTreePage.MAX_LEAF_KEYS / 2;
     private static final int MIN_INTERNAL_KEYS = BTreePage.MAX_INTERNAL_KEYS / 2;
@@ -68,6 +74,8 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private volatile long rootPageId;
     private final AtomicLong nextPageId;
     private volatile boolean unique;
+    private volatile long freeListHead = -1L;
+    private final AtomicLong freePageCount = new AtomicLong(0);
 
     /**
      * Root latch: protects transitions to rootPageId (such as when the root splits or collapses).
@@ -118,6 +126,14 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         }
     }
 
+    public long getFreeListHead() {
+        return freeListHead;
+    }
+
+    public long getFreePageCount() {
+        return freePageCount.get();
+    }
+
     public com.stratosdb.storage.wal.WALManager getWalManager() {
         return walManager;
     }
@@ -143,6 +159,8 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             bufferPool.flushPage(indexName, INITIAL_ROOT_PAGE_ID);
 
             this.rootPageId = INITIAL_ROOT_PAGE_ID;
+            this.freeListHead = -1L;
+            this.freePageCount.set(0);
             saveMetadata();
             LOG.debug("Initialized new B+Tree index '{}' with empty root at page {}", indexName, INITIAL_ROOT_PAGE_ID);
         } finally {
@@ -153,6 +171,8 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     private void loadMetadata() {
         Page meta = bufferPool.getPage(indexName, META_PAGE_ID, RAW_PAGE_FACTORY);
         meta.getLatch().readLock().lock();
+        long head;
+        long count;
         try {
             int magic = meta.getBuffer().getInt(META_MAGIC_OFFSET);
             if (magic != META_MAGIC) {
@@ -163,11 +183,68 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             if ((flags & 1) != 0) {
                 this.unique = true;
             }
-            LOG.debug("Loaded B+Tree index '{}', root at page {}, unique={}", indexName, rootPageId, unique);
+            head = meta.getBuffer().getLong(META_FREE_HEAD_OFFSET);
+            count = meta.getBuffer().getLong(META_FREE_COUNT_OFFSET);
         } finally {
             meta.getLatch().readLock().unlock();
             bufferPool.unpinPage(indexName, META_PAGE_ID);
         }
+
+        // Validate and sanitize freelist chain on load
+        long validCount = 0;
+        long curr = head;
+        long prev = -1L;
+        java.util.Set<Long> seen = new java.util.HashSet<>();
+
+        while (curr > 0 && curr != rootPageId && validCount < count && !seen.contains(curr)) {
+            seen.add(curr);
+            Page p = bufferPool.getPage(indexName, curr, RAW_PAGE_FACTORY);
+            p.getLatch().readLock().lock();
+            boolean valid;
+            long nextFree = -1L;
+            try {
+                int freeMagic = p.getBuffer().getInt(FREE_PAGE_MAGIC_OFFSET);
+                valid = (freeMagic == FREE_PAGE_MAGIC);
+                if (valid) {
+                    nextFree = p.getBuffer().getLong(FREE_PAGE_NEXT_OFFSET);
+                }
+            } finally {
+                p.getLatch().readLock().unlock();
+                bufferPool.unpinPage(indexName, curr);
+            }
+
+            if (!valid) {
+                // Truncate freelist at prev
+                if (prev > 0) {
+                    Page prevP = bufferPool.getPage(indexName, prev, RAW_PAGE_FACTORY);
+                    prevP.getLatch().writeLock().lock();
+                    try {
+                        prevP.getBuffer().putLong(FREE_PAGE_NEXT_OFFSET, -1L);
+                        prevP.setDirty(true);
+                        bufferPool.markDirty(indexName, prev);
+                    } finally {
+                        prevP.getLatch().writeLock().unlock();
+                        bufferPool.unpinPage(indexName, prev);
+                    }
+                } else {
+                    head = -1L;
+                }
+                break;
+            }
+            validCount++;
+            prev = curr;
+            curr = nextFree;
+        }
+
+        if (validCount == 0) {
+            head = -1L;
+        }
+        this.freeListHead = head;
+        this.freePageCount.set(validCount);
+        saveMetadata();
+
+        LOG.debug("Loaded B+Tree index '{}', root at page {}, unique={}, freePages={}",
+            indexName, rootPageId, unique, freePageCount.get());
     }
 
     private void saveMetadata() {
@@ -177,6 +254,8 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             meta.getBuffer().putInt(META_MAGIC_OFFSET, META_MAGIC);
             meta.getBuffer().putLong(META_ROOT_OFFSET, rootPageId);
             meta.getBuffer().putInt(META_FLAGS_OFFSET, unique ? 1 : 0);
+            meta.getBuffer().putLong(META_FREE_HEAD_OFFSET, freeListHead);
+            meta.getBuffer().putLong(META_FREE_COUNT_OFFSET, freePageCount.get());
             meta.setDirty(true);
             bufferPool.markDirty(indexName, META_PAGE_ID);
         } finally {
@@ -187,7 +266,65 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
     }
 
     private long allocatePageId() {
+        if (freeListHead > 0 && freeListHead != rootPageId) {
+            long recycledPageId = freeListHead;
+            Page page = bufferPool.getPage(indexName, recycledPageId, RAW_PAGE_FACTORY);
+            page.getLatch().writeLock().lock();
+            try {
+                int magic = page.getBuffer().getInt(FREE_PAGE_MAGIC_OFFSET);
+                if (magic == FREE_PAGE_MAGIC) {
+                    long nextFree = page.getBuffer().getLong(FREE_PAGE_NEXT_OFFSET);
+                    this.freeListHead = (nextFree > 0 && nextFree != recycledPageId && nextFree != rootPageId) ? nextFree : -1L;
+                    long remaining = freePageCount.decrementAndGet();
+                    if (remaining < 0) freePageCount.set(0);
+
+                    // Reformat recycled page as empty leaf
+                    java.nio.ByteBuffer buf = page.getBuffer();
+                    buf.putInt(0, 1); // isLeaf = 1
+                    buf.putInt(4, 0); // keyCount = 0
+                    buf.putLong(8, -1L); // nextLeafPageId = -1
+                    buf.putLong(16, 0L); // pageLSN = 0
+                    buf.putInt(FREE_PAGE_MAGIC_OFFSET, 0);
+                    buf.putLong(FREE_PAGE_NEXT_OFFSET, 0L);
+                    page.setDirty(true);
+                    bufferPool.markDirty(indexName, recycledPageId);
+                    saveMetadata();
+                    LOG.debug("Recycled page {} from freelist for index '{}', remaining free: {}",
+                        recycledPageId, indexName, freePageCount.get());
+                    return recycledPageId;
+                } else {
+                    LOG.warn("Freelist head page {} lacked expected magic, resetting freelist", recycledPageId);
+                    this.freeListHead = -1L;
+                    this.freePageCount.set(0);
+                    saveMetadata();
+                }
+            } finally {
+                page.getLatch().writeLock().unlock();
+                bufferPool.unpinPage(indexName, recycledPageId);
+            }
+        }
         return nextPageId.getAndIncrement();
+    }
+
+    private void markPageAsFree(BTreePage page) {
+        long pageId = page.getPageId();
+        long oldHead = this.freeListHead;
+
+        java.nio.ByteBuffer buf = page.getBuffer();
+        buf.putInt(0, FREE_PAGE_MAGIC);
+        buf.putInt(4, 0);
+        buf.putLong(8, -1L);
+        buf.putLong(16, 0L);
+        buf.putInt(FREE_PAGE_MAGIC_OFFSET, FREE_PAGE_MAGIC);
+        buf.putLong(FREE_PAGE_NEXT_OFFSET, oldHead);
+        page.setDirty(true);
+        bufferPool.markDirty(indexName, pageId);
+        bufferPool.flushPage(indexName, pageId);
+
+        this.freeListHead = pageId;
+        this.freePageCount.incrementAndGet();
+        saveMetadata();
+        LOG.debug("Freed page {} for index '{}', freelist count: {}", pageId, indexName, freePageCount.get());
     }
 
     // --- Point Insert ---
@@ -341,6 +478,14 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
      */
     private void pessimisticInsert(long xid, long key, BTreePage.RID rid) {
         rootLatch.writeLock().lock();
+        try {
+            pessimisticInsertInternal(xid, key, rid);
+        } finally {
+            rootLatch.writeLock().unlock();
+        }
+    }
+
+    private void pessimisticInsertInternal(long xid, long key, BTreePage.RID rid) {
         List<HeldFrame> heldFrames = new ArrayList<>();
 
         try {
@@ -520,7 +665,6 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
                 }
             }
             heldFrames.clear();
-            rootLatch.writeLock().unlock();
         }
     }
 
@@ -643,6 +787,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
                 // If root collapsed
                 if (!root.isLeaf() && root.getKeyCount() == 0) {
                     long onlyChild = root.getChildren().get(0);
+                    markPageAsFree(root);
                     this.rootPageId = onlyChild;
                     saveMetadata();
                     LOG.debug("Root collapsed to page {} for index '{}'", rootPageId, indexName);
@@ -910,6 +1055,8 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         parentChildren.remove(rightIdx);
         parent.setInternalContents(parentKeys, parentChildren);
         bufferPool.markDirty(indexName, parent.getPageId());
+
+        markPageAsFree(rightPage);
     }
 
     // --- Point Search with Read Latch Crabbing ---
@@ -1066,6 +1213,106 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         return rootPageId;
     }
 
+    public record IndexRecord(long key, BTreePage.RID rid) implements Comparable<IndexRecord> {
+        @Override
+        public int compareTo(IndexRecord other) {
+            int cmp = Long.compare(this.key, other.key);
+            if (cmp != 0) return cmp;
+            int pageCmp = Long.compare(this.rid.pageId(), other.rid.pageId());
+            if (pageCmp != 0) return pageCmp;
+            return Integer.compare(this.rid.slot(), other.rid.slot());
+        }
+    }
+
+    public void defragment() {
+        rebuild(null);
+    }
+
+    public void rebuild(List<IndexRecord> records) {
+        rootLatch.writeLock().lock();
+        try {
+            List<IndexRecord> toInsert;
+            if (records != null) {
+                toInsert = new ArrayList<>(records);
+                Collections.sort(toInsert);
+            } else {
+                toInsert = new ArrayList<>();
+                long currLeafId = findLeftmostLeafPageId();
+                while (currLeafId > 0) {
+                    BTreePage leaf = bufferPool.getPage(indexName, currLeafId, BTreePage.FACTORY);
+                    leaf.getLatch().readLock().lock();
+                    long nextId;
+                    try {
+                        List<Long> keys = leaf.getKeys();
+                        List<BTreePage.RID> values = leaf.getLeafValues();
+                        for (int i = 0; i < keys.size(); i++) {
+                            toInsert.add(new IndexRecord(keys.get(i), values.get(i)));
+                        }
+                        nextId = leaf.getNextLeafPageId();
+                    } finally {
+                        leaf.getLatch().readLock().unlock();
+                        bufferPool.unpinPage(indexName, currLeafId);
+                    }
+                    currLeafId = nextId;
+                }
+            }
+
+            // Reset freelist and page allocation
+            this.freeListHead = -1L;
+            this.freePageCount.set(0);
+            this.rootPageId = INITIAL_ROOT_PAGE_ID;
+            this.nextPageId.set(INITIAL_ROOT_PAGE_ID + 1);
+
+            // Re-initialize root page 1 as empty leaf
+            BTreePage root = bufferPool.getPage(indexName, INITIAL_ROOT_PAGE_ID, BTreePage.FACTORY);
+            root.getLatch().writeLock().lock();
+            try {
+                root.setLeafContents(List.of(), List.of());
+                root.setNextLeafPageId(-1L);
+                root.setPageLSN(0L);
+                bufferPool.markDirty(indexName, INITIAL_ROOT_PAGE_ID);
+            } finally {
+                root.getLatch().writeLock().unlock();
+                bufferPool.unpinPage(indexName, INITIAL_ROOT_PAGE_ID);
+            }
+            saveMetadata();
+
+            // Re-insert all entries sequentially
+            for (IndexRecord rec : toInsert) {
+                pessimisticInsertInternal(0L, rec.key(), rec.rid());
+            }
+
+            // Truncate index file to exactly the allocated pages
+            long totalPages = this.nextPageId.get();
+            bufferPool.flushAll();
+            bufferPool.truncateTable(indexName, totalPages);
+            saveMetadata();
+
+            LOG.info("Rebuilt/defragmented B+Tree index '{}': repacked {} entries into {} pages",
+                indexName, toInsert.size(), totalPages);
+        } finally {
+            rootLatch.writeLock().unlock();
+        }
+    }
+
+    private long findLeftmostLeafPageId() {
+        long currId = this.rootPageId;
+        while (true) {
+            BTreePage curr = bufferPool.getPage(indexName, currId, BTreePage.FACTORY);
+            curr.getLatch().readLock().lock();
+            long pinnedId = currId;
+            try {
+                if (curr.isLeaf()) {
+                    return pinnedId;
+                }
+                currId = curr.getChildren().get(0);
+            } finally {
+                curr.getLatch().readLock().unlock();
+                bufferPool.unpinPage(indexName, pinnedId);
+            }
+        }
+    }
+
     /**
      * Validates structural consistency of the B+Tree:
      * - Key ordering across internal nodes and leaves.
@@ -1170,6 +1417,37 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         orphanInChain.removeAll(leavesFromRoot);
         if (!orphanInChain.isEmpty()) {
             throw new IllegalStateException("Orphan pointers detected: leaves in sibling chain unreachable from root: " + orphanInChain);
+        }
+
+        // Freelist validation
+        long currFree = this.freeListHead;
+        java.util.Set<Long> freePages = new java.util.HashSet<>();
+        long countedFree = 0;
+        while (currFree > 0) {
+            if (freePages.contains(currFree)) {
+                throw new IllegalStateException("Freelist cycle detected at page " + currFree);
+            }
+            if (pagesReachableFromRoot.contains(currFree) || leavesInChain.contains(currFree)) {
+                throw new IllegalStateException("Active tree page " + currFree + " is present on freelist!");
+            }
+            freePages.add(currFree);
+            countedFree++;
+
+            Page freeP = bufferPool.getPage(indexName, currFree, RAW_PAGE_FACTORY);
+            freeP.getLatch().readLock().lock();
+            try {
+                int magic = freeP.getBuffer().getInt(FREE_PAGE_MAGIC_OFFSET);
+                if (magic != FREE_PAGE_MAGIC) {
+                    throw new IllegalStateException("Free page " + currFree + " does not have valid magic: " + magic);
+                }
+                currFree = freeP.getBuffer().getLong(FREE_PAGE_NEXT_OFFSET);
+            } finally {
+                freeP.getLatch().readLock().unlock();
+                bufferPool.unpinPage(indexName, freeP.getPageId());
+            }
+        }
+        if (countedFree != this.freePageCount.get()) {
+            throw new IllegalStateException("Freelist count mismatch: tracked " + this.freePageCount.get() + " but traversed " + countedFree);
         }
 
         return totalKeys;

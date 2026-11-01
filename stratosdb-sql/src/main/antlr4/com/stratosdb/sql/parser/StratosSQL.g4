@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | reindexStatement | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
 
 // --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
 // independent parse entry point using this SAME lexer (see PlpgsqlParser),
@@ -187,6 +187,7 @@ triggerHandlerName: IDENTIFIER;
 explain: EXPLAIN select;
 analyze: ANALYZE tableName SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
+reindexStatement: REINDEX (TABLE tableName | INDEX indexName | tableName) SEMICOLON?;
 checkpointStatement: CHECKPOINT SEMICOLON?;
 promoteStatement: PROMOTE SEMICOLON?;
 beginTxn: BEGIN TRANSACTION? SEMICOLON? | START TRANSACTION SEMICOLON?;
@@ -506,6 +507,7 @@ ANTI: A N T I;
 EXPLAIN: E X P L A I N;
 ANALYZE: A N A L Y Z E;
 VACUUM: V A C U U M;
+REINDEX: R E I N D E X;
 CHECKPOINT: C H E C K P O I N T;
 PROMOTE: P R O M O T E;
 BEGIN: B E G I N;
