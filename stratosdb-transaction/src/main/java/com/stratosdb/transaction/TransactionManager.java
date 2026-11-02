@@ -128,16 +128,31 @@ public class TransactionManager {
      * started" apart from "committed after I started but before I read."
      */
     public Transaction begin() {
+        return begin(IsolationLevel.READ_COMMITTED);
+    }
+
+    public Transaction begin(IsolationLevel isolationLevel) {
         long xid = nextXID.getAndIncrement();
         reserveXidWatermarkIfNeeded(xid);
         Set<Long> activeAtStart = new HashSet<>(activeXids); // snapshot BEFORE adding self
         activeXids.add(xid);
 
-        Transaction tx = new Transaction(xid, new Snapshot(xid, activeAtStart));
+        Transaction tx = new Transaction(xid, new Snapshot(xid, nextXID.get(), activeAtStart), isolationLevel);
         transactionsByXid.put(xid, tx);
         currentTransaction.set(tx);
-        LOG.debug("Began transaction {} with snapshot {}", xid, tx.getSnapshot());
+        LOG.debug("Began transaction {} with snapshot {} at isolation {}", xid, tx.getSnapshot(), tx.getIsolationLevel());
         return tx;
+    }
+
+    /**
+     * Creates a fresh MVCC snapshot for an active transaction.
+     * Used by READ COMMITTED transactions so each query statement observes
+     * all transactions committed prior to that statement's execution.
+     */
+    public Snapshot createSnapshot(long ownerXid) {
+        Set<Long> currentActive = new HashSet<>(activeXids);
+        currentActive.remove(ownerXid);
+        return new Snapshot(ownerXid, nextXID.get(), currentActive);
     }
 
     /**

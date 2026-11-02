@@ -98,4 +98,18 @@ public class LockManager {
         }
         LOG.debug("Released all locks for transaction {}", xid);
     }
+
+    /** Returns true if the specified row is currently exclusively locked. */
+    public boolean isLocked(RowId rowId) {
+        synchronized (monitor) {
+            return lockHolder.containsKey(rowId);
+        }
+    }
+
+    /** Returns the transaction ID currently holding the exclusive lock on rowId, or null if unlocked. */
+    public Long getHolder(RowId rowId) {
+        synchronized (monitor) {
+            return lockHolder.get(rowId);
+        }
+    }
 }

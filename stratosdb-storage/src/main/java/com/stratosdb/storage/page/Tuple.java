@@ -45,6 +45,9 @@ public class Tuple {
     private long xmin = 0;
     private long xmax = 0;
     private short infomask = 0;
+    private long pageId = -1;
+    private int slot = -1;
+    private String tableName = null;
     
     public Tuple() {
         this.values = new ArrayList<>();
@@ -165,6 +168,12 @@ public class Tuple {
     public void setXmax(long xmax) { this.xmax = xmax; }
     public short getInfomask() { return infomask; }
     public void setInfomask(short infomask) { this.infomask = infomask; }
+    public long getPageId() { return pageId; }
+    public void setPageId(long pageId) { this.pageId = pageId; }
+    public int getSlot() { return slot; }
+    public void setSlot(int slot) { this.slot = slot; }
+    public String getTableName() { return tableName; }
+    public void setTableName(String tableName) { this.tableName = tableName; }
 
     /**
      * Serialize tuple to schema-less compact binary format.

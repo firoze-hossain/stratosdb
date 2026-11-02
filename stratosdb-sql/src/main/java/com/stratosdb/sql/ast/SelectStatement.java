@@ -14,13 +14,26 @@ import java.util.List;
  *
  * fromSubquery and tableAlias: support derived tables in FROM clause
  * ("FROM (SELECT ...) AS dt") and table aliases ("FROM customers AS c").
+ *
+ * forUpdate: true when SELECT ... FOR UPDATE is specified, locking selected rows
+ * exclusively under LockManager to prevent concurrent modifications until transaction ends.
  */
 public record SelectStatement(String tableName, List<String> columns, WhereExpr where,
                               String orderBy, String limit, String offset, List<JoinClause> joins,
                               List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
                               List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                               List<String> columnAliases, List<OrderItem> orderItems,
-                              SelectStatement fromSubquery, String tableAlias) implements Statement {
+                              SelectStatement fromSubquery, String tableAlias, boolean forUpdate) implements Statement {
+
+    public SelectStatement(String tableName, List<String> columns, WhereExpr where,
+                           String orderBy, String limit, String offset, List<JoinClause> joins,
+                           List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
+                           List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
+                           List<String> columnAliases, List<OrderItem> orderItems,
+                           SelectStatement fromSubquery, String tableAlias) {
+        this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
+             windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, false);
+    }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
                            String orderBy, String limit, String offset, List<JoinClause> joins,
@@ -28,7 +41,7 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                            List<String> columnAliases, List<OrderItem> orderItems) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, orderItems, null, null);
+             windowFunctions, functionCalls, columnAliases, orderItems, null, null, false);
     }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
@@ -37,7 +50,7 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                            List<String> columnAliases) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, List.of(), null, null);
+             windowFunctions, functionCalls, columnAliases, List.of(), null, null, false);
     }
 
     @Override
@@ -56,18 +69,24 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
     public SelectStatement withWhere(WhereExpr newWhere) {
         return new SelectStatement(tableName, columns, newWhere, orderBy, limit, offset, joins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate);
     }
 
     public SelectStatement withJoins(List<JoinClause> newJoins) {
         return new SelectStatement(tableName, columns, where, orderBy, limit, offset, newJoins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate);
     }
 
     public SelectStatement withJoinsAndWhere(List<JoinClause> newJoins, WhereExpr newWhere) {
         return new SelectStatement(tableName, columns, newWhere, orderBy, limit, offset, newJoins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate);
+    }
+
+    public SelectStatement withForUpdate(boolean newForUpdate) {
+        return new SelectStatement(tableName, columns, where, orderBy, limit, offset, joins,
+                                   aggregates, groupBy, havingClause, windowFunctions, functionCalls,
+                                   columnAliases, orderItems, fromSubquery, tableAlias, newForUpdate);
     }
 }

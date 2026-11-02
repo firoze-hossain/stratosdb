@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | showCatalog | explain | analyze | vacuum | reindexStatement | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
+sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | setTransaction | setSessionCharacteristics | showCatalog | explain | analyze | vacuum | reindexStatement | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
 
 // --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
 // independent parse entry point using this SAME lexer (see PlpgsqlParser),
@@ -190,9 +190,13 @@ vacuum: VACUUM tableName SEMICOLON?;
 reindexStatement: REINDEX (TABLE tableName | INDEX indexName | tableName) SEMICOLON?;
 checkpointStatement: CHECKPOINT SEMICOLON?;
 promoteStatement: PROMOTE SEMICOLON?;
-beginTxn: BEGIN TRANSACTION? SEMICOLON? | START TRANSACTION SEMICOLON?;
-commitTxn: COMMIT SEMICOLON?;
-rollbackTxn: ROLLBACK SEMICOLON?;
+beginTxn: (BEGIN | START) TRANSACTION? (ISOLATION LEVEL isolationLevel | transactionMode)* SEMICOLON?;
+setTransaction: SET (LOCAL | SESSION)? TRANSACTION (ISOLATION LEVEL isolationLevel | transactionMode)* SEMICOLON?;
+setSessionCharacteristics: SET SESSION CHARACTERISTICS AS TRANSACTION (ISOLATION LEVEL isolationLevel | transactionMode)* SEMICOLON?;
+isolationLevel: READ COMMITTED | REPEATABLE READ | SERIALIZABLE | READ UNCOMMITTED;
+transactionMode: READ ONLY_KW | READ WRITE;
+commitTxn: COMMIT TRANSACTION? SEMICOLON?;
+rollbackTxn: ROLLBACK TRANSACTION? SEMICOLON?;
 savepoint: SAVEPOINT savepointName SEMICOLON?;
 releaseSavepoint: RELEASE SAVEPOINT? savepointName SEMICOLON?;
 rollbackToSavepoint: ROLLBACK TO SAVEPOINT? savepointName SEMICOLON?;
@@ -201,7 +205,8 @@ savepointName: IDENTIFIER;
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN (COMMA LPAREN valueList RPAREN)* returningClause? SEMICOLON?;
 returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
-select: SELECT selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? SEMICOLON?;
+select: SELECT selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? forUpdateClause? SEMICOLON?;
+forUpdateClause: FOR UPDATE (NOWAIT)?;
 tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: IDENTIFIER;
@@ -526,6 +531,17 @@ RETURNING: R E T U R N I N G;
 KEY: K E Y;
 ISOLATION: I S O L A T I O N;
 LEVEL: L E V E L;
+READ: R E A D;
+WRITE: W R I T E;
+COMMITTED: C O M M I T T E D;
+UNCOMMITTED: U N C O M M I T T E D;
+REPEATABLE: R E P E A T A B L E;
+SERIALIZABLE: S E R I A L I Z A B L E;
+CHARACTERISTICS: C H A R A C T E R I S T I C S;
+LOCAL: L O C A L;
+SESSION: S E S S I O N;
+ONLY_KW: O N L Y;
+NOWAIT: N O W A I T;
 COMMIT: C O M M I T;
 ROLLBACK: R O L L B A C K;
 SAVEPOINT: S A V E P O I N T;

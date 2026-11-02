@@ -1,6 +1,7 @@
 package com.stratosdb.sql.parser;
 
 import com.stratosdb.sql.ast.*;
+import com.stratosdb.transaction.IsolationLevel;
 import org.antlr.v4.runtime.*;
 import org.antlr.v4.runtime.tree.TerminalNode;
 import org.slf4j.Logger;
@@ -173,7 +174,22 @@ public class SqlParser {
         } else if (ctx.showDatabases() != null) {
             return new ShowDatabasesStatement();
         } else if (ctx.beginTxn() != null) {
-            return new BeginStatement();
+            IsolationLevel level = null;
+            if (ctx.beginTxn().isolationLevel() != null && !ctx.beginTxn().isolationLevel().isEmpty()) {
+                level = parseIsolationLevel(ctx.beginTxn().isolationLevel(0));
+            }
+            return new BeginStatement(level);
+        } else if (ctx.setTransaction() != null) {
+            IsolationLevel level = (ctx.setTransaction().isolationLevel() != null && !ctx.setTransaction().isolationLevel().isEmpty())
+                ? parseIsolationLevel(ctx.setTransaction().isolationLevel(0))
+                : null;
+            boolean isLocal = ctx.setTransaction().LOCAL() != null;
+            return new SetTransactionIsolationStatement(level, isLocal);
+        } else if (ctx.setSessionCharacteristics() != null) {
+            IsolationLevel level = (ctx.setSessionCharacteristics().isolationLevel() != null && !ctx.setSessionCharacteristics().isolationLevel().isEmpty())
+                ? parseIsolationLevel(ctx.setSessionCharacteristics().isolationLevel(0))
+                : null;
+            return new SetSessionCharacteristicsStatement(level);
         } else if (ctx.commitTxn() != null) {
             return new CommitStatement();
         } else if (ctx.rollbackTxn() != null) {
@@ -764,7 +780,17 @@ public class SqlParser {
             }
         }
 
-        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias);
+        boolean forUpdate = ctx.forUpdateClause() != null;
+        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate);
+    }
+
+    private IsolationLevel parseIsolationLevel(StratosSQLParser.IsolationLevelContext ctx) {
+        if (ctx == null) return IsolationLevel.READ_COMMITTED;
+        if (ctx.READ() != null && ctx.COMMITTED() != null) return IsolationLevel.READ_COMMITTED;
+        if (ctx.REPEATABLE() != null && ctx.READ() != null) return IsolationLevel.REPEATABLE_READ;
+        if (ctx.SERIALIZABLE() != null) return IsolationLevel.SERIALIZABLE;
+        if (ctx.READ() != null && ctx.UNCOMMITTED() != null) return IsolationLevel.READ_UNCOMMITTED;
+        return IsolationLevel.fromString(ctx.getText());
     }
 
     private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {

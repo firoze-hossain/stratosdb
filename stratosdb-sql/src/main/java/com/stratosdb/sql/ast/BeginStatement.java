@@ -1,3 +1,9 @@
 package com.stratosdb.sql.ast;
 
-public record BeginStatement() implements Statement {}
+import com.stratosdb.transaction.IsolationLevel;
+
+public record BeginStatement(IsolationLevel isolationLevel) implements Statement {
+    public BeginStatement() {
+        this(null);
+    }
+}

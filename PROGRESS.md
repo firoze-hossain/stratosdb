@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Commits | 109 |
-| Tests passing | **598 / 598** |
-| Main source | ~39,450 lines |
-| Test source | ~19,450 lines |
+| Commits | 110 |
+| Tests passing | **624 / 624** |
+| Main source | ~39,850 lines |
+| Test source | ~19,950 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), and Sprint 9 (Weeks 17-18: Native Binary Parameter Decoding and TLS/SSL Integration in StdWireServer) fully completed. Full reactor test suite verified at 598/598 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), and Sprint 10 (Week 19: Isolation Levels: Read Committed vs Repeatable Read & SELECT FOR UPDATE) fully completed. Full reactor test suite verified at 624/624 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1497,6 +1497,50 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Sheet 2 (Row 22, Sprint 9 Week 18: TLS/SSL Integration in StdWireServer) marked `Completed`.
     - Sheet 3 (Row 26, Wire Encryption (TLS/SSL)) marked `Resolved`.
     - Sheet 5 (Row 13, Wire Protocol TLS 1.3 Encryption) marked `Passed (Week 18)`.
+
+## Sprint 10 — Week 19: Transactions — Isolation Levels: Read Committed vs Repeatable Read & SELECT FOR UPDATE ✅ DONE
+
+- ✅ **Transaction Isolation Levels (`IsolationLevel.java`, `Snapshot.java`, `Transaction.java`)**:
+  - Implemented standard SQL isolation levels: `READ_COMMITTED`, `REPEATABLE_READ`, `READ_UNCOMMITTED`, and `SERIALIZABLE`.
+  - Extended `Snapshot` with transaction high watermark (`xmax`): tracks `nextXID.get()` at snapshot creation time. Any transaction starting with `xid >= xmax` was initiated after the snapshot was taken and is guaranteed invisible.
+  - Updated `MVCCVisibility.definitelyCommittedBefore(...)` and `isVisible(...)` to strictly respect snapshot `xmax` and active transaction sets.
+
+- ✅ **SQL Grammar & AST Support (`StratosSQL.g4`, AST Records, `SqlParser.java`)**:
+  - Added grammar and AST parsing for:
+    - `SET TRANSACTION ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SERIALIZABLE | READ UNCOMMITTED}` (`SetTransactionIsolationStatement`)
+    - `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...` (`SetSessionCharacteristicsStatement`)
+    - `BEGIN [TRANSACTION] [ISOLATION LEVEL ...] [READ ONLY | READ WRITE]` (`BeginStatement`)
+    - `SHOW TRANSACTION ISOLATION LEVEL`, `SHOW default_transaction_isolation`, `SHOW transaction_isolation`
+    - `SET default_transaction_isolation = '...'` / `SET transaction_isolation = '...'`
+    - `SELECT ... FOR UPDATE [NOWAIT]` (`SelectStatement.forUpdate()`)
+
+- ✅ **Snapshot Lifecycle Semantics in `ExecutorEngine`**:
+  - **Read Committed**: Each statement executed within an explicit transaction acquires a fresh MVCC snapshot (`txn.setSnapshot(transactionManager.createSnapshot(txn.getXID()))`), observing all transactions committed prior to statement execution.
+  - **Repeatable Read**: The initial MVCC snapshot captured at `BEGIN` is preserved across all statements in the transaction, preventing non-repeatable reads and phantom reads.
+
+- ✅ **Row-Level Locking with `SELECT ... FOR UPDATE`**:
+  - Row tracking in execution: `Tuple` preserves `pageId`, `slot`, and `tableName` across scan operators (`SeqScanOperator`, `IndexScanOperator`), projection (`ProjectOperator`, `project`, `applyColumnAliases`), filters, and joins (`JoinUtils`).
+  - `applyForUpdateLocking(...)`: acquires exclusive row locks via `LockManager.acquireExclusive(...)` for all matching rows, serializing concurrent writers and concurrent `FOR UPDATE` queries until transaction commit or rollback.
+  - Plain MVCC readers (`SELECT`) never acquire row locks and are never blocked by `FOR UPDATE`.
+  - Rejects `SELECT ... FOR UPDATE` in read-only mode and read-only replica configurations with clear error.
+  - Circular wait deadlock detection: integrates seamlessly with `LockManager`'s wait-for graph cycle detection.
+
+- ✅ **Comprehensive Verification & Testing (`TransactionIsolationLevelsTest.java`)**:
+  - 9 end-to-end multi-threaded test cases:
+    1. `testSetAndShowTransactionIsolationLevel`: verifies `SHOW`/`SET TRANSACTION ISOLATION LEVEL`, `SET SESSION CHARACTERISTICS`, `BEGIN ISOLATION LEVEL ...`, and configuration parameters.
+    2. `testNonRepeatableReadObservedUnderReadCommitted`: verifies that T1 under Read Committed observes an update committed by T2 between statement 1 and statement 2.
+    3. `testNonRepeatableReadPreventedUnderRepeatableRead`: verifies that T1 under Repeatable Read preserves its initial snapshot and does not see concurrent committed updates.
+    4. `testPhantomReadPreventedUnderRepeatableRead`: verifies that newly inserted rows committed by T2 are invisible to T1's queries under Repeatable Read.
+    5. `testSelectForUpdateLocksRowsAndBlocksConcurrentUpdate`: verifies that `SELECT ... FOR UPDATE` takes row-level exclusive locks and blocks concurrent `UPDATE` on the locked row until commit.
+    6. `testSelectForUpdateBlocksConcurrentForUpdate`: verifies that concurrent `SELECT ... FOR UPDATE` on the same row blocks until the first transaction commits.
+    7. `testPlainSelectDoesNotBlockOnForUpdate`: verifies that non-locking MVCC readers proceed without delay when rows are locked by `FOR UPDATE`.
+    8. `testDeadlockDetectionOnForUpdate`: verifies circular wait deadlock detection and abortion of one contending transaction while the other succeeds.
+    9. `testForUpdateInReadOnlyModeFails`: verifies that `SELECT ... FOR UPDATE` is cleanly rejected in read-only mode.
+  - Full reactor test suite verified at **624 / 624 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 23, Sprint 10 Week 19: Isolation Levels: Read Committed vs Repeatable Read) marked `Completed`.
+    - Sheet 3 (Row 13, Transaction Isolation Levels) marked `Resolved`.
+    - Sheet 3 (Row 14, Row Locking & Concurrency Control) marked `Resolved`.
 
 ## What to do next
 

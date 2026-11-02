@@ -97,6 +97,9 @@ public final class JoinUtils {
     public static Tuple qualify(Tuple tuple, String tableName) {
         if (tuple == null) return null;
         Tuple qualified = new Tuple();
+        qualified.setPageId(tuple.getPageId());
+        qualified.setSlot(tuple.getSlot());
+        qualified.setTableName(tuple.getTableName() != null ? tuple.getTableName() : tableName);
         List<String> columnNames = tuple.getColumnNames();
         for (int i = 0; i < columnNames.size(); i++) {
             String name = columnNames.get(i);
@@ -118,6 +121,9 @@ public final class JoinUtils {
     public static Tuple qualifyWithAlias(Tuple tuple, String alias) {
         if (tuple == null || alias == null) return tuple;
         Tuple qualified = new Tuple();
+        qualified.setPageId(tuple.getPageId());
+        qualified.setSlot(tuple.getSlot());
+        qualified.setTableName(tuple.getTableName());
         List<String> columnNames = tuple.getColumnNames();
         for (int i = 0; i < columnNames.size(); i++) {
             String name = columnNames.get(i);
@@ -140,6 +146,9 @@ public final class JoinUtils {
     public static Tuple unqualify(Tuple tuple) {
         if (tuple == null) return null;
         Tuple unqual = new Tuple();
+        unqual.setPageId(tuple.getPageId());
+        unqual.setSlot(tuple.getSlot());
+        unqual.setTableName(tuple.getTableName());
         List<String> columnNames = tuple.getColumnNames();
         for (int i = 0; i < columnNames.size(); i++) {
             String name = columnNames.get(i);
@@ -160,6 +169,15 @@ public final class JoinUtils {
 
     public static Tuple merge(Tuple left, Tuple right) {
         Tuple merged = new Tuple();
+        if (left != null && left.getPageId() >= 0) {
+            merged.setPageId(left.getPageId());
+            merged.setSlot(left.getSlot());
+            merged.setTableName(left.getTableName());
+        } else if (right != null && right.getPageId() >= 0) {
+            merged.setPageId(right.getPageId());
+            merged.setSlot(right.getSlot());
+            merged.setTableName(right.getTableName());
+        }
         if (left != null) {
             List<String> leftNames = left.getColumnNames();
             for (int i = 0; i < leftNames.size(); i++) {

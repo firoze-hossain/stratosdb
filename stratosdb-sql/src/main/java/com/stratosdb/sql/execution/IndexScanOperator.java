@@ -118,6 +118,9 @@ public class IndexScanOperator implements PhysicalOperator {
                 Tuple tuple = tupleDeserializer != null
                     ? tupleDeserializer.apply(tableName, payload)
                     : Tuple.deserialize(payload, tableColumns);
+                tuple.setPageId(rid.pageId());
+                tuple.setSlot(rid.slot());
+                tuple.setTableName(tableName);
                 slot.set(tuple);
                 return slot;
             }

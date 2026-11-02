@@ -75,10 +75,16 @@ public final class MVCCVisibility {
      * "read whatever happens to be committed right now."
      */
     public static boolean isVisible(byte[] stored, Snapshot snapshot, TransactionManager txnManager) {
+        if (stored == null) {
+            return false;
+        }
+        if (snapshot == null) {
+            return true;
+        }
         long xmin = readXmin(stored);
         long xmax = readXmax(stored);
 
-        boolean creatorVisible = (xmin == 0L) || (xmin == snapshot.getXid()) || definitelyCommittedBefore(xmin, snapshot, txnManager);
+        boolean creatorVisible = (xmin == 0L) || (xmin == snapshot.getOwnerXid()) || definitelyCommittedBefore(xmin, snapshot, txnManager);
         if (!creatorVisible) {
             return false;
         }
@@ -87,7 +93,7 @@ public final class MVCCVisibility {
             return true;
         }
 
-        boolean removedByMe = xmax == snapshot.getXid();
+        boolean removedByMe = xmax == snapshot.getOwnerXid();
         if (removedByMe) {
             return false; // I deleted/updated it myself within this same transaction - it's gone, even to me
         }
@@ -97,7 +103,7 @@ public final class MVCCVisibility {
     }
 
     private static boolean definitelyCommittedBefore(long xid, Snapshot snapshot, TransactionManager txnManager) {
-        return xid < snapshot.getXid()
+        return xid < snapshot.getXmax()
             && !snapshot.wasActiveAtStart(xid)
             && txnManager.isCommitted(xid);
     }

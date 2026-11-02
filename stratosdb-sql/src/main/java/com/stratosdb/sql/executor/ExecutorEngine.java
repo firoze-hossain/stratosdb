@@ -21,8 +21,10 @@ import com.stratosdb.storage.page.RangeValue;
 import com.stratosdb.storage.page.SlottedPage;
 import com.stratosdb.storage.page.Tuple;
 import com.stratosdb.storage.wal.WALManager;
+import com.stratosdb.transaction.IsolationLevel;
 import com.stratosdb.transaction.Transaction;
 import com.stratosdb.transaction.TransactionManager;
+import com.stratosdb.transaction.locking.LockManager;
 import com.stratosdb.transaction.mvcc.MVCCVisibility;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -700,6 +702,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private static final class SessionState {
         Transaction transaction;
         boolean poisoned;
+        IsolationLevel defaultIsolationLevel = IsolationLevel.READ_COMMITTED;
         List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
         List<DdlUndoAction> ddlUndoActions = new ArrayList<>();
         List<UndoAction> dmlUndoActions = new ArrayList<>();
@@ -920,8 +923,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return QueryResult.error(e.getMessage());
             }
 
-            if (stmt instanceof BeginStatement) {
-                return executeBegin();
+            if (stmt instanceof BeginStatement s) {
+                return executeBegin(s.isolationLevel());
             }
             if (stmt instanceof CommitStatement) {
                 return executeCommit();
@@ -931,6 +934,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             if (stmt instanceof RollbackToSavepointStatement s) {
                 return executeRollbackToSavepoint(s);
+            }
+            if (stmt instanceof SetTransactionIsolationStatement s) {
+                return executeSetTransactionIsolation(s);
+            }
+            if (stmt instanceof SetSessionCharacteristicsStatement s) {
+                return executeSetSessionCharacteristics(s);
             }
 
             if (state.poisoned) {
@@ -944,7 +953,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
 
             boolean explicit = state.transaction != null;
-            Transaction txn = explicit ? state.transaction : transactionManager.begin();
+            Transaction txn = explicit ? state.transaction : transactionManager.begin(state.defaultIsolationLevel);
+            if (explicit && (txn.getIsolationLevel() == IsolationLevel.READ_COMMITTED || txn.getIsolationLevel() == IsolationLevel.READ_UNCOMMITTED)) {
+                txn.setSnapshot(transactionManager.createSnapshot(txn.getXID()));
+            }
             try {
                 QueryResult result = dispatch(stmt, txn, sql, params);
                 recordTableStats(stmt, result);
@@ -1016,15 +1028,39 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeBegin() {
+        return executeBegin(null);
+    }
+
+    private QueryResult executeBegin(IsolationLevel requestedLevel) {
         SessionState state = session.get();
         if (state.transaction != null) {
             return QueryResult.error("Already in a transaction - nested BEGIN is not supported");
         }
-        state.transaction = transactionManager.begin();
+        IsolationLevel level = requestedLevel != null ? requestedLevel : state.defaultIsolationLevel;
+        state.transaction = transactionManager.begin(level);
         state.poisoned = false;
         state.savepoints.clear();
         state.ddlUndoActions.clear();
         return QueryResult.success("BEGIN");
+    }
+
+    private QueryResult executeSetTransactionIsolation(SetTransactionIsolationStatement stmt) {
+        SessionState state = session.get();
+        IsolationLevel level = stmt.isolationLevel() != null ? stmt.isolationLevel() : state.defaultIsolationLevel;
+        if (state.transaction != null) {
+            state.transaction.setIsolationLevel(level);
+        } else {
+            state.defaultIsolationLevel = level;
+        }
+        return QueryResult.success("SET");
+    }
+
+    private QueryResult executeSetSessionCharacteristics(SetSessionCharacteristicsStatement stmt) {
+        SessionState state = session.get();
+        if (stmt.isolationLevel() != null) {
+            state.defaultIsolationLevel = stmt.isolationLevel();
+        }
+        return QueryResult.success("SET");
     }
 
     private QueryResult executeCommit() {
@@ -1362,6 +1398,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         SelectStatement.class, ShowTablesStatement.class, ShowStatsStatement.class, ShowCatalogStatement.class,
         ShowStatementsStatement.class, ShowActivityStatement.class, ShowTableStatsStatement.class,
         ShowTransactionIsolationLevelStatement.class, ShowParameterStatement.class, SetParameterStatement.class,
+        SetTransactionIsolationStatement.class, SetSessionCharacteristicsStatement.class,
         ExplainStatement.class, BeginStatement.class, CommitStatement.class,
         RollbackStatement.class, SavepointStatement.class, ReleaseSavepointStatement.class, RollbackToSavepointStatement.class,
         CopyStatement.class, // COPY TO is a read; COPY FROM is separately rejected inside executeCopy/the STDIN handshake below
@@ -1442,6 +1479,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (readOnly && stmt instanceof CopyStatement copyStmt && copyStmt.isFrom()) {
             return QueryResult.error("cannot execute COPY FROM in a read-only replica");
         }
+        if (readOnly && stmt instanceof SelectStatement select && select.forUpdate()) {
+            return QueryResult.error("cannot execute SELECT FOR UPDATE in a read-only replica");
+        }
         if (stmt instanceof CreateTableStatement s) return executeCreateTable(s, txn, sql);
         if (stmt instanceof CreateIndexStatement s) return executeCreateIndex(s, txn);
         if (stmt instanceof InsertStatement s) return executeInsert(s, txn, params);
@@ -1471,6 +1511,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof ShowStatementsStatement) return executeShowStatements();
         if (stmt instanceof ShowActivityStatement) return executeShowActivity();
         if (stmt instanceof ShowTransactionIsolationLevelStatement) return executeShowTransactionIsolationLevel();
+        if (stmt instanceof SetTransactionIsolationStatement s) return executeSetTransactionIsolation(s);
+        if (stmt instanceof SetSessionCharacteristicsStatement s) return executeSetSessionCharacteristics(s);
         if (stmt instanceof ShowParameterStatement s) return executeShowParameter(s);
         if (stmt instanceof SetParameterStatement s) return executeSetParameter(s);
         if (stmt instanceof ShowCatalogStatement) return executeShowCatalog();
@@ -3199,11 +3241,49 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * base a cost on yet) - it's the honest "does an applicable index exist
      * at all" version, same spirit as the Week 3 plan called for.
      */
-    private QueryResult executeSelect(SelectStatement stmt, Transaction txn) {
+    private QueryResult executeSelect(SelectStatement stmt, Transaction txn) throws DeadlockException {
         return executeSelect(stmt, txn, session.get().currentParams);
     }
 
-    private QueryResult executeSelect(SelectStatement stmt, Transaction txn, List<Object> params) {
+    private QueryResult executeSelect(SelectStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
+        QueryResult result = executeSelectInternal(stmt, txn, params);
+        if (stmt.forUpdate()) {
+            return applyForUpdateLocking(stmt, result, txn);
+        }
+        return result;
+    }
+
+    private QueryResult applyForUpdateLocking(SelectStatement stmt, QueryResult result, Transaction txn) throws DeadlockException {
+        if (!result.isSuccess()) {
+            return result;
+        }
+        if (txn == null) {
+            return QueryResult.error("FOR UPDATE cannot be used without a transaction");
+        }
+        List<Tuple> rawRows = result.getRows();
+        List<Tuple> lockedRows = new ArrayList<>();
+        for (Tuple t : rawRows) {
+            if (t.getPageId() >= 0 && t.getSlot() >= 0) {
+                String tbl = t.getTableName() != null ? t.getTableName() : stmt.tableName();
+                HeapTable table = tbl != null ? tables.get(tbl) : null;
+                transactionManager.getLockManager().acquireExclusive(
+                    new LockManager.RowId(tbl, t.getPageId(), t.getSlot()), txn.getXID());
+                if (table != null) {
+                    byte[] stored = table.readTuple(t.getPageId(), t.getSlot());
+                    if (stored != null && MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
+                        lockedRows.add(t);
+                    }
+                } else {
+                    lockedRows.add(t);
+                }
+            } else {
+                lockedRows.add(t);
+            }
+        }
+        return QueryResult.success(lockedRows, result.getColumnNames());
+    }
+
+    private QueryResult executeSelectInternal(SelectStatement stmt, Transaction txn, List<Object> params) {
         if (stmt.tableName() == null && stmt.fromSubquery() == null) {
             Tuple projected = new Tuple();
             if (!stmt.columns().isEmpty()) {
@@ -3399,7 +3479,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         PhysicalOperator scanOp;
         if (plan.useIndex()) {
             boolean isEqualityScan = plan.loKey().equals(plan.hiKey());
-            boolean indexOnlyEligible = isEqualityScan
+            boolean indexOnlyEligible = !stmt.forUpdate()
+                && isEqualityScan
                 && stmt.where() instanceof WhereExpr.Comparison
                 && stmt.columns().size() == 1
                 && stmt.columns().get(0).equalsIgnoreCase(plan.index().columnName());
@@ -3669,6 +3750,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 continue;
             }
             Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(stored));
+            tuple.setPageId(rid.pageId());
+            tuple.setSlot(rid.slot());
+            tuple.setTableName(stmt.tableName());
             if (!matchesWhere(tuple, stmt.where(), txn)) {
                 continue;
             }
@@ -3831,6 +3915,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                         continue;
                     }
                     Tuple tuple = deserializeTuple(stmt.tableName(), MVCCVisibility.readPayload(stored));
+                    tuple.setPageId(pageId);
+                    tuple.setSlot(slot);
+                    tuple.setTableName(stmt.tableName());
                     if (!matchesWhere(tuple, stmt.where(), txn)) {
                         continue;
                     }
@@ -7405,8 +7492,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * and proven, not the stronger one assumed by inspection.
      */
     private QueryResult executeShowTransactionIsolationLevel() {
+        SessionState state = session.get();
+        IsolationLevel level = (state.transaction != null)
+            ? state.transaction.getIsolationLevel()
+            : state.defaultIsolationLevel;
         Tuple row = new Tuple();
-        row.addValue("transaction_isolation", "read committed");
+        row.addValue("transaction_isolation", level.getSqlName());
         return QueryResult.success(List.of(row));
     }
 
@@ -7435,6 +7526,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     private QueryResult executeShowParameter(ShowParameterStatement stmt) {
         String lowerName = stmt.parameterName().toLowerCase(java.util.Locale.ROOT);
+        SessionState state = session.get();
+        if (lowerName.equals("transaction_isolation")) {
+            IsolationLevel level = (state.transaction != null)
+                ? state.transaction.getIsolationLevel()
+                : state.defaultIsolationLevel;
+            Tuple row = new Tuple();
+            row.addValue("transaction_isolation", level.getSqlName());
+            return QueryResult.success(List.of(row));
+        }
+        if (lowerName.equals("default_transaction_isolation")) {
+            Tuple row = new Tuple();
+            row.addValue("default_transaction_isolation", state.defaultIsolationLevel.getSqlName());
+            return QueryResult.success(List.of(row));
+        }
         String value = KNOWN_SHOW_PARAMETERS.get(lowerName);
         if (value == null) {
             return QueryResult.error("unrecognized configuration parameter \"" + stmt.parameterName() + "\"");
@@ -7457,6 +7562,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * SHOW <param> could then read back correctly too.
      */
     private QueryResult executeSetParameter(SetParameterStatement stmt) {
+        String lowerName = stmt.parameterName().toLowerCase(java.util.Locale.ROOT);
+        SessionState state = session.get();
+        if (lowerName.equals("default_transaction_isolation") || lowerName.equals("transaction_isolation")) {
+            try {
+                IsolationLevel level = IsolationLevel.fromString(stmt.value());
+                state.defaultIsolationLevel = level;
+                if (lowerName.equals("transaction_isolation") && state.transaction != null) {
+                    state.transaction.setIsolationLevel(level);
+                }
+                return QueryResult.success("SET");
+            } catch (Exception e) {
+                return QueryResult.error("invalid value for parameter \"" + stmt.parameterName() + "\": \"" + stmt.value() + "\"");
+            }
+        }
         return QueryResult.success("SET");
     }
 
@@ -7478,6 +7597,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return tuple;
         }
         Tuple projected = new Tuple();
+        projected.setPageId(tuple.getPageId());
+        projected.setSlot(tuple.getSlot());
+        projected.setTableName(tuple.getTableName());
         for (String colName : requestedColumns) {
             projected.addValue(colName, findColumnValue(tuple, colName));
         }
@@ -7500,6 +7622,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return projected;
         }
         Tuple renamed = new Tuple();
+        renamed.setPageId(projected.getPageId());
+        renamed.setSlot(projected.getSlot());
+        renamed.setTableName(projected.getTableName());
         for (int i = 0; i < projected.size(); i++) {
             String realName = projected.getColumnNames().get(i);
             String alias = (i < columnAliases.size()) ? columnAliases.get(i) : null;
@@ -7521,6 +7646,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return project(tuple, requestedColumns);
         }
         Tuple projected = new Tuple();
+        projected.setPageId(tuple.getPageId());
+        projected.setSlot(tuple.getSlot());
+        projected.setTableName(tuple.getTableName());
         if (!requestedColumns.isEmpty()) {
             if (requestedColumns.get(0).equals("*")) {
                 for (int i = 0; i < tuple.size(); i++) {

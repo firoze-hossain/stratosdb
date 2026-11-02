@@ -64,6 +64,9 @@ public class SeqScanOperator implements PhysicalOperator {
                 Tuple tuple = tupleDeserializer != null
                     ? tupleDeserializer.apply(tableName, payload)
                     : Tuple.deserialize(payload, tableColumns);
+                tuple.setPageId(row.pageId());
+                tuple.setSlot(row.slot());
+                tuple.setTableName(tableName);
                 slot.set(tuple);
                 return slot;
             }
