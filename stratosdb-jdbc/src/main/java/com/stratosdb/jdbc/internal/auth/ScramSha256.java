@@ -11,6 +11,7 @@ import java.security.NoSuchAlgorithmException;
  */
 public final class ScramSha256 {
     public static final String MECHANISM_NAME = "SCRAM-SHA-256";
+    public static final String MECHANISM_NAME_PLUS = "SCRAM-SHA-256-PLUS";
 
     private ScramSha256() {
     }

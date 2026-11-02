@@ -157,9 +157,26 @@ class StratosConnection implements InvocationHandler {
             throw new SQLException("The server requires SCRAM-SHA-256 authentication but no password was supplied "
                 + "(pass one via the \"password\" property, e.g. DriverManager.getConnection(url, user, password))");
         }
-        ScramClient scram = new ScramClient(username, password);
+        ScramClient scram;
+        String mechanism = ScramSha256.MECHANISM_NAME;
+        if (socket instanceof javax.net.ssl.SSLSocket sslSocket) {
+            try {
+                java.security.cert.Certificate[] certs = sslSocket.getSession().getPeerCertificates();
+                if (certs != null && certs.length > 0 && certs[0] instanceof java.security.cert.X509Certificate x509) {
+                    byte[] endPointHash = java.security.MessageDigest.getInstance("SHA-256").digest(x509.getEncoded());
+                    scram = new ScramClient(username, password, "tls-server-end-point", endPointHash);
+                    mechanism = ScramSha256.MECHANISM_NAME_PLUS;
+                } else {
+                    scram = new ScramClient(username, password);
+                }
+            } catch (Exception e) {
+                scram = new ScramClient(username, password);
+            }
+        } else {
+            scram = new ScramClient(username, password);
+        }
         String clientFirstMessage = scram.buildClientFirstMessage();
-        writeSaslInitialResponse(clientFirstMessage);
+        writeSaslInitialResponse(mechanism, clientFirstMessage);
 
         StdWireMessages.TypedMessage continueMsg = StdWireMessages.readTypedMessage(in);
         if (continueMsg.type() != 'R' || readAuthCode(continueMsg) != 11) {
@@ -188,7 +205,11 @@ class StratosConnection implements InvocationHandler {
     }
 
     private void writeSaslInitialResponse(String clientFirstMessage) throws IOException {
-        byte[] mechanismBytes = ScramSha256.MECHANISM_NAME.getBytes(StandardCharsets.UTF_8);
+        writeSaslInitialResponse(ScramSha256.MECHANISM_NAME, clientFirstMessage);
+    }
+
+    private void writeSaslInitialResponse(String mechanism, String clientFirstMessage) throws IOException {
+        byte[] mechanismBytes = mechanism.getBytes(StandardCharsets.UTF_8);
         byte[] dataBytes = clientFirstMessage.getBytes(StandardCharsets.UTF_8);
         int bodyLen = mechanismBytes.length + 1 + 4 + dataBytes.length;
         out.writeByte('p');

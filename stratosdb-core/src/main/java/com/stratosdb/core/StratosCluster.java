@@ -46,6 +46,23 @@ public class StratosCluster implements DatabaseClusterHost {
     private final DatabaseConfig templateConfig;
     private final Map<String, StratosDB> databases = new ConcurrentHashMap<>();
 
+    private final Map<String, com.stratosdb.sql.executor.ExecutorEngine.Role> sharedRoles = new ConcurrentHashMap<>();
+    private final Map<String, java.util.Set<String>> sharedRoleParents = new ConcurrentHashMap<>();
+    private final Map<String, java.util.Set<String>> sharedRoleAdminOptions = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, java.util.Set<String>>> sharedDatabasePrivileges = new ConcurrentHashMap<>();
+    private final Map<String, String> sharedDatabaseOwners = new ConcurrentHashMap<>();
+
+    @Override
+    public Map<String, com.stratosdb.sql.executor.ExecutorEngine.Role> getSharedRoles() { return sharedRoles; }
+    @Override
+    public Map<String, java.util.Set<String>> getSharedRoleParents() { return sharedRoleParents; }
+    @Override
+    public Map<String, java.util.Set<String>> getSharedRoleAdminOptions() { return sharedRoleAdminOptions; }
+    @Override
+    public Map<String, Map<String, java.util.Set<String>>> getSharedDatabasePrivileges() { return sharedDatabasePrivileges; }
+    @Override
+    public Map<String, String> getSharedDatabaseOwners() { return sharedDatabaseOwners; }
+
     public StratosCluster(DatabaseConfig templateConfig) {
         this.templateConfig = templateConfig;
         this.clusterDataDirectory = new File(templateConfig.getDataDirectory());

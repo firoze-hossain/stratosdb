@@ -82,13 +82,9 @@ public class SqlParser {
         } else if (ctx.dropRole() != null) {
             return new DropRoleStatement(ctx.dropRole().roleName().getText());
         } else if (ctx.grantStatement() != null) {
-            StratosSQLParser.GrantStatementContext gctx = ctx.grantStatement();
-            List<String> privileges = buildPrivilegeList(gctx.privilegeList());
-            return new GrantStatement(privileges, gctx.tableName().getText(), gctx.roleName().getText());
+            return buildGrantStatement(ctx.grantStatement());
         } else if (ctx.revokeStatement() != null) {
-            StratosSQLParser.RevokeStatementContext rctx = ctx.revokeStatement();
-            List<String> privileges = buildPrivilegeList(rctx.privilegeList());
-            return new RevokeStatement(privileges, rctx.tableName().getText(), rctx.roleName().getText());
+            return buildRevokeStatement(ctx.revokeStatement());
         } else if (ctx.alterTableAddColumn() != null) {
             StratosSQLParser.AlterTableAddColumnContext actx = ctx.alterTableAddColumn();
             String defaultVal = actx.defaultValue() != null ? actx.defaultValue().getText() : null;
@@ -930,6 +926,64 @@ public class SqlParser {
             else if (opt.PASSWORD() != null) password = opt.STRING_LITERAL().getText();
         }
         return new CreateRoleStatement(roleName, login, superuser, password);
+    }
+
+    private Statement buildGrantStatement(StratosSQLParser.GrantStatementContext ctx) {
+        if (ctx.grantTable() != null) {
+            StratosSQLParser.GrantTableContext tctx = ctx.grantTable();
+            List<String> privileges = buildPrivilegeList(tctx.privilegeList());
+            List<String> roles = tctx.roleList().roleName().stream().map(RuleContext::getText).toList();
+            return new GrantStatement(privileges, tctx.tableName().getText(), roles);
+        } else if (ctx.grantDatabase() != null) {
+            StratosSQLParser.GrantDatabaseContext dctx = ctx.grantDatabase();
+            List<String> privileges = buildDbPrivilegeList(dctx.dbPrivilegeList());
+            List<String> roles = dctx.roleList().roleName().stream().map(RuleContext::getText).toList();
+            return new GrantDatabaseStatement(privileges, dctx.databaseName().getText(), roles);
+        } else if (ctx.grantRole() != null) {
+            StratosSQLParser.GrantRoleContext rctx = ctx.grantRole();
+            List<String> roles = rctx.roleList(0).roleName().stream().map(RuleContext::getText).toList();
+            List<String> grantees = rctx.roleList(1).roleName().stream().map(RuleContext::getText).toList();
+            boolean withAdmin = rctx.ADMIN() != null;
+            return new GrantRoleStatement(roles, grantees, withAdmin);
+        }
+        throw new IllegalArgumentException("Unknown GRANT statement format");
+    }
+
+    private Statement buildRevokeStatement(StratosSQLParser.RevokeStatementContext ctx) {
+        if (ctx.revokeTable() != null) {
+            StratosSQLParser.RevokeTableContext tctx = ctx.revokeTable();
+            List<String> privileges = buildPrivilegeList(tctx.privilegeList());
+            List<String> roles = tctx.roleList().roleName().stream().map(RuleContext::getText).toList();
+            return new RevokeStatement(privileges, tctx.tableName().getText(), roles);
+        } else if (ctx.revokeDatabase() != null) {
+            StratosSQLParser.RevokeDatabaseContext dctx = ctx.revokeDatabase();
+            List<String> privileges = buildDbPrivilegeList(dctx.dbPrivilegeList());
+            List<String> roles = dctx.roleList().roleName().stream().map(RuleContext::getText).toList();
+            return new RevokeDatabaseStatement(privileges, dctx.databaseName().getText(), roles);
+        } else if (ctx.revokeRole() != null) {
+            StratosSQLParser.RevokeRoleContext rctx = ctx.revokeRole();
+            List<String> roles = rctx.roleList(0).roleName().stream().map(RuleContext::getText).toList();
+            List<String> grantees = rctx.roleList(1).roleName().stream().map(RuleContext::getText).toList();
+            boolean adminOptionOnly = rctx.ADMIN() != null;
+            return new RevokeRoleStatement(roles, grantees, adminOptionOnly);
+        }
+        throw new IllegalArgumentException("Unknown REVOKE statement format");
+    }
+
+    private List<String> buildDbPrivilegeList(StratosSQLParser.DbPrivilegeListContext ctx) {
+        List<String> privileges = new ArrayList<>();
+        for (StratosSQLParser.DbPrivilegeNameContext p : ctx.dbPrivilegeName()) {
+            if (p.ALL() != null) {
+                privileges.add("CONNECT");
+                privileges.add("CREATE");
+                privileges.add("TEMP");
+            } else if (p.TEMPORARY() != null) {
+                privileges.add("TEMP");
+            } else {
+                privileges.add(p.getText().toUpperCase(java.util.Locale.ROOT));
+            }
+        }
+        return privileges;
     }
 
     private List<String> buildPrivilegeList(StratosSQLParser.PrivilegeListContext ctx) {

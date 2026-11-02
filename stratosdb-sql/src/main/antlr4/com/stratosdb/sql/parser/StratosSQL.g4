@@ -121,18 +121,31 @@ dropTable: DROP TABLE tableName SEMICOLON?;
 createDatabase: CREATE DATABASE databaseName SEMICOLON?;
 dropDatabase: DROP DATABASE databaseName SEMICOLON?;
 showDatabases: SHOW DATABASES SEMICOLON?;
-databaseName: IDENTIFIER;
+databaseName: anyIdentifier;
 copyStatement: COPY tableName (LPAREN columnName (COMMA columnName)* RPAREN)? (FROM | TO) copyTarget (WITH? LPAREN copyOption (COMMA copyOption)* RPAREN)? SEMICOLON?;
 copyTarget: STRING_LITERAL | STDIN | STDOUT;
 copyOption: FORMAT (TEXT | CSV) | DELIMITER STRING_LITERAL | HEADER (TRUE | FALSE)? | NULL STRING_LITERAL;
 createRole: CREATE ROLE roleName (WITH)? roleOption* SEMICOLON?;
 roleOption: LOGIN | NOLOGIN | SUPERUSER | NOSUPERUSER | PASSWORD STRING_LITERAL;
 dropRole: DROP ROLE roleName SEMICOLON?;
-grantStatement: GRANT privilegeList ON TABLE? tableName TO roleName SEMICOLON?;
-revokeStatement: REVOKE privilegeList ON TABLE? tableName FROM roleName SEMICOLON?;
+grantStatement: grantTable | grantDatabase | grantRole;
+revokeStatement: revokeTable | revokeDatabase | revokeRole;
+
+grantTable: GRANT privilegeList ON TABLE? tableName TO roleList SEMICOLON?;
+revokeTable: REVOKE privilegeList ON TABLE? tableName FROM roleList SEMICOLON?;
+
+grantDatabase: GRANT dbPrivilegeList ON DATABASE databaseName TO roleList SEMICOLON?;
+revokeDatabase: REVOKE dbPrivilegeList ON DATABASE databaseName FROM roleList SEMICOLON?;
+
+grantRole: GRANT roleList TO roleList (WITH ADMIN OPTION)? SEMICOLON?;
+revokeRole: REVOKE (ADMIN OPTION FOR)? roleList FROM roleList SEMICOLON?;
+
+roleList: roleName (COMMA roleName)*;
+dbPrivilegeList: dbPrivilegeName (COMMA dbPrivilegeName)*;
+dbPrivilegeName: CONNECT | CREATE | TEMP | TEMPORARY | ALL PRIVILEGES?;
 privilegeList: privilegeName (COMMA privilegeName)*;
 privilegeName: SELECT | INSERT | UPDATE | DELETE | ALL PRIVILEGES?;
-roleName: IDENTIFIER;
+roleName: anyIdentifier;
 alterTableAddColumn: ALTER TABLE tableName ADD COLUMN? columnName dataType (DEFAULT defaultValue)? SEMICOLON?;
 alterTableDropColumn: ALTER TABLE tableName DROP COLUMN? columnName SEMICOLON?;
 alterTableRenameColumn: ALTER TABLE tableName RENAME COLUMN columnName TO columnName SEMICOLON?;
@@ -148,7 +161,7 @@ createPolicy: CREATE POLICY policyName ON tableName (FOR policyCommand)? (TO rol
               USING LPAREN expression RPAREN (WITH CHECK LPAREN expression RPAREN)? SEMICOLON?;
 dropPolicy: DROP POLICY policyName ON tableName SEMICOLON?;
 policyCommand: SELECT | INSERT | UPDATE | DELETE | ALL;
-policyName: IDENTIFIER;
+policyName: anyIdentifier;
 createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
 viewName: IDENTIFIER;
@@ -328,10 +341,11 @@ literal: STRING_LITERAL | MINUS? INTEGER_LITERAL | MINUS? FLOAT_LITERAL | TRUE |
 defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | NEXTVAL LPAREN STRING_LITERAL RPAREN;
 
 // Identifiers
-tableName: (IDENTIFIER DOT)? (IDENTIFIER | TABLES | TYPE);
-typeName: IDENTIFIER;
-columnName: (IDENTIFIER DOT (IDENTIFIER DOT)?)? (IDENTIFIER | TYPE | TABLES | VIEW | INDEX | DEFAULT);
-alias: IDENTIFIER | STRING_LITERAL;
+anyIdentifier: IDENTIFIER | ADMIN | CONNECT | OPTION | TEMP | TEMPORARY | TABLES | TYPE | VIEW | INDEX | DEFAULT;
+tableName: (anyIdentifier DOT)? anyIdentifier;
+typeName: anyIdentifier;
+columnName: (anyIdentifier DOT (anyIdentifier DOT)?)? anyIdentifier;
+alias: anyIdentifier | STRING_LITERAL;
 limitValue: INTEGER_LITERAL | PARAMETER;
 offsetValue: INTEGER_LITERAL | PARAMETER;
 
@@ -384,6 +398,11 @@ NOLOGIN: N O L O G I N;
 SUPERUSER: S U P E R U S E R;
 NOSUPERUSER: N O S U P E R U S E R;
 PRIVILEGES: P R I V I L E G E S;
+CONNECT: C O N N E C T;
+TEMP: T E M P;
+TEMPORARY: T E M P O R A R Y;
+ADMIN: A D M I N;
+OPTION: O P T I O N;
 PASSWORD: P A S S W O R D;
 ALTER: A L T E R;
 SECURITY: S E C U R I T Y;

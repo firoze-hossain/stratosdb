@@ -1,6 +1,8 @@
 package com.stratosdb.sql.executor;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * A real, minimal contract {@link ExecutorEngine} depends on for
@@ -26,4 +28,11 @@ public interface DatabaseClusterHost {
     void dropDatabase(String name, String currentDatabaseName);
 
     List<String> listDatabaseNames();
+
+    default Map<String, ExecutorEngine.Role> getSharedRoles() { return null; }
+    default Map<String, Set<String>> getSharedRoleParents() { return null; }
+    default Map<String, Set<String>> getSharedRoleAdminOptions() { return null; }
+    default Map<String, Map<String, Set<String>>> getSharedDatabasePrivileges() { return null; }
+    default Map<String, String> getSharedDatabaseOwners() { return null; }
 }
+

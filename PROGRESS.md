@@ -1,17 +1,17 @@
 # StratosDB — Progress Tracker
 
-**Last verified:** November 1, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
+**Last verified:** November 2, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
 
 ## At a glance
 
 | | |
 |---|---|
-| Commits | 110 |
-| Tests passing | **624 / 624** |
-| Main source | ~39,850 lines |
-| Test source | ~19,950 lines |
+| Commits | 111 |
+| Tests passing | **636 / 636** |
+| Main source | ~40,570 lines |
+| Test source | ~20,950 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), and Sprint 10 (Week 19: Isolation Levels: Read Committed vs Repeatable Read & SELECT FOR UPDATE) fully completed. Full reactor test suite verified at 624/624 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), and Sprint 10 (Weeks 19-20: Isolation Levels & SCRAM-SHA-256-PLUS Channel Binding + Role Inheritance + Database Permissions) fully completed. Full reactor test suite verified at 636/636 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1541,6 +1541,56 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - Sheet 2 (Row 23, Sprint 10 Week 19: Isolation Levels: Read Committed vs Repeatable Read) marked `Completed`.
     - Sheet 3 (Row 13, Transaction Isolation Levels) marked `Resolved`.
     - Sheet 3 (Row 14, Row Locking & Concurrency Control) marked `Resolved`.
+
+## Sprint 10 — Week 20: Security / Auth — SCRAM-SHA-256-PLUS Channel Binding & Roles ✅ DONE
+
+- ✅ **RFC 5802 / RFC 5929 Channel Binding (`SCRAM-SHA-256-PLUS`)**:
+  - Implemented `SCRAM-SHA-256-PLUS` mechanism across server and client authenticators (`ScramSha256.java`, `ScramClient.java`, `StdWireServer.java`, `StratosConnection.java`).
+  - Added channel binding token extraction in `StdSslEngineHandler`: derives `tls-server-end-point` (`SHA-256(server_cert.getEncoded())`) and `tls-unique` data from active TLS sessions.
+  - Implemented GS2 header parsing and validation in `Handshake.clientFirst`: validates `p=` attribute against connection TLS state, prevents non-TLS channel binding attempts, and requires channel binding when `-PLUS` is chosen.
+  - Channel binding verification in `Handshake.clientFinal`: decodes `c=` attribute, verifies GS2 header prefix, extracts channel binding data, and validates against server cryptographic hash.
+  - **Man-in-the-Middle (MITM) Protection**: Forged certificate hashes presented by clients (or proxies terminating TLS) fail channel binding validation, immediately terminating the connection with authentication failure.
+  - **Downgrade Attack Prevention**: Detects and rejects client downgrade attempts (`y,,` flag claiming server does not support channel binding) over active TLS connections advertising channel binding capability.
+  - Client JDBC auto-negotiation in `StratosConnection`: automatically detects `SSLSocket`, extracts server certificate, computes SHA-256 endpoint hash, and negotiates `SCRAM-SHA-256-PLUS`.
+
+- ✅ **Multi-Tier Role Inheritance DAG (`ExecutorEngine.java`, `StratosSQL.g4`)**:
+  - Implemented role membership statements: `GRANT roleList TO roleList [WITH ADMIN OPTION]` and `REVOKE [ADMIN OPTION FOR] roleList FROM roleList`.
+  - Transitive closure evaluation via BFS (`getEffectiveRoles`): computes all inherited parent roles across arbitrary hierarchy depths (e.g., `user -> junior -> senior -> lead`).
+  - Permission resolution across the inheritance DAG: table privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), table ownership, superuser status, and RLS exemptions evaluate transitively across all effective roles.
+  - Cycle detection in role hierarchy: prevents self-grants (`A TO A`) and circular grants (`A TO B` then `B TO A`) with clear `Role cycle detected` error.
+  - `WITH ADMIN OPTION` delegation: roles granted with admin options can grant and revoke member roles to others without requiring superuser privileges; `REVOKE ADMIN OPTION FOR` cleanly revokes delegation while preserving membership.
+  - Role management cascade: `DROP ROLE` cleans up all role memberships, admin options, database privileges, and table privileges.
+
+- ✅ **Database-Level Permissions (`CONNECT` & `CREATE`)**:
+  - Implemented database privilege statements: `GRANT dbPrivilegeList ON DATABASE dbName TO roleList` and `REVOKE dbPrivilegeList ON DATABASE dbName FROM roleList` (`CONNECT`, `CREATE`, `TEMP`/`TEMPORARY`, `ALL`).
+  - Connection startup authorization: `StdWireServer.performStartup` verifies `requireDatabasePrivilege(targetDbName, "CONNECT")`; unauthorized roles are rejected with `FATAL: permission denied for database "..." (missing CONNECT privilege)`.
+  - DDL schema creation authorization: `ExecutorEngine.executeCreateTable` enforces `requireDatabasePrivilege(currentDatabaseName, "CREATE")`.
+  - Inherited database privileges: multi-tier role inheritance transitively propagates database-level permissions.
+  - Multi-database cluster integration: `DatabaseClusterHost` and `StratosCluster` share global role registries, role hierarchies, and database privileges across all databases in the cluster.
+
+- ✅ **Catalog Persistence & Restart Durability**:
+  - Role memberships persisted in `catalog.txt` under `ROLE_MEMBER:<role>:<grantee>`.
+  - Database grants persisted under `DBGRANT:<database>:<role>`.
+  - System catalog recovery: role hierarchies and database permissions are safely restored on startup and reapplied across restarts.
+
+- ✅ **Comprehensive Verification & Testing (`ScramChannelBindingAndRolesTest.java`)**:
+  - 12 end-to-end integration test cases:
+    1. `testScramSha256PlusTlsServerEndPointHandshakeAndQueries`: verifies TLS connection auto-negotiates `SCRAM-SHA-256-PLUS` with `tls-server-end-point` and executes queries.
+    2. `testScramSha256PlusTlsUniqueHandshakeDirect`: verifies low-level `tls-unique` channel binding verification.
+    3. `testScramSha256PlusMitmDetectionWithForgedCertificateHash`: verifies server detects forged certificate hash and rejects with authentication failure.
+    4. `testScramSha256PlusDowngradePrevention`: verifies server rejects `y,,` downgrade attempt over TLS.
+    5. `testScramSha256PlusRejectedOnPlaintextConnection`: verifies server rejects `SCRAM-SHA-256-PLUS` request over plaintext.
+    6. `testMultiTierRoleInheritanceAndPrivilegeResolution`: verifies transitive table permissions through 3 levels of role inheritance.
+    7. `testRoleCyclePrevention`: verifies rejection of self-grants and circular role grants.
+    8. `testRevokeRoleSeveringInheritance`: verifies revoking intermediate role link severs access immediately.
+    9. `testAdminOptionDelegationAndRevocation`: verifies `WITH ADMIN OPTION` delegation and revocation.
+    10. `testDatabaseConnectPrivilegeEnforcementOverWire`: verifies `CONNECT` privilege enforcement on connection startup across cluster databases.
+    11. `testDatabaseCreatePrivilegeEnforcement`: verifies `CREATE` privilege enforcement on `CREATE TABLE`.
+    12. `testRoleHierarchyAndDatabasePermissionsPersistAcrossRestart`: verifies role hierarchy and database permissions survive complete database shutdown and restart.
+  - Full reactor test suite verified at **636 / 636 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 24, Sprint 10 Week 20: SCRAM-SHA-256-PLUS Channel Binding & Roles) marked `Completed`.
+    - Sheet 3 (Row 26, Wire Encryption (TLS/SSL)) updated with channel binding and roles.
 
 ## What to do next
 

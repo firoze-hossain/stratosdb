@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
@@ -38,6 +39,7 @@ import java.util.Map;
  */
 public final class ScramSha256 {
     public static final String MECHANISM_NAME = "SCRAM-SHA-256";
+    public static final String MECHANISM_NAME_PLUS = "SCRAM-SHA-256-PLUS";
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final int SERVER_NONCE_BYTES = 18; // 24 base64 characters - a comfortable, real amount of server-contributed entropy
@@ -60,17 +62,33 @@ public final class ScramSha256 {
     public static final class Handshake {
         private final UserStore.ScramCredential credential;
         private final String username;
+        private final boolean tlsActive;
+        private final Map<String, byte[]> channelBindings;
+        private final String chosenMechanism;
         private String clientFirstMessageBare;
         private String serverFirstMessage;
         private String combinedNonce;
+        private String gs2Header;
+        private String channelBindingType;
 
         public Handshake(String username, UserStore.ScramCredential credential) {
+            this(username, credential, false, Map.of(), MECHANISM_NAME);
+        }
+
+        public Handshake(String username, UserStore.ScramCredential credential, boolean tlsActive, Map<String, byte[]> channelBindings) {
+            this(username, credential, tlsActive, channelBindings, MECHANISM_NAME);
+        }
+
+        public Handshake(String username, UserStore.ScramCredential credential, boolean tlsActive, Map<String, byte[]> channelBindings, String chosenMechanism) {
             this.username = username;
             this.credential = credential;
+            this.tlsActive = tlsActive;
+            this.channelBindings = channelBindings != null ? channelBindings : Map.of();
+            this.chosenMechanism = chosenMechanism != null ? chosenMechanism : MECHANISM_NAME;
         }
 
         /**
-         * Processes the client-first-message ("n,,n=<user>,r=<nonce>")
+         * Processes the client-first-message ("n,,n=<user>,r=<nonce>" or "p=<cb>,,n=<user>,r=<nonce>")
          * and returns the server-first-message to send back.
          *
          * A null credential (unknown username) still produces a normal,
@@ -86,8 +104,33 @@ public final class ScramSha256 {
          * StoredKey.
          */
         public String clientFirst(String clientFirstMessage) throws ScramAuthenticationException {
-            Map<String, String> attrs = parseAttributes(stripGs2Header(clientFirstMessage));
-            this.clientFirstMessageBare = stripGs2Header(clientFirstMessage);
+            int secondComma = clientFirstMessage.indexOf(',', clientFirstMessage.indexOf(',') + 1);
+            if (secondComma < 0) {
+                throw new ScramAuthenticationException("client-first-message is missing GS2 header");
+            }
+            this.gs2Header = clientFirstMessage.substring(0, secondComma + 1);
+            this.clientFirstMessageBare = clientFirstMessage.substring(secondComma + 1);
+
+            if (gs2Header.startsWith("p=")) {
+                if (!tlsActive) {
+                    throw new ScramAuthenticationException("Channel binding flag 'p=' received on a non-TLS connection");
+                }
+                int comma1 = gs2Header.indexOf(',');
+                this.channelBindingType = gs2Header.substring(2, comma1);
+                if (!channelBindings.containsKey(this.channelBindingType)) {
+                    throw new ScramAuthenticationException("Unsupported channel binding type: " + this.channelBindingType);
+                }
+            } else if (gs2Header.startsWith("y")) {
+                if (tlsActive && !channelBindings.isEmpty()) {
+                    throw new ScramAuthenticationException("Channel binding downgrade detected: client sent 'y' over a TLS connection supporting channel binding");
+                }
+            } else if (gs2Header.startsWith("n")) {
+                if (MECHANISM_NAME_PLUS.equals(chosenMechanism)) {
+                    throw new ScramAuthenticationException("Channel binding is required for SCRAM-SHA-256-PLUS (client sent 'n')");
+                }
+            }
+
+            Map<String, String> attrs = parseAttributes(clientFirstMessageBare);
             String clientNonce = attrs.get("r");
             if (clientNonce == null) {
                 throw new ScramAuthenticationException("client-first-message is missing its nonce (r=)");
@@ -107,7 +150,7 @@ public final class ScramSha256 {
 
         /**
          * Processes the client-final-message
-         * ("c=biws,r=<nonce>,p=<base64 proof>") and returns the
+         * ("c=<base64-cbind>,r=<nonce>,p=<base64 proof>") and returns the
          * server-final-message ("v=<base64 signature>") on success, or
          * throws on any failure - wrong nonce (a real, if unlikely,
          * replay/mixup defense), unknown user, or a proof that doesn't
@@ -122,12 +165,40 @@ public final class ScramSha256 {
             Map<String, String> attrs = parseAttributes(clientFinalMessage);
             String receivedNonce = attrs.get("r");
             String proofBase64 = attrs.get("p");
-            if (receivedNonce == null || proofBase64 == null) {
+            String cAttr = attrs.get("c");
+            if (receivedNonce == null || proofBase64 == null || cAttr == null) {
                 throw new ScramAuthenticationException("client-final-message is missing required fields");
             }
             if (!receivedNonce.equals(combinedNonce)) {
                 throw new ScramAuthenticationException("nonce mismatch - possible replay or a handshake mixup");
             }
+
+            // Verify channel binding in c=
+            byte[] decodedC;
+            try {
+                decodedC = Base64.getDecoder().decode(cAttr);
+            } catch (IllegalArgumentException e) {
+                throw new ScramAuthenticationException("Malformed base64 in c= attribute: " + e.getMessage());
+            }
+
+            byte[] expectedGs2Bytes = this.gs2Header.getBytes(StandardCharsets.UTF_8);
+            if (decodedC.length < expectedGs2Bytes.length ||
+                !MessageDigest.isEqual(Arrays.copyOfRange(decodedC, 0, expectedGs2Bytes.length), expectedGs2Bytes)) {
+                throw new ScramAuthenticationException("Channel binding GS2 header mismatch in c= attribute");
+            }
+
+            if (channelBindingType != null) {
+                byte[] actualCb = Arrays.copyOfRange(decodedC, expectedGs2Bytes.length, decodedC.length);
+                byte[] expectedCb = channelBindings.get(channelBindingType);
+                if (expectedCb == null || !MessageDigest.isEqual(actualCb, expectedCb)) {
+                    throw new ScramAuthenticationException("Channel binding verification failed for " + channelBindingType + " (man-in-the-middle attack detected)");
+                }
+            } else {
+                if (decodedC.length != expectedGs2Bytes.length) {
+                    throw new ScramAuthenticationException("Unexpected channel binding data in c= attribute for non-channel-bound connection");
+                }
+            }
+
             if (credential == null) {
                 // No real StoredKey to verify against (unknown user, deferred from
                 // clientFirst - see its own javadoc) - fail now, but only now.

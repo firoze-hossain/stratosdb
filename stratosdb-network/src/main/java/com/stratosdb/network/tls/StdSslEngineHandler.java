@@ -10,8 +10,12 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.security.MessageDigest;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Handles the SSLEngine TLS 1.3 handshake and provides encrypted stream adapters
@@ -175,6 +179,66 @@ public class StdSslEngineHandler implements AutoCloseable {
         } catch (SSLPeerUnverifiedException ignored) {
         }
         return null;
+    }
+
+    private byte[] tlsUniqueBytes;
+
+    public void setTlsUnique(byte[] bytes) {
+        this.tlsUniqueBytes = bytes;
+    }
+
+    public X509Certificate getLocalCertificate() {
+        try {
+            Certificate[] certs = engine.getSession().getLocalCertificates();
+            if (certs != null && certs.length > 0 && certs[0] instanceof X509Certificate x509) {
+                return x509;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    public byte[] getTlsServerEndPoint() {
+        X509Certificate cert = getLocalCertificate();
+        if (cert == null) return null;
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 algorithm must be available", e);
+        }
+    }
+
+    public byte[] getTlsUnique() {
+        if (tlsUniqueBytes != null) {
+            return tlsUniqueBytes;
+        }
+        try {
+            if (engine.getSession() instanceof ExtendedSSLSession extSession) {
+                return extSession.exportKeyingMaterialData("EXPORTER-Channel-Binding", new byte[0], 32);
+            }
+        } catch (Exception ignored) {
+        }
+        byte[] id = engine.getSession().getId();
+        if (id != null && id.length > 0) {
+            try {
+                return MessageDigest.getInstance("SHA-256").digest(id);
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    public Map<String, byte[]> getChannelBindings() {
+        Map<String, byte[]> map = new HashMap<>();
+        byte[] endPoint = getTlsServerEndPoint();
+        if (endPoint != null) {
+            map.put("tls-server-end-point", endPoint);
+        }
+        byte[] unique = getTlsUnique();
+        if (unique != null) {
+            map.put("tls-unique", unique);
+        }
+        return Collections.unmodifiableMap(map);
     }
 
     @Override

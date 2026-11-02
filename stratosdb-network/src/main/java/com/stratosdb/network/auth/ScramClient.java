@@ -23,7 +23,10 @@ import java.util.Map;
 public final class ScramClient {
     private final String username;
     private final String password;
+    private final String channelBindingType;
+    private final byte[] channelBindingData;
     private final String clientNonce;
+    private String gs2Header = "n,,";
     private String clientFirstMessageBare;
     private String serverFirstMessage;
     private byte[] clientKey;
@@ -31,17 +34,28 @@ public final class ScramClient {
     private String clientFinalMessageWithoutProof;
 
     public ScramClient(String username, String password) {
+        this(username, password, null, null);
+    }
+
+    public ScramClient(String username, String password, String channelBindingType, byte[] channelBindingData) {
         this.username = username;
         this.password = password;
+        this.channelBindingType = channelBindingType;
+        this.channelBindingData = channelBindingData;
         byte[] nonceBytes = new byte[18];
         new SecureRandom().nextBytes(nonceBytes);
         this.clientNonce = Base64.getEncoder().withoutPadding().encodeToString(nonceBytes);
     }
 
-    /** The GS2 header "n,," (no channel binding, no authzid) plus "n=<user>,r=<nonce>" - sent as SCRAM's initial response data. */
+    /** The GS2 header plus "n=<user>,r=<nonce>" - sent as SCRAM's initial response data. */
     public String buildClientFirstMessage() {
         clientFirstMessageBare = "n=" + username + ",r=" + clientNonce;
-        return "n,," + clientFirstMessageBare;
+        if (channelBindingType != null) {
+            this.gs2Header = "p=" + channelBindingType + ",,";
+        } else {
+            this.gs2Header = "n,,";
+        }
+        return this.gs2Header + clientFirstMessageBare;
     }
 
     /**
@@ -63,7 +77,16 @@ public final class ScramClient {
         byte[] storedKey = sha256(clientKey);
         serverKey = hmac(saltedPassword, "Server Key");
 
-        String gs2HeaderBase64 = Base64.getEncoder().encodeToString("n,,".getBytes(StandardCharsets.UTF_8));
+        byte[] gs2Bytes = gs2Header.getBytes(StandardCharsets.UTF_8);
+        byte[] cBytes;
+        if (channelBindingType != null && channelBindingData != null) {
+            cBytes = new byte[gs2Bytes.length + channelBindingData.length];
+            System.arraycopy(gs2Bytes, 0, cBytes, 0, gs2Bytes.length);
+            System.arraycopy(channelBindingData, 0, cBytes, gs2Bytes.length, channelBindingData.length);
+        } else {
+            cBytes = gs2Bytes;
+        }
+        String gs2HeaderBase64 = Base64.getEncoder().encodeToString(cBytes);
         clientFinalMessageWithoutProof = "c=" + gs2HeaderBase64 + ",r=" + combinedNonce;
 
         String authMessage = clientFirstMessageBare + "," + serverFirstMessage + "," + clientFinalMessageWithoutProof;

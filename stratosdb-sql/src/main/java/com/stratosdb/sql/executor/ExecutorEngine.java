@@ -47,11 +47,19 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * javadoc for why authentication and privilege-tracking are kept as
      * two genuinely separate concerns, bridged rather than merged.
      */
-    private final Map<String, Role> roles = new ConcurrentHashMap<>();
+    private Map<String, Role> roles = new ConcurrentHashMap<>();
     /** tableName -> roleName -> the set of privileges ("SELECT"/"INSERT"/"UPDATE"/"DELETE") that role has been GRANTed on that table. */
     private final Map<String, Map<String, Set<String>>> tablePrivileges = new ConcurrentHashMap<>();
     /** tableName -> the username that ran CREATE TABLE - an owner implicitly has every privilege on their own table, the same as real Postgres. */
     private final Map<String, String> tableOwners = new ConcurrentHashMap<>();
+    /** granteeRole -> set of parent roles directly granted to this grantee. */
+    private Map<String, Set<String>> roleParents = new ConcurrentHashMap<>();
+    /** granteeRole -> set of parent roles granted WITH ADMIN OPTION. */
+    private Map<String, Set<String>> roleAdminOptions = new ConcurrentHashMap<>();
+    /** databaseName -> roleName -> set of database privileges ("CONNECT", "CREATE", "TEMP"). */
+    private Map<String, Map<String, Set<String>>> databasePrivileges = new ConcurrentHashMap<>();
+    /** databaseName -> owner */
+    private Map<String, String> databaseOwners = new ConcurrentHashMap<>();
     /**
      * The column(s) declared as this table's own primary key, combining
      * both real syntax forms this engine now supports (an inline,
@@ -135,6 +143,28 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     public void setClusterHost(DatabaseClusterHost clusterHost, String currentDatabaseName) {
         this.clusterHost = clusterHost;
         this.currentDatabaseName = currentDatabaseName;
+        if (clusterHost != null) {
+            if (clusterHost.getSharedRoles() != null) {
+                clusterHost.getSharedRoles().putAll(this.roles);
+                this.roles = clusterHost.getSharedRoles();
+            }
+            if (clusterHost.getSharedRoleParents() != null) {
+                clusterHost.getSharedRoleParents().putAll(this.roleParents);
+                this.roleParents = clusterHost.getSharedRoleParents();
+            }
+            if (clusterHost.getSharedRoleAdminOptions() != null) {
+                clusterHost.getSharedRoleAdminOptions().putAll(this.roleAdminOptions);
+                this.roleAdminOptions = clusterHost.getSharedRoleAdminOptions();
+            }
+            if (clusterHost.getSharedDatabasePrivileges() != null) {
+                clusterHost.getSharedDatabasePrivileges().putAll(this.databasePrivileges);
+                this.databasePrivileges = clusterHost.getSharedDatabasePrivileges();
+            }
+            if (clusterHost.getSharedDatabaseOwners() != null) {
+                clusterHost.getSharedDatabaseOwners().putAll(this.databaseOwners);
+                this.databaseOwners = clusterHost.getSharedDatabaseOwners();
+            }
+        }
     }
 
     // Store column names for each table
@@ -1498,6 +1528,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof DropRoleStatement s) return executeDropRole(s);
         if (stmt instanceof GrantStatement s) return executeGrant(s);
         if (stmt instanceof RevokeStatement s) return executeRevoke(s);
+        if (stmt instanceof GrantDatabaseStatement s) return executeGrantDatabase(s);
+        if (stmt instanceof RevokeDatabaseStatement s) return executeRevokeDatabase(s);
+        if (stmt instanceof GrantRoleStatement s) return executeGrantRole(s);
+        if (stmt instanceof RevokeRoleStatement s) return executeRevokeRole(s);
         if (stmt instanceof AlterTableAddColumnStatement s) return executeAlterTableAddColumn(s, txn);
         if (stmt instanceof AlterTableDropColumnStatement s) return executeAlterTableDropColumn(s, txn);
         if (stmt instanceof AlterTableRenameColumnStatement s) return executeAlterTableRenameColumn(s, txn);
@@ -2198,6 +2232,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeCreateTable(CreateTableStatement stmt, Transaction txn, String sql) {
+        String effDb = currentDatabaseName != null ? currentDatabaseName : "stratos";
+        QueryResult dbDenied = requireDatabasePrivilege(effDb, "CREATE");
+        if (dbDenied != null) {
+            return dbDenied;
+        }
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot create table with reserved system table name: " + stmt.tableName());
         }
@@ -3053,11 +3092,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      */
     private QueryResult executeCheckpoint() {
         String currentUser = session.get().currentUser;
-        if (currentUser != null) {
-            Role role = roles.get(currentUser);
-            if (role == null || !role.superuser()) {
-                return QueryResult.error("permission denied: CHECKPOINT requires superuser");
-            }
+        if (currentUser != null && !isSuperuser(currentUser)) {
+            return QueryResult.error("permission denied: CHECKPOINT requires superuser");
         }
         bufferPool.flushAll();
         walManager.checkpointAndArchive();
@@ -5849,6 +5885,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         try {
             clusterHost.createDatabase(stmt.databaseName());
+            String currentUser = session.get().currentUser;
+            databaseOwners.put(stmt.databaseName(), currentUser != null ? currentUser : "stratos");
             return QueryResult.success("Database created: " + stmt.databaseName());
         } catch (IllegalStateException | IllegalArgumentException e) {
             return QueryResult.error(e.getMessage());
@@ -6309,6 +6347,91 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      *      unknown username stays exactly as unrestricted as this
      *      engine's whole permission system not existing at all.
      */
+    public Set<String> getEffectiveRoles(String username) {
+        if (username == null) return Set.of();
+        Set<String> effective = new LinkedHashSet<>();
+        effective.add(username);
+        Queue<String> queue = new ArrayDeque<>();
+        queue.add(username);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            Set<String> parents = roleParents.get(current);
+            if (parents != null) {
+                for (String parent : parents) {
+                    if (effective.add(parent)) {
+                        queue.add(parent);
+                    }
+                }
+            }
+        }
+        return Collections.unmodifiableSet(effective);
+    }
+
+    public boolean isSuperuser(String username) {
+        if (username == null) return true;
+        Role directRole = roles.get(username);
+        if (directRole == null) {
+            // An unmanaged identity (where no CREATE ROLE was executed, e.g. default bootstrap admin/stratos in tests)
+            // is not restricted by role privilege checks.
+            return true;
+        }
+        if (directRole.superuser()) return true;
+        Set<String> effective = getEffectiveRoles(username);
+        for (String r : effective) {
+            Role role = roles.get(r);
+            if (role != null && role.superuser()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean isDatabaseOwnerOrSuperuser(String databaseName, String username) {
+        if (username == null) return true;
+        if (isSuperuser(username)) return true;
+        String owner = databaseOwners.get(databaseName);
+        if (owner == null) {
+            return "admin".equalsIgnoreCase(username) || "stratos".equalsIgnoreCase(username);
+        }
+        return getEffectiveRoles(username).contains(owner);
+    }
+
+    public boolean hasDatabasePrivilege(String username, String databaseName, String privilege) {
+        if (username == null) return true;
+        Role directRole = roles.get(username);
+        if (directRole == null) return true; // unmanaged / trust user backward compatibility
+        if (isSuperuser(username)) return true;
+        if (isDatabaseOwnerOrSuperuser(databaseName, username)) return true;
+
+        Map<String, Set<String>> byDb = databasePrivileges.get(databaseName);
+        if (byDb == null || byDb.isEmpty()) {
+            return "CONNECT".equalsIgnoreCase(privilege) || "TEMP".equalsIgnoreCase(privilege) || "TEMPORARY".equalsIgnoreCase(privilege);
+        }
+
+        Set<String> effective = getEffectiveRoles(username);
+        String targetPriv = privilege.toUpperCase(java.util.Locale.ROOT);
+        for (String r : effective) {
+            Set<String> granted = byDb.get(r);
+            if (granted != null) {
+                if (granted.contains("ALL") || granted.contains("ALL PRIVILEGES") || granted.contains(targetPriv)) {
+                    return true;
+                }
+                if ("TEMP".equals(targetPriv) && granted.contains("TEMPORARY")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public QueryResult requireDatabasePrivilege(String databaseName, String privilege) {
+        String currentUser = session.get().currentUser;
+        if (!hasDatabasePrivilege(currentUser, databaseName, privilege)) {
+            return QueryResult.error("permission denied for database " + databaseName + " (missing " + privilege + " privilege)");
+        }
+        return null;
+    }
+
     private boolean hasPrivilege(String tableName, String privilege) {
         if ("SELECT".equalsIgnoreCase(privilege) && (SystemCatalog.isSystemTable(tableName) || StdCatalogViews.isVirtualView(tableName))) {
             return true;
@@ -6317,12 +6440,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (currentUser == null) return true;
         Role role = roles.get(currentUser);
         if (role == null) return true;
-        if (role.superuser()) return true;
-        if (currentUser.equals(tableOwners.get(tableName))) return true;
+        if (isSuperuser(currentUser)) return true;
+        String owner = tableOwners.get(tableName);
+        if (owner != null && getEffectiveRoles(currentUser).contains(owner)) return true;
+
         Map<String, Set<String>> byTable = tablePrivileges.get(tableName);
         if (byTable == null) return false;
-        Set<String> granted = byTable.get(currentUser);
-        return granted != null && granted.contains(privilege);
+        Set<String> effective = getEffectiveRoles(currentUser);
+        String targetPriv = privilege.toUpperCase(java.util.Locale.ROOT);
+        for (String r : effective) {
+            Set<String> granted = byTable.get(r);
+            if (granted != null) {
+                if (granted.contains("ALL") || granted.contains("ALL PRIVILEGES") || granted.contains(targetPriv)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** Returns an error QueryResult if the current session lacks privilege, null (meaning "proceed") otherwise - callers do `QueryResult denied = requirePrivilege(...); if (denied != null) return denied;`. */
@@ -6339,8 +6473,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (currentUser == null) return null;
         Role role = roles.get(currentUser);
         if (role == null) return null; // see hasPrivilege's own javadoc for this same, deliberate backward-compatibility choice
-        if (role.superuser()) return null;
-        if (currentUser.equals(tableOwners.get(tableName))) return null;
+        if (isSuperuser(currentUser)) return null;
+        String owner = tableOwners.get(tableName);
+        if (owner != null && getEffectiveRoles(currentUser).contains(owner)) return null;
         return QueryResult.error("permission denied: must be owner or superuser to alter table " + tableName);
     }
 
@@ -6361,8 +6496,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (currentUser == null) return true;
         Role role = roles.get(currentUser);
         if (role == null) return true;
-        if (role.superuser()) return true;
-        if (!rlsForcedTables.contains(tableName) && currentUser.equals(tableOwners.get(tableName))) return true;
+        for (String r : getEffectiveRoles(currentUser)) {
+            Role rObj = roles.get(r);
+            if (rObj != null && rObj.superuser()) return true;
+        }
+        if (!rlsForcedTables.contains(tableName)) {
+            String owner = tableOwners.get(tableName);
+            if (owner != null && getEffectiveRoles(currentUser).contains(owner)) return true;
+        }
         return false;
     }
 
@@ -6372,7 +6513,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     /** A policy with no TO clause at all applies to every role (real Postgres's own implicit PUBLIC) - otherwise it applies only when the current session's own real, authenticated user matches exactly. */
     private boolean policyAppliesToRole(CreatePolicyStatement policy, String currentUser) {
-        return policy.roleName() == null || policy.roleName().equals(currentUser);
+        if (policy.roleName() == null) return true;
+        if (currentUser == null) return false;
+        return policy.roleName().equals(currentUser) || getEffectiveRoles(currentUser).contains(policy.roleName());
     }
 
     /**
@@ -6491,10 +6634,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         for (Map<String, Set<String>> byTable : tablePrivileges.values()) {
             byTable.remove(stmt.roleName());
         }
+        for (Map<String, Set<String>> byDb : databasePrivileges.values()) {
+            byDb.remove(stmt.roleName());
+        }
+        roleParents.remove(stmt.roleName());
+        for (Set<String> parents : roleParents.values()) {
+            parents.remove(stmt.roleName());
+        }
+        roleAdminOptions.remove(stmt.roleName());
+        for (Set<String> opts : roleAdminOptions.values()) {
+            opts.remove(stmt.roleName());
+        }
         if (roleCredentialSink != null) {
             roleCredentialSink.onRoleDropped(stmt.roleName());
         }
         catalogLines.remove("ROLE:" + stmt.roleName());
+        catalogLines.keySet().removeIf(k -> k.startsWith("ROLE_MEMBER:" + stmt.roleName() + ":") || k.endsWith(":" + stmt.roleName()));
+        catalogLines.keySet().removeIf(k -> k.startsWith("DBGRANT:") && k.endsWith(":" + stmt.roleName()));
         saveCatalog();
         return QueryResult.success("Role dropped: " + stmt.roleName());
     }
@@ -6503,16 +6659,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
-        if (!roles.containsKey(stmt.roleName())) {
-            return QueryResult.error("Role not found: " + stmt.roleName());
-        }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
 
-        tablePrivileges.computeIfAbsent(stmt.tableName(), k -> new ConcurrentHashMap<>())
-            .computeIfAbsent(stmt.roleName(), k -> ConcurrentHashMap.newKeySet())
-            .addAll(stmt.privileges());
-        persistGrants(stmt.tableName(), stmt.roleName());
+        List<String> targetRoles = stmt.roleNames() != null ? stmt.roleNames() : List.of(stmt.roleName());
+        for (String roleName : targetRoles) {
+            if (!roles.containsKey(roleName)) {
+                return QueryResult.error("Role not found: " + roleName);
+            }
+        }
+        for (String roleName : targetRoles) {
+            tablePrivileges.computeIfAbsent(stmt.tableName(), k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(roleName, k -> ConcurrentHashMap.newKeySet())
+                .addAll(stmt.privileges());
+            persistGrants(stmt.tableName(), roleName);
+        }
         return QueryResult.success("Privileges granted");
     }
 
@@ -6520,21 +6681,157 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
-        if (!roles.containsKey(stmt.roleName())) {
-            return QueryResult.error("Role not found: " + stmt.roleName());
-        }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
 
-        Map<String, Set<String>> byTable = tablePrivileges.get(stmt.tableName());
-        if (byTable != null) {
-            Set<String> granted = byTable.get(stmt.roleName());
-            if (granted != null) {
-                granted.removeAll(stmt.privileges());
+        List<String> targetRoles = stmt.roleNames() != null ? stmt.roleNames() : List.of(stmt.roleName());
+        for (String roleName : targetRoles) {
+            if (!roles.containsKey(roleName)) {
+                return QueryResult.error("Role not found: " + roleName);
             }
         }
-        persistGrants(stmt.tableName(), stmt.roleName());
+        for (String roleName : targetRoles) {
+            Map<String, Set<String>> byTable = tablePrivileges.get(stmt.tableName());
+            if (byTable != null) {
+                Set<String> granted = byTable.get(roleName);
+                if (granted != null) {
+                    granted.removeAll(stmt.privileges());
+                }
+            }
+            persistGrants(stmt.tableName(), roleName);
+        }
         return QueryResult.success("Privileges revoked");
+    }
+
+    private QueryResult executeGrantRole(GrantRoleStatement stmt) {
+        String currentUser = session.get().currentUser;
+        if (currentUser != null && !isSuperuser(currentUser)) {
+            for (String role : stmt.roles()) {
+                Set<String> adminOpts = roleAdminOptions.get(currentUser);
+                if (adminOpts == null || !adminOpts.contains(role)) {
+                    return QueryResult.error("permission denied to grant role " + role);
+                }
+            }
+        }
+
+        for (String role : stmt.roles()) {
+            if (!roles.containsKey(role)) {
+                return QueryResult.error("Role not found: " + role);
+            }
+        }
+        for (String grantee : stmt.grantees()) {
+            if (!roles.containsKey(grantee)) {
+                return QueryResult.error("Role not found: " + grantee);
+            }
+            if (stmt.roles().contains(grantee)) {
+                return QueryResult.error("Role cycle detected: " + grantee + " cannot be granted to itself");
+            }
+            for (String role : stmt.roles()) {
+                if (getEffectiveRoles(role).contains(grantee)) {
+                    return QueryResult.error("Role cycle detected: " + role + " is already a member of " + grantee);
+                }
+            }
+        }
+
+        for (String grantee : stmt.grantees()) {
+            for (String role : stmt.roles()) {
+                roleParents.computeIfAbsent(grantee, k -> ConcurrentHashMap.newKeySet()).add(role);
+                if (stmt.withAdminOption()) {
+                    roleAdminOptions.computeIfAbsent(grantee, k -> ConcurrentHashMap.newKeySet()).add(role);
+                }
+                String key = "ROLE_MEMBER:" + role + ":" + grantee;
+                String sql = "GRANT " + role + " TO " + grantee + (stmt.withAdminOption() ? " WITH ADMIN OPTION" : "");
+                catalogLines.put(key, catalogEntry("GRANT", sql));
+            }
+        }
+        saveCatalog();
+        return QueryResult.success("Role granted");
+    }
+
+    private QueryResult executeRevokeRole(RevokeRoleStatement stmt) {
+        String currentUser = session.get().currentUser;
+        if (currentUser != null && !isSuperuser(currentUser)) {
+            for (String role : stmt.roles()) {
+                Set<String> adminOpts = roleAdminOptions.get(currentUser);
+                if (adminOpts == null || !adminOpts.contains(role)) {
+                    return QueryResult.error("permission denied to revoke role " + role);
+                }
+            }
+        }
+
+        for (String grantee : stmt.grantees()) {
+            for (String role : stmt.roles()) {
+                if (stmt.adminOptionOnly()) {
+                    Set<String> adminOpts = roleAdminOptions.get(grantee);
+                    if (adminOpts != null) adminOpts.remove(role);
+                } else {
+                    Set<String> parents = roleParents.get(grantee);
+                    if (parents != null) parents.remove(role);
+                    Set<String> adminOpts = roleAdminOptions.get(grantee);
+                    if (adminOpts != null) adminOpts.remove(role);
+                    catalogLines.remove("ROLE_MEMBER:" + role + ":" + grantee);
+                }
+            }
+        }
+        saveCatalog();
+        return QueryResult.success("Role revoked");
+    }
+
+    private QueryResult executeGrantDatabase(GrantDatabaseStatement stmt) {
+        String currentUser = session.get().currentUser;
+        if (currentUser != null && !isDatabaseOwnerOrSuperuser(stmt.databaseName(), currentUser)) {
+            return QueryResult.error("permission denied: must be database owner or superuser to grant database privileges");
+        }
+        List<String> targetRoles = stmt.roleNames() != null ? stmt.roleNames() : List.of(stmt.roleName());
+        for (String roleName : targetRoles) {
+            if (!roles.containsKey(roleName)) {
+                return QueryResult.error("Role not found: " + roleName);
+            }
+        }
+        for (String roleName : targetRoles) {
+            databasePrivileges.computeIfAbsent(stmt.databaseName(), k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(roleName, k -> ConcurrentHashMap.newKeySet())
+                .addAll(stmt.privileges());
+            persistDatabaseGrants(stmt.databaseName(), roleName);
+        }
+        return QueryResult.success("Database privileges granted");
+    }
+
+    private QueryResult executeRevokeDatabase(RevokeDatabaseStatement stmt) {
+        String currentUser = session.get().currentUser;
+        if (currentUser != null && !isDatabaseOwnerOrSuperuser(stmt.databaseName(), currentUser)) {
+            return QueryResult.error("permission denied: must be database owner or superuser to revoke database privileges");
+        }
+        List<String> targetRoles = stmt.roleNames() != null ? stmt.roleNames() : List.of(stmt.roleName());
+        for (String roleName : targetRoles) {
+            if (!roles.containsKey(roleName)) {
+                return QueryResult.error("Role not found: " + roleName);
+            }
+        }
+        for (String roleName : targetRoles) {
+            Map<String, Set<String>> byDb = databasePrivileges.get(stmt.databaseName());
+            if (byDb != null) {
+                Set<String> granted = byDb.get(roleName);
+                if (granted != null) {
+                    granted.removeAll(stmt.privileges());
+                }
+            }
+            persistDatabaseGrants(stmt.databaseName(), roleName);
+        }
+        return QueryResult.success("Database privileges revoked");
+    }
+
+    private void persistDatabaseGrants(String databaseName, String roleName) {
+        String key = "DBGRANT:" + databaseName + ":" + roleName;
+        Map<String, Set<String>> byDb = databasePrivileges.get(databaseName);
+        Set<String> granted = byDb != null ? byDb.get(roleName) : null;
+        if (granted == null || granted.isEmpty()) {
+            catalogLines.remove(key);
+        } else {
+            String sql = "GRANT " + String.join(", ", granted) + " ON DATABASE " + databaseName + " TO " + roleName;
+            catalogLines.put(key, catalogEntry("GRANT", sql));
+        }
+        saveCatalog();
     }
 
     /**

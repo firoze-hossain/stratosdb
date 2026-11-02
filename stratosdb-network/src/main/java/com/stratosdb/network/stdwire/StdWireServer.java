@@ -424,7 +424,9 @@ public class StdWireServer {
             LOG.info("Client certificate authenticated: user={} CN={}", requestedUser, certCn);
             StdWireMessages.writeAuthenticationOk(out);
         } else if (userStore != null) {
-            if (!performScramAuthentication(params.get("user"), in, out)) {
+            boolean tlsActive = sslHandler != null;
+            Map<String, byte[]> channelBindings = tlsActive ? sslHandler.getChannelBindings() : Map.of();
+            if (!performScramAuthentication(params.get("user"), in, out, tlsActive, channelBindings)) {
                 return null; // performScramAuthentication already sent the ErrorResponse
             }
         } else {
@@ -440,6 +442,15 @@ public class StdWireServer {
         // makes GRANT/REVOKE mean anything once a role IS created, not a promise that
         // every connection is now locked down by default.
         db().setCurrentUser(params.get("user"));
+        String targetDbName = (cluster != null)
+            ? ((params.get("database") == null || params.get("database").isBlank()) ? com.stratosdb.core.StratosCluster.DEFAULT_DATABASE : params.get("database"))
+            : (params.get("database") != null ? params.get("database") : "stratos");
+        com.stratosdb.sql.executor.QueryResult dbConnectDenied = db().getExecutor().requireDatabasePrivilege(targetDbName, "CONNECT");
+        if (dbConnectDenied != null) {
+            StdWireMessages.writeErrorResponse(out, "FATAL: permission denied for database \"" + targetDbName + "\" (missing CONNECT privilege)");
+            out.flush();
+            return null;
+        }
         StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB stdwire compatibility layer)");
         StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
         StdWireMessages.writeParameterStatus(out, "server_encoding", "UTF8");
@@ -452,13 +463,17 @@ public class StdWireServer {
     }
 
     /**
-     * The real SCRAM-SHA-256 handshake (RFC 5802) - see ScramSha256's own
-     * javadoc for the cryptographic details. Only ever reached when a
+     * The real SCRAM-SHA-256 and SCRAM-SHA-256-PLUS handshake (RFC 5802 / RFC 5929) -
+     * see ScramSha256's own javadoc for the cryptographic details. Only ever reached when a
      * UserStore was supplied to this server; trust auth (the unchanged
      * default) never calls this at all.
      */
-    private boolean performScramAuthentication(String username, DataInputStream in, DataOutputStream out) throws IOException {
-        StdWireMessages.writeAuthenticationSasl(out, ScramSha256.MECHANISM_NAME);
+    private boolean performScramAuthentication(String username, DataInputStream in, DataOutputStream out, boolean tlsActive, Map<String, byte[]> channelBindings) throws IOException {
+        if (tlsActive) {
+            StdWireMessages.writeAuthenticationSasl(out, ScramSha256.MECHANISM_NAME_PLUS, ScramSha256.MECHANISM_NAME);
+        } else {
+            StdWireMessages.writeAuthenticationSasl(out, ScramSha256.MECHANISM_NAME);
+        }
         out.flush();
 
         StdWireMessages.TypedMessage initialMsg = StdWireMessages.readTypedMessage(in);
@@ -468,19 +483,26 @@ public class StdWireServer {
             return false;
         }
         StdWireMessages.SaslInitialResponse initial = StdWireMessages.readSaslInitialResponse(initialMsg);
-        if (!ScramSha256.MECHANISM_NAME.equals(initial.mechanism())) {
-            StdWireMessages.writeErrorResponse(out, "Unsupported SASL mechanism: " + initial.mechanism());
+        String mech = initial.mechanism();
+        if (!ScramSha256.MECHANISM_NAME.equals(mech) && !ScramSha256.MECHANISM_NAME_PLUS.equals(mech)) {
+            StdWireMessages.writeErrorResponse(out, "Unsupported SASL mechanism: " + mech);
+            out.flush();
+            return false;
+        }
+        if (ScramSha256.MECHANISM_NAME_PLUS.equals(mech) && !tlsActive) {
+            StdWireMessages.writeErrorResponse(out, "SCRAM-SHA-256-PLUS requires a TLS connection");
             out.flush();
             return false;
         }
 
         UserStore.ScramCredential credential = userStore.getScramCredential(username);
-        ScramSha256.Handshake handshake = new ScramSha256.Handshake(username, credential);
+        ScramSha256.Handshake handshake = new ScramSha256.Handshake(username, credential, tlsActive, channelBindings, mech);
 
         String serverFirstMessage;
         try {
             serverFirstMessage = handshake.clientFirst(initial.initialResponseData());
         } catch (ScramSha256.ScramAuthenticationException e) {
+            LOG.warn("SCRAM client-first failed for user {}: {}", username, e.getMessage());
             StdWireMessages.writeErrorResponse(out, "Authentication failed: " + e.getMessage());
             out.flush();
             return false;
