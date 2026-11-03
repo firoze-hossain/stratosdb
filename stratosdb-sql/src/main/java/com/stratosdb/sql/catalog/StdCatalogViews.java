@@ -1,7 +1,10 @@
 package com.stratosdb.sql.catalog;
 
+import com.stratosdb.sql.ast.CheckConstraintDefinition;
+import com.stratosdb.sql.ast.ForeignKeyDefinition;
 import com.stratosdb.sql.ast.SelectStatement;
 import com.stratosdb.sql.executor.ExecutorEngine;
+import com.stratosdb.sql.executor.Sequence;
 import com.stratosdb.storage.page.Tuple;
 
 import java.util.*;
@@ -35,8 +38,13 @@ public final class StdCatalogViews {
         String name = stripQuotes(tableName).toLowerCase(Locale.ROOT);
         return switch (canonicalViewName(name)) {
             case "class", "attribute", "type", "namespace", "index",
-                 "information_schema.tables", "database", "am",
-                 "tables", "views", "indexes", "statistic" -> true;
+                 "information_schema.tables", "information_schema.columns",
+                 "information_schema.table_constraints", "information_schema.key_column_usage",
+                 "information_schema.referential_constraints", "information_schema.schemata",
+                 "information_schema.sequences",
+                 "database", "am", "tables", "views", "indexes", "statistic",
+                 "constraint", "description", "proc", "roles", "enum", "inherits",
+                 "partitioned_table", "sequence" -> true;
             default -> false;
         };
     }
@@ -52,8 +60,40 @@ public final class StdCatalogViews {
             name = name.substring("stratos_catalog.".length());
         }
 
-        if (name.equals("information_schema_tables") || name.equals("information_schema.tables") || name.equals("tables")) {
+        if (name.startsWith("information_schema.")) {
+            String sub = name.substring("information_schema.".length());
+            return switch (sub) {
+                case "tables" -> "information_schema.tables";
+                case "columns" -> "information_schema.columns";
+                case "table_constraints" -> "information_schema.table_constraints";
+                case "key_column_usage" -> "information_schema.key_column_usage";
+                case "referential_constraints" -> "information_schema.referential_constraints";
+                case "schemata" -> "information_schema.schemata";
+                case "sequences" -> "information_schema.sequences";
+                default -> "information_schema." + sub;
+            };
+        }
+
+        if (name.equals("information_schema_tables") || name.equals("tables")) {
             return "information_schema.tables";
+        }
+        if (name.equals("information_schema_columns") || name.equals("columns")) {
+            return "information_schema.columns";
+        }
+        if (name.equals("information_schema_table_constraints") || name.equals("table_constraints")) {
+            return "information_schema.table_constraints";
+        }
+        if (name.equals("information_schema_key_column_usage") || name.equals("key_column_usage")) {
+            return "information_schema.key_column_usage";
+        }
+        if (name.equals("information_schema_referential_constraints") || name.equals("referential_constraints")) {
+            return "information_schema.referential_constraints";
+        }
+        if (name.equals("information_schema_schemata") || name.equals("schemata")) {
+            return "information_schema.schemata";
+        }
+        if (name.equals("information_schema_sequences") || name.equals("sequences")) {
+            return "information_schema.sequences";
         }
 
         return switch (name) {
@@ -68,6 +108,14 @@ public final class StdCatalogViews {
             case "pg_views", "std_views", "stratos_views" -> "views";
             case "pg_indexes", "std_indexes", "stratos_indexes" -> "indexes";
             case "pg_statistic", "std_statistic", "stratos_statistic", "statistic" -> "statistic";
+            case "pg_constraint", "std_constraint", "stratos_constraint", "constraint" -> "constraint";
+            case "pg_description", "std_description", "stratos_description", "description" -> "description";
+            case "pg_proc", "std_proc", "stratos_proc", "proc" -> "proc";
+            case "pg_roles", "std_roles", "stratos_roles", "roles", "pg_user", "std_user" -> "roles";
+            case "pg_enum", "std_enum", "stratos_enum", "enum" -> "enum";
+            case "pg_inherits", "std_inherits", "stratos_inherits", "inherits" -> "inherits";
+            case "pg_partitioned_table", "std_partitioned_table", "stratos_partitioned_table", "partitioned_table" -> "partitioned_table";
+            case "pg_sequence", "std_sequence", "stratos_sequence", "sequence" -> "sequence";
             default -> name;
         };
     }
@@ -134,12 +182,26 @@ public final class StdCatalogViews {
             case "namespace" -> generateNamespaceRows(engine);
             case "index" -> generateIndexRows(engine);
             case "information_schema.tables" -> generateInformationSchemaTablesRows(engine);
+            case "information_schema.columns" -> generateColumnsRows(engine);
+            case "information_schema.table_constraints" -> generateTableConstraintsRows(engine);
+            case "information_schema.key_column_usage" -> generateKeyColumnUsageRows(engine);
+            case "information_schema.referential_constraints" -> generateReferentialConstraintsRows(engine);
+            case "information_schema.schemata" -> generateSchemataRows(engine);
+            case "information_schema.sequences" -> generateSequencesRows(engine);
             case "database" -> generateDatabaseRows(engine);
             case "am" -> generateAmRows(engine);
             case "tables" -> generateTablesRows(engine);
             case "views" -> generateViewsRows(engine);
             case "indexes" -> generateIndexesRows(engine);
             case "statistic" -> generateStatisticRows(engine);
+            case "constraint" -> generateConstraintRows(engine);
+            case "description" -> generateDescriptionRows(engine);
+            case "proc" -> generateProcRows(engine);
+            case "roles" -> generateRolesRows(engine);
+            case "enum" -> generateEnumRows(engine);
+            case "inherits" -> generateInheritsRows(engine);
+            case "partitioned_table" -> generatePartitionedTableRows(engine);
+            case "sequence" -> generateSequenceRows(engine);
             default -> Collections.emptyList();
         };
     }
@@ -200,6 +262,18 @@ public final class StdCatalogViews {
                 idxOid, 0, 1, 0.0f, 0,
                 0, "f", "f", "p", "i",
                 1, 0, "f", "f", "f",
+                "f", "f", "t", "d", "f"
+            ));
+        }
+
+        // 4. Sequences
+        for (String seqName : engine.getSequenceNames()) {
+            int seqOid = getRelationOid(seqName);
+            rows.add(createTuple(cols,
+                seqOid, seqName, 2200, seqOid + 1, 10, 0,
+                seqOid, 0, 1, 1.0f, 0,
+                0, "f", "f", "p", "S",
+                0, 0, "f", "f", "f",
                 "f", "f", "t", "d", "f"
             ));
         }
@@ -467,6 +541,415 @@ public final class StdCatalogViews {
                     cs.correlation()
                 ));
             }
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateColumnsRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "table_catalog", "table_schema", "table_name", "column_name",
+            "ordinal_position", "column_default", "is_nullable", "data_type",
+            "character_maximum_length", "character_octet_length", "numeric_precision",
+            "numeric_scale", "datetime_precision", "udt_name", "is_identity", "identity_generation"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        for (String table : engine.getAllTableNames()) {
+            boolean isSys = SystemCatalog.isSystemTable(table);
+            String schema = isSys ? "std_catalog" : "public";
+            List<String> tableCols = engine.getTableColumns(table);
+            if (tableCols == null) continue;
+            Map<String, String> types = engine.getTableColumnTypes(table);
+            Map<String, String> defaults = engine.getTableColumnDefaults(table);
+            List<String> pks = engine.getTablePrimaryKeys(table);
+
+            for (int i = 0; i < tableCols.size(); i++) {
+                String col = tableCols.get(i);
+                String typeStr = types != null ? types.get(col) : "VARCHAR";
+                int typOid = getTypeOid(typeStr);
+                String dType = formatType(typOid);
+                boolean isPk = pks != null && pks.contains(col);
+                String isNullable = isPk ? "NO" : "YES";
+                String defVal = defaults != null ? defaults.get(col) : null;
+                Integer charLen = (dType.contains("varying") || dType.equals("character")) ? Integer.valueOf(255) : null;
+                Integer octetLen = charLen != null ? Integer.valueOf(charLen * 4) : null;
+                Integer numPrec = typOid == 23 ? Integer.valueOf(32) : (typOid == 20 ? Integer.valueOf(64) : (typOid == 21 ? Integer.valueOf(16) : (typOid == 701 ? Integer.valueOf(53) : null)));
+                Integer numScale = (numPrec != null && typOid != 701) ? Integer.valueOf(0) : null;
+                Integer dtPrec = (typOid == 1114 || typOid == 1083) ? Integer.valueOf(6) : null;
+                String udt = switch (typOid) {
+                    case 16 -> "bool";
+                    case 20 -> "int8";
+                    case 21 -> "int2";
+                    case 23 -> "int4";
+                    case 701 -> "float8";
+                    case 1114 -> "timestamp";
+                    case 1082 -> "date";
+                    case 1083 -> "time";
+                    case 17 -> "bytea";
+                    case 25 -> "text";
+                    default -> "varchar";
+                };
+
+                rows.add(createTuple(cols,
+                    "stratos", schema, table, col,
+                    i + 1, defVal, isNullable, dType,
+                    charLen, octetLen, numPrec,
+                    numScale, dtPrec, udt, "NO", null
+                ));
+            }
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateTableConstraintsRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "constraint_catalog", "constraint_schema", "constraint_name",
+            "table_catalog", "table_schema", "table_name", "constraint_type",
+            "is_deferrable", "initially_deferred", "enforced"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        // 1. Primary keys
+        for (String table : engine.getAllTableNames()) {
+            List<String> pks = engine.getTablePrimaryKeys(table);
+            if (pks != null && !pks.isEmpty()) {
+                String schema = SystemCatalog.isSystemTable(table) ? "std_catalog" : "public";
+                rows.add(createTuple(cols,
+                    "stratos", schema, table + "_pkey",
+                    "stratos", schema, table, "PRIMARY KEY",
+                    "NO", "NO", "YES"
+                ));
+            }
+        }
+        // 2. Foreign keys
+        for (Map.Entry<String, List<ForeignKeyDefinition>> entry : engine.getAllForeignKeys().entrySet()) {
+            for (ForeignKeyDefinition fk : entry.getValue()) {
+                rows.add(createTuple(cols,
+                    "stratos", "public", fk.name(),
+                    "stratos", "public", fk.childTable(), "FOREIGN KEY",
+                    "NO", "NO", "YES"
+                ));
+            }
+        }
+        // 3. Check constraints
+        for (Map.Entry<String, List<CheckConstraintDefinition>> entry : engine.getAllCheckConstraints().entrySet()) {
+            for (CheckConstraintDefinition chk : entry.getValue()) {
+                rows.add(createTuple(cols,
+                    "stratos", "public", chk.name(),
+                    "stratos", "public", entry.getKey(), "CHECK",
+                    "NO", "NO", "YES"
+                ));
+            }
+        }
+        // 4. Unique indexes
+        for (ExecutorEngine.IndexMetadata idx : engine.getAllIndexes()) {
+            if (idx.isUnique() && !idx.isPrimary()) {
+                rows.add(createTuple(cols,
+                    "stratos", "public", idx.indexName(),
+                    "stratos", "public", idx.tableName(), "UNIQUE",
+                    "NO", "NO", "YES"
+                ));
+            }
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateKeyColumnUsageRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "constraint_catalog", "constraint_schema", "constraint_name",
+            "table_catalog", "table_schema", "table_name",
+            "column_name", "ordinal_position", "position_in_unique_constraint"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        // Primary keys
+        for (String table : engine.getAllTableNames()) {
+            List<String> pks = engine.getTablePrimaryKeys(table);
+            if (pks != null && !pks.isEmpty()) {
+                String schema = SystemCatalog.isSystemTable(table) ? "std_catalog" : "public";
+                for (int i = 0; i < pks.size(); i++) {
+                    rows.add(createTuple(cols,
+                        "stratos", schema, table + "_pkey",
+                        "stratos", schema, table,
+                        pks.get(i), i + 1, null
+                    ));
+                }
+            }
+        }
+        // Foreign keys
+        for (Map.Entry<String, List<ForeignKeyDefinition>> entry : engine.getAllForeignKeys().entrySet()) {
+            for (ForeignKeyDefinition fk : entry.getValue()) {
+                for (int i = 0; i < fk.childColumns().size(); i++) {
+                    rows.add(createTuple(cols,
+                        "stratos", "public", fk.name(),
+                        "stratos", "public", fk.childTable(),
+                        fk.childColumns().get(i), i + 1, i + 1
+                    ));
+                }
+            }
+        }
+        // Unique indexes
+        for (ExecutorEngine.IndexMetadata idx : engine.getAllIndexes()) {
+            if (idx.isUnique() && !idx.isPrimary()) {
+                rows.add(createTuple(cols,
+                    "stratos", "public", idx.indexName(),
+                    "stratos", "public", idx.tableName(),
+                    idx.columnName(), 1, null
+                ));
+            }
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateReferentialConstraintsRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "constraint_catalog", "constraint_schema", "constraint_name",
+            "unique_constraint_catalog", "unique_constraint_schema", "unique_constraint_name",
+            "match_option", "update_rule", "delete_rule"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        for (Map.Entry<String, List<ForeignKeyDefinition>> entry : engine.getAllForeignKeys().entrySet()) {
+            for (ForeignKeyDefinition fk : entry.getValue()) {
+                String upd = fk.onUpdate() != null ? fk.onUpdate().name().replace('_', ' ') : "NO ACTION";
+                String del = fk.onDelete() != null ? fk.onDelete().name().replace('_', ' ') : "NO ACTION";
+                rows.add(createTuple(cols,
+                    "stratos", "public", fk.name(),
+                    "stratos", "public", fk.parentTable() + "_pkey",
+                    "NONE", upd, del
+                ));
+            }
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateSchemataRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "catalog_name", "schema_name", "schema_owner",
+            "default_character_set_catalog", "default_character_set_schema",
+            "default_character_set_name", "sql_path"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        List<String> schemas = List.of("public", "information_schema", "pg_catalog", "std_catalog", "pg_toast");
+        for (String s : schemas) {
+            rows.add(createTuple(cols, "stratos", s, "stratos", null, null, null, null));
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateSequencesRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "sequence_catalog", "sequence_schema", "sequence_name",
+            "data_type", "numeric_precision", "numeric_precision_radix", "numeric_scale",
+            "start_value", "minimum_value", "maximum_value", "increment", "cycle_option"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        for (Sequence seq : engine.getSequences().values()) {
+            rows.add(createTuple(cols,
+                "stratos", "public", seq.getName(),
+                "bigint", 64, 2, 0,
+                "1", "1", "9223372036854775807", String.valueOf(seq.getIncrementBy()), "NO"
+            ));
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateConstraintRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "oid", "conname", "connamespace", "contype", "condeferrable", "condeferred",
+            "convalidated", "conrelid", "contypid", "conindid", "confrelid", "confupdtype",
+            "confdeltype", "confmatchtype", "conislocal", "coninhcount", "connoinherit",
+            "conkey", "confkey", "conpfeqop", "conppeqop", "conffeqop", "conexclop", "conbin"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        int nextOid = 30000;
+
+        // Primary keys
+        for (String table : engine.getAllTableNames()) {
+            List<String> pks = engine.getTablePrimaryKeys(table);
+            if (pks != null && !pks.isEmpty()) {
+                int relOid = getRelationOid(table);
+                List<String> tableCols = engine.getTableColumns(table);
+                List<Integer> attnums = new ArrayList<>();
+                if (tableCols != null) {
+                    for (String pk : pks) {
+                        int idx = tableCols.indexOf(pk);
+                        if (idx >= 0) attnums.add(idx + 1);
+                    }
+                }
+                String conkey = "{" + String.join(",", attnums.stream().map(Object::toString).toList()) + "}";
+                rows.add(createTuple(cols,
+                    relOid + 100, table + "_pkey", 2200, "p", "f", "f",
+                    "t", relOid, 0, 0, 0, "a",
+                    "a", "u", "t", 0, "t",
+                    conkey, null, null, null, null, null, null
+                ));
+            }
+        }
+
+        // Foreign keys
+        for (Map.Entry<String, List<ForeignKeyDefinition>> entry : engine.getAllForeignKeys().entrySet()) {
+            for (ForeignKeyDefinition fk : entry.getValue()) {
+                int childOid = getRelationOid(fk.childTable());
+                int parentOid = getRelationOid(fk.parentTable());
+                List<String> childCols = engine.getTableColumns(fk.childTable());
+                List<String> parentCols = engine.getTableColumns(fk.parentTable());
+                List<Integer> childAttnums = new ArrayList<>();
+                List<Integer> parentAttnums = new ArrayList<>();
+                if (childCols != null) {
+                    for (String c : fk.childColumns()) {
+                        int idx = childCols.indexOf(c);
+                        if (idx >= 0) childAttnums.add(idx + 1);
+                    }
+                }
+                if (parentCols != null) {
+                    for (String c : fk.parentColumns()) {
+                        int idx = parentCols.indexOf(c);
+                        if (idx >= 0) parentAttnums.add(idx + 1);
+                    }
+                }
+                String conkey = "{" + String.join(",", childAttnums.stream().map(Object::toString).toList()) + "}";
+                String confkey = "{" + String.join(",", parentAttnums.stream().map(Object::toString).toList()) + "}";
+                String upd = fk.onUpdate() == ForeignKeyDefinition.ActionType.CASCADE ? "c" :
+                    (fk.onUpdate() == ForeignKeyDefinition.ActionType.SET_NULL ? "n" : "a");
+                String del = fk.onDelete() == ForeignKeyDefinition.ActionType.CASCADE ? "c" :
+                    (fk.onDelete() == ForeignKeyDefinition.ActionType.SET_NULL ? "n" : "a");
+                rows.add(createTuple(cols,
+                    nextOid++, fk.name(), 2200, "f", "f", "f",
+                    "t", childOid, 0, 0, parentOid, upd,
+                    del, "u", "t", 0, "t",
+                    conkey, confkey, null, null, null, null, null
+                ));
+            }
+        }
+
+        // Check constraints
+        for (Map.Entry<String, List<CheckConstraintDefinition>> entry : engine.getAllCheckConstraints().entrySet()) {
+            int relOid = getRelationOid(entry.getKey());
+            for (CheckConstraintDefinition chk : entry.getValue()) {
+                rows.add(createTuple(cols,
+                    nextOid++, chk.name(), 2200, "c", "f", "f",
+                    "t", relOid, 0, 0, 0, "a",
+                    "a", "u", "t", 0, "t",
+                    null, null, null, null, null, null, chk.expressionSql()
+                ));
+            }
+        }
+
+        // Unique constraints
+        for (ExecutorEngine.IndexMetadata idx : engine.getAllIndexes()) {
+            if (idx.isUnique() && !idx.isPrimary()) {
+                int relOid = getRelationOid(idx.tableName());
+                int idxOid = getIndexOid(idx.indexName());
+                rows.add(createTuple(cols,
+                    nextOid++, idx.indexName(), 2200, "u", "f", "f",
+                    "t", relOid, 0, idxOid, 0, "a",
+                    "a", "u", "t", 0, "t",
+                    "{1}", null, null, null, null, null, null
+                ));
+            }
+        }
+
+        return rows;
+    }
+
+    private static List<Tuple> generateDescriptionRows(ExecutorEngine engine) {
+        List<String> cols = List.of("objoid", "classoid", "objsubid", "description");
+        return Collections.emptyList();
+    }
+
+    private static List<Tuple> generateProcRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "oid", "proname", "pronamespace", "proowner", "prolang", "procost",
+            "prorows", "provariadic", "prosupport", "prokind", "prosecdef", "proleakproof",
+            "proisstrict", "proretset", "provolatile", "proparallel", "pronargs",
+            "pronargdefaults", "prorettype", "proargtypes", "proallargtypes", "proargmodes",
+            "proargnames", "proargdefaults", "protrftypes", "prosrc", "probin", "prosqlbody",
+            "proconfig", "proacl"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        int pOid = 50000;
+        List<String> builtinFuncs = List.of(
+            "version", "current_schema", "current_database", "nextval", "currval",
+            "setval", "txid_current", "pg_total_relation_size", "pg_relation_size",
+            "obj_description", "col_description", "shobj_description", "has_table_privilege",
+            "has_database_privilege", "has_schema_privilege", "pg_get_serial_sequence"
+        );
+        for (String fn : builtinFuncs) {
+            rows.add(createTuple(cols,
+                pOid++, fn, 11, 10, 12, 1.0f,
+                0.0f, 0, 0, "f", "f", "f",
+                "f", "f", "v", "u", 0,
+                0, 25, "", null, null,
+                null, null, null, fn, null, null,
+                null, null
+            ));
+        }
+        for (String fn : engine.getFunctions().keySet()) {
+            rows.add(createTuple(cols,
+                pOid++, fn, 2200, 10, 12, 1.0f,
+                0.0f, 0, 0, "f", "f", "f",
+                "f", "f", "v", "u", 0,
+                0, 25, "", null, null,
+                null, null, null, fn, null, null,
+                null, null
+            ));
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateRolesRows(ExecutorEngine engine) {
+        List<String> cols = List.of(
+            "rolname", "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb",
+            "rolcanlogin", "rolreplication", "rolconnlimit", "rolpassword",
+            "rolvaliduntil", "rolbypassrls", "rolconfig", "oid"
+        );
+        List<Tuple> rows = new ArrayList<>();
+        Set<String> added = new HashSet<>();
+        for (String r : List.of("stratos", "postgres", "admin")) {
+            rows.add(createTuple(cols,
+                r, "t", "t", "t", "t",
+                "t", "t", -1, "********",
+                null, "f", null, 10 + added.size()
+            ));
+            added.add(r);
+        }
+        for (ExecutorEngine.Role role : engine.getRoles().values()) {
+            if (!added.add(role.name())) continue;
+            rows.add(createTuple(cols,
+                role.name(), role.superuser() ? "t" : "f", "t", "f", "t",
+                role.login() ? "t" : "f", "f", -1, "********",
+                null, "f", null, 10 + added.size()
+            ));
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateEnumRows(ExecutorEngine engine) {
+        List<String> cols = List.of("oid", "enumtypid", "enumsortorder", "enumlabel");
+        List<Tuple> rows = new ArrayList<>();
+        int eOid = 60000;
+        for (String enumName : engine.getEnumTypes()) {
+            int typOid = getTypeOid(enumName);
+            rows.add(createTuple(cols, eOid++, typOid, 1.0f, enumName));
+        }
+        return rows;
+    }
+
+    private static List<Tuple> generateInheritsRows(ExecutorEngine engine) {
+        List<String> cols = List.of("inhrelid", "inhparent", "inhseqno");
+        return Collections.emptyList();
+    }
+
+    private static List<Tuple> generatePartitionedTableRows(ExecutorEngine engine) {
+        List<String> cols = List.of("partrelid", "partstrat", "partnatts", "partdefid", "partattrs", "partclass", "partcollation", "partexprs");
+        return Collections.emptyList();
+    }
+
+    private static List<Tuple> generateSequenceRows(ExecutorEngine engine) {
+        List<String> cols = List.of("seqrelid", "seqtypid", "seqstart", "seqincrement", "seqmax", "seqmin", "seqcache", "seqcycle");
+        List<Tuple> rows = new ArrayList<>();
+        for (Sequence seq : engine.getSequences().values()) {
+            int seqOid = getRelationOid(seq.getName());
+            rows.add(createTuple(cols,
+                seqOid, 20, 1L, seq.getIncrementBy(), 9223372036854775807L, 1L, 1L, "f"
+            ));
         }
         return rows;
     }

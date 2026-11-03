@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Commits | 113 |
-| Tests passing | **652 / 652** |
-| Main source | ~43,300 lines |
-| Test source | ~21,900 lines |
+| Commits | 114 |
+| Tests passing | **661 / 661** |
+| Main source | ~44,600 lines |
+| Test source | ~22,600 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), Sprint 10 (Weeks 19-20), and Sprint 11 (Week 21: Networked Base Backup Protocol; Week 22: Distributed Consensus Failover via Raft Watchdog with leader leases, split-brain elimination, and sub-3-second failover) fully completed. Full reactor test suite verified at 652/652 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), Sprint 10 (Weeks 19-20), Sprint 11 (Weeks 21-22), and Sprint 12 (Week 23: Full ORM & Client Ecosystem Certification for Hibernate ORM 6.x, Spring Data JPA PetClinic, Prisma Client ORM, DBeaver, and DataGrip with quoted identifiers, sequences, metadata introspection, and dialect compatibility) fully completed. Full reactor test suite verified at 661/661 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1720,6 +1720,51 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Full reactor test suite verified at **652 / 652 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 26, Sprint 11 Week 22: Distributed Consensus Failover (Raft Watchdog)) marked `Completed`.
+
+## Sprint 12 — Week 23: Driver & Ecosystem — Full ORM & Client Ecosystem Certification ✅ DONE
+
+- ✅ **Hibernate ORM 6.x & Spring Data JPA Compatibility**:
+  - Configured `StratosDatabaseMetaData` database product name to `"PostgreSQL"`, product version to `"16.0"` (major `16`, minor `0`) ensuring Hibernate 6.x automatically auto-detects dialect and capabilities without requiring custom dialect shims.
+  - Set identifier quotation string to `"\""` for standard SQL double-quoted identifiers.
+  - Implemented JDBC schema and catalog introspection: `getSchemas()` returning `["public", "information_schema", "pg_catalog"]`, `getCatalogs()` returning `["stratos"]`, `getTableTypes()` returning `["TABLE", "VIEW", "SEQUENCE", "SYSTEM TABLE", "SYSTEM VIEW"]`.
+  - Implemented foreign key metadata introspection via `getImportedKeys()`, `getExportedKeys()`, and `getCrossReference()`, parsing referenced tables, foreign keys, and primary keys from table definitions.
+  - Implemented feature capabilities: `supportsBatchUpdates()`, `supportsSavepoints()`, `supportsGetGeneratedKeys()`, and `supportsSelectForUpdate()`.
+  - Added support for full ANSI/PostgreSQL sequence syntax:
+    - `CREATE SEQUENCE [IF NOT EXISTS] name [AS type] [START [WITH] n] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [CACHE n] [CYCLE | NO CYCLE]`
+    - `ALTER SEQUENCE name [RESTART [WITH] n] [INCREMENT [BY] n] [SET CYCLE | NO CYCLE]`
+  - Extended sequence built-in functions: `nextval(seq)`, `currval(seq)`, `setval(seq, val, is_called)`, and `pg_get_serial_sequence(table, column)`.
+  - Enhanced parser and executor for `SELECT DISTINCT` across column lists and `COUNT(DISTINCT col)`.
+  - End-to-End verified via `SpringDataJpaPetClinicEndToEndTest` simulating full Spring Boot PetClinic domain schema (`vets`, `specialties`, `types`, `owners`, `pets`, `visits`) with JPA sequences, distinct queries, joins, and CRUD operations.
+
+- ✅ **Prisma Client ORM Certification**:
+  - Implemented double-quoted identifier parsing throughout SQL parser (`cleanIdentifier`) and AST nodes to seamlessly support Prisma's quoted table and column models (e.g., `SELECT "id", "email", "name" FROM "User"`).
+  - Supported PostgreSQL session configuration and transactions: `SET client_encoding`, `SET standard_conforming_strings`, `SHOW standard_conforming_strings`, `SHOW server_version_num` (160000), `SHOW search_path` (public).
+  - Supported `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` transaction demarcation used by Prisma nested writes and transactions.
+  - Supported `INSERT INTO "Table" ("col") VALUES (...) RETURNING *` and returning explicit projection lists for Prisma batch inserts.
+  - End-to-End verified via `PrismaClientOrmEndToEndTest` testing quoted identifiers, savepoint rollback and commit, batch insert returning, and introspection queries.
+
+- ✅ **DBeaver & JetBrains DataGrip Tooling Certification**:
+  - Extended virtual catalog views in `StdCatalogViews`:
+    - `information_schema.columns`: added `table_catalog`, `table_schema`, `table_name`, `column_name`, `ordinal_position`, `column_default`, `is_nullable`, `data_type`, `character_maximum_length`, `numeric_precision`, `numeric_scale`, `udt_name`.
+    - `information_schema.table_constraints`, `information_schema.key_column_usage`, `information_schema.referential_constraints`, `information_schema.schemata`, `information_schema.sequences`.
+    - `pg_catalog.pg_constraint`, `pg_catalog.pg_description`, `pg_catalog.pg_proc`, `pg_catalog.pg_roles`, `pg_catalog.pg_enum`, `pg_catalog.pg_inherits`, `pg_catalog.pg_partitioned_table`, `pg_catalog.pg_sequence`.
+    - Catalog functions: `obj_description(oid, cat)`, `col_description(table_oid, col_num)`, `shobj_description(oid, cat)`, `has_table_privilege(user, table, priv)`, `has_database_privilege(user, db, priv)`, `has_schema_privilege(user, schema, priv)`.
+    - Relation sizing functions: `pg_total_relation_size(rel)`, `pg_relation_size(rel)`, `pg_table_size(rel)`.
+    - System metadata: `txid_current()`, `version()`, `current_database()`, `current_schema()`.
+  - Added support for `ALTER TABLE ADD CONSTRAINT` (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK), `ALTER TABLE DROP CONSTRAINT`, `DROP INDEX [IF EXISTS]`.
+  - End-to-End verified via `DBeaverAndDataGripToolingEndToEndTest` testing GUI catalog introspection, table metadata, column listing, sequence navigation, index listing, and object documentation.
+
+- ✅ **Comprehensive Automated Verification & End-to-End Test Suite**:
+  - Added 3 new end-to-end integration test suites in `stratosdb-testing`:
+    1. `SpringDataJpaPetClinicEndToEndTest`
+    2. `PrismaClientOrmEndToEndTest`
+    3. `DBeaverAndDataGripToolingEndToEndTest`
+  - Added 2 metadata and foreign key test cases in `StratosDriverTest` (`stratosdb-jdbc`).
+  - Full reactor test suite verified at **661 / 661 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 27, Sprint 12 Week 23: Full ORM & Client Ecosystem Certification) marked `Completed`.
+    - Sheet 5 (Row 14, Hibernate ORM & Spring Boot Compatibility) marked `Passed (Week 23)`.
+    - Sheet 5 (Row 15, Database GUI Tool Compatibility) marked `Passed (Week 23)`.
 
 ## What to do next
 

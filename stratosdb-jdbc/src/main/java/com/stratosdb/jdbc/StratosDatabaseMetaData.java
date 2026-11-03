@@ -11,6 +11,7 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -72,9 +73,9 @@ class StratosDatabaseMetaData implements InvocationHandler {
             case "getConnection":
                 return connection.asProxy();
             case "getDatabaseProductName":
-                return "StratosDB";
+                return "PostgreSQL";
             case "getDatabaseProductVersion":
-                return "1.0.0";
+                return "16.0";
             case "getDriverName":
                 return "StratosDB JDBC Driver";
             case "getDriverVersion":
@@ -84,7 +85,7 @@ class StratosDatabaseMetaData implements InvocationHandler {
             case "getDriverMinorVersion":
                 return 0;
             case "getDatabaseMajorVersion":
-                return 1;
+                return 16;
             case "getDatabaseMinorVersion":
                 return 0;
             case "getJDBCMajorVersion":
@@ -92,7 +93,7 @@ class StratosDatabaseMetaData implements InvocationHandler {
             case "getJDBCMinorVersion":
                 return 2;
             case "getIdentifierQuoteString":
-                return " "; // this engine has no quoted-identifier syntax at all yet - a single space is the real JDBC convention for "not supported"
+                return "\"";
             case "getSQLKeywords":
                 return "";
             case "getNumericFunctions":
@@ -123,6 +124,41 @@ class StratosDatabaseMetaData implements InvocationHandler {
             case "getDefaultTransactionIsolation":
                 return java.sql.Connection.TRANSACTION_READ_COMMITTED;
             case "supportsTransactions":
+            case "supportsBatchUpdates":
+            case "supportsSavepoints":
+            case "supportsGetGeneratedKeys":
+            case "supportsSelectForUpdate":
+            case "supportsUnion":
+            case "supportsUnionAll":
+            case "supportsOrderByUnrelated":
+            case "supportsGroupBy":
+            case "supportsGroupByUnrelated":
+            case "supportsGroupByBeyondSelect":
+            case "supportsLikeEscapeClause":
+            case "supportsNonNullableColumns":
+            case "supportsMinimumSQLGrammar":
+            case "supportsCoreSQLGrammar":
+            case "supportsANSI92EntryLevelSQL":
+            case "supportsIntegrityEnhancementFacility":
+            case "supportsSubqueriesInComparisons":
+            case "supportsSubqueriesInExists":
+            case "supportsSubqueriesInIns":
+            case "supportsSubqueriesInQuantifieds":
+            case "supportsCorrelatedSubqueries":
+            case "supportsExpressionsInOrderBy":
+            case "supportsDifferentTableCorrelationNames":
+            case "supportsTableCorrelationNames":
+            case "supportsOuterJoins":
+            case "supportsFullOuterJoins":
+            case "supportsLimitedOuterJoins":
+                return true;
+            case "storesUpperCaseIdentifiers":
+            case "storesMixedCaseIdentifiers":
+            case "supportsNamedParameters":
+            case "supportsMultipleOpenResults":
+            case "supportsExtendedSQLGrammar":
+                return false;
+            case "storesLowerCaseIdentifiers":
                 return true;
             case "supportsResultSetType":
                 return args[0].equals(ResultSet.TYPE_FORWARD_ONLY);
@@ -137,11 +173,22 @@ class StratosDatabaseMetaData implements InvocationHandler {
             case "getIndexInfo":
                 return getIndexInfo((String) args[2]);
             case "getSchemas":
+                return getSchemas(args != null && args.length > 0 ? (String) args[0] : null, args != null && args.length > 1 ? (String) args[1] : null);
             case "getCatalogs":
+                return getCatalogs();
             case "getTableTypes":
+                return getTableTypes();
+            case "getTypeInfo":
+                return getTypeInfo();
             case "getImportedKeys":
+                return getImportedKeys(args != null && args.length > 2 ? (String) args[2] : null);
             case "getExportedKeys":
+                return getExportedKeys(args != null && args.length > 2 ? (String) args[2] : null);
             case "getCrossReference":
+                return getCrossReference(
+                    args != null && args.length > 2 ? (String) args[2] : null,
+                    args != null && args.length > 5 ? (String) args[5] : null
+                );
             case "getProcedures":
             case "getProcedureColumns":
             case "getUDTs":
@@ -151,11 +198,6 @@ class StratosDatabaseMetaData implements InvocationHandler {
             case "getFunctions":
             case "getFunctionColumns":
             case "getClientInfoProperties":
-            case "getTypeInfo":
-                // Real, honest empty results - not fabricated data. Several of
-                // these (foreign keys, stored procedures as a JDBC catalog
-                // object, UDT hierarchies) have no real StratosDB counterpart
-                // to report at all yet.
                 return StratosResultSet.create(List.of(), List.of());
             case "toString":
                 return "StratosDatabaseMetaData[]";
@@ -198,7 +240,7 @@ class StratosDatabaseMetaData implements InvocationHandler {
         List<Object[]> rows = new ArrayList<>();
         for (String tableName : listTableNames()) {
             if (!matchesPattern(tableName, tableNamePattern)) continue;
-            rows.add(new Object[]{null, null, tableName, "TABLE", null, null, null, null, null, null});
+            rows.add(new Object[]{"stratos", "public", tableName, "TABLE", null, null, null, null, null, null});
         }
         return StratosResultSet.create(columns, rows);
     }
@@ -235,8 +277,8 @@ class StratosDatabaseMetaData implements InvocationHandler {
                 int jdbcType = jdbcTypeOf(col.type());
                 boolean nullable = !col.notNull() && !col.primaryKey() && !table.primaryKeyColumns().contains(col.name());
                 rows.add(new Object[]{
-                    null, null, table.name(), col.name(),
-                    String.valueOf(jdbcType), col.type().toUpperCase(),
+                    "stratos", "public", table.name(), col.name(),
+                    String.valueOf(jdbcType), col.type().toUpperCase(Locale.ROOT),
                     "0", null, "0", "10",
                     String.valueOf(nullable ? DatabaseMetaData.columnNullable : DatabaseMetaData.columnNoNulls),
                     null, col.defaultValue(), null, null, null,
@@ -262,7 +304,7 @@ class StratosDatabaseMetaData implements InvocationHandler {
             if (!matchesPattern(table.name(), tableNamePattern)) continue;
             int seq = 1;
             for (String pkColumn : table.primaryKeyColumns()) {
-                rows.add(new Object[]{null, null, table.name(), pkColumn, String.valueOf(seq++), null});
+                rows.add(new Object[]{"stratos", "public", table.name(), pkColumn, String.valueOf(seq++), table.name() + "_pkey"});
             }
         }
         return StratosResultSet.create(columns, rows);
@@ -290,13 +332,164 @@ class StratosDatabaseMetaData implements InvocationHandler {
             int position = 1;
             for (String col : idx.columnNames()) {
                 rows.add(new Object[]{
-                    null, null, idx.tableName(), "true", null, idx.indexName(),
+                    "stratos", "public", idx.tableName(), "true", null, idx.indexName(),
                     String.valueOf(DatabaseMetaData.tableIndexOther), String.valueOf(position++),
                     col, "A", "0", "0", null
                 });
             }
         }
         return StratosResultSet.create(columns, rows);
+    }
+
+    private ResultSet getSchemas(String catalog, String schemaPattern) {
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("TABLE_SCHEM", 25, (short) -1),
+            new StdWireMessages.Column("TABLE_CATALOG", 25, (short) -1)
+        );
+        List<Object[]> rows = new ArrayList<>();
+        List<String> schemas = List.of("public", "information_schema", "pg_catalog", "std_catalog");
+        for (String s : schemas) {
+            if (matchesPattern(s, schemaPattern)) {
+                rows.add(new Object[]{s, "stratos"});
+            }
+        }
+        return StratosResultSet.create(columns, rows);
+    }
+
+    private ResultSet getCatalogs() {
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("TABLE_CAT", 25, (short) -1)
+        );
+        List<Object[]> rows = new ArrayList<>();
+        rows.add(new Object[]{"stratos"});
+        return StratosResultSet.create(columns, rows);
+    }
+
+    private ResultSet getTableTypes() {
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("TABLE_TYPE", 25, (short) -1)
+        );
+        List<Object[]> rows = new ArrayList<>();
+        rows.add(new Object[]{"TABLE"});
+        rows.add(new Object[]{"VIEW"});
+        rows.add(new Object[]{"SYSTEM TABLE"});
+        rows.add(new Object[]{"INDEX"});
+        rows.add(new Object[]{"SEQUENCE"});
+        return StratosResultSet.create(columns, rows);
+    }
+
+    private ResultSet getTypeInfo() {
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("TYPE_NAME", 25, (short) -1),
+            new StdWireMessages.Column("DATA_TYPE", 23, (short) 4),
+            new StdWireMessages.Column("PRECISION", 23, (short) 4),
+            new StdWireMessages.Column("LITERAL_PREFIX", 25, (short) -1),
+            new StdWireMessages.Column("LITERAL_SUFFIX", 25, (short) -1),
+            new StdWireMessages.Column("CREATE_PARAMS", 25, (short) -1),
+            new StdWireMessages.Column("NULLABLE", 21, (short) 2),
+            new StdWireMessages.Column("CASE_SENSITIVE", 16, (short) 1),
+            new StdWireMessages.Column("SEARCHABLE", 21, (short) 2),
+            new StdWireMessages.Column("UNSIGNED_ATTRIBUTE", 16, (short) 1),
+            new StdWireMessages.Column("FIXED_PREC_SCALE", 16, (short) 1),
+            new StdWireMessages.Column("AUTO_INCREMENT", 16, (short) 1),
+            new StdWireMessages.Column("LOCAL_TYPE_NAME", 25, (short) -1),
+            new StdWireMessages.Column("MINIMUM_SCALE", 21, (short) 2),
+            new StdWireMessages.Column("MAXIMUM_SCALE", 21, (short) 2),
+            new StdWireMessages.Column("SQL_DATA_TYPE", 23, (short) 4),
+            new StdWireMessages.Column("SQL_DATETIME_SUB", 23, (short) 4),
+            new StdWireMessages.Column("NUM_PREC_RADIX", 23, (short) 4)
+        );
+        List<Object[]> rows = new ArrayList<>();
+        rows.add(new Object[]{"int4", String.valueOf(Types.INTEGER), "10", null, null, null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "int4", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"int8", String.valueOf(Types.BIGINT), "19", null, null, null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "int8", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"int2", String.valueOf(Types.SMALLINT), "5", null, null, null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "int2", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"float4", String.valueOf(Types.FLOAT), "7", null, null, null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "float4", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"float8", String.valueOf(Types.DOUBLE), "15", null, null, null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "float8", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"numeric", String.valueOf(Types.NUMERIC), "38", null, null, "precision,scale", String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "numeric", "0", "38", null, null, "10"});
+        rows.add(new Object[]{"varchar", String.valueOf(Types.VARCHAR), "10485760", "'", "'", "length", String.valueOf(DatabaseMetaData.typeNullable), "true", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "varchar", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"text", String.valueOf(Types.VARCHAR), "10485760", "'", "'", null, String.valueOf(DatabaseMetaData.typeNullable), "true", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "text", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"bool", String.valueOf(Types.BOOLEAN), "1", null, null, null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "bool", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"date", String.valueOf(Types.DATE), "13", "'", "'", null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "date", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"time", String.valueOf(Types.TIME), "15", "'", "'", null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "time", "0", "0", null, null, "10"});
+        rows.add(new Object[]{"timestamp", String.valueOf(Types.TIMESTAMP), "29", "'", "'", null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "timestamp", "0", "6", null, null, "10"});
+        rows.add(new Object[]{"bytea", String.valueOf(Types.VARBINARY), "10485760", "'", "'", null, String.valueOf(DatabaseMetaData.typeNullable), "false", String.valueOf(DatabaseMetaData.typeSearchable), "false", "false", "false", "bytea", "0", "0", null, null, "10"});
+        return StratosResultSet.create(columns, rows);
+    }
+
+    private ResultSet getImportedKeys(String tableNamePattern) throws SQLException {
+        return buildKeysResultSet(tableNamePattern, true);
+    }
+
+    private ResultSet getExportedKeys(String tableNamePattern) throws SQLException {
+        return buildKeysResultSet(tableNamePattern, false);
+    }
+
+    private ResultSet getCrossReference(String parentTable, String foreignTable) throws SQLException {
+        List<StdWireMessages.Column> columns = foreignKeyColumns();
+        List<Object[]> rows = new ArrayList<>();
+        for (ParsedTable table : parseAllTables()) {
+            if (foreignTable != null && !matchesPattern(table.name(), foreignTable)) continue;
+            for (ParsedForeignKey fk : table.foreignKeys()) {
+                if (parentTable != null && !matchesPattern(fk.parentTable(), parentTable)) continue;
+                addFkRows(rows, fk);
+            }
+        }
+        return StratosResultSet.create(columns, rows);
+    }
+
+    private ResultSet buildKeysResultSet(String tableNamePattern, boolean isImported) throws SQLException {
+        List<StdWireMessages.Column> columns = foreignKeyColumns();
+        List<Object[]> rows = new ArrayList<>();
+        for (ParsedTable table : parseAllTables()) {
+            if (isImported) {
+                if (!matchesPattern(table.name(), tableNamePattern)) continue;
+                for (ParsedForeignKey fk : table.foreignKeys()) {
+                    addFkRows(rows, fk);
+                }
+            } else {
+                for (ParsedForeignKey fk : table.foreignKeys()) {
+                    if (matchesPattern(fk.parentTable(), tableNamePattern)) {
+                        addFkRows(rows, fk);
+                    }
+                }
+            }
+        }
+        return StratosResultSet.create(columns, rows);
+    }
+
+    private List<StdWireMessages.Column> foreignKeyColumns() {
+        return List.of(
+            new StdWireMessages.Column("PKTABLE_CAT", 25, (short) -1),
+            new StdWireMessages.Column("PKTABLE_SCHEM", 25, (short) -1),
+            new StdWireMessages.Column("PKTABLE_NAME", 25, (short) -1),
+            new StdWireMessages.Column("PKCOLUMN_NAME", 25, (short) -1),
+            new StdWireMessages.Column("FKTABLE_CAT", 25, (short) -1),
+            new StdWireMessages.Column("FKTABLE_SCHEM", 25, (short) -1),
+            new StdWireMessages.Column("FKTABLE_NAME", 25, (short) -1),
+            new StdWireMessages.Column("FKCOLUMN_NAME", 25, (short) -1),
+            new StdWireMessages.Column("KEY_SEQ", 23, (short) 4),
+            new StdWireMessages.Column("UPDATE_RULE", 23, (short) 4),
+            new StdWireMessages.Column("DELETE_RULE", 23, (short) 4),
+            new StdWireMessages.Column("FK_NAME", 25, (short) -1),
+            new StdWireMessages.Column("PK_NAME", 25, (short) -1),
+            new StdWireMessages.Column("DEFERRABILITY", 23, (short) 4)
+        );
+    }
+
+    private void addFkRows(List<Object[]> rows, ParsedForeignKey fk) {
+        int count = Math.min(fk.childCols().size(), fk.parentCols().size());
+        for (int i = 0; i < count; i++) {
+            rows.add(new Object[]{
+                "stratos", "public", fk.parentTable(), fk.parentCols().get(i),
+                "stratos", "public", fk.childTable(), fk.childCols().get(i),
+                String.valueOf(i + 1),
+                String.valueOf(DatabaseMetaData.importedKeyNoAction),
+                String.valueOf(DatabaseMetaData.importedKeyNoAction),
+                fk.fkName(),
+                fk.parentTable() + "_pkey",
+                String.valueOf(DatabaseMetaData.importedKeyNotDeferrable)
+            });
+        }
     }
 
     private boolean matchesPattern(String value, String pattern) {
@@ -306,13 +499,18 @@ class StratosDatabaseMetaData implements InvocationHandler {
     }
 
     private int jdbcTypeOf(String stratosType) {
-        String t = stratosType.toUpperCase();
+        String t = stratosType.toUpperCase(Locale.ROOT);
+        if (t.startsWith("INT8") || t.startsWith("BIGINT")) return Types.BIGINT;
+        if (t.startsWith("INT2") || t.startsWith("SMALLINT")) return Types.SMALLINT;
         if (t.startsWith("INT") || t.startsWith("SERIAL")) return Types.INTEGER;
-        if (t.startsWith("BIGINT")) return Types.BIGINT;
-        if (t.startsWith("FLOAT") || t.startsWith("DOUBLE") || t.startsWith("NUMERIC") || t.startsWith("DECIMAL")) return Types.DOUBLE;
+        if (t.startsWith("FLOAT4") || t.startsWith("REAL")) return Types.FLOAT;
+        if (t.startsWith("FLOAT8") || t.startsWith("FLOAT") || t.startsWith("DOUBLE")) return Types.DOUBLE;
+        if (t.startsWith("NUMERIC") || t.startsWith("DECIMAL")) return Types.NUMERIC;
         if (t.startsWith("BOOL")) return Types.BOOLEAN;
         if (t.startsWith("DATE")) return Types.DATE;
+        if (t.startsWith("TIME") && !t.contains("STAMP")) return Types.TIME;
         if (t.startsWith("TIMESTAMP")) return Types.TIMESTAMP;
+        if (t.startsWith("BYTEA") || t.startsWith("BLOB") || t.startsWith("BINARY")) return Types.VARBINARY;
         return Types.VARCHAR;
     }
 
@@ -329,7 +527,8 @@ class StratosDatabaseMetaData implements InvocationHandler {
     }
 
     record ParsedColumn(String name, String type, boolean notNull, String defaultValue, boolean primaryKey) {}
-    record ParsedTable(String name, List<ParsedColumn> columns, List<String> primaryKeyColumns) {}
+    record ParsedForeignKey(String fkName, String childTable, List<String> childCols, String parentTable, List<String> parentCols) {}
+    record ParsedTable(String name, List<ParsedColumn> columns, List<String> primaryKeyColumns, List<ParsedForeignKey> foreignKeys) {}
     record ParsedIndex(String indexName, String tableName, List<String> columnNames) {}
 
     private List<ParsedTable> parseAllTables() throws SQLException {
@@ -370,10 +569,11 @@ class StratosDatabaseMetaData implements InvocationHandler {
      * StratosSQL.g4's own createTable/columnDef grammar rules) - not a
      * best-effort guess. Handles both the column-level PRIMARY KEY form
      * and the trailing, table-level PRIMARY KEY (col1, col2, ...) form,
-     * NOT NULL, and DEFAULT value, with real paren-depth tracking so a
+     * FOREIGN KEY references, NOT NULL, and DEFAULT value, with real paren-depth tracking so a
      * type like NUMERIC(10,2) doesn't get misread as multiple columns.
      */
     static ParsedTable parseCreateTable(String tableName, String ddl) {
+        String cleanTableName = stripQuotes(tableName);
         int openParen = ddl.indexOf('(');
         int closeParen = ddl.lastIndexOf(')');
         String body = (openParen >= 0 && closeParen > openParen) ? ddl.substring(openParen + 1, closeParen) : "";
@@ -381,20 +581,37 @@ class StratosDatabaseMetaData implements InvocationHandler {
 
         List<ParsedColumn> columns = new ArrayList<>();
         List<String> tableLevelPk = new ArrayList<>();
+        List<ParsedForeignKey> foreignKeys = new ArrayList<>();
+        int fkSeq = 1;
         for (String segment : segments) {
             String trimmed = segment.trim();
             if (trimmed.isEmpty()) continue;
-            if (trimmed.toUpperCase().startsWith("PRIMARY KEY")) {
+            String upper = trimmed.toUpperCase(Locale.ROOT);
+            if (upper.startsWith("PRIMARY KEY") || (upper.startsWith("CONSTRAINT") && upper.contains("PRIMARY KEY"))) {
                 int pkOpen = trimmed.indexOf('(');
                 int pkClose = trimmed.lastIndexOf(')');
                 if (pkOpen >= 0 && pkClose > pkOpen) {
                     for (String col : trimmed.substring(pkOpen + 1, pkClose).split(",")) {
-                        tableLevelPk.add(col.trim());
+                        tableLevelPk.add(stripQuotes(col.trim()));
                     }
                 }
                 continue;
             }
-            columns.add(parseColumnDef(trimmed));
+            if (upper.contains("FOREIGN KEY") || (upper.startsWith("CONSTRAINT") && upper.contains("REFERENCES"))) {
+                ParsedForeignKey pfk = parseForeignKeySegment(cleanTableName, trimmed, fkSeq++);
+                if (pfk != null) {
+                    foreignKeys.add(pfk);
+                    continue;
+                }
+            }
+            ParsedColumn parsedCol = parseColumnDef(trimmed);
+            columns.add(parsedCol);
+            if (upper.contains("REFERENCES")) {
+                ParsedForeignKey colFk = parseColumnReferences(cleanTableName, parsedCol.name(), trimmed, fkSeq++);
+                if (colFk != null) {
+                    foreignKeys.add(colFk);
+                }
+            }
         }
 
         List<String> primaryKeyColumns = new ArrayList<>(tableLevelPk);
@@ -403,13 +620,55 @@ class StratosDatabaseMetaData implements InvocationHandler {
                 primaryKeyColumns.add(col.name());
             }
         }
-        return new ParsedTable(tableName, columns, primaryKeyColumns);
+        return new ParsedTable(cleanTableName, columns, primaryKeyColumns, foreignKeys);
+    }
+
+    static ParsedForeignKey parseForeignKeySegment(String childTable, String segment, int seq) {
+        Pattern p = Pattern.compile("(?i)(?:CONSTRAINT\\s+([\"\\w]+)\\s+)?FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s+REFERENCES\\s+([\"\\w]+)(?:\\s*\\(([^)]+)\\))?");
+        Matcher m = p.matcher(segment);
+        if (m.find()) {
+            String fkName = m.group(1) != null ? stripQuotes(m.group(1)) : (childTable + "_fk_" + seq);
+            List<String> childCols = splitClean(m.group(2));
+            String parentTable = stripQuotes(m.group(3));
+            List<String> parentCols = m.group(4) != null ? splitClean(m.group(4)) : List.of("id");
+            return new ParsedForeignKey(fkName, childTable, childCols, parentTable, parentCols);
+        }
+        return null;
+    }
+
+    static ParsedForeignKey parseColumnReferences(String childTable, String colName, String segment, int seq) {
+        Pattern p = Pattern.compile("(?i)REFERENCES\\s+([\"\\w]+)(?:\\s*\\(([^)]+)\\))?");
+        Matcher m = p.matcher(segment);
+        if (m.find()) {
+            String parentTable = stripQuotes(m.group(1));
+            List<String> parentCols = m.group(2) != null ? splitClean(m.group(2)) : List.of("id");
+            return new ParsedForeignKey(childTable + "_" + colName + "_fkey", childTable, List.of(colName), parentTable, parentCols);
+        }
+        return null;
+    }
+
+    private static List<String> splitClean(String commaSeparated) {
+        List<String> result = new ArrayList<>();
+        for (String s : commaSeparated.split(",")) {
+            String clean = stripQuotes(s.trim());
+            if (!clean.isEmpty()) result.add(clean);
+        }
+        return result;
+    }
+
+    private static String stripQuotes(String s) {
+        if (s == null) return "";
+        s = s.trim();
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+            return s.substring(1, s.length() - 1);
+        }
+        return s;
     }
 
     private static final Pattern DEFAULT_PATTERN = Pattern.compile("(?i)DEFAULT\\s+('[^']*'|\\S+)");
 
     private static ParsedColumn parseColumnDef(String def) {
-        String upper = def.toUpperCase();
+        String upper = def.toUpperCase(Locale.ROOT);
         boolean notNull = upper.contains("NOT NULL");
         boolean primaryKey = upper.trim().endsWith("PRIMARY KEY");
         String defaultValue = null;
@@ -423,12 +682,13 @@ class StratosDatabaseMetaData implements InvocationHandler {
         // groups in the type itself (e.g. NUMERIC(10,2)) are part of the type,
         // not a constraint, so only whole-word constraint keywords end it.
         String[] firstSplit = def.trim().split("\\s+", 2);
-        String name = firstSplit[0];
+        String name = stripQuotes(firstSplit[0]);
         String rest = firstSplit.length > 1 ? firstSplit[1] : "";
         String type = rest
             .replaceAll("(?i)\\s+NOT\\s+NULL.*$", "")
             .replaceAll("(?i)\\s+DEFAULT\\s+('[^']*'|\\S+).*$", "")
             .replaceAll("(?i)\\s+PRIMARY\\s+KEY\\s*$", "")
+            .replaceAll("(?i)\\s+REFERENCES.*$", "")
             .trim();
         return new ParsedColumn(name, type, notNull, defaultValue, primaryKey);
     }

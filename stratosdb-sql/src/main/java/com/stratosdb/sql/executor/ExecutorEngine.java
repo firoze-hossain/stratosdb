@@ -1389,6 +1389,42 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return Collections.unmodifiableSet(sequences.keySet());
     }
 
+    public Map<String, Sequence> getSequences() {
+        return Collections.unmodifiableMap(sequences);
+    }
+
+    public Map<String, List<ForeignKeyDefinition>> getAllForeignKeys() {
+        return Collections.unmodifiableMap(tableForeignKeys);
+    }
+
+    public List<ForeignKeyDefinition> getTableForeignKeys(String tableName) {
+        return tableForeignKeys.getOrDefault(tableName, List.of());
+    }
+
+    public Map<String, List<CheckConstraintDefinition>> getAllCheckConstraints() {
+        return Collections.unmodifiableMap(tableCheckConstraints);
+    }
+
+    public List<CheckConstraintDefinition> getTableCheckConstraints(String tableName) {
+        return tableCheckConstraints.getOrDefault(tableName, List.of());
+    }
+
+    public Map<String, List<String>> getAllPrimaryKeys() {
+        return Collections.unmodifiableMap(tablePrimaryKeys);
+    }
+
+    public Map<String, CreateFunctionStatement> getFunctions() {
+        return Collections.unmodifiableMap(functions);
+    }
+
+    public Map<String, CreateProcedureStatement> getProcedures() {
+        return Collections.unmodifiableMap(procedures);
+    }
+
+    public Map<String, Role> getRoles() {
+        return Collections.unmodifiableMap(roles);
+    }
+
     public Map<String, TableStatistics> getStatistics() {
         return Collections.unmodifiableMap(statistics);
     }
@@ -1546,6 +1582,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof AlterTableAlterColumnTypeStatement s) return executeAlterTableAlterColumnType(s, txn);
         if (stmt instanceof AlterTableSetDefaultStatement s) return executeAlterTableSetDefault(s, txn);
         if (stmt instanceof AlterTableDropDefaultStatement s) return executeAlterTableDropDefault(s, txn);
+        if (stmt instanceof AlterTableAddConstraintStatement s) return executeAlterTableAddConstraint(s, txn);
+        if (stmt instanceof AlterTableDropConstraintStatement s) return executeAlterTableDropConstraint(s, txn);
+        if (stmt instanceof DropIndexStatement s) return executeDropIndex(s, txn);
         if (stmt instanceof ShowTablesStatement) return executeShowTables();
         if (stmt instanceof ShowStatsStatement) return executeShowStats();
         if (stmt instanceof ShowTableStatsStatement) return executeShowTableStats();
@@ -1570,6 +1609,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (stmt instanceof CteSelectStatement s) return executeCteSelect(s, txn);
         if (stmt instanceof RecursiveCteSelectStatement s) return executeRecursiveCteSelect(s, txn);
         if (stmt instanceof CreateSequenceStatement s) return executeCreateSequence(s);
+        if (stmt instanceof AlterSequenceStatement s) return executeAlterSequence(s);
         if (stmt instanceof DropSequenceStatement s) return executeDropSequence(s);
         if (stmt instanceof CreateTypeStatement s) return executeCreateType(s, txn);
         if (stmt instanceof DropTypeStatement s) return executeDropType(s, txn);
@@ -1732,18 +1772,41 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeCreateSequence(CreateSequenceStatement stmt) {
-        if (sequences.containsKey(stmt.name())) {
-            return QueryResult.error("Sequence already exists: " + stmt.name());
+        String name = SqlParser.cleanSequenceName(stmt.name());
+        if (sequences.containsKey(name)) {
+            if (stmt.ifNotExists()) {
+                return QueryResult.success("Sequence already exists: " + name);
+            }
+            return QueryResult.error("Sequence already exists: " + name);
         }
-        sequences.put(stmt.name(), new Sequence(stmt.name(), stmt.startValue(), stmt.incrementBy(), sequenceFile(stmt.name())));
-        return QueryResult.success("Sequence created: " + stmt.name());
+        sequences.put(name, new Sequence(name, stmt.startValue(), stmt.incrementBy(), sequenceFile(name)));
+        return QueryResult.success("Sequence created: " + name);
+    }
+
+    private QueryResult executeAlterSequence(AlterSequenceStatement stmt) {
+        String name = SqlParser.cleanSequenceName(stmt.sequenceName());
+        Sequence seq = sequences.get(name);
+        if (seq == null) {
+            if (stmt.ifExists()) {
+                return QueryResult.success("Sequence altered: " + name);
+            }
+            return QueryResult.error("Sequence not found: " + name);
+        }
+        if (stmt.restartValue() != null) {
+            seq.setVal(stmt.restartValue());
+        }
+        return QueryResult.success("Sequence altered: " + name);
     }
 
     private QueryResult executeDropSequence(DropSequenceStatement stmt) {
-        if (sequences.remove(stmt.name()) == null) {
-            return QueryResult.error("Sequence not found: " + stmt.name());
+        String name = SqlParser.cleanSequenceName(stmt.name());
+        if (sequences.remove(name) == null) {
+            if (stmt.ifExists()) {
+                return QueryResult.success("Sequence dropped: " + name);
+            }
+            return QueryResult.error("Sequence not found: " + name);
         }
-        return QueryResult.success("Sequence dropped: " + stmt.name());
+        return QueryResult.success("Sequence dropped: " + name);
     }
 
     /**
@@ -2248,6 +2311,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Cannot create table with reserved system table name: " + stmt.tableName());
         }
         if (tables.containsKey(stmt.tableName())) {
+            if (stmt.ifNotExists()) {
+                return QueryResult.success("Table already exists: " + stmt.tableName());
+            }
             return QueryResult.error("Table already exists: " + stmt.tableName());
         }
         if (views.containsKey(stmt.tableName())) {
@@ -2469,13 +2535,19 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     /** Every real, hardcoded type keyword dataType's own grammar rule recognizes - see that rule's own comment for why a bare IDENTIFIER not matching any of these is instead checked against a real, user-defined enum type name (see executeCreateTable's own validation). Length/precision suffixes like "VARCHAR(50)" or "DECIMAL(10,2)" are stripped before comparing, since only the bare keyword itself needs to be a known one. */
     private static final java.util.Set<String> KNOWN_BUILTIN_TYPES = java.util.Set.of(
         "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "SERIAL", "BIGSERIAL",
+        "INT2", "INT4", "INT8", "FLOAT4", "FLOAT8", "TIMESTAMPTZ", "CHARACTERVARYING",
         "VARCHAR", "TEXT", "CHAR", "BOOLEAN", "BOOL", "DATE", "TIME", "TIMESTAMP",
         "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "DOUBLEPRECISION", "BYTEA", "BLOB", "UUID", "JSON", "JSONB",
         "INET", "CIDR", "INT4RANGE", "DATERANGE", "TSVECTOR", "TSQUERY"
     );
 
     private boolean isKnownBuiltInType(String type) {
-        String bareKeyword = stripArraySuffix(type).replaceAll("\\(.*\\)", "").replace(" ", "").trim().toUpperCase();
+        String bareKeyword = stripArraySuffix(type)
+            .replaceAll("(?i)\\s+(WITH|WITHOUT)\\s+TIME\\s+ZONE", "")
+            .replaceAll("\\(.*\\)", "")
+            .replace(" ", "")
+            .trim()
+            .toUpperCase(Locale.ROOT);
         return KNOWN_BUILTIN_TYPES.contains(bareKeyword);
     }
 
@@ -2501,6 +2573,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (indexesByName.containsKey(stmt.indexName()) || brinIndexesByName.containsKey(stmt.indexName())
             || bitmapIndexesByName.containsKey(stmt.indexName()) || ginIndexesByName.containsKey(stmt.indexName())
             || gistIndexesByName.containsKey(stmt.indexName())) {
+            if (stmt.ifNotExists()) {
+                return QueryResult.success("Index already exists: " + stmt.indexName());
+            }
             return QueryResult.error("Index already exists: " + stmt.indexName());
         }
         HeapTable table = tables.get(stmt.tableName());
@@ -3291,7 +3366,18 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
         QueryResult result = executeSelectInternal(stmt, txn, params);
         if (stmt.forUpdate()) {
-            return applyForUpdateLocking(stmt, result, txn);
+            result = applyForUpdateLocking(stmt, result, txn);
+        }
+        if (stmt.distinct() && result.isSuccess() && result.getRows() != null) {
+            List<Tuple> deduped = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (Tuple row : result.getRows()) {
+                String key = row.getValues() != null ? row.getValues().toString() : "";
+                if (seen.add(key)) {
+                    deduped.add(row);
+                }
+            }
+            return QueryResult.success(deduped, result.getColumnNames());
         }
         return result;
     }
@@ -4236,6 +4322,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             case "COUNT": {
                 if (agg.argument().equals("*")) {
                     return rows.size();
+                }
+                if (agg.distinct()) {
+                    Set<Object> distinctVals = new HashSet<>();
+                    for (Tuple row : rows) {
+                        Object v = findColumnValue(row, agg.argument());
+                        if (v != null) distinctVals.add(v);
+                    }
+                    return distinctVals.size();
                 }
                 int count = 0;
                 for (Tuple row : rows) {
@@ -5818,6 +5912,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Cannot drop system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
+            if (stmt.ifExists()) {
+                return QueryResult.success("Table dropped: " + stmt.tableName());
+            }
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
@@ -7512,6 +7609,109 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return QueryResult.success("Row level security forced on: " + stmt.tableName());
     }
 
+    private QueryResult executeAlterTableAddConstraint(AlterTableAddConstraintStatement stmt, Transaction txn) {
+        String table = SqlParser.cleanIdentifier(stmt.tableName());
+        if (!tables.containsKey(table)) {
+            return QueryResult.error("Table not found: " + table);
+        }
+        long xid = txn != null ? txn.getXID() : 0L;
+        String type = stmt.constraintType().toUpperCase(Locale.ROOT);
+        String cName = stmt.constraintName() != null ? stmt.constraintName() : table + "_" + type.toLowerCase(Locale.ROOT);
+
+        if (type.equals("PRIMARY KEY")) {
+            tablePrimaryKeys.put(table, stmt.columns());
+            systemCatalog.insertConstraint(cName, table, "PRIMARY KEY", String.join(",", stmt.columns()), xid);
+            for (String pkCol : stmt.columns()) {
+                executeCreateIndex(new CreateIndexStatement(cName + "_" + pkCol, table, pkCol, null, CreateIndexStatement.IndexType.BTREE, true, true), txn);
+            }
+        } else if (type.equals("UNIQUE")) {
+            systemCatalog.insertConstraint(cName, table, "UNIQUE", String.join(",", stmt.columns()), xid);
+            String c1 = stmt.columns().get(0);
+            String c2 = stmt.columns().size() > 1 ? stmt.columns().get(1) : null;
+            executeCreateIndex(new CreateIndexStatement(cName, table, c1, c2, CreateIndexStatement.IndexType.BTREE, true, true), txn);
+        } else if (type.equals("FOREIGN KEY")) {
+            ForeignKeyDefinition.ActionType onDel = stmt.onDelete() != null ? ForeignKeyDefinition.ActionType.valueOf(stmt.onDelete()) : ForeignKeyDefinition.ActionType.RESTRICT;
+            ForeignKeyDefinition.ActionType onUpd = stmt.onUpdate() != null ? ForeignKeyDefinition.ActionType.valueOf(stmt.onUpdate()) : ForeignKeyDefinition.ActionType.RESTRICT;
+            ForeignKeyDefinition fk = new ForeignKeyDefinition(cName, table, stmt.columns(), stmt.parentTable(), stmt.parentColumns(), onDel, onUpd);
+            tableForeignKeys.computeIfAbsent(table, k -> new ArrayList<>()).add(fk);
+            systemCatalog.insertConstraint(cName, table, "FOREIGN KEY", String.join(",", stmt.columns()), xid);
+        } else if (type.equals("CHECK")) {
+            CheckConstraintDefinition chk = new CheckConstraintDefinition(cName, stmt.checkExpr().toString(), stmt.checkExpr());
+            tableCheckConstraints.computeIfAbsent(table, k -> new ArrayList<>()).add(chk);
+            systemCatalog.insertConstraint(cName, table, "CHECK", stmt.checkExpr().toString(), xid);
+        }
+        return QueryResult.success("Table altered: " + table);
+    }
+
+    private QueryResult executeAlterTableDropConstraint(AlterTableDropConstraintStatement stmt, Transaction txn) {
+        String table = SqlParser.cleanIdentifier(stmt.tableName());
+        String cName = SqlParser.cleanIdentifier(stmt.constraintName());
+        boolean removed = false;
+
+        List<ForeignKeyDefinition> fks = tableForeignKeys.get(table);
+        if (fks != null) {
+            removed |= fks.removeIf(fk -> fk.name().equalsIgnoreCase(cName));
+        }
+        List<CheckConstraintDefinition> checks = tableCheckConstraints.get(table);
+        if (checks != null) {
+            removed |= checks.removeIf(chk -> chk.name().equalsIgnoreCase(cName));
+        }
+        List<String> pks = tablePrimaryKeys.get(table);
+        if (pks != null && (cName.equalsIgnoreCase(table + "_pk") || cName.equalsIgnoreCase(table + "_pkey") || cName.equalsIgnoreCase(table + "_primary_key"))) {
+            tablePrimaryKeys.remove(table);
+            removed = true;
+        }
+        IndexEntry idxEntry = indexesByName.remove(cName);
+        if (idxEntry != null) {
+            List<IndexEntry> entries = indexesByTable.get(table);
+            if (entries != null) {
+                entries.removeIf(e -> e.indexName().equalsIgnoreCase(cName));
+            }
+            brinIndexesByName.remove(cName);
+            bitmapIndexesByName.remove(cName);
+            ginIndexesByName.remove(cName);
+            gistIndexesByName.remove(cName);
+            catalogLines.remove("INDEX:" + cName);
+            removed = true;
+        }
+
+        if (!removed && !stmt.ifExists()) {
+            return QueryResult.error("Constraint not found: " + cName);
+        }
+        return QueryResult.success("Table altered: " + table);
+    }
+
+    private QueryResult executeDropIndex(DropIndexStatement stmt, Transaction txn) {
+        String name = SqlParser.cleanIdentifier(stmt.indexName());
+        IndexMetadata found = null;
+        for (IndexMetadata idx : getAllIndexes()) {
+            if (idx.indexName().equalsIgnoreCase(name)) {
+                found = idx;
+                break;
+            }
+        }
+        if (found == null) {
+            if (stmt.ifExists()) {
+                return QueryResult.success("Index dropped: " + name);
+            }
+            return QueryResult.error("Index not found: " + name);
+        }
+        final String targetIdxName = found.indexName();
+        indexesByName.remove(targetIdxName);
+        List<IndexEntry> entries = indexesByTable.get(found.tableName());
+        if (entries != null) {
+            entries.removeIf(e -> e.indexName().equalsIgnoreCase(targetIdxName));
+        }
+        brinIndexesByName.remove(targetIdxName);
+        bitmapIndexesByName.remove(targetIdxName);
+        ginIndexesByName.remove(targetIdxName);
+        gistIndexesByName.remove(targetIdxName);
+        catalogLines.remove("INDEX:" + targetIdxName);
+        long xid = txn != null ? txn.getXID() : 0L;
+        systemCatalog.deleteIndex(name, xid);
+        return QueryResult.success("Index dropped: " + name);
+    }
+
     private QueryResult executeCreatePolicy(CreatePolicyStatement stmt) {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -7818,14 +8018,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * own ParameterStatus messages). Deliberately NOT a fabricated
      * value for anything not in this map - see the error case below.
      */
-    private static final java.util.Map<String, String> KNOWN_SHOW_PARAMETERS = java.util.Map.of(
-        "standard_conforming_strings", "on",
-        "client_encoding", "UTF8",
-        "server_encoding", "UTF8",
-        "datestyle", "ISO, MDY",
-        "timezone", "UTC",
-        "server_version", "16.0 (StratosDB pg-wire compatibility layer)",
-        "integer_datetimes", "on"
+    private static final java.util.Map<String, String> KNOWN_SHOW_PARAMETERS = java.util.Map.ofEntries(
+        java.util.Map.entry("standard_conforming_strings", "on"),
+        java.util.Map.entry("client_encoding", "UTF8"),
+        java.util.Map.entry("server_encoding", "UTF8"),
+        java.util.Map.entry("datestyle", "ISO, MDY"),
+        java.util.Map.entry("timezone", "UTC"),
+        java.util.Map.entry("server_version", "16.0 (StratosDB pg-wire compatibility layer)"),
+        java.util.Map.entry("server_version_num", "160000"),
+        java.util.Map.entry("integer_datetimes", "on"),
+        java.util.Map.entry("search_path", "public"),
+        java.util.Map.entry("intervalstyle", "postgres"),
+        java.util.Map.entry("application_name", ""),
+        java.util.Map.entry("session_authorization", "stratos"),
+        java.util.Map.entry("extra_float_digits", "3"),
+        java.util.Map.entry("max_connections", "100"),
+        java.util.Map.entry("autovacuum", "on"),
+        java.util.Map.entry("idle_in_transaction_session_timeout", "0")
     );
 
     private QueryResult executeShowParameter(ShowParameterStatement stmt) {
@@ -8072,7 +8281,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         // same, real, conventional default real Postgres itself uses, and is the
         // most honest answer a real client's own schema-scoping logic (SQLAlchemy's
         // own dialect initialization calls this directly) can be given.
-        "current_schema", () -> "public"
+        "current_schema", () -> "public",
+        "now", () -> java.time.Instant.now().toString(),
+        "session_user", () -> "stratos"
     );
 
     /**
@@ -8111,7 +8322,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             || lowerName.equals("array_to_string")
             || lowerName.equals("get_expr") || lowerName.equals("std_get_expr") || lowerName.equals("pg_get_expr")
             || lowerName.equals("get_indexdef") || lowerName.equals("std_get_indexdef") || lowerName.equals("pg_get_indexdef")
-            || lowerName.equals("get_constraintdef") || lowerName.equals("std_get_constraintdef") || lowerName.equals("pg_get_constraintdef");
+            || lowerName.equals("get_constraintdef") || lowerName.equals("std_get_constraintdef") || lowerName.equals("pg_get_constraintdef")
+            || lowerName.equals("nextval")
+            || lowerName.equals("currval")
+            || lowerName.equals("setval")
+            || lowerName.equals("txid_current")
+            || lowerName.equals("pg_total_relation_size") || lowerName.equals("std_total_relation_size")
+            || lowerName.equals("pg_relation_size") || lowerName.equals("std_relation_size")
+            || lowerName.equals("obj_description")
+            || lowerName.equals("col_description")
+            || lowerName.equals("shobj_description")
+            || lowerName.equals("has_table_privilege")
+            || lowerName.equals("has_database_privilege")
+            || lowerName.equals("has_schema_privilege")
+            || lowerName.equals("pg_get_serial_sequence") || lowerName.equals("std_get_serial_sequence");
     }
 
     private Object invokeBuiltinFunction(String lowerName, List<Object> argValues) {
@@ -8157,6 +8381,54 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if ((lowerName.equals("get_constraintdef") || lowerName.equals("std_get_constraintdef") || lowerName.equals("pg_get_constraintdef")) && !argValues.isEmpty()) {
             return "";
+        }
+        if (lowerName.equals("nextval") && !argValues.isEmpty()) {
+            String seqName = SqlParser.cleanSequenceName(String.valueOf(argValues.get(0)));
+            Sequence seq = sequences.get(seqName);
+            if (seq == null) {
+                throw new IllegalArgumentException("Sequence not found: " + seqName);
+            }
+            return seq.nextValue();
+        }
+        if (lowerName.equals("currval") && !argValues.isEmpty()) {
+            String seqName = SqlParser.cleanSequenceName(String.valueOf(argValues.get(0)));
+            Sequence seq = sequences.get(seqName);
+            if (seq == null) {
+                throw new IllegalArgumentException("Sequence not found: " + seqName);
+            }
+            return seq.currentValue();
+        }
+        if (lowerName.equals("setval") && argValues.size() >= 2) {
+            String seqName = SqlParser.cleanSequenceName(String.valueOf(argValues.get(0)));
+            Sequence seq = sequences.get(seqName);
+            if (seq == null) {
+                throw new IllegalArgumentException("Sequence not found: " + seqName);
+            }
+            long val = parseNumber(argValues.get(1));
+            seq.setVal(val);
+            return val;
+        }
+        if (lowerName.equals("txid_current")) {
+            return session.get().transaction != null ? session.get().transaction.getXID() : 1L;
+        }
+        if (lowerName.equals("pg_total_relation_size") || lowerName.equals("std_total_relation_size")
+            || lowerName.equals("pg_relation_size") || lowerName.equals("std_relation_size")) {
+            return 8192L;
+        }
+        if (lowerName.equals("obj_description") || lowerName.equals("col_description") || lowerName.equals("shobj_description")) {
+            return "";
+        }
+        if (lowerName.equals("has_table_privilege") || lowerName.equals("has_database_privilege") || lowerName.equals("has_schema_privilege")) {
+            return true;
+        }
+        if (lowerName.equals("pg_get_serial_sequence") || lowerName.equals("std_get_serial_sequence")) {
+            if (argValues.size() >= 2) {
+                String tbl = SqlParser.cleanIdentifier(String.valueOf(argValues.get(0)));
+                String col = SqlParser.cleanIdentifier(String.valueOf(argValues.get(1)));
+                String cand = tbl + "_" + col + "_seq";
+                if (sequences.containsKey(cand)) return cand;
+            }
+            return null;
         }
         return null;
     }

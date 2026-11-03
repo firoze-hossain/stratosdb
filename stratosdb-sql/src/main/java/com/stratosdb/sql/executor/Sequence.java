@@ -62,6 +62,21 @@ public class Sequence {
         return name;
     }
 
+    public long currentValue() {
+        return currentValue.get();
+    }
+
+    public long getIncrementBy() {
+        return incrementBy;
+    }
+
+    public void setVal(long value) {
+        synchronized (lock) {
+            currentValue.set(value);
+            reserveWatermark(value);
+        }
+    }
+
     /** Advances the sequence and returns the new value - never repeats, even across a crash, by construction (see class javadoc). */
     public long nextValue() {
         long value = currentValue.addAndGet(incrementBy);

@@ -10,6 +10,8 @@ import java.util.List;
  * tracked separately, not folded into this list, since ExecutorEngine
  * combines both real sources when actually recording a table's own primary
  * key (see executeCreateTable).
+ *
+ * ifNotExists: true when CREATE TABLE IF NOT EXISTS is specified.
  */
 public record CreateTableStatement(
     String tableName,
@@ -17,15 +19,22 @@ public record CreateTableStatement(
     List<String> primaryKeyColumns,
     List<TableConstraint> uniqueConstraints,
     List<ForeignKeyDefinition> foreignKeys,
-    List<CheckConstraintDefinition> checkConstraints
+    List<CheckConstraintDefinition> checkConstraints,
+    boolean ifNotExists
 ) implements Statement {
     public record TableConstraint(String name, String type, List<String> columns) {}
 
     public CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns) {
-        this(tableName, columns, primaryKeyColumns, List.of(), List.of(), List.of());
+        this(tableName, columns, primaryKeyColumns, List.of(), List.of(), List.of(), false);
     }
 
     public CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns, List<TableConstraint> uniqueConstraints) {
-        this(tableName, columns, primaryKeyColumns, uniqueConstraints, List.of(), List.of());
+        this(tableName, columns, primaryKeyColumns, uniqueConstraints, List.of(), List.of(), false);
+    }
+
+    public CreateTableStatement(String tableName, List<ColumnDefinition> columns, List<String> primaryKeyColumns,
+                                List<TableConstraint> uniqueConstraints, List<ForeignKeyDefinition> foreignKeys,
+                                List<CheckConstraintDefinition> checkConstraints) {
+        this(tableName, columns, primaryKeyColumns, uniqueConstraints, foreignKeys, checkConstraints, false);
     }
 }

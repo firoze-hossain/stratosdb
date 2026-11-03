@@ -88,31 +88,37 @@ public class SqlParser {
         } else if (ctx.alterTableAddColumn() != null) {
             StratosSQLParser.AlterTableAddColumnContext actx = ctx.alterTableAddColumn();
             String defaultVal = actx.defaultValue() != null ? actx.defaultValue().getText() : null;
-            return new AlterTableAddColumnStatement(actx.tableName().getText(), actx.columnName().getText(), actx.dataType().getText(), defaultVal);
+            return new AlterTableAddColumnStatement(parseTableName(actx.tableName()), cleanColumnName(actx.columnName().getText()), actx.dataType().getText(), defaultVal);
         } else if (ctx.alterTableDropColumn() != null) {
             StratosSQLParser.AlterTableDropColumnContext actx = ctx.alterTableDropColumn();
-            return new AlterTableDropColumnStatement(actx.tableName().getText(), actx.columnName().getText());
+            return new AlterTableDropColumnStatement(parseTableName(actx.tableName()), cleanColumnName(actx.columnName().getText()));
         } else if (ctx.alterTableRenameColumn() != null) {
             StratosSQLParser.AlterTableRenameColumnContext actx = ctx.alterTableRenameColumn();
-            return new AlterTableRenameColumnStatement(actx.tableName().getText(), actx.columnName(0).getText(), actx.columnName(1).getText());
+            return new AlterTableRenameColumnStatement(parseTableName(actx.tableName()), cleanColumnName(actx.columnName(0).getText()), cleanColumnName(actx.columnName(1).getText()));
         } else if (ctx.alterTableRenameTable() != null) {
             StratosSQLParser.AlterTableRenameTableContext actx = ctx.alterTableRenameTable();
-            return new AlterTableRenameTableStatement(actx.tableName(0).getText(), actx.tableName(1).getText());
+            return new AlterTableRenameTableStatement(parseTableName(actx.tableName(0)), parseTableName(actx.tableName(1)));
         } else if (ctx.alterTableAlterColumnType() != null) {
             StratosSQLParser.AlterTableAlterColumnTypeContext actx = ctx.alterTableAlterColumnType();
-            return new AlterTableAlterColumnTypeStatement(actx.tableName().getText(), actx.columnName().getText(), actx.dataType().getText());
+            return new AlterTableAlterColumnTypeStatement(parseTableName(actx.tableName()), cleanColumnName(actx.columnName().getText()), actx.dataType().getText());
         } else if (ctx.alterTableSetDefault() != null) {
             StratosSQLParser.AlterTableSetDefaultContext actx = ctx.alterTableSetDefault();
-            return new AlterTableSetDefaultStatement(actx.tableName().getText(), actx.columnName().getText(), actx.defaultValue().getText());
+            return new AlterTableSetDefaultStatement(parseTableName(actx.tableName()), cleanColumnName(actx.columnName().getText()), actx.defaultValue().getText());
         } else if (ctx.alterTableDropDefault() != null) {
             StratosSQLParser.AlterTableDropDefaultContext actx = ctx.alterTableDropDefault();
-            return new AlterTableDropDefaultStatement(actx.tableName().getText(), actx.columnName().getText());
+            return new AlterTableDropDefaultStatement(parseTableName(actx.tableName()), cleanColumnName(actx.columnName().getText()));
+        } else if (ctx.alterTableAddConstraint() != null) {
+            return buildAlterTableAddConstraint(ctx.alterTableAddConstraint());
+        } else if (ctx.alterTableDropConstraint() != null) {
+            return buildAlterTableDropConstraint(ctx.alterTableDropConstraint());
+        } else if (ctx.dropIndex() != null) {
+            return new DropIndexStatement(cleanIdentifier(ctx.dropIndex().indexName().getText()), ctx.dropIndex().PLSQL_IF() != null);
         } else if (ctx.alterTableEnableRls() != null) {
-            return new AlterTableEnableRlsStatement(ctx.alterTableEnableRls().tableName().getText());
+            return new AlterTableEnableRlsStatement(parseTableName(ctx.alterTableEnableRls().tableName()));
         } else if (ctx.alterTableDisableRls() != null) {
-            return new AlterTableDisableRlsStatement(ctx.alterTableDisableRls().tableName().getText());
+            return new AlterTableDisableRlsStatement(parseTableName(ctx.alterTableDisableRls().tableName()));
         } else if (ctx.alterTableForceRls() != null) {
-            return new AlterTableForceRlsStatement(ctx.alterTableForceRls().tableName().getText());
+            return new AlterTableForceRlsStatement(parseTableName(ctx.alterTableForceRls().tableName()));
         } else if (ctx.createPolicy() != null) {
             StratosSQLParser.CreatePolicyContext pctx = ctx.createPolicy();
             String command = pctx.policyCommand() != null ? pctx.policyCommand().getText().toUpperCase() : "ALL";
@@ -195,14 +201,14 @@ public class SqlParser {
         } else if (ctx.dropView() != null) {
             return new DropViewStatement(ctx.dropView().viewName().getText());
         } else if (ctx.savepoint() != null) {
-            return new SavepointStatement(ctx.savepoint().savepointName().getText());
+            return new SavepointStatement(cleanIdentifier(ctx.savepoint().savepointName().getText()));
         } else if (ctx.releaseSavepoint() != null) {
-            return new ReleaseSavepointStatement(ctx.releaseSavepoint().savepointName().getText());
+            return new ReleaseSavepointStatement(cleanIdentifier(ctx.releaseSavepoint().savepointName().getText()));
         } else if (ctx.rollbackToSavepoint() != null) {
-            return new RollbackToSavepointStatement(ctx.rollbackToSavepoint().savepointName().getText());
+            return new RollbackToSavepointStatement(cleanIdentifier(ctx.rollbackToSavepoint().savepointName().getText()));
         } else if (ctx.selectWithCte() != null) {
             StratosSQLParser.SelectWithCteContext cteCtx = ctx.selectWithCte();
-            String cteName = cteCtx.cteName().getText();
+            String cteName = cleanIdentifier(cteCtx.cteName().getText());
             boolean hasRecursiveKeyword = cteCtx.RECURSIVE() != null;
             boolean hasUnionAllStructure = cteCtx.select().size() == 3;
             if (hasRecursiveKeyword != hasUnionAllStructure) {
@@ -218,27 +224,11 @@ public class SqlParser {
             SelectStatement outerQuery = buildSelect(cteCtx.select(1));
             return new CteSelectStatement(cteName, cteQuery, outerQuery);
         } else if (ctx.createSequence() != null) {
-            StratosSQLParser.CreateSequenceContext seqCtx = ctx.createSequence();
-            String name = seqCtx.sequenceName().getText();
-            List<TerminalNode> ints = seqCtx.INTEGER_LITERAL();
-            // START and INCREMENT are both optional and order-independent in
-            // input, but the grammar only records their integer literals in
-            // left-to-right appearance order - START's value (if given)
-            // always comes before INCREMENT's in that list, matching how a
-            // real "CREATE SEQUENCE x START WITH 100 INCREMENT BY 5" reads.
-            long startValue = 1;
-            long incrementBy = 1;
-            if (seqCtx.START() != null && seqCtx.INCREMENT() != null && ints.size() == 2) {
-                startValue = Long.parseLong(ints.get(0).getText());
-                incrementBy = Long.parseLong(ints.get(1).getText());
-            } else if (seqCtx.START() != null && ints.size() >= 1) {
-                startValue = Long.parseLong(ints.get(0).getText());
-            } else if (seqCtx.INCREMENT() != null && ints.size() >= 1) {
-                incrementBy = Long.parseLong(ints.get(0).getText());
-            }
-            return new CreateSequenceStatement(name, startValue, incrementBy);
+            return buildCreateSequence(ctx.createSequence());
+        } else if (ctx.alterSequence() != null) {
+            return buildAlterSequence(ctx.alterSequence());
         } else if (ctx.dropSequence() != null) {
-            return new DropSequenceStatement(ctx.dropSequence().sequenceName().getText());
+            return new DropSequenceStatement(cleanSequenceName(ctx.dropSequence().sequenceName().getText()), ctx.dropSequence().PLSQL_IF() != null);
         } else if (ctx.createType() != null) {
             String typeName = ctx.createType().typeName().getText();
             List<String> enumValues = new ArrayList<>();
@@ -360,11 +350,12 @@ public class SqlParser {
     }
 
     private CreateIndexStatement buildCreateIndex(StratosSQLParser.CreateIndexContext ctx) {
-        String indexName = ctx.indexName().getText();
-        String tableName = ctx.tableName().getText();
-        String columnName = ctx.columnName(0).getText();
-        String columnName2 = ctx.columnName().size() > 1 ? ctx.columnName(1).getText() : null;
+        String indexName = cleanIdentifier(ctx.indexName().getText());
+        String tableName = parseTableName(ctx.tableName());
+        String columnName = cleanColumnName(ctx.columnName(0).getText());
+        String columnName2 = ctx.columnName().size() > 1 ? cleanColumnName(ctx.columnName(1).getText()) : null;
         boolean isUnique = ctx.UNIQUE() != null;
+        boolean ifNotExists = ctx.PLSQL_IF() != null;
         CreateIndexStatement.IndexType indexType;
         if (ctx.HASH() != null) indexType = CreateIndexStatement.IndexType.HASH;
         else if (ctx.BRIN() != null) indexType = CreateIndexStatement.IndexType.BRIN;
@@ -372,7 +363,7 @@ public class SqlParser {
         else if (ctx.BITMAP() != null) indexType = CreateIndexStatement.IndexType.BITMAP;
         else if (ctx.GIST() != null) indexType = CreateIndexStatement.IndexType.GIST;
         else indexType = CreateIndexStatement.IndexType.BTREE; // default, matching Postgres's own convention
-        return new CreateIndexStatement(indexName, tableName, columnName, columnName2, indexType, isUnique);
+        return new CreateIndexStatement(indexName, tableName, columnName, columnName2, indexType, isUnique, ifNotExists);
     }
 
     /**
@@ -383,10 +374,10 @@ public class SqlParser {
      * of what the executor could or couldn't do with it.
      */
     private UpdateStatement buildUpdate(StratosSQLParser.UpdateContext ctx) {
-        String tableName = ctx.tableName().getText();
+        String tableName = parseTableName(ctx.tableName());
         List<Assignment> assignments = new ArrayList<>();
         for (StratosSQLParser.AssignmentContext assignCtx : ctx.assignment()) {
-            String column = assignCtx.columnName().getText();
+            String column = cleanColumnName(assignCtx.columnName().getText());
             String value = assignCtx.literal().getText();
             assignments.add(new Assignment(column, value));
         }
@@ -395,13 +386,14 @@ public class SqlParser {
     }
 
     private CreateTableStatement buildCreateTable(StratosSQLParser.CreateTableContext ctx) {
-        String tableName = ctx.tableName().getText();
+        String tableName = parseTableName(ctx.tableName());
+        boolean ifNotExists = ctx.PLSQL_IF() != null;
         List<ColumnDefinition> columns = new ArrayList<>();
         List<ForeignKeyDefinition> foreignKeys = new ArrayList<>();
         List<CheckConstraintDefinition> checkConstraints = new ArrayList<>();
 
         for (StratosSQLParser.ColumnDefContext colCtx : ctx.columnDef()) {
-            String name = colCtx.columnName().getText();
+            String name = cleanColumnName(colCtx.columnName().getText());
             String type = colCtx.dataType().getText();
             boolean notNull = false;
             String defaultValue = null;
@@ -424,9 +416,9 @@ public class SqlParser {
                         defaultValue = cCtx.defaultValue().getText();
                     }
                     if (cCtx.REFERENCES() != null) {
-                        String fkName = cCtx.constraintName() != null ? cCtx.constraintName().getText() : tableName + "_" + name + "_fkey";
-                        String parentTable = cCtx.tableName().getText();
-                        List<String> parentCols = cCtx.columnName() != null ? List.of(cCtx.columnName().getText()) : List.of();
+                        String fkName = cCtx.constraintName() != null ? cleanIdentifier(cCtx.constraintName().getText()) : tableName + "_" + name + "_fkey";
+                        String parentTable = parseTableName(cCtx.tableName());
+                        List<String> parentCols = cCtx.columnName() != null ? List.of(cleanColumnName(cCtx.columnName().getText())) : List.of();
                         ForeignKeyDefinition.ActionType onDelete = ForeignKeyDefinition.ActionType.RESTRICT;
                         ForeignKeyDefinition.ActionType onUpdate = ForeignKeyDefinition.ActionType.RESTRICT;
                         for (StratosSQLParser.FkActionContext actCtx : cCtx.fkAction()) {
@@ -439,7 +431,7 @@ public class SqlParser {
                         foreignKeys.add(new ForeignKeyDefinition(fkName, tableName, List.of(name), parentTable, parentCols, onDelete, onUpdate));
                     }
                     if (cCtx.CHECK() != null && cCtx.expression() != null) {
-                        String chkName = cCtx.constraintName() != null ? cCtx.constraintName().getText() : tableName + "_" + name + "_check";
+                        String chkName = cCtx.constraintName() != null ? cleanIdentifier(cCtx.constraintName().getText()) : tableName + "_" + name + "_check";
                         WhereExpr expr = buildWhereExpr(cCtx.expression());
                         String exprSql = cCtx.expression().getText();
                         checkConstraints.add(new CheckConstraintDefinition(chkName, exprSql, expr));
@@ -454,7 +446,7 @@ public class SqlParser {
 
         if (ctx.tableConstraint() != null) {
             for (StratosSQLParser.TableConstraintContext tcCtx : ctx.tableConstraint()) {
-                String cName = tcCtx.constraintName() != null ? tcCtx.constraintName().getText() : null;
+                String cName = tcCtx.constraintName() != null ? cleanIdentifier(tcCtx.constraintName().getText()) : null;
                 if (tcCtx.PRIMARY() != null) {
                     List<String> cols = extractColumns(tcCtx.columnNameList(0));
                     primaryKeyColumns.addAll(cols);
@@ -465,7 +457,7 @@ public class SqlParser {
                 } else if (tcCtx.FOREIGN() != null) {
                     List<String> childCols = extractColumns(tcCtx.childCols);
                     String fkName = cName != null ? cName : tableName + "_" + String.join("_", childCols) + "_fkey";
-                    String parentTable = tcCtx.tableName().getText();
+                    String parentTable = parseTableName(tcCtx.tableName());
                     List<String> parentCols = tcCtx.parentCols != null ? extractColumns(tcCtx.parentCols) : List.of();
                     ForeignKeyDefinition.ActionType onDelete = ForeignKeyDefinition.ActionType.RESTRICT;
                     ForeignKeyDefinition.ActionType onUpdate = ForeignKeyDefinition.ActionType.RESTRICT;
@@ -486,14 +478,14 @@ public class SqlParser {
             }
         }
 
-        return new CreateTableStatement(tableName, columns, primaryKeyColumns, tableConstraints, foreignKeys, checkConstraints);
+        return new CreateTableStatement(tableName, columns, primaryKeyColumns, tableConstraints, foreignKeys, checkConstraints, ifNotExists);
     }
 
     private List<String> extractColumns(StratosSQLParser.ColumnNameListContext ctx) {
         List<String> cols = new ArrayList<>();
         if (ctx != null && ctx.columnName() != null) {
             for (StratosSQLParser.ColumnNameContext c : ctx.columnName()) {
-                cols.add(c.getText());
+                cols.add(cleanColumnName(c.getText()));
             }
         }
         return cols;
@@ -517,7 +509,7 @@ public class SqlParser {
     }
 
     private InsertStatement buildInsert(StratosSQLParser.InsertContext ctx) {
-        String tableName = ctx.tableName().getText();
+        String tableName = parseTableName(ctx.tableName());
 
         // One real row per VALUES tuple - see InsertStatement's own javadoc
         // for why this is now a list of rows rather than a single flat list.
@@ -550,7 +542,7 @@ public class SqlParser {
         // (SERIAL's entire point is letting a column be omitted).
         List<String> columns = new ArrayList<>();
         for (StratosSQLParser.ColumnNameContext colCtx : ctx.columnName()) {
-            columns.add(colCtx.getText());
+            columns.add(cleanColumnName(colCtx.getText()));
         }
 
         List<String> returningColumns = new ArrayList<>();
@@ -559,7 +551,7 @@ public class SqlParser {
                 returningColumns.add("*");
             } else {
                 for (StratosSQLParser.ColumnNameContext colCtx : ctx.returningClause().columnName()) {
-                    returningColumns.add(colCtx.getText());
+                    returningColumns.add(cleanColumnName(colCtx.getText()));
                 }
             }
         }
@@ -591,91 +583,91 @@ public class SqlParser {
             return new WhereExpr.Or(buildWhereExpr(c.expression(0)), buildWhereExpr(c.expression(1)));
         }
         if (ctx instanceof StratosSQLParser.EqColumnCompareContext c) {
-            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "=", c.columnName(1).getText());
+            return new WhereExpr.ColumnComparison(cleanColumnName(c.columnName(0).getText()), "=", cleanColumnName(c.columnName(1).getText()));
         }
         if (ctx instanceof StratosSQLParser.GtColumnCompareContext c) {
-            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), ">", c.columnName(1).getText());
+            return new WhereExpr.ColumnComparison(cleanColumnName(c.columnName(0).getText()), ">", cleanColumnName(c.columnName(1).getText()));
         }
         if (ctx instanceof StratosSQLParser.LtColumnCompareContext c) {
-            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "<", c.columnName(1).getText());
+            return new WhereExpr.ColumnComparison(cleanColumnName(c.columnName(0).getText()), "<", cleanColumnName(c.columnName(1).getText()));
         }
         if (ctx instanceof StratosSQLParser.GeColumnCompareContext c) {
-            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), ">=", c.columnName(1).getText());
+            return new WhereExpr.ColumnComparison(cleanColumnName(c.columnName(0).getText()), ">=", cleanColumnName(c.columnName(1).getText()));
         }
         if (ctx instanceof StratosSQLParser.LeColumnCompareContext c) {
-            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "<=", c.columnName(1).getText());
+            return new WhereExpr.ColumnComparison(cleanColumnName(c.columnName(0).getText()), "<=", cleanColumnName(c.columnName(1).getText()));
         }
         if (ctx instanceof StratosSQLParser.NeColumnCompareContext c) {
-            return new WhereExpr.ColumnComparison(c.columnName(0).getText(), "!=", c.columnName(1).getText());
+            return new WhereExpr.ColumnComparison(cleanColumnName(c.columnName(0).getText()), "!=", cleanColumnName(c.columnName(1).getText()));
         }
         if (ctx instanceof StratosSQLParser.EqCompareContext c) {
-            return new WhereExpr.Comparison(c.columnName().getText(), "=", c.literal().getText());
+            return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), "=", c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.GtCompareContext c) {
-            return new WhereExpr.Comparison(c.columnName().getText(), ">", c.literal().getText());
+            return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), ">", c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.LtCompareContext c) {
-            return new WhereExpr.Comparison(c.columnName().getText(), "<", c.literal().getText());
+            return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), "<", c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.GeCompareContext c) {
-            return new WhereExpr.Comparison(c.columnName().getText(), ">=", c.literal().getText());
+            return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), ">=", c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.LeCompareContext c) {
-            return new WhereExpr.Comparison(c.columnName().getText(), "<=", c.literal().getText());
+            return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), "<=", c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.NeCompareContext c) {
-            return new WhereExpr.Comparison(c.columnName().getText(), "!=", c.literal().getText());
+            return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), "!=", c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.LikeCompareContext c) {
-            return new WhereExpr.Like(c.columnName().getText(), c.literal().getText());
+            return new WhereExpr.Like(cleanColumnName(c.columnName().getText()), c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.ContainsCompareContext c) {
-            return new WhereExpr.Contains(c.columnName().getText(), c.literal().getText());
+            return new WhereExpr.Contains(cleanColumnName(c.columnName().getText()), c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.ArrayContainsCompareContext c) {
-            return new WhereExpr.ArrayContains(c.columnName().getText(), c.literal().getText());
+            return new WhereExpr.ArrayContains(cleanColumnName(c.columnName().getText()), c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.TsMatchCompareContext c) {
-            return new WhereExpr.TsMatch(c.columnName().getText(), c.literal().getText());
+            return new WhereExpr.TsMatch(cleanColumnName(c.columnName().getText()), c.literal().getText());
         }
         if (ctx instanceof StratosSQLParser.EqZeroArgFunctionCompareContext c) {
-            return new WhereExpr.EqZeroArgFunction(c.columnName().getText(), c.IDENTIFIER().getText());
+            return new WhereExpr.EqZeroArgFunction(cleanColumnName(c.columnName().getText()), c.IDENTIFIER().getText());
         }
         if (ctx instanceof StratosSQLParser.JsonExtractTextEqCompareContext c) {
-            return new WhereExpr.JsonExtractTextEquals(c.columnName().getText(), c.literal(0).getText(), c.literal(1).getText());
+            return new WhereExpr.JsonExtractTextEquals(cleanColumnName(c.columnName().getText()), c.literal(0).getText(), c.literal(1).getText());
         }
         if (ctx instanceof StratosSQLParser.RangeOverlapsCompareContext c) {
-            return new WhereExpr.RangeOverlaps(c.columnName(0).getText(), c.columnName(1).getText(), c.literal(0).getText(), c.literal(1).getText());
+            return new WhereExpr.RangeOverlaps(cleanColumnName(c.columnName(0).getText()), cleanColumnName(c.columnName(1).getText()), c.literal(0).getText(), c.literal(1).getText());
         }
         if (ctx instanceof StratosSQLParser.InListExprContext c) {
-            return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), false);
+            return new WhereExpr.InList(cleanColumnName(c.columnName().getText()), buildValueList(c.valueList()), false);
         }
         if (ctx instanceof StratosSQLParser.NotInListExprContext c) {
-            return new WhereExpr.InList(c.columnName().getText(), buildValueList(c.valueList()), true);
+            return new WhereExpr.InList(cleanColumnName(c.columnName().getText()), buildValueList(c.valueList()), true);
         }
         if (ctx instanceof StratosSQLParser.InSubqueryExprContext c) {
-            return new WhereExpr.InSubquery(c.columnName().getText(), buildSelect(c.select()), false);
+            return new WhereExpr.InSubquery(cleanColumnName(c.columnName().getText()), buildSelect(c.select()), false);
         }
         if (ctx instanceof StratosSQLParser.NotInSubqueryExprContext c) {
-            return new WhereExpr.InSubquery(c.columnName().getText(), buildSelect(c.select()), true);
+            return new WhereExpr.InSubquery(cleanColumnName(c.columnName().getText()), buildSelect(c.select()), true);
         }
         if (ctx instanceof StratosSQLParser.EqSubqueryExprContext c) {
-            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "=", buildSelect(c.select()));
+            return new WhereExpr.ScalarSubqueryComparison(cleanColumnName(c.columnName().getText()), "=", buildSelect(c.select()));
         }
         if (ctx instanceof StratosSQLParser.GtSubqueryExprContext c) {
-            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), ">", buildSelect(c.select()));
+            return new WhereExpr.ScalarSubqueryComparison(cleanColumnName(c.columnName().getText()), ">", buildSelect(c.select()));
         }
         if (ctx instanceof StratosSQLParser.LtSubqueryExprContext c) {
-            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "<", buildSelect(c.select()));
+            return new WhereExpr.ScalarSubqueryComparison(cleanColumnName(c.columnName().getText()), "<", buildSelect(c.select()));
         }
         if (ctx instanceof StratosSQLParser.GeSubqueryExprContext c) {
-            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), ">=", buildSelect(c.select()));
+            return new WhereExpr.ScalarSubqueryComparison(cleanColumnName(c.columnName().getText()), ">=", buildSelect(c.select()));
         }
         if (ctx instanceof StratosSQLParser.LeSubqueryExprContext c) {
-            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "<=", buildSelect(c.select()));
+            return new WhereExpr.ScalarSubqueryComparison(cleanColumnName(c.columnName().getText()), "<=", buildSelect(c.select()));
         }
         if (ctx instanceof StratosSQLParser.NeSubqueryExprContext c) {
-            return new WhereExpr.ScalarSubqueryComparison(c.columnName().getText(), "!=", buildSelect(c.select()));
+            return new WhereExpr.ScalarSubqueryComparison(cleanColumnName(c.columnName().getText()), "!=", buildSelect(c.select()));
         }
         if (ctx instanceof StratosSQLParser.ExistsExprContext c) {
             return new WhereExpr.ExistsSubquery(buildSelect(c.select()), false);
@@ -707,13 +699,13 @@ public class SqlParser {
 
         if (ctx.tableSource() != null) {
             if (ctx.tableSource().tableName() != null) {
-                tableName = ctx.tableSource().tableName().getText();
+                tableName = parseTableName(ctx.tableSource().tableName());
             }
             if (ctx.tableSource().select() != null) {
                 fromSubquery = buildSelect(ctx.tableSource().select());
             }
             if (ctx.tableSource().alias() != null) {
-                tableAlias = ctx.tableSource().alias().getText();
+                tableAlias = cleanIdentifier(ctx.tableSource().alias().getText());
             }
         }
         List<String> columns = new ArrayList<>();
@@ -726,7 +718,7 @@ public class SqlParser {
             columns.add("*");
         } else {
             for (StratosSQLParser.SelectItemContext itemCtx : ctx.selectList().selectItem()) {
-                String alias = itemCtx.alias() != null ? itemCtx.alias().getText() : null;
+                String alias = itemCtx.alias() != null ? cleanIdentifier(itemCtx.alias().getText()) : null;
                 if (itemCtx.windowFunction() != null) {
                     windowFunctions.add(buildWindowFunctionCall(itemCtx.windowFunction(), alias));
                 } else if (itemCtx.aggregateFunction() != null) {
@@ -734,7 +726,7 @@ public class SqlParser {
                 } else if (itemCtx.functionCall() != null) {
                     functionCalls.add(buildFunctionCallItem(itemCtx.functionCall(), alias));
                 } else if (itemCtx.columnName() != null) {
-                    columns.add(itemCtx.columnName().getText());
+                    columns.add(cleanColumnName(itemCtx.columnName().getText()));
                     columnAliases.add(alias);
                 } else if (itemCtx.literal() != null) {
                     columns.add(itemCtx.literal().getText());
@@ -744,7 +736,7 @@ public class SqlParser {
                     // for this engine's simple SELECT list (an expression like "age > 30" isn't a
                     // projectable column), kept only because the grammar allows it. Fall back to
                     // raw text rather than silently dropping it.
-                    columns.add(itemCtx.getText());
+                    columns.add(cleanColumnName(itemCtx.getText()));
                 }
             }
         }
@@ -757,7 +749,7 @@ public class SqlParser {
         List<String> groupBy = new ArrayList<>();
         if (ctx.groupByList() != null) {
             for (StratosSQLParser.ColumnNameContext colCtx : ctx.groupByList().columnName()) {
-                groupBy.add(colCtx.getText());
+                groupBy.add(cleanColumnName(colCtx.getText()));
             }
         }
 
@@ -772,12 +764,13 @@ public class SqlParser {
             orderByText = ctx.orderList().getText();
             for (StratosSQLParser.OrderItemContext itemCtx : ctx.orderList().orderItem()) {
                 boolean ascending = itemCtx.DESC() == null;
-                orderItems.add(new OrderItem(itemCtx.columnName().getText(), ascending));
+                orderItems.add(new OrderItem(cleanColumnName(itemCtx.columnName().getText()), ascending));
             }
         }
 
         boolean forUpdate = ctx.forUpdateClause() != null;
-        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate);
+        boolean distinct = ctx.DISTINCT() != null;
+        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct);
     }
 
     private IsolationLevel parseIsolationLevel(StratosSQLParser.IsolationLevelContext ctx) {
@@ -808,7 +801,7 @@ public class SqlParser {
         List<String> partitionBy = new ArrayList<>();
         if (ctx.groupByList() != null) {
             for (StratosSQLParser.ColumnNameContext colCtx : ctx.groupByList().columnName()) {
-                partitionBy.add(colCtx.getText());
+                partitionBy.add(cleanColumnName(colCtx.getText()));
             }
         }
 
@@ -816,7 +809,7 @@ public class SqlParser {
         if (ctx.orderList() != null) {
             for (StratosSQLParser.OrderItemContext itemCtx : ctx.orderList().orderItem()) {
                 boolean descending = itemCtx.DESC() != null;
-                orderBy.add(new WindowOrderItem(itemCtx.columnName().getText(), descending));
+                orderBy.add(new WindowOrderItem(cleanColumnName(itemCtx.columnName().getText()), descending));
             }
         }
 
@@ -831,8 +824,9 @@ public class SqlParser {
         else if (ctx.MIN() != null) function = "MIN";
         else function = "MAX";
 
-        String argument = ctx.STAR() != null ? "*" : ctx.columnName().getText();
-        return new AggregateCall(function, argument, alias);
+        String argument = ctx.STAR() != null ? "*" : cleanColumnName(ctx.columnName().getText());
+        boolean distinct = ctx.DISTINCT() != null;
+        return new AggregateCall(function, argument, alias, distinct);
     }
 
     private JoinClause buildJoinClause(StratosSQLParser.JoinClauseContext ctx) {
@@ -842,19 +836,19 @@ public class SqlParser {
 
         if (ctx.tableSource() != null) {
             if (ctx.tableSource().tableName() != null) {
-                tableName = ctx.tableSource().tableName().getText();
+                tableName = parseTableName(ctx.tableSource().tableName());
             }
             if (ctx.tableSource().select() != null) {
                 subquery = buildSelect(ctx.tableSource().select());
             }
             if (ctx.tableSource().alias() != null) {
-                tableAlias = ctx.tableSource().alias().getText();
+                tableAlias = cleanIdentifier(ctx.tableSource().alias().getText());
             }
         }
 
         List<StratosSQLParser.ColumnNameContext> columns = ctx.columnName();
-        String leftColumn = columns.get(0).getText();
-        String rightColumn = columns.get(1).getText();
+        String leftColumn = cleanColumnName(columns.get(0).getText());
+        String rightColumn = cleanColumnName(columns.get(1).getText());
         JoinClause.JoinType joinType = JoinClause.JoinType.INNER;
         if (ctx.joinType() != null) {
             if (ctx.joinType().LEFT() != null) {
@@ -875,14 +869,178 @@ public class SqlParser {
     }
 
     private DeleteStatement buildDelete(StratosSQLParser.DeleteContext ctx) {
-        String tableName = ctx.tableName().getText();
+        String tableName = parseTableName(ctx.tableName());
         WhereExpr where = buildWhereExpr(ctx.expression());
         return new DeleteStatement(tableName, where);
     }
 
     private DropTableStatement buildDropTable(StratosSQLParser.DropTableContext ctx) {
-        String tableName = ctx.tableName().getText();
-        return new DropTableStatement(tableName);
+        String tableName = parseTableName(ctx.tableName());
+        boolean ifExists = ctx.PLSQL_IF() != null;
+        return new DropTableStatement(tableName, ifExists);
+    }
+
+    private AlterTableAddConstraintStatement buildAlterTableAddConstraint(StratosSQLParser.AlterTableAddConstraintContext ctx) {
+        String tableName = parseTableName(ctx.tableName());
+        StratosSQLParser.TableConstraintContext tcCtx = ctx.tableConstraint();
+        String constraintName = tcCtx.constraintName() != null ? cleanIdentifier(tcCtx.constraintName().getText()) : null;
+        if (tcCtx.PRIMARY() != null) {
+            List<String> cols = extractColumns(tcCtx.columnNameList(0));
+            return new AlterTableAddConstraintStatement(tableName, constraintName, "PRIMARY KEY", cols);
+        } else if (tcCtx.UNIQUE() != null) {
+            List<String> cols = extractColumns(tcCtx.columnNameList(0));
+            return new AlterTableAddConstraintStatement(tableName, constraintName, "UNIQUE", cols);
+        } else if (tcCtx.FOREIGN() != null) {
+            List<String> childCols = extractColumns(tcCtx.childCols);
+            String parentTable = parseTableName(tcCtx.tableName());
+            List<String> parentCols = tcCtx.parentCols != null ? extractColumns(tcCtx.parentCols) : List.of();
+            ForeignKeyDefinition.ActionType onDelete = ForeignKeyDefinition.ActionType.RESTRICT;
+            ForeignKeyDefinition.ActionType onUpdate = ForeignKeyDefinition.ActionType.RESTRICT;
+            for (StratosSQLParser.FkActionContext actCtx : tcCtx.fkAction()) {
+                if (actCtx.DELETE() != null) {
+                    onDelete = parseFkActionType(actCtx.fkActionType());
+                } else if (actCtx.UPDATE() != null) {
+                    onUpdate = parseFkActionType(actCtx.fkActionType());
+                }
+            }
+            return new AlterTableAddConstraintStatement(tableName, constraintName, "FOREIGN KEY", childCols, parentTable, parentCols, onDelete.name(), onUpdate.name(), null);
+        } else if (tcCtx.CHECK() != null) {
+            WhereExpr expr = buildWhereExpr(tcCtx.expression());
+            return new AlterTableAddConstraintStatement(tableName, constraintName, "CHECK", List.of(), null, List.of(), null, null, expr);
+        }
+        throw new IllegalArgumentException("Unknown table constraint: " + tcCtx.getText());
+    }
+
+    private AlterTableDropConstraintStatement buildAlterTableDropConstraint(StratosSQLParser.AlterTableDropConstraintContext ctx) {
+        String tableName = parseTableName(ctx.tableName());
+        String constraintName = cleanIdentifier(ctx.constraintName().getText());
+        boolean ifExists = ctx.PLSQL_IF() != null;
+        return new AlterTableDropConstraintStatement(tableName, constraintName, ifExists);
+    }
+
+    private CreateSequenceStatement buildCreateSequence(StratosSQLParser.CreateSequenceContext ctx) {
+        String name = cleanSequenceName(ctx.sequenceName().getText());
+        boolean ifNotExists = ctx.PLSQL_IF() != null;
+        long startValue = 1;
+        long incrementBy = 1;
+        Long minValue = null;
+        Long maxValue = null;
+        Long cache = null;
+        boolean cycle = false;
+
+        for (StratosSQLParser.SequenceOptionContext opt : ctx.sequenceOption()) {
+            if (opt.START() != null && opt.INTEGER_LITERAL() != null) {
+                startValue = Long.parseLong(opt.INTEGER_LITERAL().getText());
+            } else if (opt.INCREMENT() != null && opt.INTEGER_LITERAL() != null) {
+                incrementBy = Long.parseLong(opt.INTEGER_LITERAL().getText());
+            } else if (opt.MINVALUE() != null && opt.INTEGER_LITERAL() != null) {
+                minValue = Long.parseLong(opt.INTEGER_LITERAL().getText());
+            } else if (opt.MAXVALUE() != null && opt.INTEGER_LITERAL() != null) {
+                maxValue = Long.parseLong(opt.INTEGER_LITERAL().getText());
+            } else if (opt.CACHE() != null && opt.INTEGER_LITERAL() != null) {
+                cache = Long.parseLong(opt.INTEGER_LITERAL().getText());
+            } else if (opt.CYCLE() != null && opt.NO() == null) {
+                cycle = true;
+            } else if (opt.NO() != null && opt.CYCLE() != null) {
+                cycle = false;
+            }
+        }
+        return new CreateSequenceStatement(name, startValue, incrementBy, ifNotExists, minValue, maxValue, cache, cycle);
+    }
+
+    private AlterSequenceStatement buildAlterSequence(StratosSQLParser.AlterSequenceContext ctx) {
+        String name = cleanSequenceName(ctx.sequenceName().getText());
+        boolean ifExists = ctx.PLSQL_IF() != null;
+        Long restartValue = null;
+        Long incrementBy = null;
+        Long minValue = null;
+        Long maxValue = null;
+        Long cache = null;
+        Boolean cycle = null;
+
+        for (StratosSQLParser.AlterSequenceOptionContext opt : ctx.alterSequenceOption()) {
+            if (opt.RESTART() != null) {
+                if (opt.INTEGER_LITERAL() != null) {
+                    restartValue = Long.parseLong(opt.INTEGER_LITERAL().getText());
+                } else {
+                    restartValue = 1L;
+                }
+            } else if (opt.sequenceOption() != null) {
+                StratosSQLParser.SequenceOptionContext sOpt = opt.sequenceOption();
+                if (sOpt.START() != null && sOpt.INTEGER_LITERAL() != null) {
+                    restartValue = Long.parseLong(sOpt.INTEGER_LITERAL().getText());
+                } else if (sOpt.INCREMENT() != null && sOpt.INTEGER_LITERAL() != null) {
+                    incrementBy = Long.parseLong(sOpt.INTEGER_LITERAL().getText());
+                } else if (sOpt.MINVALUE() != null && sOpt.INTEGER_LITERAL() != null) {
+                    minValue = Long.parseLong(sOpt.INTEGER_LITERAL().getText());
+                } else if (sOpt.MAXVALUE() != null && sOpt.INTEGER_LITERAL() != null) {
+                    maxValue = Long.parseLong(sOpt.INTEGER_LITERAL().getText());
+                } else if (sOpt.CACHE() != null && sOpt.INTEGER_LITERAL() != null) {
+                    cache = Long.parseLong(sOpt.INTEGER_LITERAL().getText());
+                } else if (sOpt.CYCLE() != null && sOpt.NO() == null) {
+                    cycle = true;
+                } else if (sOpt.NO() != null && sOpt.CYCLE() != null) {
+                    cycle = false;
+                }
+            }
+        }
+        return new AlterSequenceStatement(name, restartValue, incrementBy, minValue, maxValue, cache, cycle, ifExists);
+    }
+
+    public static String cleanIdentifier(String s) {
+        if (s == null) return null;
+        s = s.trim();
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+            s = s.substring(1, s.length() - 1).replace("\"\"", "\"");
+        }
+        return s;
+    }
+
+    public static String parseTableName(StratosSQLParser.TableNameContext ctx) {
+        if (ctx == null) return null;
+        if (ctx.anyIdentifier().size() == 2) {
+            String schema = cleanIdentifier(ctx.anyIdentifier(0).getText());
+            String table = cleanIdentifier(ctx.anyIdentifier(1).getText());
+            if ("public".equalsIgnoreCase(schema)) {
+                return table;
+            }
+            return table;
+        }
+        return cleanIdentifier(ctx.anyIdentifier(0).getText());
+    }
+
+    public static String cleanColumnName(String raw) {
+        if (raw == null) return null;
+        raw = raw.trim();
+        if (raw.contains(".")) {
+            String[] parts = raw.split("\\.");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.length; i++) {
+                if (i > 0) sb.append(".");
+                sb.append(cleanIdentifier(parts[i]));
+            }
+            return sb.toString();
+        }
+        return cleanIdentifier(raw);
+    }
+
+    public static String cleanSequenceName(String raw) {
+        if (raw == null) return null;
+        raw = raw.trim();
+        if (raw.startsWith("'") && raw.endsWith("'") && raw.length() >= 2) {
+            raw = raw.substring(1, raw.length() - 1);
+        }
+        if (raw.endsWith("::regclass")) {
+            raw = raw.substring(0, raw.length() - "::regclass".length()).trim();
+            if (raw.startsWith("'") && raw.endsWith("'") && raw.length() >= 2) {
+                raw = raw.substring(1, raw.length() - 1);
+            }
+        }
+        if (raw.contains(".")) {
+            String[] parts = raw.split("\\.");
+            return cleanIdentifier(parts[parts.length - 1]);
+        }
+        return cleanIdentifier(raw);
     }
 
     private CopyStatement buildCopyStatement(StratosSQLParser.CopyStatementContext ctx) {

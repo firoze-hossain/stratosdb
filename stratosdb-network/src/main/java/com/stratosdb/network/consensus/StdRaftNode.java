@@ -109,7 +109,11 @@ public class StdRaftNode implements AutoCloseable {
     }
 
     public boolean isLeader() {
-        return role == StdRaftRole.LEADER;
+        if (role != StdRaftRole.LEADER) return false;
+        if (!peers.isEmpty() && (System.currentTimeMillis() - lastQuorumAckTime > maxElectionTimeoutMillis)) {
+            return false;
+        }
+        return true;
     }
 
     public String getLeaderId() {
@@ -344,7 +348,17 @@ public class StdRaftNode implements AutoCloseable {
         while (running.get()) {
             try {
                 if (role == StdRaftRole.LEADER) {
-                    sendHeartbeats();
+                    if (!peers.isEmpty() && (System.currentTimeMillis() - lastQuorumAckTime > maxElectionTimeoutMillis)) {
+                        synchronized (this) {
+                            if (role == StdRaftRole.LEADER) {
+                                LOG.warn("Node {} stepping down from LEADER to FOLLOWER due to quorum loss", nodeId);
+                                role = StdRaftRole.FOLLOWER;
+                                leaderId = null;
+                            }
+                        }
+                    } else {
+                        sendHeartbeats();
+                    }
                     Thread.sleep(heartbeatIntervalMillis);
                 } else {
                     long elapsed = System.currentTimeMillis() - lastHeartbeatTime;

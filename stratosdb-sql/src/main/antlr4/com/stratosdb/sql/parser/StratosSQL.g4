@@ -3,7 +3,7 @@ grammar StratosSQL;
 // Parser rules
 parse: sqlStatement EOF;
 
-sqlStatement: createTable | createIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | setTransaction | setSessionCharacteristics | showCatalog | explain | analyze | vacuum | reindexStatement | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
+sqlStatement: createTable | createIndex | dropIndex | insert | selectWithCte | select | update | delete | dropTable | showTables | showStats | showTableStats | showStatements | showActivity | showTransactionIsolationLevel | showParameter | setParameter | setTransaction | setSessionCharacteristics | showCatalog | explain | analyze | vacuum | reindexStatement | beginTxn | commitTxn | rollbackTxn | createView | dropView | savepoint | releaseSavepoint | rollbackToSavepoint | createSequence | alterSequence | dropSequence | createType | dropType | createFunction | dropFunction | createProcedure | dropProcedure | callStatement | createTrigger | dropTrigger | createExtension | dropExtension | createNativeFunction | alterTableAddColumn | alterTableDropColumn | alterTableRenameColumn | alterTableRenameTable | alterTableAlterColumnType | alterTableSetDefault | alterTableDropDefault | alterTableAddConstraint | alterTableDropConstraint | alterTableEnableRls | alterTableDisableRls | alterTableForceRls | createPolicy | dropPolicy | createRole | dropRole | grantStatement | revokeStatement | copyStatement | checkpointStatement | promoteStatement | createDatabase | dropDatabase | showDatabases;
 
 // --- Real procedural language ("LANGUAGE plpgsql") - a real, second, wholly
 // independent parse entry point using this SAME lexer (see PlpgsqlParser),
@@ -100,7 +100,7 @@ plpgsqlExpr: plpgsqlExpr op=(STAR | DIVIDE) plpgsqlExpr                    #Plpg
            ;
 
 // DDL
-createTable: CREATE TABLE tableName LPAREN (columnDef | tableConstraint) (COMMA (columnDef | tableConstraint))* RPAREN SEMICOLON?;
+createTable: CREATE TABLE (PLSQL_IF NOT EXISTS)? tableName LPAREN (columnDef | tableConstraint) (COMMA (columnDef | tableConstraint))* RPAREN SEMICOLON?;
 tableConstraint: (CONSTRAINT constraintName)? PRIMARY KEY LPAREN columnNameList RPAREN
                | (CONSTRAINT constraintName)? UNIQUE LPAREN columnNameList RPAREN
                | (CONSTRAINT constraintName)? FOREIGN KEY LPAREN childCols=columnNameList RPAREN REFERENCES tableName (LPAREN parentCols=columnNameList RPAREN)? fkAction*
@@ -115,9 +115,10 @@ fkActionType: CASCADE
             | SET NULL
             | NO ACTION
             ;
-constraintName: IDENTIFIER;
-createIndex: CREATE (UNIQUE)? INDEX indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
-dropTable: DROP TABLE tableName SEMICOLON?;
+constraintName: anyIdentifier;
+createIndex: CREATE (UNIQUE)? INDEX (PLSQL_IF NOT EXISTS)? indexName ON tableName LPAREN columnName (COMMA columnName)? RPAREN (USING (HASH | BTREE | BRIN | GIN | BITMAP | GIST))? SEMICOLON?;
+dropIndex: DROP INDEX (PLSQL_IF EXISTS)? indexName SEMICOLON?;
+dropTable: DROP TABLE (PLSQL_IF EXISTS)? tableName SEMICOLON?;
 createDatabase: CREATE DATABASE databaseName SEMICOLON?;
 dropDatabase: DROP DATABASE databaseName SEMICOLON?;
 showDatabases: SHOW DATABASES SEMICOLON?;
@@ -153,6 +154,8 @@ alterTableRenameTable: ALTER TABLE tableName RENAME TO tableName SEMICOLON?;
 alterTableAlterColumnType: ALTER TABLE tableName ALTER COLUMN? columnName TYPE dataType SEMICOLON?;
 alterTableSetDefault: ALTER TABLE tableName ALTER COLUMN? columnName SET DEFAULT defaultValue SEMICOLON?;
 alterTableDropDefault: ALTER TABLE tableName ALTER COLUMN? columnName DROP DEFAULT SEMICOLON?;
+alterTableAddConstraint: ALTER TABLE tableName ADD tableConstraint SEMICOLON?;
+alterTableDropConstraint: ALTER TABLE tableName DROP CONSTRAINT (PLSQL_IF EXISTS)? constraintName SEMICOLON?;
 alterTableEnableRls: ALTER TABLE tableName ENABLE ROW LEVEL SECURITY SEMICOLON?;
 alterTableDisableRls: ALTER TABLE tableName DISABLE ROW LEVEL SECURITY SEMICOLON?;
 alterTableForceRls: ALTER TABLE tableName FORCE ROW LEVEL SECURITY SEMICOLON?;
@@ -164,7 +167,7 @@ policyCommand: SELECT | INSERT | UPDATE | DELETE | ALL;
 policyName: anyIdentifier;
 createView: CREATE VIEW viewName AS select SEMICOLON?;
 dropView: DROP VIEW viewName SEMICOLON?;
-viewName: IDENTIFIER;
+viewName: anyIdentifier;
 showTables: SHOW TABLES SEMICOLON?;
 showStats: SHOW STATS SEMICOLON?;
 showTableStats: SHOW TABLE STATS SEMICOLON?;
@@ -174,11 +177,26 @@ showActivity: SHOW ACTIVITY SEMICOLON?;
 showParameter: SHOW IDENTIFIER SEMICOLON?;
 setParameter: SET IDENTIFIER ASSIGN (literal | IDENTIFIER) SEMICOLON?;
 showCatalog: SHOW CATALOG SEMICOLON?;
-createSequence: CREATE SEQUENCE sequenceName (START WITH? INTEGER_LITERAL)? (INCREMENT BY? INTEGER_LITERAL)? SEMICOLON?;
+createSequence: CREATE SEQUENCE (PLSQL_IF NOT EXISTS)? sequenceName (AS dataType)? sequenceOption* SEMICOLON?;
+alterSequence: ALTER SEQUENCE (PLSQL_IF EXISTS)? sequenceName (AS dataType)? alterSequenceOption* SEMICOLON?;
 createType: CREATE TYPE typeName AS ENUM LPAREN STRING_LITERAL (COMMA STRING_LITERAL)* RPAREN SEMICOLON?;
-dropSequence: DROP SEQUENCE sequenceName SEMICOLON?;
+dropSequence: DROP SEQUENCE (PLSQL_IF EXISTS)? sequenceName SEMICOLON?;
 dropType: DROP TYPE typeName SEMICOLON?;
-sequenceName: IDENTIFIER;
+sequenceName: (anyIdentifier DOT)? anyIdentifier;
+sequenceOption: START WITH? INTEGER_LITERAL
+              | INCREMENT BY? INTEGER_LITERAL
+              | MINVALUE INTEGER_LITERAL
+              | NO MINVALUE
+              | MAXVALUE INTEGER_LITERAL
+              | NO MAXVALUE
+              | CACHE INTEGER_LITERAL
+              | CYCLE
+              | NO CYCLE
+              | OWNED BY (NONE | columnName)
+              ;
+alterSequenceOption: sequenceOption
+                   | RESTART (WITH? INTEGER_LITERAL)?
+                   ;
 createFunction: CREATE (OR REPLACE)? FUNCTION functionName LPAREN (functionParam (COMMA functionParam)*)? RPAREN RETURNS dataType AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
 dropFunction: DROP FUNCTION functionName SEMICOLON?;
 functionName: IDENTIFIER (DOT IDENTIFIER)?;
@@ -191,11 +209,11 @@ functionCall: functionName LPAREN (functionArg (COMMA functionArg)*)? RPAREN;
 functionArg: literal | columnName;
 createProcedure: CREATE (OR REPLACE)? PROCEDURE procedureName LPAREN (functionParam (COMMA functionParam)*)? RPAREN AS DOLLAR_QUOTED_STRING LANGUAGE (SQL_LANG | IDENTIFIER) SEMICOLON?;
 dropProcedure: DROP PROCEDURE procedureName SEMICOLON?;
-procedureName: IDENTIFIER;
+procedureName: anyIdentifier;
 callStatement: CALL procedureName LPAREN (functionArg (COMMA functionArg)*)? RPAREN SEMICOLON?;
 createTrigger: CREATE TRIGGER triggerName (BEFORE | AFTER) (INSERT | UPDATE | DELETE) ON tableName FOR EACH ROW EXECUTE (FUNCTION | PROCEDURE) triggerHandlerName LPAREN RPAREN SEMICOLON?;
 dropTrigger: DROP TRIGGER triggerName ON tableName SEMICOLON?;
-triggerName: IDENTIFIER;
+triggerName: anyIdentifier;
 triggerHandlerName: IDENTIFIER;
 explain: EXPLAIN select;
 analyze: ANALYZE (TABLE? tableName)? SEMICOLON?;
@@ -213,17 +231,17 @@ rollbackTxn: ROLLBACK TRANSACTION? SEMICOLON?;
 savepoint: SAVEPOINT savepointName SEMICOLON?;
 releaseSavepoint: RELEASE SAVEPOINT? savepointName SEMICOLON?;
 rollbackToSavepoint: ROLLBACK TO SAVEPOINT? savepointName SEMICOLON?;
-savepointName: IDENTIFIER;
+savepointName: anyIdentifier;
 
 // DML
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN (COMMA LPAREN valueList RPAREN)* returningClause? SEMICOLON?;
 returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
-select: SELECT selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? forUpdateClause? SEMICOLON?;
+select: SELECT (ALL | DISTINCT)? selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? forUpdateClause? SEMICOLON?;
 forUpdateClause: FOR UPDATE (NOWAIT)?;
 tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
-cteName: IDENTIFIER;
-joinClause: (joinType)? JOIN tableSource ON columnName ASSIGN columnName;
+cteName: anyIdentifier;
+joinClause: (joinType)? JOIN tableSource ON LPAREN? columnName ASSIGN columnName RPAREN?;
 
 joinType: INNER
         | LEFT OUTER?
@@ -240,7 +258,7 @@ havingClause: aggregateFunction ASSIGN literal
             | aggregateFunction GE literal
             | aggregateFunction LE literal
             | aggregateFunction NE literal;
-aggregateFunction: (COUNT | SUM | AVG | MIN | MAX) LPAREN (STAR | columnName) RPAREN;
+aggregateFunction: (COUNT | SUM | AVG | MIN | MAX) LPAREN (ALL | DISTINCT)? (STAR | columnName) RPAREN;
 update: UPDATE tableName SET assignment (COMMA assignment)* (WHERE expression)? SEMICOLON?;
 delete: DELETE FROM tableName (WHERE expression)? SEMICOLON?;
 
@@ -257,7 +275,7 @@ columnConstraint: NOT NULL
 assignment: columnName ASSIGN literal;
 orderList: orderItem (COMMA orderItem)*;
 orderItem: columnName (ASC | DESC)?;
-indexName: IDENTIFIER;
+indexName: anyIdentifier;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
@@ -315,12 +333,18 @@ arrayLiteral: ARRAY LBRACKET (literal (COMMA literal)*)? RBRACKET;
 
 // Data types
 dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
+        | INT2 | INT4 | INT8
+        | FLOAT4 | FLOAT8
         | VARCHAR (LPAREN INTEGER_LITERAL RPAREN)?
+        | CHARACTER VARYING (LPAREN INTEGER_LITERAL RPAREN)?
         | TEXT | CHAR (LPAREN INTEGER_LITERAL RPAREN)?
         | BOOLEAN | BOOL
-        | DATE | TIME | TIMESTAMP
-        | DECIMAL (LPAREN INTEGER_LITERAL COMMA INTEGER_LITERAL RPAREN)?
-        | NUMERIC (LPAREN INTEGER_LITERAL COMMA INTEGER_LITERAL RPAREN)?
+        | DATE
+        | TIME (LPAREN INTEGER_LITERAL RPAREN)? (WITH TIME ZONE | WITHOUT TIME ZONE)?
+        | TIMESTAMP (LPAREN INTEGER_LITERAL RPAREN)? (WITH TIME ZONE | WITHOUT TIME ZONE)?
+        | TIMESTAMPTZ
+        | DECIMAL (LPAREN INTEGER_LITERAL (COMMA INTEGER_LITERAL)? RPAREN)?
+        | NUMERIC (LPAREN INTEGER_LITERAL (COMMA INTEGER_LITERAL)? RPAREN)?
         | DOUBLE PRECISION? | FLOAT | REAL
         | BYTEA | BLOB
         | UUID
@@ -338,10 +362,21 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
 
 // Literals
 literal: STRING_LITERAL | MINUS? INTEGER_LITERAL | MINUS? FLOAT_LITERAL | TRUE | FALSE | NULL | PARAMETER;
-defaultValue: literal | CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | NEXTVAL LPAREN STRING_LITERAL RPAREN;
+defaultValue: literal
+            | CURRENT_DATE
+            | CURRENT_TIME
+            | CURRENT_TIMESTAMP
+            | NEXTVAL LPAREN STRING_LITERAL (COLONCOLON anyIdentifier)? RPAREN
+            | anyIdentifier LPAREN (literal | anyIdentifier | (STRING_LITERAL COLONCOLON anyIdentifier))? RPAREN
+            ;
 
 // Identifiers
-anyIdentifier: IDENTIFIER | ADMIN | CONNECT | OPTION | TEMP | TEMPORARY | TABLES | TYPE | VIEW | INDEX | DEFAULT;
+anyIdentifier: IDENTIFIER
+             | QUOTED_IDENTIFIER
+             | ADMIN | CONNECT | OPTION | TEMP | TEMPORARY | TABLES | TYPE | VIEW | INDEX | DEFAULT
+             | ROLE | KEY | ACTION | CASCADE | RESTRICT | PRIMARY | UNIQUE | CHECK
+             | NONE | MINVALUE | MAXVALUE | CACHE | CYCLE | RESTART | OWNED | ZONE | WITHOUT | CHARACTER | VARYING
+             ;
 tableName: (anyIdentifier DOT)? anyIdentifier;
 typeName: anyIdentifier;
 columnName: (anyIdentifier DOT (anyIdentifier DOT)?)? anyIdentifier;
@@ -566,6 +601,18 @@ ROLLBACK: R O L L B A C K;
 SAVEPOINT: S A V E P O I N T;
 RELEASE: R E L E A S E;
 TO: T O;
+DISTINCT: D I S T I N C T;
+MINVALUE: M I N V A L U E;
+MAXVALUE: M A X V A L U E;
+CACHE: C A C H E;
+CYCLE: C Y C L E;
+RESTART: R E S T A R T;
+OWNED: O W N E D;
+ZONE: Z O N E;
+WITHOUT: W I T H O U T;
+CHARACTER: C H A R A C T E R;
+VARYING: V A R Y I N G;
+NONE: N O N E;
 
 COUNT: C O U N T;
 SUM: S U M;
@@ -587,6 +634,12 @@ BOOL: B O O L;
 DATE: D A T E;
 TIME: T I M E;
 TIMESTAMP: T I M E S T A M P;
+TIMESTAMPTZ: T I M E S T A M P T Z;
+INT2: I N T '2';
+INT4: I N T '4';
+INT8: I N T '8';
+FLOAT4: F L O A T '4';
+FLOAT8: F L O A T '8';
 DECIMAL: D E C I M A L;
 NUMERIC: N U M E R I C;
 DOUBLE: D O U B L E;
@@ -621,6 +674,7 @@ NE: '!=';
 ARRAY_CONTAINS: '@>';
 TS_MATCH: '@@';
 JSON_EXTRACT_TEXT: '->>';
+COLONCOLON: '::';
 STAR: '*';
 
 // Literals
@@ -631,6 +685,7 @@ STAR: '*';
 // picking whichever rule was declared first, so a keyword declared
 // AFTER this one would always lose to being tokenized as a plain
 // IDENTIFIER instead, no matter how the keyword's own rule is written.
+QUOTED_IDENTIFIER: '"' ('""' | ~["])* '"';
 IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
 STRING_LITERAL: '\'' ('\'\'' | ~['])* '\'';
 /** Postgres's own $$ ... $$ delimiter for a function body - lets the body contain semicolons, quotes, or anything else without conflicting with the surrounding statement's own delimiters. Non-greedy (.*?) so the FIRST closing $$ ends the body, not the last one in the whole remaining input. */
