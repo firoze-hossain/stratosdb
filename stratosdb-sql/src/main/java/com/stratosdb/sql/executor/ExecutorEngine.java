@@ -1415,13 +1415,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * inside an explicit transaction.
      */
     private volatile boolean readOnly = false;
+    private volatile java.util.function.BooleanSupplier leaseChecker = null;
 
     public void setReadOnly(boolean readOnly) {
         this.readOnly = readOnly;
     }
 
+    public void setLeaseChecker(java.util.function.BooleanSupplier leaseChecker) {
+        this.leaseChecker = leaseChecker;
+    }
+
     public boolean isReadOnly() {
-        return readOnly;
+        if (readOnly) return true;
+        if (leaseChecker != null && !leaseChecker.getAsBoolean()) return true;
+        return false;
     }
 
     private static final java.util.Set<Class<? extends Statement>> READ_ONLY_SAFE_STATEMENTS = java.util.Set.of(
@@ -1503,13 +1510,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn, String sql, List<Object> params) throws DeadlockException {
-        if (readOnly && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
+        if (isReadOnly() && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
             return QueryResult.error("cannot execute statement in a read-only replica");
         }
-        if (readOnly && stmt instanceof CopyStatement copyStmt && copyStmt.isFrom()) {
+        if (isReadOnly() && stmt instanceof CopyStatement copyStmt && copyStmt.isFrom()) {
             return QueryResult.error("cannot execute COPY FROM in a read-only replica");
         }
-        if (readOnly && stmt instanceof SelectStatement select && select.forUpdate()) {
+        if (isReadOnly() && stmt instanceof SelectStatement select && select.forUpdate()) {
             return QueryResult.error("cannot execute SELECT FOR UPDATE in a read-only replica");
         }
         if (stmt instanceof CreateTableStatement s) return executeCreateTable(s, txn, sql);

@@ -66,30 +66,51 @@ public class StratosHa {
     private final List<NodeConfig> replicaCandidates;
     private final long healthCheckIntervalMillis;
     private final int failureThreshold;
+    private final com.stratosdb.network.consensus.StdRaftNode raftNode;
     private volatile boolean running = false;
     private volatile boolean failoverTriggered = false;
     private Thread watchdogThread;
 
     public StratosHa(NodeConfig primary, List<NodeConfig> replicaCandidates, long healthCheckIntervalMillis, int failureThreshold) {
+        this(primary, replicaCandidates, healthCheckIntervalMillis, failureThreshold, null);
+    }
+
+    public StratosHa(NodeConfig primary, List<NodeConfig> replicaCandidates, long healthCheckIntervalMillis, int failureThreshold, com.stratosdb.network.consensus.StdRaftNode raftNode) {
         this.primary = primary;
         this.replicaCandidates = replicaCandidates;
         this.healthCheckIntervalMillis = healthCheckIntervalMillis;
         this.failureThreshold = failureThreshold;
+        this.raftNode = raftNode;
+    }
+
+    public com.stratosdb.network.consensus.StdRaftNode getRaftNode() {
+        return raftNode;
     }
 
     public void start() {
+        if (raftNode != null) {
+            try {
+                raftNode.start();
+            } catch (IOException e) {
+                LOG.error("Failed to start embedded Raft node: {}", e.getMessage(), e);
+            }
+        }
         running = true;
         watchdogThread = new Thread(this::watchLoop, "stratos-ha-watchdog");
         watchdogThread.setDaemon(true);
         watchdogThread.start();
-        LOG.info("StratosHa watchdog started: monitoring primary {}:{} every {}ms, failover after {} consecutive failures",
-            primary.host(), primary.port(), healthCheckIntervalMillis, failureThreshold);
+        LOG.info("StratosHa watchdog started: monitoring primary {}:{} every {}ms, failover after {} consecutive failures{}",
+            primary.host(), primary.port(), healthCheckIntervalMillis, failureThreshold,
+            raftNode != null ? " [Raft Consensus Node: " + raftNode.getNodeId() + "]" : " [Standalone]");
     }
 
     public void stop() {
         running = false;
         if (watchdogThread != null) {
             watchdogThread.interrupt();
+        }
+        if (raftNode != null) {
+            raftNode.stop();
         }
     }
 
@@ -100,6 +121,19 @@ public class StratosHa {
     private void watchLoop() {
         int consecutiveFailures = 0;
         while (running && !failoverTriggered) {
+            if (raftNode != null && !raftNode.isLeader()) {
+                // In distributed consensus mode, only the elected Raft leader executes health checks
+                // and failover. Standby / follower watchdogs remain passive to prevent split-brain.
+                consecutiveFailures = 0;
+                try {
+                    Thread.sleep(healthCheckIntervalMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                continue;
+            }
+
             boolean healthy = isHealthy(primary);
             if (healthy) {
                 if (consecutiveFailures > 0) {
@@ -111,7 +145,9 @@ public class StratosHa {
                 LOG.warn("Primary {}:{} health check failed ({} of {} before failover)", primary.host(), primary.port(), consecutiveFailures, failureThreshold);
                 if (consecutiveFailures >= failureThreshold) {
                     triggerFailover();
-                    return;
+                    if (failoverTriggered) {
+                        return;
+                    }
                 }
             }
             try {
@@ -143,7 +179,7 @@ public class StratosHa {
      * node to count as healthy.
      */
     /** A real connect+read timeout for every real connection this watchdog itself makes - see StratosDump's own new overload's javadoc for the real, intermittent hang this prevents. Deliberately shorter than any reasonable health-check interval, so a hung attempt fails fast and the watchdog's own loop keeps making real, timely progress. */
-    private static final int CONNECTION_TIMEOUT_MILLIS = 3000;
+    private static final int CONNECTION_TIMEOUT_MILLIS = 800;
 
     private boolean isHealthy(NodeConfig node) {
         try {
@@ -173,6 +209,13 @@ public class StratosHa {
      */
     private void triggerFailover() {
         LOG.error("Primary {}:{} declared unreachable after {} consecutive failures - beginning failover", primary.host(), primary.port(), failureThreshold);
+        if (raftNode != null) {
+            String primaryId = primary.host() + ":" + primary.port();
+            if (!raftNode.canPromote(primaryId, 2500)) {
+                LOG.error("Raft consensus leader could not verify safe promotion gate for primary {} - aborting failover attempt", primaryId);
+                return;
+            }
+        }
         for (NodeConfig candidate : replicaCandidates) {
             if (!isHealthy(candidate)) {
                 LOG.warn("Failover candidate {}:{} is itself unreachable - trying the next one", candidate.host(), candidate.port());
@@ -209,6 +252,9 @@ public class StratosHa {
         long intervalMillis = 5000;
         int threshold = 3;
         List<NodeConfig> replicas = new ArrayList<>();
+        String raftId = null;
+        int raftPort = -1;
+        List<com.stratosdb.network.consensus.StdRaftPeer> raftPeers = new ArrayList<>();
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -225,6 +271,14 @@ public class StratosHa {
                 case "-d" -> database = args[++i];
                 case "--interval-ms" -> intervalMillis = Long.parseLong(args[++i]);
                 case "--failure-threshold" -> threshold = Integer.parseInt(args[++i]);
+                case "--raft-id" -> raftId = args[++i];
+                case "--raft-port" -> raftPort = Integer.parseInt(args[++i]);
+                case "--raft-peer" -> {
+                    String[] parts = args[++i].split("=");
+                    String pId = parts[0];
+                    String[] hp = parts[1].split(":");
+                    raftPeers.add(new com.stratosdb.network.consensus.StdRaftPeer(pId, hp[0], Integer.parseInt(hp[1])));
+                }
                 default -> {
                     System.err.println("Unrecognized argument: " + args[i]);
                     printUsage();
@@ -247,15 +301,21 @@ public class StratosHa {
             finalReplicas.add(new NodeConfig(r.host(), r.port(), user, password, database));
         }
 
-        StratosHa ha = new StratosHa(primary, finalReplicas, intervalMillis, threshold);
+        com.stratosdb.network.consensus.StdRaftNode raftNode = null;
+        if (raftId != null && raftPort > 0) {
+            raftNode = new com.stratosdb.network.consensus.StdRaftNode(raftId, "0.0.0.0", raftPort, raftPeers);
+        }
+
+        StratosHa ha = new StratosHa(primary, finalReplicas, intervalMillis, threshold, raftNode);
         ha.start();
         Thread.currentThread().join();
     }
 
     private static void printUsage() {
         System.err.println("Usage: StratosHa --primary host:port --replica host:port [--replica host:port ...] "
-            + "-U user -d database [--interval-ms 5000] [--failure-threshold 3]");
+            + "-U user -d database [--interval-ms 5000] [--failure-threshold 3] "
+            + "[--raft-id id --raft-port port [--raft-peer id=host:port ...]]");
         System.err.println("Password is read from the STRATOSDB_HA_PASSWORD environment variable.");
-        System.err.println("Real, honestly-stated scope: a single watchdog process, not real distributed consensus - see this class's own javadoc.");
+        System.err.println("Supported modes: standalone watchdog or distributed Raft consensus cluster.");
     }
 }

@@ -227,4 +227,15 @@ public class StratosDB {
     public boolean isReadOnly() {
         return executor.isReadOnly();
     }
+
+    /**
+     * Attaches a distributed consensus lease checker (e.g. from Raft consensus).
+     * If the lease checker returns false (lease lost or expired), write operations
+     * are immediately rejected and isReadOnly() returns true.
+     */
+    public void setLeaseChecker(java.util.function.BooleanSupplier leaseChecker) {
+        if (executor != null) {
+            executor.setLeaseChecker(leaseChecker);
+        }
+    }
 }
