@@ -63,31 +63,22 @@ public class StreamingWalApplier {
     private long totalOpsApplied = 0;
     private long totalTransactionsApplied = 0;
     private final com.stratosdb.storage.buffer.BufferPoolManager bufferPool;
+    private final com.stratosdb.transaction.TransactionManager transactionManager;
 
     private record PendingOp(int opType, String tableName, long pageId, byte[] tupleData, int slot, byte[] newData) {}
 
     public StreamingWalApplier(DiskManager diskManager) {
-        this(diskManager, null);
+        this(diskManager, null, null);
     }
 
-    /**
-     * bufferPool, when supplied, is the SAME buffer pool a live replica's
-     * own normal query-serving path (HeapTable/ExecutorEngine) reads
-     * through - after each applied transaction's pages are written
-     * directly to diskManager (bypassing the buffer pool entirely, the
-     * same as WALManager.recover() already does), this applier also
-     * evicts those exact pages from bufferPool's own cache, so a
-     * concurrent read on the replica can never return a stale,
-     * pre-replication cached copy instead of the just-applied data. Pass
-     * null (see the other constructor) only when there is no live,
-     * concurrently-queryable buffer pool to keep consistent - e.g. the
-     * isolated, offline scenario StreamingApplierTest itself uses, where
-     * a fresh BufferPoolManager is constructed only after all bytes are
-     * already applied.
-     */
     public StreamingWalApplier(DiskManager diskManager, com.stratosdb.storage.buffer.BufferPoolManager bufferPool) {
+        this(diskManager, bufferPool, null);
+    }
+
+    public StreamingWalApplier(DiskManager diskManager, com.stratosdb.storage.buffer.BufferPoolManager bufferPool, com.stratosdb.transaction.TransactionManager transactionManager) {
         this.diskManager = diskManager;
         this.bufferPool = bufferPool;
+        this.transactionManager = transactionManager;
     }
 
     /**
@@ -262,6 +253,9 @@ public class StreamingWalApplier {
     }
 
     private void applyCommittedTransaction(long xid) {
+        if (transactionManager != null) {
+            transactionManager.recordExternalCommit(xid);
+        }
         List<PendingOp> ops = pendingByXid.remove(xid);
         if (ops == null) {
             return; // a commit for a transaction with no buffered ops (e.g. a DDL-only or read-only transaction)

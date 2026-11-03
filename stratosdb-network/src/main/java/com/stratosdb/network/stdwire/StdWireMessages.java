@@ -4,6 +4,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /**
  * Encodes/decodes PostgreSQL wire protocol v3 messages - the actual byte
@@ -239,6 +240,18 @@ public final class StdWireMessages {
     /** SASLInitialResponse ('p'): the client's chosen mechanism name plus its initial response data (client-first-message for SCRAM) - the ONE 'p' message shaped differently from a plain PasswordMessage, since it's prefixed with the mechanism name and an explicit data length rather than being just a bare, null-terminated string. */
     public record SaslInitialResponse(String mechanism, String initialResponseData) {}
 
+    public static void writeSaslInitialResponse(DataOutputStream out, String mechanism, byte[] initialData) throws IOException {
+        writeMessage(out, 'p', buf -> {
+            putCString(buf, mechanism);
+            buf.putInt(initialData.length);
+            buf.put(initialData);
+        });
+    }
+
+    public static void writeSaslResponse(DataOutputStream out, byte[] responseData) throws IOException {
+        writeMessage(out, 'p', buf -> buf.put(responseData));
+    }
+
     public static SaslInitialResponse readSaslInitialResponse(TypedMessage msg) {
         byte[] body = msg.body();
         String mechanism = msg.readCString(0);
@@ -361,6 +374,21 @@ public final class StdWireMessages {
         writeMessage(out, 'd', buf -> buf.put(bytes));
     }
 
+    /**
+     * Streams raw binary chunk data inside a CopyData ('d') message.
+     * Used by replication stream (BASE_BACKUP tarball streaming) to send
+     * raw byte chunks without UTF-8 string encoding or extra buffer allocations.
+     */
+    public static void writeCopyData(DataOutputStream out, byte[] bytes, int offset, int length) throws IOException {
+        out.writeByte('d');
+        out.writeInt(length + 4);
+        out.write(bytes, offset, length);
+    }
+
+    public static void writeCopyData(DataOutputStream out, byte[] bytes) throws IOException {
+        writeCopyData(out, bytes, 0, bytes.length);
+    }
+
     /** Sent by the server once, after every row for a COPY TO STDOUT - or by the client, once, after every line for a COPY FROM STDIN (this engine writes the client-bound version; the client-bound version arriving on a real connection is read as an ordinary TypedMessage of type 'c', not through this method). */
     public static void writeCopyDone(DataOutputStream out) throws IOException {
         writeMessage(out, 'c', buf -> {});
@@ -460,13 +488,23 @@ public final class StdWireMessages {
 
     /** The StartupMessage: untyped (no leading type byte, like SSLRequest), just protocol version + key/value params, ending with a final empty string. */
     public static void writeStartupMessage(DataOutputStream out, String user, String database) throws IOException {
+        Map<String, String> params = new java.util.LinkedHashMap<>();
+        params.put("user", user);
+        if (database != null) {
+            params.put("database", database);
+        }
+        writeStartupMessage(out, params);
+    }
+
+    /** Writes a StartupMessage with arbitrary key-value parameters (such as replication=database, application_name, etc.). */
+    public static void writeStartupMessage(DataOutputStream out, Map<String, String> params) throws IOException {
         java.nio.ByteBuffer scratch = java.nio.ByteBuffer.allocate(65536);
         scratch.putInt(PROTOCOL_VERSION_3);
-        putCString(scratch, "user");
-        putCString(scratch, user);
-        if (database != null) {
-            putCString(scratch, "database");
-            putCString(scratch, database);
+        for (Map.Entry<String, String> entry : params.entrySet()) {
+            if (entry.getValue() != null) {
+                putCString(scratch, entry.getKey());
+                putCString(scratch, entry.getValue());
+            }
         }
         scratch.put((byte) 0); // terminating empty string
         int bodyLen = scratch.position();

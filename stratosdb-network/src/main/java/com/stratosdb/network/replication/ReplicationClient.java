@@ -64,9 +64,28 @@ public class ReplicationClient {
     private volatile Socket activeSocket;
 
     public ReplicationClient(String primaryHost, int primaryPort, DiskManager diskManager, BufferPoolManager bufferPool) {
+        this(primaryHost, primaryPort, diskManager, bufferPool, 0, 0);
+    }
+
+    public ReplicationClient(String primaryHost, int primaryPort, DiskManager diskManager, BufferPoolManager bufferPool, long startingEpoch, long startingOffset) {
+        this(primaryHost, primaryPort, diskManager, bufferPool, null, startingEpoch, startingOffset);
+    }
+
+    public ReplicationClient(String primaryHost, int primaryPort, DiskManager diskManager, BufferPoolManager bufferPool, com.stratosdb.transaction.TransactionManager transactionManager, long startingEpoch, long startingOffset) {
         this.primaryHost = primaryHost;
         this.primaryPort = primaryPort;
-        this.applier = new StreamingWalApplier(diskManager, bufferPool);
+        this.applier = new StreamingWalApplier(diskManager, bufferPool, transactionManager);
+        this.lastAppliedEpoch = startingEpoch;
+        this.lastAppliedOffset = startingOffset;
+    }
+
+    /**
+     * Sets the epoch and WAL byte offset from which this client resumes streaming.
+     * Useful when bootstrapping a replica from a base backup taken at a known checkpoint LSN and epoch.
+     */
+    public synchronized void setResumePosition(long epoch, long offset) {
+        this.lastAppliedEpoch = epoch;
+        this.lastAppliedOffset = offset;
     }
 
     public void start() {
@@ -175,6 +194,10 @@ public class ReplicationClient {
 
     public long getLastAppliedOffset() {
         return lastAppliedOffset;
+    }
+
+    public long getLastAppliedEpoch() {
+        return lastAppliedEpoch;
     }
 
     public StreamingWalApplier getApplier() {

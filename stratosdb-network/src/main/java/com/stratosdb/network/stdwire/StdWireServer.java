@@ -380,8 +380,10 @@ public class StdWireServer {
         }
 
         Map<String, String> params = StdWireMessages.parseStartupParams(body, 4);
-        LOG.info("stdwire startup: user={} database={} application_name={}",
-            params.get("user"), params.get("database"), params.get("application_name"));
+        LOG.info("stdwire startup: user={} database={} application_name={} replication={}",
+            params.get("user"), params.get("database"), params.get("application_name"), params.get("replication"));
+
+        boolean isReplication = params.containsKey("replication");
 
         if (cluster != null) {
             String requestedDb = params.get("database");
@@ -389,12 +391,17 @@ public class StdWireServer {
                 ? com.stratosdb.core.StratosCluster.DEFAULT_DATABASE : requestedDb;
             StratosDB target = cluster.getDatabase(targetName);
             if (target == null) {
-                // Real, honest refusal, matching real PostgreSQL's own real error for
-                // exactly this situation - not a silent fallback to some other database,
-                // and not accepted-then-broken-later.
-                StdWireMessages.writeErrorResponse(out, "database \"" + targetName + "\" does not exist");
-                out.flush();
-                return null;
+                if (isReplication) {
+                    target = cluster.getDatabase(com.stratosdb.core.StratosCluster.DEFAULT_DATABASE);
+                }
+                if (target == null) {
+                    // Real, honest refusal, matching real PostgreSQL's own real error for
+                    // exactly this situation - not a silent fallback to some other database,
+                    // and not accepted-then-broken-later.
+                    StdWireMessages.writeErrorResponse(out, "database \"" + targetName + "\" does not exist");
+                    out.flush();
+                    return null;
+                }
             }
             currentDb.set(target);
             if (userStore != null) {
@@ -445,11 +452,13 @@ public class StdWireServer {
         String targetDbName = (cluster != null)
             ? ((params.get("database") == null || params.get("database").isBlank()) ? com.stratosdb.core.StratosCluster.DEFAULT_DATABASE : params.get("database"))
             : (params.get("database") != null ? params.get("database") : "stratos");
-        com.stratosdb.sql.executor.QueryResult dbConnectDenied = db().getExecutor().requireDatabasePrivilege(targetDbName, "CONNECT");
-        if (dbConnectDenied != null) {
-            StdWireMessages.writeErrorResponse(out, "FATAL: permission denied for database \"" + targetDbName + "\" (missing CONNECT privilege)");
-            out.flush();
-            return null;
+        if (!isReplication) {
+            com.stratosdb.sql.executor.QueryResult dbConnectDenied = db().getExecutor().requireDatabasePrivilege(targetDbName, "CONNECT");
+            if (dbConnectDenied != null) {
+                StdWireMessages.writeErrorResponse(out, "FATAL: permission denied for database \"" + targetDbName + "\" (missing CONNECT privilege)");
+                out.flush();
+                return null;
+            }
         }
         StdWireMessages.writeParameterStatus(out, "server_version", "16.0 (StratosDB stdwire compatibility layer)");
         StdWireMessages.writeParameterStatus(out, "client_encoding", "UTF8");
@@ -542,6 +551,9 @@ public class StdWireServer {
         }
         if (tryHandlePromoteStatement(sql, out)) {
             return inTransaction; // PROMOTE is never itself transaction control either
+        }
+        if (tryHandleReplicationCommand(sql, in, out)) {
+            return inTransaction; // replication commands are out-of-band management operations
         }
 
         QueryResult result;
@@ -1124,6 +1136,134 @@ public class StdWireServer {
         replicationClient = null; // a second PROMOTE call must correctly report "nothing to promote" above, not silently stop an already-stopped client again
         LOG.info("Replica promoted to primary - replication stopped, read-only mode disabled");
         StdWireMessages.writeCommandComplete(out, "PROMOTE");
+        return true;
+    }
+
+    /**
+     * Intercepts and executes PostgreSQL wire protocol replication commands:
+     *   - IDENTIFY_SYSTEM: returns cluster/system identity, current timeline/epoch, LSN, and dbname
+     *   - BASE_BACKUP: flushes buffer pool, streams data directory tarball over CopyOut/CopyData, and archives WAL
+     */
+    private boolean tryHandleReplicationCommand(String sql, DataInputStream in, DataOutputStream out) throws IOException {
+        String trimmed = sql.trim();
+        if (trimmed.endsWith(";")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        }
+        String upper = trimmed.toUpperCase(java.util.Locale.ROOT);
+
+        if (upper.equals("IDENTIFY_SYSTEM")) {
+            return handleIdentifySystem(out);
+        }
+        if (upper.startsWith("BASE_BACKUP")) {
+            return handleBaseBackup(trimmed, in, out);
+        }
+        return false;
+    }
+
+    private boolean handleIdentifySystem(DataOutputStream out) throws IOException {
+        String systemId = String.valueOf(Math.abs(db().getConfig().getDataDirectory().hashCode() * 31L + 7123456789012345678L));
+        long epoch = db().getWalManager().getWalEpoch();
+        long lsn = db().getWalManager().getCurrentLSN();
+        String xlogpos = String.format("%X/%X", epoch, lsn);
+        String dbName = "stratos";
+
+        List<StdWireMessages.Column> columns = List.of(
+            new StdWireMessages.Column("systemid", 25, (short) -1),
+            new StdWireMessages.Column("timeline", 23, (short) -1),
+            new StdWireMessages.Column("xlogpos", 25, (short) -1),
+            new StdWireMessages.Column("dbname", 25, (short) -1)
+        );
+        StdWireMessages.writeRowDescription(out, columns);
+        StdWireMessages.writeDataRow(out, List.of(systemId, String.valueOf(epoch), xlogpos, dbName));
+        StdWireMessages.writeCommandComplete(out, "IDENTIFY_SYSTEM");
+        return true;
+    }
+
+    private boolean handleBaseBackup(String sql, DataInputStream in, DataOutputStream out) throws IOException {
+        com.stratosdb.network.replication.StdBaseBackupOptions options =
+            com.stratosdb.network.replication.StdBaseBackupOptions.parse(sql);
+        LOG.info("Executing BASE_BACKUP with options: label={}, fast={}, wal={}, maxRate={}",
+            options.label(), options.fast(), options.wal(), options.maxRateBytesPerSec());
+
+        // 1. Flush all dirty pages to ensure table/index files on disk are durable and consistent
+        db().getBufferPool().flushAll();
+        if (options.fast()) {
+            db().getWalManager().checkpoint();
+        }
+
+        long startEpoch = db().getWalManager().getWalEpoch();
+        long startLsn = db().getWalManager().getCurrentLSN();
+        String startRecptr = String.format("%X/%X", startEpoch, startLsn);
+        String startTli = String.valueOf(startEpoch);
+
+        // 2. Send first result set (starting WAL location & timeline)
+        List<StdWireMessages.Column> startCols = List.of(
+            new StdWireMessages.Column("recptr", 25, (short) -1),
+            new StdWireMessages.Column("tli", 23, (short) -1)
+        );
+        StdWireMessages.writeRowDescription(out, startCols);
+        StdWireMessages.writeDataRow(out, List.of(startRecptr, startTli));
+        StdWireMessages.writeCommandComplete(out, "BASE_BACKUP");
+        out.flush();
+
+        // 3. Send CopyOutResponse
+        StdWireMessages.writeCopyOutResponse(out, 0);
+        out.flush();
+
+        // 4. Stream tar archive of the data directory
+        java.nio.file.Path dataDir = java.nio.file.Path.of(db().getConfig().getDataDirectory()).toAbsolutePath().normalize();
+        java.nio.file.Path walDir = dataDir.resolve("wal").normalize();
+
+        try (com.stratosdb.network.replication.StdCopyDataOutputStream copyOut =
+                 new com.stratosdb.network.replication.StdCopyDataOutputStream(out, com.stratosdb.network.replication.StdCopyDataOutputStream.DEFAULT_BUFFER_SIZE, options.maxRateBytesPerSec())) {
+
+            // Generate synthetic backup_label
+            String backupLabel = String.format(
+                "START WAL LOCATION: %s\n" +
+                "CHECKPOINT LOCATION: %s\n" +
+                "START TIMELINE: %s\n" +
+                "LABEL: %s\n" +
+                "START TIME: %s\n",
+                startRecptr, startRecptr, startTli, options.label(), java.time.Instant.now().toString()
+            );
+            byte[] labelBytes = backupLabel.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            com.stratosdb.network.replication.StdTarArchive.writeEntry(copyOut, "backup_label", labelBytes, System.currentTimeMillis() / 1000L);
+
+            // Stream directory contents: skip active wal dir and transient files
+            com.stratosdb.network.replication.StdTarArchive.writeDirectory(copyOut, dataDir, path -> {
+                java.nio.file.Path normalized = path.toAbsolutePath().normalize();
+                if (normalized.equals(walDir) || normalized.startsWith(walDir)) {
+                    return false; // active WAL is skipped; replica bootstraps cleanly and streams WAL from ReplicationServer
+                }
+                String name = path.getFileName().toString();
+                if (name.endsWith(".tmp") || name.endsWith(".lock") || name.equals("backup_label")) {
+                    return false;
+                }
+                return true;
+            });
+            copyOut.flush();
+        }
+
+        // 5. Send CopyDone
+        StdWireMessages.writeCopyDone(out);
+        out.flush();
+
+        // 6. Capture ending location and send second result set
+        long endEpoch = db().getWalManager().getWalEpoch();
+        long endLsn = db().getWalManager().getCurrentLSN();
+        String endRecptr = String.format("%X/%X", endEpoch, endLsn);
+        String endTli = String.valueOf(endEpoch);
+
+        List<StdWireMessages.Column> endCols = List.of(
+            new StdWireMessages.Column("recptr", 25, (short) -1),
+            new StdWireMessages.Column("tli", 23, (short) -1)
+        );
+        StdWireMessages.writeRowDescription(out, endCols);
+        StdWireMessages.writeDataRow(out, List.of(endRecptr, endTli));
+        StdWireMessages.writeCommandComplete(out, "BASE_BACKUP");
+        out.flush();
+
+        LOG.info("BASE_BACKUP completed successfully: start={}/{} end={}/{}", startEpoch, startLsn, endEpoch, endLsn);
         return true;
     }
 

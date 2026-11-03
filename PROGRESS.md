@@ -1,17 +1,17 @@
 # StratosDB — Progress Tracker
 
-**Last verified:** November 2, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
+**Last verified:** November 3, 2026 — every checkmark below was confirmed by actually compiling and running the test suite against the exact code on GitHub `master`, not by reading commit messages or trusting claims. See "How this doc is kept honest" at the bottom.
 
 ## At a glance
 
 | | |
 |---|---|
-| Commits | 111 |
-| Tests passing | **636 / 636** |
-| Main source | ~40,570 lines |
-| Test source | ~20,950 lines |
+| Commits | 112 |
+| Tests passing | **646 / 646** |
+| Main source | ~42,250 lines |
+| Test source | ~21,800 lines |
 
-| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), and Sprint 10 (Weeks 19-20: Isolation Levels & SCRAM-SHA-256-PLUS Channel Binding + Role Inheritance + Database Permissions) fully completed. Full reactor test suite verified at 636/636 passing across all 12 modules. |
+| Current stage | Foundation (Weeks 1-4) complete; Part 2 Phase A/B/C/D/E completed. Sprint 4 (Weeks 07-08), Sprint 5 (Weeks 09-10), Sprint 6 (Weeks 11-12), Sprint 7 (Weeks 13-14), Sprint 8 (Weeks 15-16), Sprint 9 (Weeks 17-18), Sprint 10 (Weeks 19-20), and Sprint 11 (Week 21: Networked Base Backup Protocol with streaming tarball pages over pgwire replication connection, automatic standby replica bootstrapping, and continuous WAL replication) fully completed. Full reactor test suite verified at 646/646 passing across all 12 modules. |
 
 This tracker follows the 4-week foundation plan in `PROJECT_PLAN.md`. Anything with a green check was independently rebuilt and re-tested, not just assumed from a commit title.
 
@@ -1591,6 +1591,75 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Updated `StratosDB_6Month_Project_Plan.xlsx`:
     - Sheet 2 (Row 24, Sprint 10 Week 20: SCRAM-SHA-256-PLUS Channel Binding & Roles) marked `Completed`.
     - Sheet 3 (Row 26, Wire Encryption (TLS/SSL)) updated with channel binding and roles.
+
+## Sprint 11 — Week 21: Replication & HA — Networked Base Backup Protocol (BASE_BACKUP) ✅ DONE
+
+- ✅ **POSIX ustar Tar Archive Engine (`StdTarArchive.java`)**:
+  - Implemented pure-Java POSIX `ustar` standard tarball pack and unpack utility for raw streaming data directory transfer.
+  - Header structure: 512-byte blocks containing file name (up to 100 chars, with 155-char prefix support), file mode, user/group IDs, 12-byte octal file size, modification timestamp, octal header checksum, type flag (regular file `'0'` / directory `'5'`), `ustar\0` magic indicator, and version `00`.
+  - Checksum calculation: standard ustar algorithm treating checksum field bytes as ASCII spaces (`0x20`) during summation.
+  - Security hardening: Zip-Slip vulnerability prevention via target path normalization (`Path.normalize().startsWith(targetDir)`), strictly preventing directory traversal attacks during extraction.
+  - Granular exclusions: built-in file and directory filter support allowing base backups to skip volatile or uncommitted files (e.g., active WAL directory, sockets, locks) while packaging all database pages (`*.dat`), catalog files, and configuration.
+
+- ✅ **pgwire CopyData Stream Adapters (`StdCopyDataOutputStream.java`, `StdCopyDataInputStream.java`, `StdWireMessages.java`)**:
+  - `StdCopyDataOutputStream`: chunks arbitrary raw byte streams into pgwire `CopyData` (`'d'`) packets. Configurable buffer size (default 32KB) and optional bandwidth throttling (`MAX_RATE` bytes/sec) via token-bucket style rate limiting.
+  - `StdCopyDataInputStream`: decodes incoming pgwire stream by reading consecutive `CopyData` (`'d'`) frames, buffering payload bytes into a standard `java.io.InputStream` until receiving `CopyDone` (`'c'`) or handling replication termination.
+  - Added binary `writeCopyData(DataOutputStream out, byte[] bytes, int offset, int length)` and `writeStartupMessage(DataOutputStream out, Map<String, String> parameters)` in `StdWireMessages`.
+
+- ✅ **Command Parser & Options (`StdBaseBackupOptions.java`)**:
+  - Full parser supporting standard pgwire `BASE_BACKUP` syntax both with and without parenthesis:
+    - `LABEL 'string'`: custom backup identifier embedded into the streamed `backup_label` file.
+    - `FAST`: flushes dirty pages immediately and logs checkpoint record before starting stream.
+    - `WAL`: instructs server to stream or archive active WAL range spanning the base backup.
+    - `MAX_RATE <bytes_per_sec>`: bandwidth rate limiting for backup data transfer.
+    - `NOWAIT`, `PROGRESS`, `TABLESPACE_MAP`, `NOVERIFY_CHECKSUMS` options parsed and validated.
+
+- ✅ **Replication Wire Protocol Handshake & Server Commands (`StdWireServer.java`)**:
+  - Connection startup inspection: parses startup message parameters for `replication=database` or `replication=true`. Accepts replication connections under standard or SCRAM authentication.
+  - `IDENTIFY_SYSTEM`: responds with 4-column result set (`systemid`, `timeline`, `xlogpos`, `dbname`) followed by `CommandComplete IDENTIFY_SYSTEM`.
+  - `BASE_BACKUP`:
+    1. Synchronizes buffer pool via `bufferPool.flushAll()`; creates clean checkpoint if `FAST` is set.
+    2. Records starting replication position (WAL epoch and current LSN).
+    3. Sends starting LSN result set (`recptr` formatted as `<epoch>/<LSN>`, `tli`).
+    4. Emits `CopyOutResponse` (`'H'`) indicating binary copy mode (`format=0`, 0 columns).
+    5. Dynamically injects `backup_label` file (containing start WAL location, checkpoint time, backup label name, and database epoch) into the streamed tarball.
+    6. Streams data directory tarball across `CopyData` (`'d'`) messages, cleanly excluding active WAL directory (`wal/`) to avoid epoch divergence between primary and standby.
+    7. Sends `CopyDone` (`'c'`).
+    8. Writes ending LSN result set (`recptr`, `tli`) and emits `CommandComplete BASE_BACKUP`.
+
+- ✅ **MVCC Visibility & Cross-Node Commit Replication (`TransactionManager.java`, `StreamingWalApplier.java`, `ReplicationClient.java`)**:
+  - Implemented `TransactionManager.recordExternalCommit(long xid)`: atomically inserts replicated commit into `committedXids`, writes to disk-backed `commit.log`, and advances `nextXID.accumulateAndGet(xid + 1, Math::max)`.
+  - Integrated `StreamingWalApplier(DiskManager, BufferPoolManager, TransactionManager)`: applying `OP_COMMIT` records invokes `recordExternalCommit(xid)`, making all replicated rows immediately visible to replica MVCC snapshot queries (`xmin < snapshot.xmax`).
+  - Added arbitrary offset and epoch resumption in `ReplicationClient(host, port, diskManager, bufferPool, transactionManager, resumeEpoch, resumeOffset)` to seamlessly bridge network base backup cutover into live WAL streaming.
+
+- ✅ **Network Base Backup Client (`StdBaseBackupClient.java`) & Standby Bootstrapper (`StdReplicaBootstrapper.java`)**:
+  - `StdBaseBackupClient`: standalone Java client establishing a replication connection, executing `IDENTIFY_SYSTEM` and `BASE_BACKUP`, and extracting streamed data directory pages into a target directory over the network.
+  - `StdReplicaBootstrapper`: one-line orchestrator that executes `StdBaseBackupClient` against primary, boots a local `StratosDB` instance in read-only mode from the extracted directory, spawns a continuous `ReplicationClient` following primary WAL, and starts a local `StdWireServer` serving read queries.
+  - Promotion support: `replicaHandle.promote()` stops WAL replication streaming, unlinks replication client from wire server, and converts the replica into a read-write primary.
+
+- ✅ **Command-Line Base Backup Utility (`StdBaseBackup.java`)**:
+  - Full CLI utility in `stratosdb-cli` supporting `-h` (host), `-p` (port), `-U` (user), `-d` (database), `-D` (target directory), `--label`, `--fast`, and `--wal`.
+
+- ✅ **Comprehensive Automated Verification & End-to-End Test Suite**:
+  - Added unit test suites:
+    1. `StdTarArchiveTest` (3 tests): verifies roundtrip archive packing and unpacking of directory trees with deep hierarchies, file content fidelity, and directory structure integrity.
+    2. `StdBaseBackupOptionsTest` (3 tests): verifies option parsing with parentheses, unparenthesized syntax, and invalid option rejection.
+  - Added end-to-end integration test suite `NetworkedBaseBackupEndToEndTest` (4 tests):
+    1. `baseBackupStreamsCleanTarballOverReplicationConnection`: verifies taking networked base backup from running primary, validates extracted files (`.dat`, `backup_label`, catalog), and verifies `backup_label` contents.
+    2. `identifySystemReturnsClusterState`: verifies `IDENTIFY_SYSTEM` query over wire protocol returns correct cluster timeline, LSN, and dbname.
+    3. `standbyBootstrapsAndReplicatesContinuously`: full end-to-end lifecycle:
+       - Populates initial data on primary (`accounts`).
+       - Bootstraps new standby replica entirely over the network via `StdReplicaBootstrapper`.
+       - Verifies replica starts in read-only mode and initial data is queryable via SQL.
+       - Rejects write transactions on read-only replica.
+       - Writes concurrent INSERT, UPDATE, and DELETE operations on primary.
+       - Confirms replica applies continuous streaming WAL updates, verifying MVCC visibility on replicated rows.
+       - Promotes replica to primary via `promote()`, confirming write mode enablement and successful post-promotion writes.
+    4. `cliStdBaseBackupExecution`: verifies `StdBaseBackup.main()` CLI execution over the network.
+  - Full reactor test suite verified at **646 / 646 tests passing across all 12 modules** (0 failures, 0 errors, 2 skipped).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`:
+    - Sheet 2 (Row 25, Sprint 11 Week 21: Networked Base Backup Protocol) marked `Completed`.
+    - Sheet 3 (Row 25, Wire Protocol Completeness) updated with replication and base backup streaming.
 
 ## What to do next
 

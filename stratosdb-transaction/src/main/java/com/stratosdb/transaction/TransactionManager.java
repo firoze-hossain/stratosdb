@@ -227,6 +227,16 @@ public class TransactionManager {
         return xid == 0L || committedXids.contains(xid);
     }
 
+    /**
+     * Records an external commit arriving via physical replication (WAL streaming)
+     * so that replica MVCC visibility checks recognize this transaction as committed.
+     */
+    public void recordExternalCommit(long xid) {
+        committedXids.add(xid);
+        appendToCommitLog(xid);
+        nextXID.accumulateAndGet(xid + 1, Math::max);
+    }
+
     public boolean isActive(long xid) {
         return activeXids.contains(xid);
     }
