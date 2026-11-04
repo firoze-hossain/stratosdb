@@ -304,6 +304,8 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName GE literal                                  #GeCompare
           | columnName LE literal                                  #LeCompare
           | columnName NE literal                                  #NeCompare
+          | columnName BETWEEN literal AND literal                  #BetweenCompare
+          | columnName NOT BETWEEN literal AND literal              #NotBetweenCompare
           | columnName LIKE literal                                #LikeCompare
           | columnName CONTAINS literal                            #ContainsCompare
           | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
@@ -376,6 +378,7 @@ anyIdentifier: IDENTIFIER
              | ADMIN | CONNECT | OPTION | TEMP | TEMPORARY | TABLES | TYPE | VIEW | INDEX | DEFAULT
              | ROLE | KEY | ACTION | CASCADE | RESTRICT | PRIMARY | UNIQUE | CHECK
              | NONE | MINVALUE | MAXVALUE | CACHE | CYCLE | RESTART | OWNED | ZONE | WITHOUT | CHARACTER | VARYING
+             | BETWEEN
              ;
 tableName: (anyIdentifier DOT)? anyIdentifier;
 typeName: anyIdentifier;
@@ -463,6 +466,7 @@ VALUES: V A L U E S;
 SELECT: S E L E C T;
 FROM: F R O M;
 WHERE: W H E R E;
+BETWEEN: B E T W E E N;
 UPDATE: U P D A T E;
 SET: S E T;
 DELETE: D E L E T E;

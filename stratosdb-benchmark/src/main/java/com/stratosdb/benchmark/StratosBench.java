@@ -82,7 +82,11 @@ public class StratosBench {
             return;
         }
 
-        if (parsed.initialize) {
+        if ("tpcc".equalsIgnoreCase(parsed.benchmark)) {
+            runTpcc(parsed);
+        } else if ("sysbench".equalsIgnoreCase(parsed.benchmark)) {
+            runSysbench(parsed);
+        } else if (parsed.initialize) {
             runInitialize(parsed);
         } else {
             runBenchmark(parsed);
@@ -111,6 +115,10 @@ public class StratosBench {
               --password pw      Password (prompted interactively if the server requires SCRAM and this is omitted)
               --profile event    Profile execution with async-profiler (cpu, alloc, wall)
               --flamegraph file  Save interactive flame graph HTML to file
+              --benchmark name   Benchmark suite to run: tpcb (default), tpcc, sysbench
+              --warehouses N     Number of warehouses for TPC-C (default 50)
+              --tables N         Number of tables for Sysbench (default 1)
+              --table-size N     Number of rows per table for Sysbench (default 100000)
 
             Known limitation: under real concurrent load (-c > 1), some transactions
             may fail due to a real, not-yet-fixed race in this engine's own B+Tree
@@ -119,6 +127,100 @@ public class StratosBench {
             often this is hit. The final report's own failure count reflects this
             honestly rather than hiding it.
             """);
+    }
+
+    private static void runTpcc(Args args) throws Exception {
+        String jdbcUrl = "jdbc:stratos://" + args.host + ":" + args.port + "/" + args.database;
+        com.stratosdb.benchmark.tpcc.StdTpccBench.ConnectionSupplier supplier = () ->
+            java.sql.DriverManager.getConnection(jdbcUrl, args.user, args.password != null ? args.password : "");
+
+        if (args.initialize) {
+            System.out.printf("Initializing TPC-C with %d warehouse(s)...%n", args.warehouses);
+            try (java.sql.Connection conn = supplier.getConnection()) {
+                com.stratosdb.benchmark.tpcc.StdTpccSchema.initializeSchema(conn, "stratos");
+                new com.stratosdb.benchmark.tpcc.StdTpccDataGenerator(args.warehouses).loadData(conn);
+            }
+            System.out.println("TPC-C initialization complete.");
+            return;
+        }
+
+        int duration = args.durationSeconds > 0 ? args.durationSeconds : 10;
+        System.out.printf("Running TPC-C benchmark (%d warehouses, %d clients, %d seconds)...%n",
+            args.warehouses, args.clients, duration);
+
+        if (args.profileEvent != null && com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+            com.stratosdb.benchmark.profiler.StdAsyncProfiler.start(args.profileEvent, 5_000_000);
+        }
+
+        com.stratosdb.benchmark.tpcc.StdTpccBench.StdTpccResult res =
+            com.stratosdb.benchmark.tpcc.StdTpccBench.runBenchmark("StratosDB", args.warehouses, args.clients, duration, 1, supplier);
+
+        if (args.flameGraphOutput != null && com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+            com.stratosdb.benchmark.profiler.StdAsyncProfiler.dumpFlameGraph(new java.io.File(args.flameGraphOutput));
+        }
+
+        System.out.println("\n=================================================");
+        System.out.println(" StratosDB TPC-C Results");
+        System.out.println("=================================================");
+        System.out.printf("Warehouses:    %d%n", res.warehouses());
+        System.out.printf("Clients:       %d%n", res.clients());
+        System.out.printf("Duration:      %.2f s%n", res.durationSeconds());
+        System.out.printf("Transactions:  %,d (%,d succeeded, %,d failed)%n", res.totalTransactions(), res.successfulTransactions(), res.failedTransactions());
+        System.out.printf("Throughput:    %,.1f TPS%n", res.tps());
+        System.out.printf("tpmC:          %,.1f (New-Order/min)%n", res.tpmC());
+        System.out.printf("Latency P50:   %.3f ms%n", res.p50Ms());
+        System.out.printf("Latency P90:   %.3f ms%n", res.p90Ms());
+        System.out.printf("Latency P99:   %.3f ms%n", res.p99Ms());
+        System.out.printf("Latency Max:   %.3f ms%n", res.maxMs());
+    }
+
+    private static void runSysbench(Args args) throws Exception {
+        String jdbcUrl = "jdbc:stratos://" + args.host + ":" + args.port + "/" + args.database;
+        com.stratosdb.benchmark.sysbench.StdSysbenchBench.ConnectionSupplier supplier = () ->
+            java.sql.DriverManager.getConnection(jdbcUrl, args.user, args.password != null ? args.password : "");
+
+        if (args.initialize) {
+            System.out.printf("Initializing Sysbench with %d table(s) of %d rows...%n", args.tables, args.tableSize);
+            try (java.sql.Connection conn = supplier.getConnection()) {
+                com.stratosdb.benchmark.sysbench.StdSysbenchSchema.initializeSchema(conn, args.tables, "stratos");
+                new com.stratosdb.benchmark.sysbench.StdSysbenchDataGenerator(args.tables, args.tableSize).loadData(conn);
+            }
+            System.out.println("Sysbench initialization complete.");
+            return;
+        }
+
+        int duration = args.durationSeconds > 0 ? args.durationSeconds : 10;
+        System.out.printf("Running Sysbench oltp_read_write benchmark (%d tables, %d rows, %d clients, %d seconds)...%n",
+            args.tables, args.tableSize, args.clients, duration);
+
+        if (args.profileEvent != null && com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+            com.stratosdb.benchmark.profiler.StdAsyncProfiler.start(args.profileEvent, 5_000_000);
+        }
+
+        com.stratosdb.benchmark.sysbench.StdSysbenchBench.StdSysbenchResult res =
+            com.stratosdb.benchmark.sysbench.StdSysbenchBench.runBenchmark(
+                "StratosDB",
+                com.stratosdb.benchmark.sysbench.StdSysbenchWorkload.WorkloadType.OLTP_READ_WRITE,
+                args.tables, args.tableSize, args.clients, duration, 1, supplier);
+
+        if (args.flameGraphOutput != null && com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+            com.stratosdb.benchmark.profiler.StdAsyncProfiler.dumpFlameGraph(new java.io.File(args.flameGraphOutput));
+        }
+
+        System.out.println("\n=================================================");
+        System.out.println(" StratosDB Sysbench OLTP Results");
+        System.out.println("=================================================");
+        System.out.printf("Tables:        %d (%d rows)%n", res.tables(), res.tableSize());
+        System.out.printf("Clients:       %d%n", res.clients());
+        System.out.printf("Duration:      %.2f s%n", res.durationSeconds());
+        System.out.printf("Transactions:  %,d%n", res.totalTransactions());
+        System.out.printf("Queries:       %,d%n", res.totalQueries());
+        System.out.printf("Throughput:    %,.1f TPS%n", res.tps());
+        System.out.printf("Queries/sec:   %,.1f QPS%n", res.qps());
+        System.out.printf("Latency P50:   %.3f ms%n", res.p50Ms());
+        System.out.printf("Latency P90:   %.3f ms%n", res.p90Ms());
+        System.out.printf("Latency P99:   %.3f ms%n", res.p99Ms());
+        System.out.printf("Latency Max:   %.3f ms%n", res.maxMs());
     }
 
     // --- Initialization -----------------------------------------------------
@@ -426,6 +528,10 @@ public class StratosBench {
         String password;
         String profileEvent = null;
         String flameGraphOutput = null;
+        String benchmark = "tpcb";
+        int warehouses = 50;
+        int tables = 1;
+        int tableSize = 100_000;
 
         static Args parse(String[] argv) {
             Args a = new Args();
@@ -445,6 +551,10 @@ public class StratosBench {
                     case "--password" -> a.password = argv[++i];
                     case "--profile" -> a.profileEvent = argv[++i];
                     case "--flamegraph" -> a.flameGraphOutput = argv[++i];
+                    case "--benchmark" -> a.benchmark = argv[++i].toLowerCase();
+                    case "--warehouses" -> a.warehouses = Integer.parseInt(argv[++i]);
+                    case "--tables" -> a.tables = Integer.parseInt(argv[++i]);
+                    case "--table-size" -> a.tableSize = Integer.parseInt(argv[++i]);
                     default -> {
                         System.err.println("Unrecognized argument: " + argv[i]);
                         return null;

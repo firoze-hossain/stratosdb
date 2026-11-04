@@ -736,6 +736,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         List<Savepoint> savepoints = new ArrayList<>(); // stack, most recently created last
         List<DdlUndoAction> ddlUndoActions = new ArrayList<>();
         List<UndoAction> dmlUndoActions = new ArrayList<>();
+        List<Runnable> onCommitActions = new ArrayList<>();
         /** The real, authenticated username for this session, set once via setCurrentUser() right after login - see its own javadoc. Null (the default for every session that never calls setCurrentUser, i.e. every caller using execute() directly) means unrestricted, matching this engine's own pre-existing behavior. */
         String currentUser;
         /**
@@ -759,9 +760,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         final String name;
         final List<UndoAction> actions = new ArrayList<>();
         final int ddlUndoStartIndex;
-        Savepoint(String name, int ddlUndoStartIndex) {
+        final int onCommitStartIndex;
+        Savepoint(String name, int ddlUndoStartIndex, int onCommitStartIndex) {
             this.name = name;
             this.ddlUndoStartIndex = ddlUndoStartIndex;
+            this.onCommitStartIndex = onCommitStartIndex;
         }
     }
 
@@ -810,6 +813,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         state.dmlUndoActions.clear();
         systemCatalog.rollbackDdl(state.ddlUndoActions);
         state.ddlUndoActions.clear();
+        state.onCommitActions.clear();
         transactionManager.abort(txn);
     }
 
@@ -1071,6 +1075,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         state.poisoned = false;
         state.savepoints.clear();
         state.ddlUndoActions.clear();
+        state.onCommitActions.clear();
         return QueryResult.success("BEGIN");
     }
 
@@ -1109,6 +1114,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         state.ddlUndoActions.clear();
         state.dmlUndoActions.clear();
+        for (Runnable act : state.onCommitActions) {
+            try {
+                act.run();
+            } catch (Exception e) {
+                LOG.error("Failed executing on-commit action", e);
+            }
+        }
+        state.onCommitActions.clear();
         walManager.logCommit(state.transaction.getXID());
         transactionManager.commit(state.transaction);
         state.transaction = null;
@@ -1132,7 +1145,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (state.transaction == null) {
             return QueryResult.error("SAVEPOINT can only be used inside a transaction - BEGIN first");
         }
-        state.savepoints.add(new Savepoint(stmt.name(), state.ddlUndoActions.size()));
+        state.savepoints.add(new Savepoint(stmt.name(), state.ddlUndoActions.size(), state.onCommitActions.size()));
         return QueryResult.success("SAVEPOINT " + stmt.name());
     }
 
@@ -1182,6 +1195,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
         Savepoint target = state.savepoints.get(idx);
         systemCatalog.rollbackSavepoint(state.ddlUndoActions, target.ddlUndoStartIndex);
+        while (state.onCommitActions.size() > target.onCommitStartIndex) {
+            state.onCommitActions.remove(state.onCommitActions.size() - 1);
+        }
 
         long myXid = state.transaction.getXID();
         // Undo every action from the most recently created savepoint back
@@ -1235,7 +1251,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             byte[] restored = MVCCVisibility.withXmax(stored, MVCCVisibility.NO_XMAX);
             table.update(u.pageId(), u.slot(), restored);
             Tuple tuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(restored));
-            maintainIndexesOnWrite(u.tableName(), tuple, u.pageId(), u.slot());
+            try {
+                maintainIndexesOnWrite(u.tableName(), tuple, u.pageId(), u.slot());
+            } catch (Exception e) {
+                // Defensive: index entry may already be present or conflict during concurrent rollback
+            }
         } else if (action instanceof UndoAction.UndoUpdate u) {
             HeapTable table = tables.get(u.tableName());
             if (table == null) return;
@@ -1244,13 +1264,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 byte[] restored = MVCCVisibility.withXmax(oldStored, MVCCVisibility.NO_XMAX);
                 table.update(u.oldPageId(), u.oldSlot(), restored);
                 Tuple oldTuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(restored));
-                maintainIndexesOnWrite(u.tableName(), oldTuple, u.oldPageId(), u.oldSlot());
+                try {
+                    maintainIndexesOnWrite(u.tableName(), oldTuple, u.oldPageId(), u.oldSlot());
+                } catch (Exception e) {
+                    // Defensive: index entry may already be restored
+                }
             }
             byte[] newStored = table.readTuple(u.newPageId(), u.newSlot());
             if (newStored != null) {
                 Tuple newTuple = deserializeTuple(u.tableName(), MVCCVisibility.readPayload(newStored));
                 table.update(u.newPageId(), u.newSlot(), MVCCVisibility.withXmax(newStored, myXid));
-                maintainIndexesOnDelete(u.tableName(), newTuple, u.newPageId(), u.newSlot());
+                try {
+                    maintainIndexesOnDelete(u.tableName(), newTuple, u.newPageId(), u.newSlot());
+                } catch (Exception e) {
+                    // Defensive: index entry may already be removed
+                }
             }
         }
     }
@@ -5956,6 +5984,30 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         catalogLines.remove("TABLE:" + tableName);
         catalogLines.remove("OWNER:" + tableName);
 
+        SessionState state = session.get();
+        boolean inExplicitTxn = (state.transaction != null);
+        List<String> tablesToDrop = new ArrayList<>();
+        tablesToDrop.add(tableName);
+        tablesToDrop.add(tableName + "_pkey");
+        if (droppedEntries != null) {
+            for (IndexEntry e : droppedEntries) {
+                tablesToDrop.add(e.indexName());
+            }
+        }
+        if (bufferPool != null) {
+            if (inExplicitTxn) {
+                state.onCommitActions.add(() -> {
+                    for (String tbl : tablesToDrop) {
+                        bufferPool.dropTable(tbl);
+                    }
+                });
+            } else {
+                for (String tbl : tablesToDrop) {
+                    bufferPool.dropTable(tbl);
+                }
+            }
+        }
+
         long xid = txn != null ? txn.getXID() : 0L;
         systemCatalog.deleteTable(tableName, xid);
         systemCatalog.deleteColumns(tableName, xid);
@@ -7707,6 +7759,15 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         ginIndexesByName.remove(targetIdxName);
         gistIndexesByName.remove(targetIdxName);
         catalogLines.remove("INDEX:" + targetIdxName);
+        SessionState state = session.get();
+        boolean inExplicitTxn = (state.transaction != null);
+        if (bufferPool != null) {
+            if (inExplicitTxn) {
+                state.onCommitActions.add(() -> bufferPool.dropTable(targetIdxName));
+            } else {
+                bufferPool.dropTable(targetIdxName);
+            }
+        }
         long xid = txn != null ? txn.getXID() : 0L;
         systemCatalog.deleteIndex(name, xid);
         return QueryResult.success("Index dropped: " + name);

@@ -618,6 +618,20 @@ public class SqlParser {
         if (ctx instanceof StratosSQLParser.NeCompareContext c) {
             return new WhereExpr.Comparison(cleanColumnName(c.columnName().getText()), "!=", c.literal().getText());
         }
+        if (ctx instanceof StratosSQLParser.BetweenCompareContext c) {
+            String col = cleanColumnName(c.columnName().getText());
+            return new WhereExpr.And(
+                new WhereExpr.Comparison(col, ">=", c.literal(0).getText()),
+                new WhereExpr.Comparison(col, "<=", c.literal(1).getText())
+            );
+        }
+        if (ctx instanceof StratosSQLParser.NotBetweenCompareContext c) {
+            String col = cleanColumnName(c.columnName().getText());
+            return new WhereExpr.Or(
+                new WhereExpr.Comparison(col, "<", c.literal(0).getText()),
+                new WhereExpr.Comparison(col, ">", c.literal(1).getText())
+            );
+        }
         if (ctx instanceof StratosSQLParser.LikeCompareContext c) {
             return new WhereExpr.Like(cleanColumnName(c.columnName().getText()), c.literal().getText());
         }

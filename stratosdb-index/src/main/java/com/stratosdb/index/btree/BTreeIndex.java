@@ -677,6 +677,14 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
         return idx;
     }
 
+    private int findChildIndexForSearch(List<Long> keys, long key) {
+        int idx = 0;
+        while (idx < keys.size() && key > keys.get(idx)) {
+            idx++;
+        }
+        return idx;
+    }
+
     // --- Point Delete ---
 
     @Override
@@ -729,7 +737,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
                         int removeIdx = -1;
                         for (int i = 0; i < leafKeys.size(); i++) {
-                            if (leafKeys.get(i) == key && leafValues.get(i).equals(rid)) {
+                            if (leafKeys.get(i) == key && (rid == null || leafValues.get(i).equals(rid) || unique)) {
                                 removeIdx = i;
                                 break;
                             }
@@ -808,7 +816,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
             int removeIdx = -1;
             for (int i = 0; i < keys.size(); i++) {
-                if (keys.get(i) == key && values.get(i).equals(rid)) {
+                if (keys.get(i) == key && (rid == null || values.get(i).equals(rid) || unique)) {
                     removeIdx = i;
                     break;
                 }
@@ -1073,7 +1081,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             while (!curr.isLeaf()) {
                 List<Long> keys = curr.getKeys();
                 List<Long> children = curr.getChildren();
-                int childIdx = findChildIndex(keys, key);
+                int childIdx = findChildIndexForSearch(keys, key);
                 long childPageId = children.get(childIdx);
 
                 BTreePage child = bufferPool.getPage(indexName, childPageId, BTreePage.FACTORY);
@@ -1132,7 +1140,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
             while (!curr.isLeaf()) {
                 List<Long> keys = curr.getKeys();
                 List<Long> children = curr.getChildren();
-                int childIdx = findChildIndex(keys, fromKey);
+                int childIdx = findChildIndexForSearch(keys, fromKey);
                 long childPageId = children.get(childIdx);
 
                 BTreePage child = bufferPool.getPage(indexName, childPageId, BTreePage.FACTORY);
