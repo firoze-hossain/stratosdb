@@ -19,6 +19,8 @@ public class BufferPoolManager implements BufferPool {
     private final Map<String, Map<Long, Page>> pageCache;
     private final Map<String, Map<Long, Integer>> pinCounts;
     private final ReentrantReadWriteLock globalLock;
+    private final java.util.Queue<java.nio.ByteBuffer> directFramePool = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.atomic.AtomicLong totalFramesRecycled = new java.util.concurrent.atomic.AtomicLong(0);
 
     private final Thread backgroundFlusherThread;
     private final java.util.concurrent.atomic.AtomicBoolean flusherRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -112,7 +114,7 @@ public class BufferPoolManager implements BufferPool {
             if (tablePages != null) {
                 Page cached = tablePages.get(pageId);
                 if (cached != null) {
-                    pinPage(tableName, pageId);
+                    pinPage(tableName, pageId, cached);
                     hits++;
                     @SuppressWarnings("unchecked")
                     T page = (T) cached;
@@ -131,7 +133,7 @@ public class BufferPoolManager implements BufferPool {
             if (tablePages != null && tablePages.containsKey(pageId)) {
                 @SuppressWarnings("unchecked")
                 T page = (T) tablePages.get(pageId);
-                pinPage(tableName, pageId);
+                pinPage(tableName, pageId, page);
                 hits++;
                 return page;
             }
@@ -139,20 +141,29 @@ public class BufferPoolManager implements BufferPool {
             // Evict if needed
             evictIfNeeded();
 
-            // Load from disk if page already exists, otherwise create a properly initialized empty page.
+            // Load from disk directly into recycled off-heap direct buffer frame, or initialize clean page
+            java.nio.ByteBuffer directFrame = acquireDirectFrame();
             T page;
             if (pageId >= diskManager.getTablePageCount(tableName)) {
-                page = factory.createEmpty(pageId);
+                directFrame.clear();
+                page = factory.wrap(pageId, directFrame);
+                page.initializeHeader();
             } else {
-                Page raw = diskManager.readPage(tableName, pageId);
-                page = factory.wrap(pageId, raw.getBuffer());
+                boolean read = diskManager.readPageIntoBuffer(tableName, pageId, directFrame);
+                if (read) {
+                    page = factory.wrap(pageId, directFrame);
+                } else {
+                    directFrame.clear();
+                    page = factory.wrap(pageId, directFrame);
+                    page.initializeHeader();
+                }
             }
 
             // Add to cache
             tablePages = pageCache.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
             tablePages.put(pageId, page);
 
-            pinPage(tableName, pageId);
+            pinPage(tableName, pageId, page);
             misses++;
 
             LOG.debug("Cache miss: {}/{}", tableName, pageId);
@@ -172,6 +183,13 @@ public class BufferPoolManager implements BufferPool {
 
     @Override
     public void unpinPage(String tableName, long pageId) {
+        Map<Long, Page> tablePages = pageCache.get(tableName);
+        if (tablePages != null) {
+            Page page = tablePages.get(pageId);
+            if (page != null) {
+                page.unpin();
+            }
+        }
         Map<Long, Integer> pins = pinCounts.get(tableName);
         if (pins != null) {
             pins.computeIfPresent(pageId, (k, v) -> v > 0 ? v - 1 : 0);
@@ -213,8 +231,11 @@ public class BufferPoolManager implements BufferPool {
             Map<Long, Page> tablePages = pageCache.get(tableName);
             if (tablePages != null) {
                 Page page = tablePages.remove(pageId);
-                if (page != null && page.isDirty()) {
-                    diskManager.writePage(tableName, page);
+                if (page != null) {
+                    if (page.isDirty()) {
+                        diskManager.writePage(tableName, page);
+                    }
+                    recycleDirectFrame(page.getBuffer());
                 }
                 Map<Long, Integer> pins = pinCounts.get(tableName);
                 if (pins != null) {
@@ -227,7 +248,43 @@ public class BufferPoolManager implements BufferPool {
         }
     }
 
+    public java.nio.ByteBuffer acquireDirectFrame() {
+        java.nio.ByteBuffer buf = directFramePool.poll();
+        if (buf != null) {
+            buf.clear();
+            return buf;
+        }
+        return java.nio.ByteBuffer.allocateDirect(com.stratosdb.common.constants.PageConstants.PAGE_SIZE);
+    }
+
+    public void recycleDirectFrame(java.nio.ByteBuffer buf) {
+        if (buf != null && buf.isDirect()) {
+            totalFramesRecycled.incrementAndGet();
+            if (directFramePool.size() < maxPages) {
+                buf.clear();
+                directFramePool.offer(buf);
+            }
+        }
+    }
+
+    @Override
+    public int getDirectFramePoolSize() {
+        return directFramePool.size();
+    }
+
+    @Override
+    public long getTotalFramesRecycled() {
+        return totalFramesRecycled.get();
+    }
+
     private void pinPage(String tableName, long pageId) {
+        pinPage(tableName, pageId, null);
+    }
+
+    private void pinPage(String tableName, long pageId, Page page) {
+        if (page != null) {
+            page.pin();
+        }
         Map<Long, Integer> pins = pinCounts.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
         pins.compute(pageId, (k, v) -> (v == null) ? 1 : v + 1);
     }
@@ -256,6 +313,7 @@ public class BufferPoolManager implements BufferPool {
                     }
                     pages.remove(pageId);
                     pins.remove(pageId);
+                    recycleDirectFrame(page.getBuffer());
                     LOG.debug("Evicted: {}/{}", tableName, pageId);
                     return;
                 }
@@ -433,6 +491,7 @@ public class BufferPoolManager implements BufferPool {
         globalLock.writeLock().lock();
         try {
             pageCache.clear();
+            directFramePool.clear();
         } finally {
             globalLock.writeLock().unlock();
         }

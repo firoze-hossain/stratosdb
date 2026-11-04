@@ -38,7 +38,9 @@ public class StratosDB {
         this.diskManager = new DiskManager(config.getDataDirectory());
         this.bufferPool = new BufferPoolManager(config.getBufferPoolSize(), diskManager);
         this.walManager = new WALManager(config.getDataDirectory());
+        this.walManager.setSync(config.isSyncWAL());
         this.transactionManager = new TransactionManager(config.getDataDirectory());
+        this.transactionManager.setSyncCommitLog(config.isSyncWAL());
         this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager, config.getDataDirectory());
         if (config.getSlowQueryThresholdMs() >= 0) {
             this.executor.setSlowQueryThresholdMs(config.getSlowQueryThresholdMs());

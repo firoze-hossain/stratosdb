@@ -45,6 +45,20 @@ public class WALManager {
      */
     private final AtomicLong walEpoch;
     private boolean sync = true;
+
+    private static final int DIRECT_WAL_BUFFER_CAPACITY = 64 * 1024;
+    private static final ThreadLocal<ByteBuffer> DIRECT_RECORD_BUFFER = ThreadLocal.withInitial(() ->
+        ByteBuffer.allocateDirect(DIRECT_WAL_BUFFER_CAPACITY)
+    );
+
+    private ByteBuffer getDirectRecordBuffer(int requiredCapacity) {
+        if (requiredCapacity <= DIRECT_WAL_BUFFER_CAPACITY) {
+            ByteBuffer buf = DIRECT_RECORD_BUFFER.get();
+            buf.clear();
+            return buf;
+        }
+        return ByteBuffer.allocateDirect(requiredCapacity);
+    }
     /**
      * Where completed WAL is archived before this manager's own active
      * WAL file gets truncated/recycled - null (the default) means
@@ -207,7 +221,7 @@ public class WALManager {
      */
     public long logInsert(String tableName, long xid, long pageId, int slot, byte[] tupleData) {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(1024 + tupleData.length);
+            ByteBuffer buffer = getDirectRecordBuffer(1024 + tupleData.length);
             buffer.putInt(OP_INSERT);
             buffer.putLong(xid);
             
@@ -232,7 +246,7 @@ public class WALManager {
      */
     public long logDelete(String tableName, long xid, long pageId, int slot) {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(256);
+            ByteBuffer buffer = getDirectRecordBuffer(256);
             buffer.putInt(OP_DELETE);
             buffer.putLong(xid);
             
@@ -255,7 +269,7 @@ public class WALManager {
      */
     public long logUpdate(String tableName, long xid, long pageId, int slot, byte[] oldData, byte[] newData) {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(1024 + oldData.length + newData.length);
+            ByteBuffer buffer = getDirectRecordBuffer(1024 + oldData.length + newData.length);
             buffer.putInt(OP_UPDATE);
             buffer.putLong(xid);
             
@@ -290,7 +304,7 @@ public class WALManager {
      */
     public long logCommit(long transactionId) {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(24);
+            ByteBuffer buffer = getDirectRecordBuffer(24);
             buffer.putInt(OP_COMMIT);
             buffer.putLong(transactionId);
             buffer.putLong(System.currentTimeMillis());
@@ -314,7 +328,7 @@ public class WALManager {
             // This was previously allocate(8), which overflows on the putLong()
             // call and throws BufferOverflowException - caught below and silently
             // logged, so checkpoint() has never actually written a record.
-            ByteBuffer buffer = ByteBuffer.allocate(12);
+            ByteBuffer buffer = getDirectRecordBuffer(12);
             buffer.putInt(OP_CHECKPOINT);
             buffer.putLong(System.currentTimeMillis());
             writeBuffer(buffer, true);
@@ -330,7 +344,7 @@ public class WALManager {
     public long logIndexInsert(String indexName, long xid, long pageId, long key, long ridPageId, int ridSlot) {
         try {
             byte[] tableBytes = indexName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            ByteBuffer buffer = ByteBuffer.allocate(64 + tableBytes.length);
+            ByteBuffer buffer = getDirectRecordBuffer(64 + tableBytes.length);
             buffer.putInt(OP_INDEX_INSERT);
             buffer.putLong(xid);
             buffer.putInt(tableBytes.length);
@@ -352,7 +366,7 @@ public class WALManager {
     public long logIndexDelete(String indexName, long xid, long pageId, long key, long ridPageId, int ridSlot) {
         try {
             byte[] tableBytes = indexName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            ByteBuffer buffer = ByteBuffer.allocate(64 + tableBytes.length);
+            ByteBuffer buffer = getDirectRecordBuffer(64 + tableBytes.length);
             buffer.putInt(OP_INDEX_DELETE);
             buffer.putLong(xid);
             buffer.putInt(tableBytes.length);
@@ -383,7 +397,7 @@ public class WALManager {
             int lCount = leftKeys != null ? leftKeys.size() : 0;
             int leftSize = isLeaf ? (lCount * 20) : (lCount * 8 + (leftChildren != null ? leftChildren.size() * 8 : 0));
 
-            ByteBuffer buffer = ByteBuffer.allocate(256 + tableBytes.length + rightSize + leftSize);
+            ByteBuffer buffer = getDirectRecordBuffer(256 + tableBytes.length + rightSize + leftSize);
             buffer.putInt(OP_INDEX_SPLIT);
             buffer.putLong(xid);
             buffer.putInt(tableBytes.length);
@@ -448,7 +462,7 @@ public class WALManager {
             int pChildCount = parentChildren != null ? parentChildren.size() : 0;
             int parentSize = pKeyCount * 8 + pChildCount * 8;
 
-            ByteBuffer buffer = ByteBuffer.allocate(256 + tableBytes.length + leftSize + parentSize);
+            ByteBuffer buffer = getDirectRecordBuffer(256 + tableBytes.length + leftSize + parentSize);
             buffer.putInt(OP_INDEX_MERGE);
             buffer.putLong(xid);
             buffer.putInt(tableBytes.length);

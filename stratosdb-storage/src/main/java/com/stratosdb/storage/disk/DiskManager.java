@@ -76,6 +76,40 @@ public class DiskManager {
             return new Page(pageId);
         }
     }
+
+    /**
+     * Reads a page from disk directly into a pre-allocated direct ByteBuffer,
+     * completely eliminating intermediate Page wrapper allocations on cache miss.
+     * Returns true if bytes were read, false if the page is beyond EOF.
+     */
+    public boolean readPageIntoBuffer(String tableName, long pageId, ByteBuffer buffer) {
+        try {
+            String fileName = getTableFileName(tableName);
+            FileChannel channel = getFileChannel(fileName);
+
+            long position = pageId * PageConstants.PAGE_SIZE;
+            if (position >= channel.size()) {
+                buffer.clear();
+                return false;
+            }
+
+            buffer.position(0);
+            buffer.limit(PageConstants.PAGE_SIZE);
+
+            long curPos = position;
+            while (buffer.hasRemaining()) {
+                int bytesRead = channel.read(buffer, curPos);
+                if (bytesRead <= 0) break;
+                curPos += bytesRead;
+            }
+            buffer.position(0);
+            return true;
+        } catch (Exception e) {
+            LOG.error("Failed to read page {} into direct buffer from table {}", pageId, tableName, e);
+            buffer.clear();
+            return false;
+        }
+    }
     
     /**
      * Write a page to disk directly from its off-heap memory using thread-safe positional I/O.

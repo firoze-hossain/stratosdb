@@ -164,7 +164,7 @@
                     <version>3.2.5</version>
                     <configuration>
                         <argLine>
-                            -Djdk.attach.allowAttachSelf=true
+                            -XX:+UseZGC -XX:+AlwaysPreTouch -Xms1g -Xmx2g -Djdk.attach.allowAttachSelf=true
                         </argLine>
                     </configuration>
                 </plugin>

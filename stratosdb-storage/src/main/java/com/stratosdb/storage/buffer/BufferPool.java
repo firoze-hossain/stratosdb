@@ -28,6 +28,12 @@ public interface BufferPool {
     default int getDirtyPageCount() {
         return 0;
     }
+    default int getDirectFramePoolSize() {
+        return 0;
+    }
+    default long getTotalFramesRecycled() {
+        return 0L;
+    }
     default int flushDirtyPages(int maxPagesToFlush) {
         return 0;
     }

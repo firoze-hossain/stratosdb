@@ -57,6 +57,15 @@ public class TransactionManager {
     private volatile long persistedXidWatermark = 0; // xids up to and including this value are safe to use without another disk write
     private RandomAccessFile commitLogFile; // kept open for the process lifetime - opening/closing per commit would be needless I/O
     private final Object commitLogLock = new Object(); // serializes appends - commit() can be called from multiple threads
+    private boolean syncCommitLog = true;
+
+    public void setSyncCommitLog(boolean syncCommitLog) {
+        this.syncCommitLog = syncCommitLog;
+    }
+
+    public boolean isSyncCommitLog() {
+        return syncCommitLog;
+    }
 
     public TransactionManager() {
         this(null);
@@ -134,7 +143,7 @@ public class TransactionManager {
     public Transaction begin(IsolationLevel isolationLevel) {
         long xid = nextXID.getAndIncrement();
         reserveXidWatermarkIfNeeded(xid);
-        Set<Long> activeAtStart = new HashSet<>(activeXids); // snapshot BEFORE adding self
+        Set<Long> activeAtStart = activeXids.isEmpty() ? java.util.Collections.emptySet() : new HashSet<>(activeXids); // snapshot BEFORE adding self
         activeXids.add(xid);
 
         Transaction tx = new Transaction(xid, new Snapshot(xid, nextXID.get(), activeAtStart), isolationLevel);
@@ -150,9 +159,12 @@ public class TransactionManager {
      * all transactions committed prior to that statement's execution.
      */
     public Snapshot createSnapshot(long ownerXid) {
+        if (activeXids.isEmpty()) {
+            return new Snapshot(ownerXid, nextXID.get(), java.util.Collections.emptySet());
+        }
         Set<Long> currentActive = new HashSet<>(activeXids);
         currentActive.remove(ownerXid);
-        return new Snapshot(ownerXid, nextXID.get(), currentActive);
+        return new Snapshot(ownerXid, nextXID.get(), currentActive.isEmpty() ? java.util.Collections.emptySet() : currentActive);
     }
 
     /**
@@ -202,7 +214,9 @@ public class TransactionManager {
         synchronized (commitLogLock) {
             try {
                 commitLogFile.writeLong(xid);
-                commitLogFile.getFD().sync(); // durable before commit() returns - a crash right after must not lose this
+                if (syncCommitLog) {
+                    commitLogFile.getFD().sync(); // durable before commit() returns - a crash right after must not lose this
+                }
             } catch (IOException e) {
                 LOG.error("Failed to persist commit of xid {} to the commit log - it will not be recognized as committed after a restart", xid, e);
             }

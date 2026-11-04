@@ -45,6 +45,12 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>com.stratosdb</groupId>
+            <artifactId>stratosdb-benchmark</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>

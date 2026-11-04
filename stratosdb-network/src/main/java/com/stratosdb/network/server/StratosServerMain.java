@@ -152,6 +152,9 @@ public class StratosServerMain {
                 if (props.getProperty("slow_query_threshold_ms") != null) {
                     config.setSlowQueryThresholdMs(Long.parseLong(props.getProperty("slow_query_threshold_ms").trim()));
                 }
+                if (props.getProperty("direct_allocation") != null) {
+                    config.setDirectAllocation(Boolean.parseBoolean(props.getProperty("direct_allocation").trim()));
+                }
             } catch (Exception e) {
                 System.err.println("Warning: failed to load configuration file " + configFile + ": " + e.getMessage());
             }

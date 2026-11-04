@@ -109,6 +109,8 @@ public class StratosBench {
               -U user            Username (required)
               -d database        Database name (default stratos)
               --password pw      Password (prompted interactively if the server requires SCRAM and this is omitted)
+              --profile event    Profile execution with async-profiler (cpu, alloc, wall)
+              --flamegraph file  Save interactive flame graph HTML to file
 
             Known limitation: under real concurrent load (-c > 1), some transactions
             may fail due to a real, not-yet-fixed race in this engine's own B+Tree
@@ -280,6 +282,16 @@ public class StratosBench {
             t.start();
         }
 
+        if (args.flameGraphOutput != null || args.profileEvent != null) {
+            String evt = args.profileEvent != null ? args.profileEvent : "cpu";
+            if (com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+                com.stratosdb.benchmark.profiler.StdAsyncProfiler.start(evt);
+                System.out.println("async-profiler active (event: " + evt + ") - flame graph will be saved upon completion.");
+            } else {
+                System.out.println("Notice: async-profiler native library not found. Flame graph generation skipped.");
+            }
+        }
+
         startBarrier.await(); // release every client at (approximately) the same real moment
         long benchStart = System.nanoTime();
         if (args.durationSeconds > 0) {
@@ -289,6 +301,16 @@ public class StratosBench {
         doneLatch.await();
         long benchElapsedNanos = System.nanoTime() - benchStart;
         for (Thread t : threads) t.join();
+
+        if (args.flameGraphOutput != null && com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+            java.io.File out = new java.io.File(args.flameGraphOutput);
+            boolean dumped = com.stratosdb.benchmark.profiler.StdAsyncProfiler.dumpFlameGraph(out);
+            if (dumped) {
+                System.out.println("Flame graph generated successfully: " + out.getAbsolutePath() + " (" + out.length() + " bytes)");
+            }
+        } else if (com.stratosdb.benchmark.profiler.StdAsyncProfiler.isAvailable()) {
+            com.stratosdb.benchmark.profiler.StdAsyncProfiler.stop();
+        }
 
         printReport(args, successCount.get(), failureCount.get(), benchElapsedNanos, perClientLatencies);
     }
@@ -402,6 +424,8 @@ public class StratosBench {
         String user;
         String database = "stratos";
         String password;
+        String profileEvent = null;
+        String flameGraphOutput = null;
 
         static Args parse(String[] argv) {
             Args a = new Args();
@@ -419,6 +443,8 @@ public class StratosBench {
                     case "-U" -> a.user = argv[++i];
                     case "-d" -> a.database = argv[++i];
                     case "--password" -> a.password = argv[++i];
+                    case "--profile" -> a.profileEvent = argv[++i];
+                    case "--flamegraph" -> a.flameGraphOutput = argv[++i];
                     default -> {
                         System.err.println("Unrecognized argument: " + argv[i]);
                         return null;

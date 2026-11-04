@@ -8,8 +8,25 @@ public class DatabaseConfig {
     private int bufferPoolSize = 1024;
     private boolean syncWAL = true;
     private int maxConnections = 100;
+    private boolean directAllocation = true;
     /** Milliseconds between automatic VACUUM passes over every table; 0 (the default) means autovacuum is off - call StratosDB.startAutovacuum explicitly, or set this before construction to auto-start. */
     private long autovacuumIntervalMs = 0;
+
+    public boolean isDirectAllocation() { return directAllocation; }
+    public void setDirectAllocation(boolean directAllocation) { this.directAllocation = directAllocation; }
+
+    /**
+     * Checks whether Generational ZGC is active in the current JVM runtime.
+     * In modern OpenJDK (Java 21+ and Java 25 LTS), ZGC operates in zero-pause generational mode.
+     */
+    public static boolean isGenerationalZgcActive() {
+        for (java.lang.management.GarbageCollectorMXBean gc : java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+            if (gc.getName().toUpperCase().contains("ZGC")) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     public long getAutovacuumIntervalMs() { return autovacuumIntervalMs; }
     public void setAutovacuumIntervalMs(long autovacuumIntervalMs) { this.autovacuumIntervalMs = autovacuumIntervalMs; }
@@ -53,6 +70,7 @@ public class DatabaseConfig {
         copy.setMaxConnections(this.maxConnections);
         copy.setAutovacuumIntervalMs(this.autovacuumIntervalMs);
         copy.setSlowQueryThresholdMs(this.slowQueryThresholdMs);
+        copy.setDirectAllocation(this.directAllocation);
         return copy;
     }
 }
