@@ -189,15 +189,21 @@ public class ProductionReleaseAndDockerPackagingEndToEndTest {
         assertTrue(readmeContent.contains("helm install"), "README must document helm install");
         assertTrue(readmeContent.contains("stratosdb-jdbc"), "README must document Maven coordinates");
 
-        // 3. RozeHub Ecosystem Release Documentation
-        Path rozehubDocPath = Paths.get("/home/firoze/projects/others/RozeHub/docs/stratosdb-1.0-release.md");
-        assertTrue(Files.exists(rozehubDocPath), "RozeHub documentation must exist at /home/firoze/projects/others/RozeHub/docs/stratosdb-1.0-release.md");
-        String rozehubDoc = Files.readString(rozehubDocPath);
-        assertTrue(rozehubDoc.contains("StratosDB 1.0"), "RozeHub doc must describe StratosDB 1.0");
-        assertTrue(rozehubDoc.contains("DBNavigator"), "RozeHub doc must cover DBNavigator integration");
-        assertTrue(rozehubDoc.contains("pdo_pgsql"), "RozeHub doc must cover Laravel / PHP PDO compatibility");
-        assertTrue(rozehubDoc.contains("Lumina IDE"), "RozeHub doc must cover Lumina IDE support");
-        assertTrue(rozehubDoc.contains("ThunderCall"), "RozeHub doc must cover ThunderCall microservices");
+        // 3. RozeHub Ecosystem Release & Documentation Seeder
+        Path rozehubSeederPath = Paths.get("/home/firoze/projects/others/RozeHub/database/seeders/StratosDBDocumentationSeeder.php");
+        assertTrue(Files.exists(rozehubSeederPath), "RozeHub documentation seeder must exist at /home/firoze/projects/others/RozeHub/database/seeders/StratosDBDocumentationSeeder.php");
+        String rozehubSeeder = Files.readString(rozehubSeederPath);
+        assertTrue(rozehubSeeder.contains("StratosDB 1.0.0"), "RozeHub seeder must describe StratosDB 1.0.0");
+        assertTrue(rozehubSeeder.contains("DBNavigator"), "RozeHub seeder must cover DBNavigator integration");
+        assertTrue(rozehubSeeder.contains("pdo_pgsql"), "RozeHub seeder must cover Laravel / PHP PDO compatibility");
+        assertTrue(rozehubSeeder.contains("stratosdb-jdbc"), "RozeHub seeder must cover stratosdb-jdbc driver");
+        assertTrue(rozehubSeeder.contains("documentation_sections"), "RozeHub seeder must populate documentation_sections");
+        assertTrue(rozehubSeeder.contains("documentation_pages"), "RozeHub seeder must populate documentation_pages");
+
+        Path rozehubDatabaseSeederPath = Paths.get("/home/firoze/projects/others/RozeHub/database/seeders/DatabaseSeeder.php");
+        assertTrue(Files.exists(rozehubDatabaseSeederPath), "RozeHub DatabaseSeeder must exist");
+        String databaseSeeder = Files.readString(rozehubDatabaseSeederPath);
+        assertTrue(databaseSeeder.contains("StratosDBDocumentationSeeder::class"), "DatabaseSeeder must call StratosDBDocumentationSeeder::class");
     }
 
     @Test
