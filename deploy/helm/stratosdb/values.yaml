@@ -1,0 +1,93 @@
+# Default values for stratosdb Helm Chart.
+# This is a YAML-formatted file.
+
+image:
+  repository: stratosdb
+  tag: "1.0"
+  pullPolicy: IfNotPresent
+
+auth:
+  database: "stratos"
+  username: "admin"
+  password: "stratos_secret_password"
+  existingSecret: ""
+
+ports:
+  stdwire: 5432
+  native: 5431
+  replication: 5434
+
+primary:
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: "4000m"
+      memory: "4Gi"
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+  jvm:
+    heapSize: "3g"
+    extraOpts: "-XX:+UseZGC -XX:ZAllocationSpikeTolerance=4"
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    mountPath: /var/lib/stratosdb/data
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+replica:
+  enabled: true
+  replicaCount: 2
+  resources:
+    limits:
+      cpu: "4000m"
+      memory: "4Gi"
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+  jvm:
+    heapSize: "3g"
+    extraOpts: "-XX:+UseZGC -XX:ZAllocationSpikeTolerance=4"
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    mountPath: /var/lib/stratosdb/data
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+watchdog:
+  enabled: true
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+  jvm:
+    heapSize: "512m"
+    extraOpts: "-XX:+UseZGC"
+  heartbeatIntervalMs: 1000
+  electionTimeoutMs: 3000
+
+service:
+  primary:
+    type: ClusterIP
+    stdwirePort: 5432
+    nativePort: 5431
+    annotations: {}
+  replica:
+    type: ClusterIP
+    stdwirePort: 5432
+    nativePort: 5431
+    annotations: {}

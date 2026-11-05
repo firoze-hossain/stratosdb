@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "stratosdb.fullname" . }}-config
+  labels:
+    {{- include "stratosdb.labels" . | nindent 4 }}
+data:
+  STRATOS_PORT: {{ .Values.ports.native | quote }}
+  STRATOS_STDWIRE_PORT: {{ .Values.ports.stdwire | quote }}
+  STRATOS_REPLICATION_PORT: {{ .Values.ports.replication | quote }}

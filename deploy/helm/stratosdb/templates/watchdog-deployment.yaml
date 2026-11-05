@@ -1,0 +1,35 @@
+{{- if .Values.watchdog.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "stratosdb.watchdogFullname" . }}
+  labels:
+    {{- include "stratosdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watchdog
+spec:
+  replicas: {{ .Values.watchdog.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "stratosdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: watchdog
+  template:
+    metadata:
+      labels:
+        {{- include "stratosdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: watchdog
+    spec:
+      containers:
+        - name: watchdog
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - stratos-ha
+            - --primary={{ include "stratosdb.primaryFullname" . }}:{{ .Values.ports.replication }}
+            - --heartbeat={{ .Values.watchdog.heartbeatIntervalMs }}
+            - --election-timeout={{ .Values.watchdog.electionTimeoutMs }}
+          env:
+            - name: STRATOS_JAVA_OPTS
+              value: "-Xms{{ .Values.watchdog.jvm.heapSize }} -Xmx{{ .Values.watchdog.jvm.heapSize }} {{ .Values.watchdog.jvm.extraOpts }}"
+          resources:
+            {{- toYaml .Values.watchdog.resources | nindent 12 }}
+{{- end }}

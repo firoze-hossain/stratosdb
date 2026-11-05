@@ -12,12 +12,46 @@
     <artifactId>stratosdb-jdbc</artifactId>
     <packaging>jar</packaging>
 
+    <name>StratosDB JDBC Driver</name>
+    <description>Official pure-Java Type 4 JDBC Driver for StratosDB distributed hybrid relational database</description>
+    <url>https://github.com/firoze-hossain/stratosdb</url>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>firoze-hossain</id>
+            <name>Firoze Hossain</name>
+            <email>firoze.hossain@outlook.com</email>
+            <url>https://github.com/firoze-hossain</url>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:https://github.com/firoze-hossain/stratosdb.git</connection>
+        <developerConnection>scm:git:git@github.com:firoze-hossain/stratosdb.git</developerConnection>
+        <url>https://github.com/firoze-hossain/stratosdb</url>
+        <tag>HEAD</tag>
+    </scm>
+
     <dependencies>
         <!--
-          Test-only: stratosdb-network is only used by integration tests to
+          Test-only: stratosdb-core and stratosdb-network are only used by integration tests to
           spin up in-memory test servers. At runtime, stratosdb-jdbc is 100%
           self-contained with zero server or storage dependencies.
         -->
+        <dependency>
+            <groupId>com.stratosdb</groupId>
+            <artifactId>stratosdb-core</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>com.stratosdb</groupId>
             <artifactId>stratosdb-network</artifactId>
@@ -52,4 +86,83 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <configuration>
+                    <doclint>none</doclint>
+                    <quiet>true</quiet>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>attach-javadocs</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <distributionManagement>
+        <snapshotRepository>
+            <id>ossrh</id>
+            <url>https://s01.oss.sonatype.org/content/repositories/snapshots</url>
+        </snapshotRepository>
+        <repository>
+            <id>ossrh</id>
+            <url>https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+        </repository>
+    </distributionManagement>
+
+    <profiles>
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.plugins</groupId>
+                        <artifactId>nexus-staging-maven-plugin</artifactId>
+                        <version>1.6.13</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <serverId>ossrh</serverId>
+                            <nexusUrl>https://s01.oss.sonatype.org/</nexusUrl>
+                            <autoReleaseAfterClose>true</autoReleaseAfterClose>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

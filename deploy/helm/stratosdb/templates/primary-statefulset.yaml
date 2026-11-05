@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "stratosdb.primaryFullname" . }}
+  labels:
+    {{- include "stratosdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: primary
+spec:
+  serviceName: {{ include "stratosdb.headlessServiceName" . }}
+  replicas: {{ .Values.primary.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "stratosdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: primary
+  template:
+    metadata:
+      labels:
+        {{- include "stratosdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: primary
+    spec:
+      containers:
+        - name: stratosdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: stdwire
+              containerPort: {{ .Values.ports.stdwire }}
+              protocol: TCP
+            - name: native
+              containerPort: {{ .Values.ports.native }}
+              protocol: TCP
+            - name: replication
+              containerPort: {{ .Values.ports.replication }}
+              protocol: TCP
+          env:
+            - name: STRATOS_DATA_DIR
+              value: {{ .Values.primary.persistence.mountPath | quote }}
+            - name: STRATOS_CLUSTER_MODE
+              value: "primary"
+            - name: STRATOS_PORT
+              value: {{ .Values.ports.native | quote }}
+            - name: STRATOS_STDWIRE_PORT
+              value: {{ .Values.ports.stdwire | quote }}
+            - name: STRATOS_REPLICATION_PORT
+              value: {{ .Values.ports.replication | quote }}
+            - name: STRATOS_JAVA_OPTS
+              value: "-Xms{{ .Values.primary.jvm.heapSize }} -Xmx{{ .Values.primary.jvm.heapSize }} {{ .Values.primary.jvm.extraOpts }}"
+            - name: STRATOS_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stratosdb.secretName" . }}
+                  key: database
+            - name: STRATOS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stratosdb.secretName" . }}
+                  key: username
+            - name: STRATOS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stratosdb.secretName" . }}
+                  key: password
+          resources:
+            {{- toYaml .Values.primary.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.primary.persistence.mountPath }}
+          livenessProbe:
+            tcpSocket:
+              port: stdwire
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: stdwire
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      {{- with .Values.primary.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.primary.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.primary.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.primary.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "stratosdb.labels" . | nindent 10 }}
+          app.kubernetes.io/component: primary
+      spec:
+        accessModes:
+          {{- toYaml .Values.primary.persistence.accessModes | nindent 10 }}
+        {{- if .Values.primary.persistence.storageClass }}
+        storageClassName: {{ .Values.primary.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.primary.persistence.size | quote }}
+  {{- else }}
+      volumes:
+        - name: data
+          emptyDir: {}
+  {{- end }}

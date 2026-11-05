@@ -1,0 +1,74 @@
+# ==============================================================================
+# StratosDB 1.0 High-Availability Production Cluster
+# Primary (Read-Write) + Replica (Read-Only) + Raft Watchdog Failover
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  stratos-primary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stratosdb:1.0
+    container_name: stratos-primary
+    environment:
+      - STRATOS_PORT=5431
+      - STRATOS_STDWIRE_PORT=5432
+      - STRATOS_REPLICATION_PORT=5434
+      - STRATOS_CLUSTER_MODE=primary
+      - STRATOS_BUFFER_POOL_SIZE=16384
+      - STRATOS_DIRECT_ALLOCATION=true
+      - JAVA_OPTS=-XX:+UseZGC -XX:+AlwaysPreTouch -Xms512m -Xmx2g
+    ports:
+      - "5432:5432"   # PostgreSQL wire compatibility port (Read/Write)
+      - "5431:5431"   # Stratos Wire Protocol SWP v1.0
+      - "5434:5434"   # Streaming Replication Port
+    volumes:
+      - stratos_primary_data:/var/lib/stratosdb/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "5432"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  stratos-replica:
+    image: stratosdb:1.0
+    container_name: stratos-replica
+    depends_on:
+      stratos-primary:
+        condition: service_healthy
+    environment:
+      - STRATOS_PORT=5431
+      - STRATOS_STDWIRE_PORT=5432
+      - STRATOS_CLUSTER_MODE=replica
+      - STRATOS_REPLICA_OF=stratos-primary:5434
+      - STRATOS_BUFFER_POOL_SIZE=16384
+      - STRATOS_DIRECT_ALLOCATION=true
+      - JAVA_OPTS=-XX:+UseZGC -XX:+AlwaysPreTouch -Xms512m -Xmx2g
+    ports:
+      - "5433:5432"   # Read-Only Replica Port
+    volumes:
+      - stratos_replica_data:/var/lib/stratosdb/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "5432"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  stratos-watchdog:
+    image: stratosdb:1.0
+    container_name: stratos-watchdog
+    depends_on:
+      stratos-primary:
+        condition: service_healthy
+      stratos-replica:
+        condition: service_healthy
+    command: ["stratos-ha", "--primary=stratos-primary:5432", "--replica=stratos-replica:5432", "--heartbeat-ms=1000", "--failover-threshold-ms=3000"]
+    restart: unless-stopped
+
+volumes:
+  stratos_primary_data:
+  stratos_replica_data:

@@ -1,0 +1,27 @@
+{{- if .Values.replica.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stratosdb.replicaFullname" . }}
+  labels:
+    {{- include "stratosdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+  {{- with .Values.service.replica.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.replica.type }}
+  ports:
+    - port: {{ .Values.service.replica.stdwirePort }}
+      targetPort: stdwire
+      protocol: TCP
+      name: stdwire
+    - port: {{ .Values.service.replica.nativePort }}
+      targetPort: native
+      protocol: TCP
+      name: native
+  selector:
+    {{- include "stratosdb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+{{- end }}

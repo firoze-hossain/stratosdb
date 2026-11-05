@@ -3,6 +3,8 @@ package com.stratosdb.network.server;
 import com.stratosdb.common.constants.ProtocolConstants;
 import com.stratosdb.core.DatabaseConfig;
 import com.stratosdb.core.StratosDB;
+import com.stratosdb.network.replication.ReplicationClient;
+import com.stratosdb.network.replication.ReplicationServer;
 import com.stratosdb.network.stdwire.StdWireServer;
 
 /**
@@ -63,6 +65,9 @@ public class StratosServerMain {
         String explicitConfigFile = null;
         String dataDir = null;
         Integer port = null;
+        Integer stdwirePort = null;
+        Integer replicationPort = null;
+        String replicaOf = null;
         Boolean clusterMode = null;
 
         java.util.List<String> positional = new java.util.ArrayList<>();
@@ -71,6 +76,9 @@ public class StratosServerMain {
             String arg = args[i];
             if (arg.equals("--stdwire") || arg.startsWith("--stdwire=")) {
                 sawLegacyStdwireFlag = true;
+                if (arg.startsWith("--stdwire=") && arg.length() > "--stdwire=".length()) {
+                    stdwirePort = Integer.parseInt(arg.substring("--stdwire=".length()));
+                }
             } else if (arg.equals("--cluster")) {
                 clusterMode = true;
             } else if (arg.startsWith("--config=")) {
@@ -81,6 +89,19 @@ public class StratosServerMain {
                 port = Integer.parseInt(arg.substring("--port=".length()));
             } else if (arg.equals("--port") && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
+            } else if (arg.startsWith("--stdwire-port=")) {
+                stdwirePort = Integer.parseInt(arg.substring("--stdwire-port=".length()));
+            } else if (arg.equals("--stdwire-port") && i + 1 < args.length) {
+                stdwirePort = Integer.parseInt(args[++i]);
+            } else if (arg.startsWith("--replication-port=")) {
+                replicationPort = Integer.parseInt(arg.substring("--replication-port=".length()));
+            } else if (arg.equals("--replication-port")) {
+                boolean hasExplicitPort = i + 1 < args.length && !args[i + 1].startsWith("--");
+                replicationPort = hasExplicitPort ? Integer.parseInt(args[++i]) : ProtocolConstants.DEFAULT_REPLICATION_PORT;
+            } else if (arg.startsWith("--replica-of=")) {
+                replicaOf = arg.substring("--replica-of=".length());
+            } else if (arg.equals("--replica-of") && i + 1 < args.length) {
+                replicaOf = args[++i];
             } else if (arg.startsWith("--data-dir=")) {
                 dataDir = arg.substring("--data-dir=".length());
             } else if (arg.equals("--data-dir") && i + 1 < args.length) {
@@ -88,6 +109,26 @@ public class StratosServerMain {
             } else {
                 positional.add(arg);
             }
+        }
+
+        // Environment variables fallback
+        if (dataDir == null && System.getenv("STRATOS_DATA_DIR") != null) {
+            dataDir = System.getenv("STRATOS_DATA_DIR").trim();
+        }
+        if (port == null && System.getenv("STRATOS_PORT") != null) {
+            try { port = Integer.parseInt(System.getenv("STRATOS_PORT").trim()); } catch (Exception ignored) {}
+        }
+        if (stdwirePort == null && System.getenv("STRATOS_STDWIRE_PORT") != null) {
+            try { stdwirePort = Integer.parseInt(System.getenv("STRATOS_STDWIRE_PORT").trim()); } catch (Exception ignored) {}
+        }
+        if (replicationPort == null && System.getenv("STRATOS_REPLICATION_PORT") != null) {
+            try { replicationPort = Integer.parseInt(System.getenv("STRATOS_REPLICATION_PORT").trim()); } catch (Exception ignored) {}
+        }
+        if (replicaOf == null && System.getenv("STRATOS_REPLICA_OF") != null) {
+            replicaOf = System.getenv("STRATOS_REPLICA_OF").trim();
+        }
+        if (clusterMode == null && System.getenv("STRATOS_CLUSTER_MODE") != null) {
+            clusterMode = Boolean.parseBoolean(System.getenv("STRATOS_CLUSTER_MODE").trim());
         }
 
         // Positional args take precedence if provided: [dataDir] [port]
@@ -155,14 +196,43 @@ public class StratosServerMain {
                 if (props.getProperty("direct_allocation") != null) {
                     config.setDirectAllocation(Boolean.parseBoolean(props.getProperty("direct_allocation").trim()));
                 }
+                if (stdwirePort == null && props.getProperty("stdwire_port") != null) {
+                    stdwirePort = Integer.parseInt(props.getProperty("stdwire_port").trim());
+                }
+                if (replicationPort == null && props.getProperty("replication_port") != null) {
+                    replicationPort = Integer.parseInt(props.getProperty("replication_port").trim());
+                }
+                if (replicaOf == null && props.getProperty("replica_of") != null) {
+                    replicaOf = props.getProperty("replica_of").trim();
+                }
             } catch (Exception e) {
                 System.err.println("Warning: failed to load configuration file " + configFile + ": " + e.getMessage());
             }
         }
 
         if (dataDir == null) dataDir = "./stratosdb_data";
-        if (port == null) port = ProtocolConstants.DEFAULT_PORT;
         if (clusterMode == null) clusterMode = false;
+
+        int effectiveNativePort;
+        int effectiveStdwirePort;
+        if (stdwirePort != null) {
+            effectiveStdwirePort = stdwirePort;
+            effectiveNativePort = port != null ? port : (effectiveStdwirePort == 5432 ? 5431 : effectiveStdwirePort - 1);
+        } else if (port != null && port == 5432) {
+            effectiveStdwirePort = 5432;
+            effectiveNativePort = 5431;
+        } else {
+            effectiveNativePort = port != null ? port : ProtocolConstants.DEFAULT_PORT;
+            effectiveStdwirePort = effectiveNativePort + 1;
+        }
+
+        if (effectiveNativePort == effectiveStdwirePort) {
+            if (effectiveStdwirePort == 5432) {
+                effectiveNativePort = 5431;
+            } else {
+                effectiveNativePort = effectiveStdwirePort - 1;
+            }
+        }
 
         if (sawLegacyStdwireFlag) {
             System.out.println("Note: --stdwire is no longer needed - the real PostgreSQL "
@@ -170,20 +240,20 @@ public class StratosServerMain {
         }
 
         config.setDataDirectory(dataDir);
-        config.setPort(port);
+        config.setPort(effectiveStdwirePort);
 
         if (clusterMode) {
             com.stratosdb.core.StratosCluster cluster = new com.stratosdb.core.StratosCluster(config);
             com.stratosdb.network.stratoswire.StratosWireServer nativeServer =
-                new com.stratosdb.network.stratoswire.StratosWireServer(port, cluster);
+                new com.stratosdb.network.stratoswire.StratosWireServer(effectiveNativePort, cluster);
             nativeServer.start();
 
-            StdWireServer compatServer = new StdWireServer(port + 1, cluster);
+            StdWireServer compatServer = new StdWireServer(effectiveStdwirePort, cluster);
             compatServer.start();
 
             System.out.println("StratosDB Server started (Multi-database Cluster Mode, data: " + dataDir + "):");
-            System.out.println("  • Stratos Native Protocol (SWP v1.0): port " + port + " (Magic: STDB, native drivers & DBNavigator)");
-            System.out.println("  • PostgreSQL wire compatibility:      port " + (port + 1));
+            System.out.println("  • PostgreSQL wire compatibility:      port " + effectiveStdwirePort + " (psql, JDBC, Hibernate, Prisma)");
+            System.out.println("  • Stratos Native Protocol (SWP v1.0): port " + effectiveNativePort + " (DBNavigator)");
             System.out.println("Databases: " + cluster.listDatabaseNames() + ". Ctrl+C to stop.");
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -198,20 +268,46 @@ public class StratosServerMain {
         }
 
         StratosDB db = new StratosDB(config);
+        if (replicaOf != null) {
+            db.setReadOnly(true);
+        }
         com.stratosdb.network.stratoswire.StratosWireServer nativeServer =
-            new com.stratosdb.network.stratoswire.StratosWireServer(port, db);
+            new com.stratosdb.network.stratoswire.StratosWireServer(effectiveNativePort, db);
         nativeServer.start();
 
-        StdWireServer compatServer = new StdWireServer(port + 1, db);
+        StdWireServer compatServer = new StdWireServer(effectiveStdwirePort, db);
         compatServer.start();
 
+        ReplicationServer replicationServer = null;
+        if (replicationPort != null) {
+            replicationServer = new ReplicationServer(replicationPort, db.getWalManager());
+            replicationServer.start();
+            System.out.println("  • Streaming Replication (Primary):    port " + replicationPort);
+        }
+
+        ReplicationClient replicationClient = null;
+        if (replicaOf != null) {
+            int colonIndex = replicaOf.lastIndexOf(':');
+            if (colonIndex > 0) {
+                String host = replicaOf.substring(0, colonIndex);
+                int rPort = Integer.parseInt(replicaOf.substring(colonIndex + 1));
+                replicationClient = new ReplicationClient(host, rPort, db.getDiskManager(), db.getBufferPool());
+                replicationClient.start();
+                System.out.println("  • Streaming Replication from:         " + replicaOf + " (Replica Mode)");
+            }
+        }
+
         System.out.println("StratosDB Server started (data: " + dataDir + "):");
-        System.out.println("  • Stratos Native Protocol (SWP v1.0): port " + port + " (Magic: STDB, native drivers & DBNavigator)");
-        System.out.println("  • PostgreSQL wire compatibility:      port " + (port + 1));
+        System.out.println("  • PostgreSQL wire compatibility:      port " + effectiveStdwirePort + " (psql, JDBC, Hibernate, Prisma)");
+        System.out.println("  • Stratos Native Protocol (SWP v1.0): port " + effectiveNativePort + " (DBNavigator)");
         System.out.println("Ctrl+C to stop.");
 
+        ReplicationServer finalRepServer = replicationServer;
+        ReplicationClient finalRepClient = replicationClient;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\nShutting down...");
+            if (finalRepClient != null) finalRepClient.stop();
+            if (finalRepServer != null) finalRepServer.stop();
             nativeServer.stop();
             compatServer.stop();
             db.shutdown();
