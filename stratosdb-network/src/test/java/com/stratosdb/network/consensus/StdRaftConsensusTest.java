@@ -59,11 +59,20 @@ class StdRaftConsensusTest {
         assertNotNull(leader, "A Raft leader must be elected within 5 seconds");
         assertTrue(leader.isLeader());
 
+        long deadline = System.currentTimeMillis() + 3000;
         int leaderCount = 0;
         int followerCount = 0;
-        for (StdRaftNode node : List.of(n1, n2, n3)) {
-            if (node.isLeader()) leaderCount++;
-            if (node.getRole() == StdRaftRole.FOLLOWER) followerCount++;
+        while (System.currentTimeMillis() < deadline) {
+            leaderCount = 0;
+            followerCount = 0;
+            for (StdRaftNode node : List.of(n1, n2, n3)) {
+                if (node.isLeader()) leaderCount++;
+                if (node.getRole() == StdRaftRole.FOLLOWER) followerCount++;
+            }
+            if (leaderCount == 1 && followerCount == 2) {
+                break;
+            }
+            Thread.sleep(50);
         }
 
         assertEquals(1, leaderCount, "Exactly one node must be elected leader");

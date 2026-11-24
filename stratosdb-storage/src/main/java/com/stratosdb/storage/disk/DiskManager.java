@@ -110,6 +110,45 @@ public class DiskManager {
             return false;
         }
     }
+
+    /**
+     * Reads a page from disk directly into a native off-heap MemorySegment,
+     * providing true zero-copy direct I/O from FileChannel to foreign memory.
+     */
+    public boolean readPageIntoSegment(String tableName, long pageId, java.lang.foreign.MemorySegment segment) {
+        if (segment == null) {
+            return false;
+        }
+        return readPageIntoBuffer(tableName, pageId, segment.asByteBuffer());
+    }
+
+    /**
+     * Writes a page to disk directly from a native off-heap MemorySegment.
+     */
+    public void writePageFromSegment(String tableName, long pageId, java.lang.foreign.MemorySegment segment) {
+        if (segment == null) {
+            return;
+        }
+        try {
+            String fileName = getTableFileName(tableName);
+            FileChannel channel = getFileChannel(fileName);
+
+            ByteBuffer buffer = segment.asByteBuffer().duplicate();
+            buffer.position(0);
+            buffer.limit(PageConstants.PAGE_SIZE);
+            long position = pageId * PageConstants.PAGE_SIZE;
+
+            long curPos = position;
+            while (buffer.hasRemaining()) {
+                int bytesWritten = channel.write(buffer, curPos);
+                curPos += bytesWritten;
+            }
+            channel.force(false);
+        } catch (Exception e) {
+            LOG.error("Failed to write page {} from segment for table {}", pageId, tableName, e);
+            throw new StorageException("Failed to write page from segment");
+        }
+    }
     
     /**
      * Write a page to disk directly from its off-heap memory using thread-safe positional I/O.

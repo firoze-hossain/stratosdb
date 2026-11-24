@@ -57,6 +57,11 @@ public class BTreePage extends Page {
         public BTreePage wrap(long pageId, java.nio.ByteBuffer directBuffer) {
             return new BTreePage(pageId, directBuffer);
         }
+
+        @Override
+        public BTreePage wrap(long pageId, java.lang.foreign.MemorySegment segment) {
+            return new BTreePage(pageId, segment);
+        }
     };
 
     public BTreePage(long pageId) {

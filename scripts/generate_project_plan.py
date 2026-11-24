@@ -433,7 +433,7 @@ def create_project_plan_excel():
         # Sprint 1 (Month 1, Weeks 1-2)
         ["Sprint 01", "Week 01", "Storage Engine", "Off-Heap Direct Memory Buffers",
          "Refactor BufferPoolManager using Java 25 Foreign MemorySegment and Arena. Allocate page frames in off-heap memory. Implement zero-copy direct buffer reads/writes.",
-         "Very High", "P0 - Critical", "Page frames live off-heap; GC heap consumption drops > 80%; crash recovery tests pass.", "Planned"],
+         "Very High", "P0 - Critical", "Page frames live off-heap; GC heap consumption drops > 80%; crash recovery tests pass.", "Completed"],
         ["Sprint 01", "Week 02", "Storage Engine", "Partitioned Latch-Free Buffer Pool",
          "Replace monolithic globalLock with 64-partitioned hash striping. Implement lock-free page frame lookup using AtomicReferenceArray and CAS. Clock-sweep eviction per partition.",
          "High", "P0 - Critical", "Buffer pool scales linearly across 64 virtual threads; zero global lock contention under concurrent load.", "Planned"],

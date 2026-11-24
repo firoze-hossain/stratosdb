@@ -92,7 +92,9 @@ class ScramSha256Test {
         String clientFinal = client.buildClientFinalMessage(serverFirst);
 
         int pIndex = clientFinal.indexOf(",p=");
-        String tampered = clientFinal.substring(0, pIndex + 3) + "X" + clientFinal.substring(pIndex + 4);
+        char originalChar = clientFinal.charAt(pIndex + 3);
+        char replaceChar = (originalChar == 'X') ? 'Y' : 'X';
+        String tampered = clientFinal.substring(0, pIndex + 3) + replaceChar + clientFinal.substring(pIndex + 4);
 
         assertThrows(Exception.class, () -> server.clientFinal(tampered));
     }

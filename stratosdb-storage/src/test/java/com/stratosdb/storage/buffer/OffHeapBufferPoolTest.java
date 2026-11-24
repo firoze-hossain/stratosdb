@@ -206,4 +206,82 @@ public class OffHeapBufferPoolTest {
         bp.close();
         assertFalse(bp.isBackgroundFlusherRunning(), "Background flusher must stop cleanly on close()");
     }
+
+    @Test
+    void testDirectForeignMemorySegmentLifecycle() {
+        DiskManager dm = new DiskManager(tempDir.toString());
+        BufferPoolManager bp = new BufferPoolManager(16, dm, 0L, false);
+
+        assertNotNull(bp.getArena(), "Buffer pool must manage an active foreign memory Arena");
+        assertTrue(bp.getArena().scope().isAlive(), "Buffer pool arena must be alive");
+
+        // Direct memory segment allocation and zero-copy write
+        java.lang.foreign.MemorySegment seg = bp.acquireMemorySegment();
+        assertNotNull(seg);
+        assertTrue(seg.isNative(), "Allocated segment must be native off-heap memory");
+        assertEquals(PageConstants.PAGE_SIZE, seg.byteSize(), "Segment size must equal 8KB PAGE_SIZE");
+
+        seg.set(java.lang.foreign.ValueLayout.JAVA_LONG, 24, 0xCAFEBABE12345678L);
+        dm.writePageFromSegment("t_segment", 0, seg);
+
+        // Read directly from disk into foreign memory segment
+        java.lang.foreign.MemorySegment seg2 = bp.acquireMemorySegment();
+        boolean readOk = dm.readPageIntoSegment("t_segment", 0, seg2);
+        assertTrue(readOk, "Must successfully read page into native MemorySegment");
+        assertEquals(0xCAFEBABE12345678L, seg2.get(java.lang.foreign.ValueLayout.JAVA_LONG, 24),
+                "Read data must match written data in off-heap memory");
+
+        bp.recycleMemorySegment(seg);
+        bp.recycleMemorySegment(seg2);
+
+        // Verify clean shutdown and deterministic off-heap deallocation
+        bp.close();
+        assertFalse(bp.getArena().scope().isAlive(), "Closing buffer pool must close arena and free all off-heap frames");
+    }
+
+    @Test
+    void testConcurrentZeroCopyDirectBufferReadsAndWrites() throws Exception {
+        DiskManager dm = new DiskManager(tempDir.toString());
+        BufferPoolManager bp = track(new BufferPoolManager(64, dm, 0L, false));
+
+        int numThreads = 8;
+        int pagesPerThread = 5;
+        java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors.newFixedThreadPool(numThreads);
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(numThreads);
+
+        for (int t = 0; t < numThreads; t++) {
+            final int threadId = t;
+            exec.submit(() -> {
+                try {
+                    for (int p = 0; p < pagesPerThread; p++) {
+                        long pageId = threadId * pagesPerThread + p;
+                        Page page = bp.getPage("concurrent_table", pageId);
+                        assertNotNull(page);
+                        assertTrue(page.isOffHeap(), "Page must be off-heap");
+                        page.getBuffer().putLong(24, 777000L + pageId);
+                        bp.markDirty("concurrent_table", pageId);
+                        bp.unpinPage("concurrent_table", pageId);
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        assertTrue(latch.await(5, java.util.concurrent.TimeUnit.SECONDS), "Concurrent writers must finish within 5s");
+        exec.shutdown();
+
+        bp.flushAll();
+
+        // Verify all pages across threads were correctly written off-heap
+        for (int t = 0; t < numThreads; t++) {
+            for (int p = 0; p < pagesPerThread; p++) {
+                long pageId = t * pagesPerThread + p;
+                Page page = bp.getPage("concurrent_table", pageId);
+                assertEquals(777000L + pageId, page.getBuffer().getLong(24),
+                        "Page " + pageId + " must retain written value under concurrent off-heap access");
+                bp.unpinPage("concurrent_table", pageId);
+            }
+        }
+    }
 }

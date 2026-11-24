@@ -19,6 +19,8 @@ public class BufferPoolManager implements BufferPool {
     private final Map<String, Map<Long, Page>> pageCache;
     private final Map<String, Map<Long, Integer>> pinCounts;
     private final ReentrantReadWriteLock globalLock;
+    private final java.lang.foreign.Arena poolArena;
+    private final java.util.Queue<java.lang.foreign.MemorySegment> memorySegmentPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.Queue<java.nio.ByteBuffer> directFramePool = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.concurrent.atomic.AtomicLong totalFramesRecycled = new java.util.concurrent.atomic.AtomicLong(0);
 
@@ -40,6 +42,7 @@ public class BufferPoolManager implements BufferPool {
         this.maxPages = maxPages;
         this.diskManager = diskManager;
         this.flushIntervalMs = flushIntervalMs;
+        this.poolArena = java.lang.foreign.Arena.ofShared();
         this.pageCache = new ConcurrentHashMap<>();
         this.pinCounts = new ConcurrentHashMap<>();
         this.globalLock = new ReentrantReadWriteLock();
@@ -95,6 +98,11 @@ public class BufferPoolManager implements BufferPool {
             public SlottedPage wrap(long pageId, java.nio.ByteBuffer directBuffer) {
                 return new SlottedPage(pageId, directBuffer);
             }
+
+            @Override
+            public SlottedPage wrap(long pageId, java.lang.foreign.MemorySegment segment) {
+                return new SlottedPage(pageId, segment);
+            }
         };
 
     @Override
@@ -142,19 +150,20 @@ public class BufferPoolManager implements BufferPool {
             evictIfNeeded();
 
             // Load from disk directly into recycled off-heap direct buffer frame, or initialize clean page
-            java.nio.ByteBuffer directFrame = acquireDirectFrame();
+            java.lang.foreign.MemorySegment directSegment = acquireMemorySegment();
+            java.nio.ByteBuffer directFrame = directSegment.asByteBuffer();
             T page;
             if (pageId >= diskManager.getTablePageCount(tableName)) {
                 directFrame.clear();
-                page = factory.wrap(pageId, directFrame);
+                page = factory.wrap(pageId, directSegment);
                 page.initializeHeader();
             } else {
                 boolean read = diskManager.readPageIntoBuffer(tableName, pageId, directFrame);
                 if (read) {
-                    page = factory.wrap(pageId, directFrame);
+                    page = factory.wrap(pageId, directSegment);
                 } else {
                     directFrame.clear();
-                    page = factory.wrap(pageId, directFrame);
+                    page = factory.wrap(pageId, directSegment);
                     page.initializeHeader();
                 }
             }
@@ -236,6 +245,9 @@ public class BufferPoolManager implements BufferPool {
                         diskManager.writePage(tableName, page);
                     }
                     recycleDirectFrame(page.getBuffer());
+                    if (page.getMemorySegment() != null) {
+                        recycleMemorySegment(page.getMemorySegment());
+                    }
                 }
                 Map<Long, Integer> pins = pinCounts.get(tableName);
                 if (pins != null) {
@@ -248,13 +260,37 @@ public class BufferPoolManager implements BufferPool {
         }
     }
 
+    @Override
+    public java.lang.foreign.Arena getArena() {
+        return poolArena;
+    }
+
+    @Override
+    public java.lang.foreign.MemorySegment acquireMemorySegment() {
+        java.lang.foreign.MemorySegment seg = memorySegmentPool.poll();
+        if (seg != null && seg.scope().isAlive()) {
+            return seg;
+        }
+        return poolArena.allocate(com.stratosdb.common.constants.PageConstants.PAGE_SIZE, 8);
+    }
+
     public java.nio.ByteBuffer acquireDirectFrame() {
         java.nio.ByteBuffer buf = directFramePool.poll();
         if (buf != null) {
             buf.clear();
             return buf;
         }
-        return java.nio.ByteBuffer.allocateDirect(com.stratosdb.common.constants.PageConstants.PAGE_SIZE);
+        return acquireMemorySegment().asByteBuffer();
+    }
+
+    @Override
+    public void recycleMemorySegment(java.lang.foreign.MemorySegment seg) {
+        if (seg != null && seg.scope().isAlive()) {
+            totalFramesRecycled.incrementAndGet();
+            if (memorySegmentPool.size() < maxPages) {
+                memorySegmentPool.offer(seg);
+            }
+        }
     }
 
     public void recycleDirectFrame(java.nio.ByteBuffer buf) {
@@ -314,6 +350,9 @@ public class BufferPoolManager implements BufferPool {
                     pages.remove(pageId);
                     pins.remove(pageId);
                     recycleDirectFrame(page.getBuffer());
+                    if (page.getMemorySegment() != null) {
+                        recycleMemorySegment(page.getMemorySegment());
+                    }
                     LOG.debug("Evicted: {}/{}", tableName, pageId);
                     return;
                 }
@@ -492,9 +531,17 @@ public class BufferPoolManager implements BufferPool {
         try {
             pageCache.clear();
             directFramePool.clear();
+            memorySegmentPool.clear();
         } finally {
             globalLock.writeLock().unlock();
         }
         diskManager.close();
+        if (poolArena != null && poolArena.scope().isAlive()) {
+            try {
+                poolArena.close();
+            } catch (Exception e) {
+                LOG.debug("Exception closing buffer pool arena", e);
+            }
+        }
     }
 }

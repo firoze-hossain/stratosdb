@@ -37,6 +37,13 @@ public interface BufferPool {
     default int flushDirtyPages(int maxPagesToFlush) {
         return 0;
     }
+    default java.lang.foreign.Arena getArena() {
+        return null;
+    }
+    default java.lang.foreign.MemorySegment acquireMemorySegment() {
+        return null;
+    }
+    default void recycleMemorySegment(java.lang.foreign.MemorySegment seg) {}
     default boolean isBackgroundFlusherRunning() {
         return false;
     }

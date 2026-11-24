@@ -24,4 +24,8 @@ public interface PageFactory<T extends Page> {
         target.position(0);
         return page;
     }
+
+    default T wrap(long pageId, java.lang.foreign.MemorySegment segment) {
+        return wrap(pageId, segment.asByteBuffer());
+    }
 }
