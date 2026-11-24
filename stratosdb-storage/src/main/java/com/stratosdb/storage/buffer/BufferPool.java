@@ -48,5 +48,8 @@ public interface BufferPool {
         return false;
     }
     default void stopBackgroundFlusher() {}
+    default int getNumPartitions() {
+        return 64;
+    }
     void close();
 }

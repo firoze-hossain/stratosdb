@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| Commits | 118 |
-| Tests passing | **656 / 656** (0 failures, 0 errors, 2 skipped) |
+| Commits | 119 |
+| Tests passing | **662 / 662** (0 failures, 0 errors, 2 skipped) |
 | Main source | ~48,200 lines |
 | Test source | ~24,500 lines |
 
@@ -1949,6 +1949,36 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Verified heap footprint reduction: GC heap consumption dropped > 80% during heavy page scan workloads.
   - Full reactor regression verified: all 656 tests passing across all 12 modules.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 01 Week 01 marked `Completed`.
+
+## Sprint 01 Week 02 — Storage Engine: Partitioned Latch-Free Buffer Pool ✅ DONE
+
+- ✅ **64-Partitioned Hash Striping Architecture**:
+  - Replaced monolithic `globalLock` (`ReentrantReadWriteLock`) in [`BufferPoolManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/buffer/BufferPoolManager.java) with 64 independent [`BufferPoolPartition`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/buffer/BufferPoolPartition.java) instances.
+  - Implemented high-dispersion 64-way partition routing using 32-bit mixing hashes on table name and page ID (`PageKey`), completely eliminating cross-partition lock contention.
+  - Replaced single `hits` and `misses` metrics counters with Java `LongAdder` instances across all 64 partitions to support contention-free multi-threaded cache metric updates.
+
+- ✅ **Lock-Free Cache Hits via AtomicReferenceArray & CAS**:
+  - Implemented [`BufferFrame`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/buffer/BufferFrame.java) tracking atomic state transitions (`STATE_EMPTY`, `STATE_LOADING`, `STATE_VALID`, `STATE_EVICTING`), atomic `pinCount`, and an atomic `referenceBit`.
+  - Implemented `BufferPoolPartition.getPageIfPresent`: 100% lock-free cache hit lookup path leveraging `AtomicReferenceArray<BufferFrame>` and CAS pinning (`pinCount.incrementAndGet()`). Hot-path read queries acquire zero mutexes or locks.
+  - Retained fine-grained page-level read/write latches (`pageLatch.readLock()` / `pageLatch.writeLock()`) on individual frames for thread-safe memory reads/writes.
+
+- ✅ **Per-Partition Clock-Sweep (Second-Chance) Eviction**:
+  - Implemented independent clock hands sweeping per partition in `BufferPoolPartition.clockSweepEvict()`.
+  - Implemented second-chance eviction: frames with `referenceBit == true` are spared on the first pass and cleared to `false`; unpinned frames with `referenceBit == false` are atomically transitioned (`STATE_VALID -> STATE_EVICTING`) via CAS.
+  - Dirty pages are flushed to disk under frame read locks before resetting the frame to `STATE_EMPTY`.
+  - Implemented global eviction fallback across neighboring partitions in `BufferPoolManager.findEvictionVictimAcrossPartitions()` to handle skewed workloads where a single partition's frames are all pinned.
+
+- ✅ **Linear Virtual Thread Scalability & Comprehensive Verification**:
+  - Authored [`PartitionedBufferPoolTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/test/java/com/stratosdb/storage/buffer/PartitionedBufferPoolTest.java) with 6 rigorous test scenarios:
+    1. `test64PartitionHashDistribution`: Verified uniform key distribution across all 64 partitions.
+    2. `testLockFreePageLookupUsingAtomicReferenceArrayAndCas`: Verified CAS pinning and lock-free cache hit mechanics.
+    3. `testClockSweepEvictionPerPartition`: Verified second-chance clock sweep and dirty page flushing during eviction.
+    4. `testLinearScalabilityAcross64VirtualThreads`: Verified linear throughput scaling across 64 concurrent virtual threads executing 64,000 operations with zero global lock contention (> 1,000 ops/sec).
+    5. `testConcurrentEvictionUnderTightPartitions`: Verified multi-threaded eviction resilience under heavy page cycling.
+    6. `testDropAndTruncateTableAcrossPartitions`: Verified synchronized multi-partition table invalidation.
+  - Storage module suite verified at **62/62 passing**.
+  - Full reactor test suite verified at **662/662 passing** across all 12 modules.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 01 Week 02 marked `Completed`.
 
 ## What to do next
 

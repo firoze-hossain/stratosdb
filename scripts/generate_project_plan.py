@@ -436,7 +436,7 @@ def create_project_plan_excel():
          "Very High", "P0 - Critical", "Page frames live off-heap; GC heap consumption drops > 80%; crash recovery tests pass.", "Completed"],
         ["Sprint 01", "Week 02", "Storage Engine", "Partitioned Latch-Free Buffer Pool",
          "Replace monolithic globalLock with 64-partitioned hash striping. Implement lock-free page frame lookup using AtomicReferenceArray and CAS. Clock-sweep eviction per partition.",
-         "High", "P0 - Critical", "Buffer pool scales linearly across 64 virtual threads; zero global lock contention under concurrent load.", "Planned"],
+         "High", "P0 - Critical", "Buffer pool scales linearly across 64 virtual threads; zero global lock contention under concurrent load.", "Completed"],
 
         # Sprint 2 (Month 1, Weeks 3-4)
         ["Sprint 02", "Week 03", "Storage Engine", "Segmented 16MB WAL Files",

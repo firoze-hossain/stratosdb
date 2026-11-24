@@ -1,62 +1,107 @@
 package com.stratosdb.storage.buffer;
 
+import com.stratosdb.common.constants.PageConstants;
 import com.stratosdb.common.exceptions.StorageException;
 import com.stratosdb.storage.disk.DiskManager;
 import com.stratosdb.storage.page.Page;
+import com.stratosdb.storage.page.PageFactory;
 import com.stratosdb.storage.page.SlottedPage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.nio.ByteBuffer;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
+/**
+ * 64-Partitioned Latch-Free Buffer Pool Manager.
+ *
+ * Replaces the monolithic globalLock with 64-partitioned hash striping,
+ * lock-free page frame lookup using AtomicReferenceArray and CAS,
+ * and per-partition Clock-sweep (Second-Chance) eviction.
+ * Page frames live entirely in native off-heap memory managed via Java 25 Arena.
+ */
 public class BufferPoolManager implements BufferPool {
     private static final Logger LOG = LoggerFactory.getLogger(BufferPoolManager.class);
 
+    public static final int DEFAULT_PARTITION_COUNT = 64;
+
     private final int maxPages;
+    private final int numPartitions;
+    private final BufferPoolPartition[] partitions;
     private final DiskManager diskManager;
-    private final Map<String, Map<Long, Page>> pageCache;
-    private final Map<String, Map<Long, Integer>> pinCounts;
-    private final ReentrantReadWriteLock globalLock;
-    private final java.lang.foreign.Arena poolArena;
-    private final java.util.Queue<java.lang.foreign.MemorySegment> memorySegmentPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
-    private final java.util.Queue<java.nio.ByteBuffer> directFramePool = new java.util.concurrent.ConcurrentLinkedQueue<>();
-    private final java.util.concurrent.atomic.AtomicLong totalFramesRecycled = new java.util.concurrent.atomic.AtomicLong(0);
+
+    private final Arena poolArena;
+    private final Queue<MemorySegment> memorySegmentPool = new ConcurrentLinkedQueue<>();
+    private final Queue<ByteBuffer> directFramePool = new ConcurrentLinkedQueue<>();
+    private final AtomicLong totalFramesRecycled = new AtomicLong(0);
 
     private final Thread backgroundFlusherThread;
-    private final java.util.concurrent.atomic.AtomicBoolean flusherRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final AtomicBoolean flusherRunning = new AtomicBoolean(false);
     private final Object flusherLock = new Object();
     private final long flushIntervalMs;
-    private final java.util.concurrent.atomic.AtomicLong totalBackgroundFlushes = new java.util.concurrent.atomic.AtomicLong(0);
-    private final java.util.concurrent.atomic.AtomicLong totalDirtyPagesFlushed = new java.util.concurrent.atomic.AtomicLong(0);
+    private final AtomicLong totalBackgroundFlushes = new AtomicLong(0);
+    private final AtomicLong totalDirtyPagesFlushed = new AtomicLong(0);
 
-    private long hits = 0;
-    private long misses = 0;
+    private final LongAdder hits = new LongAdder();
+    private final LongAdder misses = new LongAdder();
 
     public BufferPoolManager(int maxPages, DiskManager diskManager) {
-        this(maxPages, diskManager, 0L, false);
+        this(maxPages, diskManager, 0L, false, DEFAULT_PARTITION_COUNT);
     }
 
     public BufferPoolManager(int maxPages, DiskManager diskManager, long flushIntervalMs, boolean startFlusher) {
+        this(maxPages, diskManager, flushIntervalMs, startFlusher, DEFAULT_PARTITION_COUNT);
+    }
+
+    public BufferPoolManager(int maxPages, DiskManager diskManager, long flushIntervalMs, boolean startFlusher, int requestedPartitions) {
         this.maxPages = maxPages;
         this.diskManager = diskManager;
         this.flushIntervalMs = flushIntervalMs;
-        this.poolArena = java.lang.foreign.Arena.ofShared();
-        this.pageCache = new ConcurrentHashMap<>();
-        this.pinCounts = new ConcurrentHashMap<>();
-        this.globalLock = new ReentrantReadWriteLock();
+        this.poolArena = Arena.ofShared();
+
+        this.numPartitions = Math.min(requestedPartitions, Math.max(1, maxPages));
+        this.partitions = new BufferPoolPartition[this.numPartitions];
+
+        int partitionCap = Math.max(4, (int) Math.ceil((double) maxPages / this.numPartitions) * 2);
+        for (int i = 0; i < this.numPartitions; i++) {
+            this.partitions[i] = new BufferPoolPartition(i, partitionCap);
+        }
 
         if (startFlusher && flushIntervalMs > 0) {
             this.flusherRunning.set(true);
             this.backgroundFlusherThread = new Thread(this::runBackgroundFlusher, "stratos-bgflusher-" + System.identityHashCode(this));
             this.backgroundFlusherThread.setDaemon(true);
             this.backgroundFlusherThread.start();
-            LOG.debug("Dirty page background flusher started with interval {}ms", flushIntervalMs);
+            LOG.debug("Dirty page background flusher started with interval {}ms across {} partitions", flushIntervalMs, numPartitions);
         } else {
             this.flusherRunning.set(false);
             this.backgroundFlusherThread = null;
         }
+    }
+
+    private int getPartitionIndex(String tableName, long pageId) {
+        int h = tableName.hashCode() * 31 + (int)(pageId ^ (pageId >>> 32));
+        h ^= (h >>> 16);
+        h *= 0x85ebca6b;
+        h ^= (h >>> 13);
+        h *= 0xc2b2ae35;
+        h ^= (h >>> 16);
+        return (h & 0x7FFFFFFF) % numPartitions;
+    }
+
+    @Override
+    public int getNumPartitions() {
+        return numPartitions;
+    }
+
+    public BufferPoolPartition getPartition(int index) {
+        return partitions[index];
     }
 
     private void runBackgroundFlusher() {
@@ -82,8 +127,8 @@ public class BufferPoolManager implements BufferPool {
         }
     }
 
-    private static final com.stratosdb.storage.page.PageFactory<SlottedPage> SLOTTED_PAGE_FACTORY =
-        new com.stratosdb.storage.page.PageFactory<>() {
+    private static final PageFactory<SlottedPage> SLOTTED_PAGE_FACTORY =
+        new PageFactory<>() {
             @Override
             public SlottedPage createEmpty(long pageId) {
                 return new SlottedPage(pageId);
@@ -95,188 +140,131 @@ public class BufferPoolManager implements BufferPool {
             }
 
             @Override
-            public SlottedPage wrap(long pageId, java.nio.ByteBuffer directBuffer) {
+            public SlottedPage wrap(long pageId, ByteBuffer directBuffer) {
                 return new SlottedPage(pageId, directBuffer);
             }
 
             @Override
-            public SlottedPage wrap(long pageId, java.lang.foreign.MemorySegment segment) {
+            public SlottedPage wrap(long pageId, MemorySegment segment) {
                 return new SlottedPage(pageId, segment);
             }
         };
 
     @Override
     public Page getPage(String tableName, long pageId) {
-        // Unchanged behavior from before this class supported other page types:
-        // every page is wrapped as a SlottedPage, whether it's brand new or
-        // freshly read from disk.
         return getPage(tableName, pageId, SLOTTED_PAGE_FACTORY);
     }
 
     @Override
-    public <T extends Page> T getPage(String tableName, long pageId, com.stratosdb.storage.page.PageFactory<T> factory) {
-        // Check if in cache under shared read lock to prevent race with eviction
-        globalLock.readLock().lock();
-        try {
-            Map<Long, Page> tablePages = pageCache.get(tableName);
-            if (tablePages != null) {
-                Page cached = tablePages.get(pageId);
-                if (cached != null) {
-                    pinPage(tableName, pageId, cached);
-                    hits++;
-                    @SuppressWarnings("unchecked")
-                    T page = (T) cached;
-                    return page;
-                }
-            }
-        } finally {
-            globalLock.readLock().unlock();
+    public <T extends Page> T getPage(String tableName, long pageId, PageFactory<T> factory) {
+        int partIdx = getPartitionIndex(tableName, pageId);
+        BufferPoolPartition targetPartition = partitions[partIdx];
+
+        // 1. Lock-free cache hit attempt
+        T cached = targetPartition.getPageIfPresent(tableName, pageId);
+        if (cached != null) {
+            hits.increment();
+            return cached;
         }
 
-        // Cache miss - load from disk
-        globalLock.writeLock().lock();
-        try {
-            // Double-check after acquiring write lock
-            Map<Long, Page> tablePages = pageCache.get(tableName);
-            if (tablePages != null && tablePages.containsKey(pageId)) {
-                @SuppressWarnings("unchecked")
-                T page = (T) tablePages.get(pageId);
-                pinPage(tableName, pageId, page);
-                hits++;
-                return page;
-            }
-
-            // Evict if needed
-            evictIfNeeded();
-
-            // Load from disk directly into recycled off-heap direct buffer frame, or initialize clean page
-            java.lang.foreign.MemorySegment directSegment = acquireMemorySegment();
-            java.nio.ByteBuffer directFrame = directSegment.asByteBuffer();
-            T page;
-            if (pageId >= diskManager.getTablePageCount(tableName)) {
-                directFrame.clear();
-                page = factory.wrap(pageId, directSegment);
-                page.initializeHeader();
-            } else {
-                boolean read = diskManager.readPageIntoBuffer(tableName, pageId, directFrame);
-                if (read) {
-                    page = factory.wrap(pageId, directSegment);
-                } else {
-                    directFrame.clear();
-                    page = factory.wrap(pageId, directSegment);
-                    page.initializeHeader();
+        // 2. Cache miss: ensure global capacity constraint before loading
+        while (getCacheSize() >= maxPages) {
+            // Evict an unpinned frame using per-partition Clock sweep
+            BufferFrame evicted = targetPartition.clockSweepEvict(diskManager, this::recycleMemorySegment);
+            if (evicted == null) {
+                // Try neighboring partitions for an unpinned frame
+                for (int i = 1; i < numPartitions; i++) {
+                    int otherIdx = (partIdx + i) % numPartitions;
+                    evicted = partitions[otherIdx].clockSweepEvict(diskManager, this::recycleMemorySegment);
+                    if (evicted != null) {
+                        break;
+                    }
                 }
             }
-
-            // Add to cache
-            tablePages = pageCache.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
-            tablePages.put(pageId, page);
-
-            pinPage(tableName, pageId, page);
-            misses++;
-
-            LOG.debug("Cache miss: {}/{}", tableName, pageId);
-            return page;
-        } finally {
-            globalLock.writeLock().unlock();
+            if (evicted == null) {
+                break;
+            }
         }
+
+        // 3. Load page into target partition under partition-local lock
+        T page = targetPartition.loadPage(
+            tableName, pageId, factory, diskManager,
+            this::acquireMemorySegment, this::recycleMemorySegment,
+            null
+        );
+
+        if (page == null) {
+            // Partition temporarily exhausted of unpinned frames under concurrent load; retry
+            for (int retry = 0; retry < 5 && page == null; retry++) {
+                for (int i = 0; i < numPartitions; i++) {
+                    partitions[i].clockSweepEvict(diskManager, this::recycleMemorySegment);
+                }
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                page = targetPartition.loadPage(
+                    tableName, pageId, factory, diskManager,
+                    this::acquireMemorySegment, this::recycleMemorySegment,
+                    null
+                );
+            }
+            if (page == null) {
+                throw new StorageException("Buffer pool exhausted: all " + maxPages + " pages are pinned under concurrent load");
+            }
+        }
+
+        misses.increment();
+        return page;
     }
 
     @Override
     public void markDirty(String tableName, long pageId) {
-        Map<Long, Page> tablePages = pageCache.get(tableName);
-        if (tablePages != null && tablePages.containsKey(pageId)) {
-            tablePages.get(pageId).setDirty(true);
-        }
+        partitions[getPartitionIndex(tableName, pageId)].markDirty(tableName, pageId);
     }
 
     @Override
     public void unpinPage(String tableName, long pageId) {
-        Map<Long, Page> tablePages = pageCache.get(tableName);
-        if (tablePages != null) {
-            Page page = tablePages.get(pageId);
-            if (page != null) {
-                page.unpin();
-            }
-        }
-        Map<Long, Integer> pins = pinCounts.get(tableName);
-        if (pins != null) {
-            pins.computeIfPresent(pageId, (k, v) -> v > 0 ? v - 1 : 0);
-        }
+        partitions[getPartitionIndex(tableName, pageId)].unpinPage(tableName, pageId);
     }
 
     @Override
     public void flushAll() {
-        globalLock.writeLock().lock();
-        try {
-            for (Map.Entry<String, Map<Long, Page>> entry : pageCache.entrySet()) {
-                String tableName = entry.getKey();
-                for (Page page : entry.getValue().values()) {
-                    if (page.isDirty()) {
-                        diskManager.writePage(tableName, page);
-                    }
-                }
-            }
-        } finally {
-            globalLock.writeLock().unlock();
+        for (BufferPoolPartition part : partitions) {
+            part.flushAll(diskManager);
         }
     }
 
     @Override
     public void flushPage(String tableName, long pageId) {
-        Map<Long, Page> tablePages = pageCache.get(tableName);
-        if (tablePages != null) {
-            Page page = tablePages.get(pageId);
-            if (page != null && page.isDirty()) {
-                diskManager.writePage(tableName, page);
-            }
-        }
+        partitions[getPartitionIndex(tableName, pageId)].flushPage(tableName, pageId, diskManager);
     }
 
     @Override
     public void evictPage(String tableName, long pageId) {
-        globalLock.writeLock().lock();
-        try {
-            Map<Long, Page> tablePages = pageCache.get(tableName);
-            if (tablePages != null) {
-                Page page = tablePages.remove(pageId);
-                if (page != null) {
-                    if (page.isDirty()) {
-                        diskManager.writePage(tableName, page);
-                    }
-                    recycleDirectFrame(page.getBuffer());
-                    if (page.getMemorySegment() != null) {
-                        recycleMemorySegment(page.getMemorySegment());
-                    }
-                }
-                Map<Long, Integer> pins = pinCounts.get(tableName);
-                if (pins != null) {
-                    pins.remove(pageId);
-                }
-                LOG.debug("Evicted: {}/{}", tableName, pageId);
-            }
-        } finally {
-            globalLock.writeLock().unlock();
-        }
+        partitions[getPartitionIndex(tableName, pageId)].evictPage(tableName, pageId, diskManager, this::recycleMemorySegment);
     }
 
     @Override
-    public java.lang.foreign.Arena getArena() {
+    public Arena getArena() {
         return poolArena;
     }
 
     @Override
-    public java.lang.foreign.MemorySegment acquireMemorySegment() {
-        java.lang.foreign.MemorySegment seg = memorySegmentPool.poll();
+    public MemorySegment acquireMemorySegment() {
+        MemorySegment seg = memorySegmentPool.poll();
         if (seg != null && seg.scope().isAlive()) {
+            directFramePool.poll();
             return seg;
         }
-        return poolArena.allocate(com.stratosdb.common.constants.PageConstants.PAGE_SIZE, 8);
+        return poolArena.allocate(PageConstants.PAGE_SIZE, 8);
     }
 
-    public java.nio.ByteBuffer acquireDirectFrame() {
-        java.nio.ByteBuffer buf = directFramePool.poll();
+    public ByteBuffer acquireDirectFrame() {
+        ByteBuffer buf = directFramePool.poll();
         if (buf != null) {
+            memorySegmentPool.poll();
             buf.clear();
             return buf;
         }
@@ -284,16 +272,24 @@ public class BufferPoolManager implements BufferPool {
     }
 
     @Override
-    public void recycleMemorySegment(java.lang.foreign.MemorySegment seg) {
+    public void recycleMemorySegment(MemorySegment seg) {
         if (seg != null && seg.scope().isAlive()) {
             totalFramesRecycled.incrementAndGet();
             if (memorySegmentPool.size() < maxPages) {
                 memorySegmentPool.offer(seg);
             }
+            if (directFramePool.size() < maxPages) {
+                try {
+                    ByteBuffer buf = seg.asByteBuffer();
+                    buf.clear();
+                    directFramePool.offer(buf);
+                } catch (Exception ignored) {
+                }
+            }
         }
     }
 
-    public void recycleDirectFrame(java.nio.ByteBuffer buf) {
+    public void recycleDirectFrame(ByteBuffer buf) {
         if (buf != null && buf.isDirect()) {
             totalFramesRecycled.incrementAndGet();
             if (directFramePool.size() < maxPages) {
@@ -313,57 +309,12 @@ public class BufferPoolManager implements BufferPool {
         return totalFramesRecycled.get();
     }
 
-    private void pinPage(String tableName, long pageId) {
-        pinPage(tableName, pageId, null);
-    }
-
-    private void pinPage(String tableName, long pageId, Page page) {
-        if (page != null) {
-            page.pin();
-        }
-        Map<Long, Integer> pins = pinCounts.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
-        pins.compute(pageId, (k, v) -> (v == null) ? 1 : v + 1);
-    }
-
-    private void evictIfNeeded() {
-        int totalPages = pageCache.values().stream()
-                .mapToInt(Map::size)
-                .sum();
-
-        if (totalPages < maxPages) {
-            return;
-        }
-
-        // Find unpinned page to evict
-        for (Map.Entry<String, Map<Long, Page>> entry : pageCache.entrySet()) {
-            String tableName = entry.getKey();
-            Map<Long, Page> pages = entry.getValue();
-            Map<Long, Integer> pins = pinCounts.getOrDefault(tableName, new ConcurrentHashMap<>());
-
-            for (Map.Entry<Long, Page> pageEntry : pages.entrySet()) {
-                Long pageId = pageEntry.getKey();
-                if (pins.getOrDefault(pageId, 0) == 0) {
-                    Page page = pageEntry.getValue();
-                    if (page.isDirty()) {
-                        diskManager.writePage(tableName, page);
-                    }
-                    pages.remove(pageId);
-                    pins.remove(pageId);
-                    recycleDirectFrame(page.getBuffer());
-                    if (page.getMemorySegment() != null) {
-                        recycleMemorySegment(page.getMemorySegment());
-                    }
-                    LOG.debug("Evicted: {}/{}", tableName, pageId);
-                    return;
-                }
-            }
-        }
-    }
-
     @Override
     public double getCacheHitRatio() {
-        long total = hits + misses;
-        return total > 0 ? (double) hits / total : 0.0;
+        long h = hits.sum();
+        long m = misses.sum();
+        long total = h + m;
+        return total > 0 ? (double) h / total : 0.0;
     }
 
     @Override
@@ -373,37 +324,18 @@ public class BufferPoolManager implements BufferPool {
 
     @Override
     public void truncateTable(String tableName, long newPageCount) {
-        globalLock.writeLock().lock();
-        try {
-            Map<Long, Page> tablePages = pageCache.get(tableName);
-            if (tablePages != null) {
-                Map<Long, Integer> pins = pinCounts.get(tableName);
-                tablePages.keySet().removeIf(pid -> {
-                    if (pid >= newPageCount) {
-                        if (pins != null) {
-                            pins.remove(pid);
-                        }
-                        return true;
-                    }
-                    return false;
-                });
-            }
-            diskManager.truncateTable(tableName, newPageCount);
-        } finally {
-            globalLock.writeLock().unlock();
+        for (BufferPoolPartition part : partitions) {
+            part.truncateTable(tableName, newPageCount, this::recycleMemorySegment);
         }
+        diskManager.truncateTable(tableName, newPageCount);
     }
 
     @Override
     public void dropTable(String tableName) {
-        globalLock.writeLock().lock();
-        try {
-            pageCache.remove(tableName);
-            pinCounts.remove(tableName);
-            diskManager.deleteTable(tableName);
-        } finally {
-            globalLock.writeLock().unlock();
+        for (BufferPoolPartition part : partitions) {
+            part.dropTable(tableName, this::recycleMemorySegment);
         }
+        diskManager.deleteTable(tableName);
     }
 
     @Override
@@ -413,7 +345,11 @@ public class BufferPoolManager implements BufferPool {
 
     @Override
     public int getCacheSize() {
-        return pageCache.values().stream().mapToInt(Map::size).sum();
+        int total = 0;
+        for (BufferPoolPartition part : partitions) {
+            total += part.getActiveCount();
+        }
+        return total;
     }
 
     @Override
@@ -423,18 +359,14 @@ public class BufferPoolManager implements BufferPool {
 
     @Override
     public long getOffHeapMemoryUsed() {
-        return (long) getCacheSize() * com.stratosdb.common.constants.PageConstants.PAGE_SIZE;
+        return (long) getCacheSize() * PageConstants.PAGE_SIZE;
     }
 
     @Override
     public int getDirtyPageCount() {
         int count = 0;
-        for (Map<Long, Page> pages : pageCache.values()) {
-            for (Page page : pages.values()) {
-                if (page.isDirty()) {
-                    count++;
-                }
-            }
+        for (BufferPoolPartition part : partitions) {
+            count += part.getDirtyCount();
         }
         return count;
     }
@@ -446,33 +378,11 @@ public class BufferPoolManager implements BufferPool {
 
     private int flushDirtyPagesInternal(boolean forceAll, int maxPagesToFlush) {
         int flushed = 0;
-        for (Map.Entry<String, Map<Long, Page>> entry : pageCache.entrySet()) {
-            String tableName = entry.getKey();
-            Map<Long, Page> pages = entry.getValue();
-            Map<Long, Integer> pins = pinCounts.getOrDefault(tableName, Map.of());
-
-            for (Map.Entry<Long, Page> pageEntry : pages.entrySet()) {
-                if (!forceAll && maxPagesToFlush > 0 && flushed >= maxPagesToFlush) {
-                    return flushed;
-                }
-                Long pageId = pageEntry.getKey();
-                Page page = pageEntry.getValue();
-
-                if (page.isDirty()) {
-                    int pin = pins.getOrDefault(pageId, 0);
-                    if (pin == 0 || forceAll) {
-                        page.getLatch().readLock().lock();
-                        try {
-                            if (page.isDirty()) {
-                                diskManager.writePage(tableName, page);
-                                flushed++;
-                            }
-                        } finally {
-                            page.getLatch().readLock().unlock();
-                        }
-                    }
-                }
+        for (BufferPoolPartition part : partitions) {
+            if (!forceAll && maxPagesToFlush > 0 && flushed >= maxPagesToFlush) {
+                break;
             }
+            flushed += part.flushDirtyPages(maxPagesToFlush - flushed, forceAll, diskManager);
         }
         return flushed;
     }
@@ -506,35 +416,15 @@ public class BufferPoolManager implements BufferPool {
         return totalDirtyPagesFlushed.get();
     }
 
-    /**
-     * Real, previously-latent bug found via a real DROP DATABASE + CREATE
-     * DATABASE (same name) reproduction: flushing dirty pages and closing
-     * the underlying file handles is not enough to make this buffer pool
-     * stop serving reads. Any already-open connection that had touched
-     * this table before close() was called would keep finding its own
-     * already-cached pages sitting right here in pageCache, and would go
-     * on serving them - correctly reflecting exactly what this table
-     * looked like before shutdown, but silently wrong the moment the
-     * underlying data directory has since been deleted and a genuinely
-     * new, empty table created at the very same path (StratosCluster's
-     * own real DROP DATABASE/CREATE DATABASE support does precisely
-     * this). Clearing the cache here, after the final flush, means any
-     * further read attempt genuinely misses and falls through to
-     * diskManager - which, already closed by this same call, throws a
-     * real, honest I/O error instead of silently returning stale data.
-     */
     @Override
     public void close() {
         stopBackgroundFlusher();
         flushAll();
-        globalLock.writeLock().lock();
-        try {
-            pageCache.clear();
-            directFramePool.clear();
-            memorySegmentPool.clear();
-        } finally {
-            globalLock.writeLock().unlock();
+        for (BufferPoolPartition part : partitions) {
+            part.clear(this::recycleMemorySegment);
         }
+        directFramePool.clear();
+        memorySegmentPool.clear();
         diskManager.close();
         if (poolArena != null && poolArena.scope().isAlive()) {
             try {
