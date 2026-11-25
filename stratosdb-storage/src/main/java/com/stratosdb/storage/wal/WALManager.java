@@ -46,6 +46,9 @@ public class WALManager {
     private final AtomicLong currentLSN;
     private final AtomicLong walEpoch;
     private final AtomicLong lastCheckpointLSN;
+    private final AtomicLong syncdLSN = new AtomicLong(0);
+    private final Object appendLock = new Object();
+    private final Object syncLock = new Object();
     private boolean sync = true;
     private volatile boolean closed = false;
 
@@ -64,6 +67,12 @@ public class WALManager {
     private String walArchiveDirectory;
     private final AtomicLong nextArchiveSequence = new AtomicLong(1);
     private final AtomicLong lastArchivedLSN = new AtomicLong(0);
+
+    // Group Commit Coalescing Engine
+    private boolean groupCommitEnabled = true;
+    private int groupCommitMaxBatchSize = GroupCommitRingBuffer.DEFAULT_MAX_BATCH_SIZE;
+    private long groupCommitDelayMicros = GroupCommitRingBuffer.DEFAULT_DELAY_MICROS;
+    private GroupCommitRingBuffer groupCommitCoordinator;
 
     // Operation types
     public static final int OP_INSERT = 1;
@@ -86,10 +95,19 @@ public class WALManager {
     }
 
     public WALManager(String dataDirectory, long segmentSize, int walKeepSegments, boolean preallocateSegments) {
+        this(dataDirectory, segmentSize, walKeepSegments, preallocateSegments, true,
+            GroupCommitRingBuffer.DEFAULT_MAX_BATCH_SIZE, GroupCommitRingBuffer.DEFAULT_DELAY_MICROS);
+    }
+
+    public WALManager(String dataDirectory, long segmentSize, int walKeepSegments, boolean preallocateSegments,
+                      boolean groupCommitEnabled, int groupCommitMaxBatchSize, long groupCommitDelayMicros) {
         this.walDirectory = dataDirectory + "/wal";
         this.segmentSize = segmentSize > 0 ? segmentSize : DEFAULT_SEGMENT_SIZE;
         this.walKeepSegments = walKeepSegments >= 0 ? walKeepSegments : DEFAULT_WAL_KEEP_SEGMENTS;
         this.preallocateSegments = preallocateSegments;
+        this.groupCommitEnabled = groupCommitEnabled;
+        this.groupCommitMaxBatchSize = groupCommitMaxBatchSize > 0 ? groupCommitMaxBatchSize : GroupCommitRingBuffer.DEFAULT_MAX_BATCH_SIZE;
+        this.groupCommitDelayMicros = groupCommitDelayMicros >= 0 ? groupCommitDelayMicros : GroupCommitRingBuffer.DEFAULT_DELAY_MICROS;
         this.currentLSN = new AtomicLong(0);
         this.walEpoch = new AtomicLong(0);
         this.lastCheckpointLSN = new AtomicLong(0);
@@ -164,7 +182,9 @@ public class WALManager {
                 long fileLen = highestFile.exists() ? highestFile.length() : 0;
 
                 long calculatedLsn = (highestSeg - 1) * segmentSize + fileLen;
-                if (currentLSN.get() == 0 && calculatedLsn > 0) {
+                if (!preallocateSegments) {
+                    currentLSN.set(Math.max(currentLSN.get(), calculatedLsn));
+                } else if (currentLSN.get() == 0 && calculatedLsn > 0) {
                     currentLSN.set(calculatedLsn);
                 }
 
@@ -174,6 +194,13 @@ public class WALManager {
 
             // Pre-allocate next segment in background
             schedulePreallocation(getSegmentNumberForLsn(currentLSN.get()) + 1);
+
+            if (groupCommitEnabled && groupCommitCoordinator == null) {
+                this.groupCommitCoordinator = new GroupCommitRingBuffer(this,
+                    GroupCommitRingBuffer.DEFAULT_RING_CAPACITY,
+                    this.groupCommitMaxBatchSize,
+                    this.groupCommitDelayMicros);
+            }
 
             LOG.info("Segmented WAL initialized: active segment {}, LSN {}, epoch {}, segmentSize {}MB, wal_keep_segments {}",
                 formatSegmentFileName(getSegmentNumberForLsn(currentLSN.get())),
@@ -462,16 +489,31 @@ public class WALManager {
     }
 
     public long logCommit(long transactionId) {
-        try {
-            ByteBuffer buffer = getDirectRecordBuffer(24);
-            buffer.putInt(OP_COMMIT);
-            buffer.putLong(transactionId);
-            buffer.putLong(System.currentTimeMillis());
-            return writeBuffer(buffer, true);
-        } catch (Exception e) {
-            LOG.error("Failed to log commit", e);
-            return -1L;
+        if (!sync || !groupCommitEnabled || groupCommitCoordinator == null) {
+            try {
+                ByteBuffer buffer = getDirectRecordBuffer(24);
+                buffer.putInt(OP_COMMIT);
+                buffer.putLong(transactionId);
+                buffer.putLong(System.currentTimeMillis());
+                return writeBuffer(buffer, true);
+            } catch (Exception e) {
+                LOG.error("Failed to log commit", e);
+                return -1L;
+            }
         }
+        return groupCommitCoordinator.commit(transactionId);
+    }
+
+    /**
+     * Writes a batch of group-committed records to the WAL.
+     * The buffer contains multiple consecutive commit records (each 20 bytes: OP_COMMIT + xid + timestamp).
+     * Automatically handles segment boundaries, forces to disk (fsync), and returns the new LSN.
+     *
+     * @param buffer Direct ByteBuffer containing prepared commit records
+     * @return the end LSN of the written batch
+     */
+    public long writeGroupCommitBatch(ByteBuffer buffer) {
+        return writeBuffer(buffer, true);
     }
 
     public void checkpoint() {
@@ -649,53 +691,90 @@ public class WALManager {
     }
 
     /**
-     * Seamless multi-segment write. Spans records across 16MB segment boundaries without truncation.
+     * Appends buffer contents to the segmented WAL across segment boundaries.
+     * Takes ~1µs in OS page cache. Does NOT fsync.
      */
-    private synchronized long writeBuffer(ByteBuffer buffer, boolean force) {
+    public long appendBuffer(ByteBuffer buffer) {
         if (closed) {
             LOG.warn("WAL write skipped - channel is already closed");
             return -1L;
         }
-        try {
-            buffer.flip();
-            int totalBytes = buffer.remaining();
-            long recordStartLsn = currentLSN.get();
+        synchronized (appendLock) {
+            try {
+                buffer.flip();
+                int totalBytes = buffer.remaining();
+                long recordStartLsn = currentLSN.get();
 
-            while (buffer.hasRemaining()) {
-                long lsn = currentLSN.get();
-                long segNum = getSegmentNumberForLsn(lsn);
-                long segOffset = getSegmentOffsetForLsn(lsn);
-                long bytesRemainingInSeg = segmentSize - segOffset;
-
-                ensureActiveSegment(segNum);
-
-                int bytesToWrite = (int) Math.min(buffer.remaining(), bytesRemainingInSeg);
-                int origLimit = buffer.limit();
-                buffer.limit(buffer.position() + bytesToWrite);
-
-                activeChannel.position(segOffset);
                 while (buffer.hasRemaining()) {
-                    activeChannel.write(buffer);
+                    long lsn = currentLSN.get();
+                    long segNum = getSegmentNumberForLsn(lsn);
+                    long segOffset = getSegmentOffsetForLsn(lsn);
+                    long bytesRemainingInSeg = segmentSize - segOffset;
+
+                    ensureActiveSegment(segNum);
+
+                    int bytesToWrite = (int) Math.min(buffer.remaining(), bytesRemainingInSeg);
+                    int origLimit = buffer.limit();
+                    buffer.limit(buffer.position() + bytesToWrite);
+
+                    activeChannel.position(segOffset);
+                    while (buffer.hasRemaining()) {
+                        activeChannel.write(buffer);
+                    }
+                    buffer.limit(origLimit);
+
+                    currentLSN.addAndGet(bytesToWrite);
+
+                    // Continuous rotation when segment boundary reached
+                    if (segOffset + bytesToWrite >= segmentSize) {
+                        rotateToNextSegment(segNum);
+                    }
                 }
-                buffer.limit(origLimit);
-
-                currentLSN.addAndGet(bytesToWrite);
-
-                // Continuous rotation when segment boundary reached
-                if (segOffset + bytesToWrite >= segmentSize) {
-                    rotateToNextSegment(segNum);
-                }
+                return recordStartLsn + totalBytes;
+            } catch (Exception e) {
+                LOG.error("Failed to append to WAL", e);
+                return -1L;
             }
-
-            if (sync && force && activeChannel != null && activeChannel.isOpen()) {
-                activeChannel.force(false);
-            }
-            saveWalControl();
-            return recordStartLsn + totalBytes;
-        } catch (Exception e) {
-            LOG.error("Failed to write to WAL", e);
-            return -1L;
         }
+    }
+
+    /**
+     * Ensures all WAL records up to at least targetLsn are durable on disk.
+     * Multiple concurrent sync requests coalesce into a single fsync.
+     */
+    public void syncWal(long targetLsn) {
+        if (!sync || closed) {
+            return;
+        }
+        if (syncdLSN.get() >= targetLsn) {
+            return;
+        }
+        synchronized (syncLock) {
+            if (syncdLSN.get() >= targetLsn) {
+                return;
+            }
+            try {
+                FileChannel ch = activeChannel;
+                if (ch != null && ch.isOpen()) {
+                    ch.force(false);
+                }
+                long flushedUpTo = currentLSN.get();
+                syncdLSN.accumulateAndGet(flushedUpTo, Math::max);
+            } catch (Exception e) {
+                LOG.error("Failed to fsync WAL", e);
+            }
+        }
+    }
+
+    /**
+     * Seamless multi-segment write. Spans records across 16MB segment boundaries without truncation.
+     */
+    private long writeBuffer(ByteBuffer buffer, boolean force) {
+        long endLsn = appendBuffer(buffer);
+        if (force && endLsn > 0) {
+            syncWal(endLsn);
+        }
+        return endLsn;
     }
 
     /**
@@ -719,6 +798,8 @@ public class WALManager {
 
             // Schedule background pre-allocation for next + 1
             schedulePreallocation(nextSegNum + 1);
+
+            saveWalControl();
 
             LOG.info("Continuous WAL rotation: completed segment {}, active segment is now {}",
                 formatSegmentFileName(completedSegmentNumber),
@@ -779,8 +860,13 @@ public class WALManager {
                 return;
             }
 
+            long highestSeg = segNumbers.get(segNumbers.size() - 1);
+            File highestFile = getSegmentFile(highestSeg);
+            long fileLen = highestFile.exists() ? highestFile.length() : 0;
+            long maxPossibleLsn = (highestSeg - 1) * segmentSize + fileLen;
+
             long startLsn = 0;
-            long endLsn = currentLSN.get();
+            long endLsn = Math.max(currentLSN.get(), maxPossibleLsn);
 
             Set<Long> committedXids = new HashSet<>();
             long[] maxCheckpointLsn = new long[]{lastCheckpointLSN.get()};
@@ -1441,6 +1527,57 @@ public class WALManager {
         }
     }
 
+    public boolean isGroupCommitEnabled() {
+        return groupCommitEnabled;
+    }
+
+    public synchronized void setGroupCommitEnabled(boolean groupCommitEnabled) {
+        this.groupCommitEnabled = groupCommitEnabled;
+        if (groupCommitEnabled && groupCommitCoordinator == null && !closed) {
+            this.groupCommitCoordinator = new GroupCommitRingBuffer(this,
+                GroupCommitRingBuffer.DEFAULT_RING_CAPACITY,
+                this.groupCommitMaxBatchSize,
+                this.groupCommitDelayMicros);
+        } else if (!groupCommitEnabled && groupCommitCoordinator != null) {
+            groupCommitCoordinator.close();
+            groupCommitCoordinator = null;
+        }
+    }
+
+    public int getGroupCommitMaxBatchSize() {
+        return groupCommitMaxBatchSize;
+    }
+
+    public synchronized void setGroupCommitMaxBatchSize(int maxBatchSize) {
+        this.groupCommitMaxBatchSize = maxBatchSize;
+        if (groupCommitCoordinator != null) {
+            groupCommitCoordinator.close();
+            this.groupCommitCoordinator = new GroupCommitRingBuffer(this,
+                GroupCommitRingBuffer.DEFAULT_RING_CAPACITY,
+                this.groupCommitMaxBatchSize,
+                this.groupCommitDelayMicros);
+        }
+    }
+
+    public long getGroupCommitDelayMicros() {
+        return groupCommitDelayMicros;
+    }
+
+    public synchronized void setGroupCommitDelayMicros(long delayMicros) {
+        this.groupCommitDelayMicros = delayMicros;
+        if (groupCommitCoordinator != null) {
+            groupCommitCoordinator.close();
+            this.groupCommitCoordinator = new GroupCommitRingBuffer(this,
+                GroupCommitRingBuffer.DEFAULT_RING_CAPACITY,
+                this.groupCommitMaxBatchSize,
+                this.groupCommitDelayMicros);
+        }
+    }
+
+    public GroupCommitRingBuffer getGroupCommitCoordinator() {
+        return groupCommitCoordinator;
+    }
+
     /**
      * Simulates an abrupt server crash by immediately closing file handles
      * without flushing a final checkpoint or performing graceful shutdown.
@@ -1449,6 +1586,9 @@ public class WALManager {
         closed = true;
         try {
             preallocator.shutdownNow();
+            if (groupCommitCoordinator != null) {
+                groupCommitCoordinator.close();
+            }
             if (activeChannel != null && activeChannel.isOpen()) {
                 activeChannel.close();
             }
@@ -1465,6 +1605,9 @@ public class WALManager {
             return;
         }
         try {
+            if (groupCommitCoordinator != null) {
+                groupCommitCoordinator.close();
+            }
             checkpoint();
             closed = true;
             preallocator.shutdownNow();

@@ -444,7 +444,7 @@ def create_project_plan_excel():
          "High", "P0 - Critical", "WAL writes seamlessly span across 16MB files without truncation; old segments preserved for archiving.", "Completed"],
         ["Sprint 02", "Week 04", "Storage Engine", "Group Commit Coalescing Engine",
          "Implement lock-free group commit ring buffer. Batch concurrent transaction commit fsyncs together into a single I/O operation (up to 256 transactions per batch).",
-         "Very High", "P0 - Critical", "Write throughput reaches 50,000+ TPS under 128 concurrent threads; p99 commit latency < 2ms.", "Planned"],
+         "Very High", "P0 - Critical", "Write throughput reaches 50,000+ TPS under 128 concurrent threads; p99 commit latency < 2ms.", "Completed"],
 
         # Sprint 3 (Month 2, Weeks 5-6)
         ["Sprint 03", "Week 05", "Concurrency", "Partitioned Lock Table & Queues",

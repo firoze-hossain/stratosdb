@@ -15,6 +15,12 @@ public class DatabaseConfig {
     private int walKeepSegments = 16;
     /** Whether to pre-allocate the next 16MB WAL segment in the background (default true). */
     private boolean walPreallocateSegments = true;
+    /** Whether group commit coalescing is enabled (default true). */
+    private boolean groupCommitEnabled = true;
+    /** Maximum number of concurrent transaction commits coalesced per batch/fsync (default 256). */
+    private int groupCommitMaxBatchSize = 256;
+    /** Delay window in microseconds for follower commit coalescing (default 20 microseconds). */
+    private long groupCommitDelayMicros = 20;
     /** Milliseconds between automatic VACUUM passes over every table; 0 (the default) means autovacuum is off - call StratosDB.startAutovacuum explicitly, or set this before construction to auto-start. */
     private long autovacuumIntervalMs = 0;
 
@@ -29,6 +35,15 @@ public class DatabaseConfig {
 
     public boolean isWalPreallocateSegments() { return walPreallocateSegments; }
     public void setWalPreallocateSegments(boolean walPreallocateSegments) { this.walPreallocateSegments = walPreallocateSegments; }
+
+    public boolean isGroupCommitEnabled() { return groupCommitEnabled; }
+    public void setGroupCommitEnabled(boolean groupCommitEnabled) { this.groupCommitEnabled = groupCommitEnabled; }
+
+    public int getGroupCommitMaxBatchSize() { return groupCommitMaxBatchSize; }
+    public void setGroupCommitMaxBatchSize(int groupCommitMaxBatchSize) { this.groupCommitMaxBatchSize = groupCommitMaxBatchSize; }
+
+    public long getGroupCommitDelayMicros() { return groupCommitDelayMicros; }
+    public void setGroupCommitDelayMicros(long groupCommitDelayMicros) { this.groupCommitDelayMicros = groupCommitDelayMicros; }
 
     /**
      * Checks whether Generational ZGC is active in the current JVM runtime.
@@ -89,6 +104,9 @@ public class DatabaseConfig {
         copy.setWalSegmentSize(this.walSegmentSize);
         copy.setWalKeepSegments(this.walKeepSegments);
         copy.setWalPreallocateSegments(this.walPreallocateSegments);
+        copy.setGroupCommitEnabled(this.groupCommitEnabled);
+        copy.setGroupCommitMaxBatchSize(this.groupCommitMaxBatchSize);
+        copy.setGroupCommitDelayMicros(this.groupCommitDelayMicros);
         return copy;
     }
 }

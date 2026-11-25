@@ -41,7 +41,10 @@ public class StratosDB {
             config.getDataDirectory(),
             config.getWalSegmentSize(),
             config.getWalKeepSegments(),
-            config.isWalPreallocateSegments()
+            config.isWalPreallocateSegments(),
+            config.isGroupCommitEnabled(),
+            config.getGroupCommitMaxBatchSize(),
+            config.getGroupCommitDelayMicros()
         );
         this.walManager.setSync(config.isSyncWAL());
         this.transactionManager = new TransactionManager(config.getDataDirectory());
