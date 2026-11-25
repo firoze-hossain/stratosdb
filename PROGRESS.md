@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Commits | 119 |
-| Tests passing | **662 / 662** (0 failures, 0 errors, 2 skipped) |
+| Tests passing | **670 / 670** (0 failures, 0 errors, 2 skipped) |
 | Main source | ~48,200 lines |
 | Test source | ~24,500 lines |
 
@@ -1979,6 +1979,46 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Storage module suite verified at **62/62 passing**.
   - Full reactor test suite verified at **662/662 passing** across all 12 modules.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 01 Week 02 marked `Completed`.
+
+## Sprint 02 Week 03 — Storage Engine: Segmented 16MB WAL Files ✅ DONE
+
+- ✅ **Segmented WAL Naming Convention & Directory Architecture**:
+  - Implemented standard 16MB segmented WAL naming convention (`wal_00000001.log`, `wal_00000002.log`, etc.) with `formatSegmentFileName`, `parseSegmentNumber`, and `isSegmentFileName` validation in [`WALManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/WALManager.java).
+  - Added transparent legacy migration during initialization (`wal.log` -> `wal_00000001.log`) and hardlink synchronization for backwards compatibility.
+  - Persisted WAL control metadata (`wal_control.txt`) recording `current_lsn`, `checkpoint_lsn`, `wal_epoch`, `segment_size`, `wal_keep_segments`, and `last_archived_lsn`.
+
+- ✅ **Continuous WAL Segment Rotation & Cross-Segment Spanning**:
+  - Implemented continuous segment rotation: when the active segment reaches `segmentSize` (16MB default), `WALManager.rotateToNextSegment()` automatically flushes and fsyncs the completed segment, initiates archive export, enforces retention pruning, activates the next segment, and schedules background pre-allocation.
+  - Implemented seamless cross-segment record spanning in `writeBuffer`: records crossing the 16MB segment boundary are split across the boundary and appended to the next segment without record truncation, preserving byte-exact LSN continuity.
+  - Implemented PostgreSQL-equivalent `rotateSegment()` (manual `pg_switch_wal()` trigger).
+
+- ✅ **Background Segment Pre-Allocation**:
+  - Created dedicated background daemon executor (`wal-preallocator` thread) pre-sizing upcoming segment files to full segment size (16MB) in the background via atomic `.prealloc` file staging and rename.
+  - Eliminates disk allocation latency, inode metadata expansion stalls, and filesystem fragmentation on write hot paths.
+
+- ✅ **wal_keep_segments Retention Policy**:
+  - Implemented configurable retention threshold `walKeepSegments` (default 16 segments = 256MB) in `DatabaseConfig` and `WALManager`.
+  - Added safe retention pruning: `WALManager.pruneOldSegments()` cleans up old completed segment files older than `wal_keep_segments`, strictly protecting all segments required by uncheckpointed recovery (`lastCheckpointLSN`).
+
+- ✅ **Zero-Truncation Recovery & Dedicated Segmented WAL Reader**:
+  - Authored [`SegmentedWalReader`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/SegmentedWalReader.java) supporting cross-segment sequential navigation, exact primitive decoding, torn-write tolerance, and zero-filled tail detection for pre-allocated files.
+  - Completely removed legacy destructive WAL file truncations (`walChannel.truncate(0)`) from `checkpoint()`, `recover()`, and `close()`, guaranteeing full WAL preservation for Point-in-Time Recovery (PITR), archiving, and continuous replication.
+  - Preserved redo idempotency across restarts using `lastCheckpointLSN` redo gating without duplicating rows.
+  - Maintained gapless non-overlapping continuous archive slicing in `archiveCurrentWalIfEnabled()`.
+
+- ✅ **Comprehensive Test Suite & Verification**:
+  - Authored [`SegmentedWalTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/test/java/com/stratosdb/storage/wal/SegmentedWalTest.java) with 8 comprehensive scenarios:
+    1. `testSegmentedWalNamingConvention`: Verified `wal_%08d.log` format and regex parsing.
+    2. `testContinuousSegmentRotationAtBoundary`: Verified rotation at segment boundary and preservation of completed segments.
+    3. `testWalWritesSeamlesslySpanAcrossSegmentBoundaries`: Verified records spanning boundary are parsed intact without truncation.
+    4. `testBackgroundSegmentPreallocation`: Verified background pre-allocation to segment size.
+    5. `testWalKeepSegmentsRetentionPolicy`: Verified retention threshold pruning while preserving active and checkpoint segments.
+    6. `testCrashRecoveryAcrossMultipleSegmentsWithoutTruncation`: Verified crash recovery across multiple segments with zero truncation.
+    7. `testSeamlessReplicationStreamingAcrossSegments`: Verified `readBytesFrom` streams across segments without gaps.
+    8. `testManualWalSwitchRotation`: Verified `rotateSegment()` behavior.
+  - All 8 tests passed with zero failures.
+  - Full storage test suite verified at **70/70 passing** (up from 62).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 02 Week 03 marked `Completed`.
 
 ## What to do next
 

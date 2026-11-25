@@ -441,7 +441,7 @@ def create_project_plan_excel():
         # Sprint 2 (Month 1, Weeks 3-4)
         ["Sprint 02", "Week 03", "Storage Engine", "Segmented 16MB WAL Files",
          "Implement segmented WAL naming convention (wal_00000001.log). Implement background segment pre-allocation and continuous WAL segment rotation. Add wal_keep_segments retention.",
-         "High", "P0 - Critical", "WAL writes seamlessly span across 16MB files without truncation; old segments preserved for archiving.", "Planned"],
+         "High", "P0 - Critical", "WAL writes seamlessly span across 16MB files without truncation; old segments preserved for archiving.", "Completed"],
         ["Sprint 02", "Week 04", "Storage Engine", "Group Commit Coalescing Engine",
          "Implement lock-free group commit ring buffer. Batch concurrent transaction commit fsyncs together into a single I/O operation (up to 256 transactions per batch).",
          "Very High", "P0 - Critical", "Write throughput reaches 50,000+ TPS under 128 concurrent threads; p99 commit latency < 2ms.", "Planned"],

@@ -9,11 +9,26 @@ public class DatabaseConfig {
     private boolean syncWAL = true;
     private int maxConnections = 100;
     private boolean directAllocation = true;
+    /** WAL segment file size in bytes (default 16MB). */
+    private long walSegmentSize = 16L * 1024 * 1024;
+    /** Number of past 16MB WAL segment files to retain before pruning (default 16). */
+    private int walKeepSegments = 16;
+    /** Whether to pre-allocate the next 16MB WAL segment in the background (default true). */
+    private boolean walPreallocateSegments = true;
     /** Milliseconds between automatic VACUUM passes over every table; 0 (the default) means autovacuum is off - call StratosDB.startAutovacuum explicitly, or set this before construction to auto-start. */
     private long autovacuumIntervalMs = 0;
 
     public boolean isDirectAllocation() { return directAllocation; }
     public void setDirectAllocation(boolean directAllocation) { this.directAllocation = directAllocation; }
+
+    public long getWalSegmentSize() { return walSegmentSize; }
+    public void setWalSegmentSize(long walSegmentSize) { this.walSegmentSize = walSegmentSize; }
+
+    public int getWalKeepSegments() { return walKeepSegments; }
+    public void setWalKeepSegments(int walKeepSegments) { this.walKeepSegments = walKeepSegments; }
+
+    public boolean isWalPreallocateSegments() { return walPreallocateSegments; }
+    public void setWalPreallocateSegments(boolean walPreallocateSegments) { this.walPreallocateSegments = walPreallocateSegments; }
 
     /**
      * Checks whether Generational ZGC is active in the current JVM runtime.
@@ -71,6 +86,9 @@ public class DatabaseConfig {
         copy.setAutovacuumIntervalMs(this.autovacuumIntervalMs);
         copy.setSlowQueryThresholdMs(this.slowQueryThresholdMs);
         copy.setDirectAllocation(this.directAllocation);
+        copy.setWalSegmentSize(this.walSegmentSize);
+        copy.setWalKeepSegments(this.walKeepSegments);
+        copy.setWalPreallocateSegments(this.walPreallocateSegments);
         return copy;
     }
 }

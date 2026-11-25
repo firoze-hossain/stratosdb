@@ -37,7 +37,12 @@ public class StratosDB {
         // Initialize components
         this.diskManager = new DiskManager(config.getDataDirectory());
         this.bufferPool = new BufferPoolManager(config.getBufferPoolSize(), diskManager);
-        this.walManager = new WALManager(config.getDataDirectory());
+        this.walManager = new WALManager(
+            config.getDataDirectory(),
+            config.getWalSegmentSize(),
+            config.getWalKeepSegments(),
+            config.isWalPreallocateSegments()
+        );
         this.walManager.setSync(config.isSyncWAL());
         this.transactionManager = new TransactionManager(config.getDataDirectory());
         this.transactionManager.setSyncCommitLog(config.isSyncWAL());

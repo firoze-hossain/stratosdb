@@ -314,7 +314,10 @@ public class StreamingWalApplierTest {
     }
 
     private byte[] readWalFile(File dataDir) throws Exception {
-        File walFile = new File(dataDir, "wal/wal.log");
+        File walFile = new File(dataDir, "wal/wal_00000001.log");
+        if (!walFile.exists()) {
+            walFile = new File(dataDir, "wal/wal.log");
+        }
         try (RandomAccessFile raf = new RandomAccessFile(walFile, "r")) {
             byte[] data = new byte[(int) raf.length()];
             raf.readFully(data);
