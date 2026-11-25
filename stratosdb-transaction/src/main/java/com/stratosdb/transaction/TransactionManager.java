@@ -51,7 +51,7 @@ public class TransactionManager {
     private final Set<Long> abortedXids = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<Long, Transaction> transactionsByXid = new ConcurrentHashMap<>();
 
-    private final LockManager lockManager = new LockManager();
+    private final LockManager lockManager;
 
     private final String dataDirectory;
     private volatile long persistedXidWatermark = 0; // xids up to and including this value are safe to use without another disk write
@@ -68,11 +68,16 @@ public class TransactionManager {
     }
 
     public TransactionManager() {
-        this(null);
+        this(null, LockManager.DEFAULT_PARTITIONS);
     }
 
     public TransactionManager(String dataDirectory) {
+        this(dataDirectory, LockManager.DEFAULT_PARTITIONS);
+    }
+
+    public TransactionManager(String dataDirectory, int lockPartitions) {
         this.dataDirectory = dataDirectory;
+        this.lockManager = new LockManager(lockPartitions > 0 ? lockPartitions : LockManager.DEFAULT_PARTITIONS);
         loadPersistedXidWatermark();
         loadPersistedCommitLog();
         openCommitLogForAppend();

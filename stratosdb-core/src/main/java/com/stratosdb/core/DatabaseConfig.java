@@ -21,6 +21,8 @@ public class DatabaseConfig {
     private int groupCommitMaxBatchSize = 256;
     /** Delay window in microseconds for follower commit coalescing (default 20 microseconds). */
     private long groupCommitDelayMicros = 20;
+    /** Number of hashed lock partitions in LockManager (default 64). */
+    private int lockPartitions = 64;
     /** Milliseconds between automatic VACUUM passes over every table; 0 (the default) means autovacuum is off - call StratosDB.startAutovacuum explicitly, or set this before construction to auto-start. */
     private long autovacuumIntervalMs = 0;
 
@@ -44,6 +46,9 @@ public class DatabaseConfig {
 
     public long getGroupCommitDelayMicros() { return groupCommitDelayMicros; }
     public void setGroupCommitDelayMicros(long groupCommitDelayMicros) { this.groupCommitDelayMicros = groupCommitDelayMicros; }
+
+    public int getLockPartitions() { return lockPartitions; }
+    public void setLockPartitions(int lockPartitions) { this.lockPartitions = lockPartitions > 0 ? lockPartitions : 64; }
 
     /**
      * Checks whether Generational ZGC is active in the current JVM runtime.
@@ -107,6 +112,7 @@ public class DatabaseConfig {
         copy.setGroupCommitEnabled(this.groupCommitEnabled);
         copy.setGroupCommitMaxBatchSize(this.groupCommitMaxBatchSize);
         copy.setGroupCommitDelayMicros(this.groupCommitDelayMicros);
+        copy.setLockPartitions(this.lockPartitions);
         return copy;
     }
 }

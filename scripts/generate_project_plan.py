@@ -449,7 +449,7 @@ def create_project_plan_excel():
         # Sprint 3 (Month 2, Weeks 5-6)
         ["Sprint 03", "Week 05", "Concurrency", "Partitioned Lock Table & Queues",
          "Refactor LockManager: replace single global monitor and 25ms polling loop with 64 hashed lock partitions and per-row condition variable queues for instant wakeups.",
-         "High", "P0 - Critical", "Transactions wake up instantly upon lock release (< 0.05ms lag); lock acquisition throughput improves 10x.", "Planned"],
+         "High", "P0 - Critical", "Transactions wake up instantly upon lock release (< 0.05ms lag); lock acquisition throughput improves 10x.", "Completed"],
         ["Sprint 03", "Week 06", "Concurrency", "Table Intent Locks & Row Share",
          "Implement table-level Intent Shared (IS) and Intent Exclusive (IX) locks. Implement SELECT ... FOR SHARE and SELECT ... FOR UPDATE with explicit lock modes.",
          "Medium", "P1 - High", "DDL blocked by active readers; concurrent SELECT FOR UPDATE serializes correctly; passing 10 concurrency tests.", "Planned"],
