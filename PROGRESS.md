@@ -2095,6 +2095,68 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Full transaction test suite verified at **10/10 passing** (up from 2).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 03 Week 05 marked `Completed`.
 
+## Sprint 03 Week 06 — Concurrency: Table Intent Locks & Row Share ✅ DONE
+
+- ✅ **Hierarchical Multi-Granularity Locking Protocol (Gray/Reuter)**:
+  - Implemented [`LockMode`](file:///home/firoze/projects/Others/stratosdb/stratosdb-transaction/src/main/java/com/stratosdb/transaction/locking/LockMode.java) enum defining `IS` (Intent Shared), `IX` (Intent Exclusive), `S` (Shared), `SIX` (Shared Intent Exclusive), and `X` (Exclusive).
+  - Built rigorous multi-granularity compatibility matrix (`LockMode.isCompatible`) and hierarchy strength evaluator (`LockMode.isStrongerThanOrEqualTo`), ensuring correct coexistence of coarse table locks and fine row locks.
+
+- ✅ **Table-Level Intent Locking in LockManager**:
+  - Added table-level locking structures in [`LockManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-transaction/src/main/java/com/stratosdb/transaction/locking/LockManager.java) with dedicated per-table `ReentrantLock` and condition variables for instant wakeups.
+  - Implemented `acquireTableLock(tableName, LockMode, xid, ...)`, `releaseTableLock`, `isTableLocked`, `getTableLockMode`, and waiter counting.
+  - Wired table intent locks into query execution:
+    - Readers (`SELECT`) acquire table `IS` locks.
+    - Writers (`INSERT`, `UPDATE`, `DELETE`) acquire table `IX` locks.
+    - DDL operations (`DROP TABLE`, `ALTER TABLE`, `CREATE INDEX`) acquire table `X` locks.
+  - Table-modifying DDL is strictly blocked while active readers/writers hold intent locks, and vice-versa.
+
+- ✅ **Multi-Holder Row Shared (`S`) and Exclusive (`X`) Locks**:
+  - Refactored `RowLockEntry` to support multiple concurrent shared holders (`Set<Long> holders`) alongside exclusive lock tracking (`exclusiveHolder`).
+  - Implemented `acquireShared(RowId, xid, ...)` allowing multiple concurrent readers to lock identical rows without blocking.
+  - Implemented `acquireExclusive(RowId, xid, ...)` serializing writers and blocking on any active shared or exclusive holders.
+  - Implemented row lock upgrading (`S -> X`): sole shared holder can seamlessly upgrade to exclusive mode without self-deadlock.
+
+- ✅ **Generalized Directed Deadlock Wait-For Graph**:
+  - Upgraded deadlock detection from 1-to-1 dependency mapping to multi-holder directed dependency graph (`Map<Long, Set<Long>> waitsFor`).
+  - Contended table or row lock acquisitions register directed dependency edges to *all* active conflicting holders, with DFS cycle detection across heterogeneous lock types.
+  - Seamless lock release in `releaseAll(xid)` unregisters all table and row locks and cleans up dependency edges.
+
+- ✅ **SQL Grammar, AST, and Parser Support for `SELECT ... FOR SHARE / UPDATE`**:
+  - Updated ANTLR grammar [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4) with `SHARE` keyword and updated `forUpdateClause: FOR (UPDATE | SHARE) (NOWAIT)?`.
+  - Updated [`SelectStatement`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/SelectStatement.java) record with `boolean forShare` flag and backward-compatible factory methods.
+  - Updated [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java) to parse `FOR SHARE` and `FOR UPDATE`.
+
+- ✅ **Executor Engine & EvalPlanQual (EPQ) Re-Evaluation**:
+  - Updated [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java) to acquire table intent locks (`IS`/`IX`) on root and joined tables, and table `X` locks on DDL operations.
+  - Implemented row-level locking clause execution: `SELECT ... FOR SHARE` acquires row `S` locks; `SELECT ... FOR UPDATE` acquires row `X` locks.
+  - Implemented PostgreSQL EvalPlanQual (EPQ) re-evaluation: when `SELECT FOR UPDATE` blocks on a row currently being updated by another transaction, waking up under `READ COMMITTED` isolation refreshes the snapshot and re-scans the row version chain so the newly committed row is locked and returned.
+
+- ✅ **Comprehensive Test Suite & Verification**:
+  - Authored [`TableIntentAndRowShareLockTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-transaction/src/test/java/com/stratosdb/transaction/locking/TableIntentAndRowShareLockTest.java) (8 unit tests in `stratosdb-transaction`):
+    1. `testCompatibilityMatrix`: Verified all combinations of `IS`, `IX`, `S`, `SIX`, and `X`.
+    2. `testConcurrentTableIntentLocks`: Verified concurrent `IS` and `IX` locks coexist.
+    3. `testTableExclusiveBlockedByIntentShared`: Verified table `X` lock is blocked by active `IS` lock until release.
+    4. `testConcurrentRowSharedLocks`: Verified multiple concurrent transactions acquire `S` locks on identical row without blocking.
+    5. `testRowExclusiveBlocksRowShared`: Verified row `X` lock blocks incoming `S` locks.
+    6. `testRowSharedBlocksRowExclusiveUntilAllRelease`: Verified row `X` lock is queued until all `S` holders release.
+    7. `testRowShareToExclusiveUpgrade`: Verified sole `S` holder upgrades to `X`.
+    8. `testCrossTableDeadlockDetection`: Verified deadlock detection across conflicting table locks.
+  - Authored [`TableIntentAndRowShareConcurrencyTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/TableIntentAndRowShareConcurrencyTest.java) (11 integration tests in `stratosdb-testing`):
+    1. `testSqlParserForShareAndForUpdate`: Verified AST and parser correctness.
+    2. `testActiveReaderHoldingTableIntentSharedBlocksTableExclusiveDdl`: Verified active `SELECT` blocks `DROP TABLE`.
+    3. `testTableIntentExclusiveBlocksTableExclusiveDdl`: Verified active `UPDATE` (table `IX`) blocks `ALTER TABLE`.
+    4. `testTableExclusiveDdlBlocksTableIntentShared`: Verified `ALTER TABLE` holding table `X` blocks incoming `SELECT`.
+    5. `testConcurrentSelectForShareDoesNotBlock`: Verified concurrent `FOR SHARE` reads don't block each other.
+    6. `testSelectForShareBlocksConcurrentSelectForUpdate`: Verified `FOR SHARE` blocks `FOR UPDATE`.
+    7. `testSelectForUpdateBlocksConcurrentSelectForShare`: Verified `FOR UPDATE` blocks `FOR SHARE`.
+    8. `testConcurrentSelectForUpdateSerializes`: Verified concurrent `FOR UPDATE` serializes and sees committed updates (EPQ).
+    9. `testCrossTableDeadlockDetectionWithIntentLocks`: Verified deadlock abort and rollback.
+    10. `testRowShareUpgradeViaUpdate`: Verified row `S` lock upgrades to `X` via `UPDATE`.
+    11. `testTransactionRollbackReleasesAllTableAndRowLocks`: Verified rollback frees all table and row locks.
+  - Transaction module tests verified at **18/18 passing** (up from 10).
+  - All 11 concurrency integration tests verified **11/11 passing**.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 03 Week 06 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

@@ -782,9 +782,17 @@ public class SqlParser {
             }
         }
 
-        boolean forUpdate = ctx.forUpdateClause() != null;
+        boolean forUpdate = false;
+        boolean forShare = false;
+        if (ctx.forUpdateClause() != null) {
+            if (ctx.forUpdateClause().SHARE() != null) {
+                forShare = true;
+            } else {
+                forUpdate = true;
+            }
+        }
         boolean distinct = ctx.DISTINCT() != null;
-        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct);
+        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, forShare);
     }
 
     private IsolationLevel parseIsolationLevel(StratosSQLParser.IsolationLevelContext ctx) {

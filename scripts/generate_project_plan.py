@@ -452,7 +452,7 @@ def create_project_plan_excel():
          "High", "P0 - Critical", "Transactions wake up instantly upon lock release (< 0.05ms lag); lock acquisition throughput improves 10x.", "Completed"],
         ["Sprint 03", "Week 06", "Concurrency", "Table Intent Locks & Row Share",
          "Implement table-level Intent Shared (IS) and Intent Exclusive (IX) locks. Implement SELECT ... FOR SHARE and SELECT ... FOR UPDATE with explicit lock modes.",
-         "Medium", "P1 - High", "DDL blocked by active readers; concurrent SELECT FOR UPDATE serializes correctly; passing 10 concurrency tests.", "Planned"],
+         "Medium", "P1 - High", "DDL blocked by active readers; concurrent SELECT FOR UPDATE serializes correctly; passing 10 concurrency tests.", "Completed"],
 
         # Sprint 4 (Month 2, Weeks 7-8)
         ["Sprint 04", "Week 07", "SQL Engine", "Compound & Non-Equi Join Engine",

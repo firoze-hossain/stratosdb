@@ -25,6 +25,7 @@ import com.stratosdb.transaction.IsolationLevel;
 import com.stratosdb.transaction.Transaction;
 import com.stratosdb.transaction.TransactionManager;
 import com.stratosdb.transaction.locking.LockManager;
+import com.stratosdb.transaction.locking.LockMode;
 import com.stratosdb.transaction.mvcc.MVCCVisibility;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1580,8 +1581,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (isReadOnly() && stmt instanceof CopyStatement copyStmt && copyStmt.isFrom()) {
             return QueryResult.error("cannot execute COPY FROM in a read-only replica");
         }
-        if (isReadOnly() && stmt instanceof SelectStatement select && select.forUpdate()) {
-            return QueryResult.error("cannot execute SELECT FOR UPDATE in a read-only replica");
+        if (isReadOnly() && stmt instanceof SelectStatement select && (select.forUpdate() || select.forShare())) {
+            return QueryResult.error("cannot execute SELECT FOR UPDATE/SHARE in a read-only replica");
         }
         if (stmt instanceof CreateTableStatement s) return executeCreateTable(s, txn, sql);
         if (stmt instanceof CreateIndexStatement s) return executeCreateIndex(s, txn);
@@ -2597,7 +2598,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * findIndex() only reports indexes that exist, but this is still worth
      * knowing before relying on it.
      */
-    private QueryResult executeCreateIndex(CreateIndexStatement stmt, Transaction txn) {
+    private QueryResult executeCreateIndex(CreateIndexStatement stmt, Transaction txn) throws DeadlockException {
         if (indexesByName.containsKey(stmt.indexName()) || brinIndexesByName.containsKey(stmt.indexName())
             || bitmapIndexesByName.containsKey(stmt.indexName()) || ginIndexesByName.containsKey(stmt.indexName())
             || gistIndexesByName.containsKey(stmt.indexName())) {
@@ -2610,6 +2611,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         List<String> columns = tableColumns.get(stmt.tableName());
         boolean columnExists = columns != null && columns.stream().anyMatch(c -> c.equalsIgnoreCase(stmt.columnName()));
         if (!columnExists) {
@@ -3210,11 +3212,12 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return QueryResult.success("CHECKPOINT");
     }
 
-    private QueryResult executeInsert(InsertStatement stmt, Transaction txn) {
+    private QueryResult executeInsert(InsertStatement stmt, Transaction txn) throws DeadlockException {
         return executeInsert(stmt, txn, List.of());
     }
 
-    private QueryResult executeInsert(InsertStatement stmt, Transaction txn, List<Object> params) {
+    private QueryResult executeInsert(InsertStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
+        acquireTableLockForDml(stmt.tableName(), txn);
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -3387,14 +3390,49 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * base a cost on yet) - it's the honest "does an applicable index exist
      * at all" version, same spirit as the Week 3 plan called for.
      */
+    private void acquireTableLockForSelect(SelectStatement stmt, Transaction txn) throws DeadlockException {
+        if (txn == null) return;
+        LockMode mode = stmt.forUpdate() ? LockMode.IX : LockMode.IS;
+        if (stmt.tableName() != null && tables.containsKey(stmt.tableName())) {
+            transactionManager.getLockManager().acquireTableLock(stmt.tableName(), mode, txn.getXID());
+        }
+        if (stmt.joins() != null) {
+            for (JoinClause join : stmt.joins()) {
+                if (join.tableName() != null && tables.containsKey(join.tableName())) {
+                    transactionManager.getLockManager().acquireTableLock(join.tableName(), mode, txn.getXID());
+                }
+            }
+        }
+    }
+
+    private void acquireTableLockForDml(String rawTableName, Transaction txn) throws DeadlockException {
+        if (rawTableName != null && tables.containsKey(rawTableName) && txn != null) {
+            transactionManager.getLockManager().acquireTableLock(rawTableName, LockMode.IX, txn.getXID());
+        }
+    }
+
+    private void acquireTableLockForDdl(String rawTableName, Transaction txn) throws DeadlockException {
+        if (rawTableName != null && tables.containsKey(rawTableName) && txn != null) {
+            transactionManager.getLockManager().acquireTableLock(rawTableName, LockMode.X, txn.getXID());
+        }
+    }
+
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn) throws DeadlockException {
         return executeSelect(stmt, txn, session.get().currentParams);
     }
 
     private QueryResult executeSelect(SelectStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
+        acquireTableLockForSelect(stmt, txn);
         QueryResult result = executeSelectInternal(stmt, txn, params);
-        if (stmt.forUpdate()) {
-            result = applyForUpdateLocking(stmt, result, txn);
+        if (stmt.forUpdate() || stmt.forShare()) {
+            result = applyLockingClause(stmt, result, txn);
+            if (result.isSuccess() && (result.getRows() == null || result.getRows().isEmpty())
+                && stmt.where() != null) {
+                QueryResult recheck = executeSelectInternal(stmt, txn, params);
+                if (recheck.isSuccess() && recheck.getRows() != null && !recheck.getRows().isEmpty()) {
+                    result = applyLockingClause(stmt, recheck, txn);
+                }
+            }
         }
         if (stmt.distinct() && result.isSuccess() && result.getRows() != null) {
             List<Tuple> deduped = new ArrayList<>();
@@ -3410,25 +3448,37 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return result;
     }
 
-    private QueryResult applyForUpdateLocking(SelectStatement stmt, QueryResult result, Transaction txn) throws DeadlockException {
+    private QueryResult applyLockingClause(SelectStatement stmt, QueryResult result, Transaction txn) throws DeadlockException {
         if (!result.isSuccess()) {
             return result;
         }
         if (txn == null) {
-            return QueryResult.error("FOR UPDATE cannot be used without a transaction");
+            return QueryResult.error((stmt.forUpdate() ? "FOR UPDATE" : "FOR SHARE") + " cannot be used without a transaction");
         }
+        boolean isExclusive = stmt.forUpdate();
         List<Tuple> rawRows = result.getRows();
         List<Tuple> lockedRows = new ArrayList<>();
         for (Tuple t : rawRows) {
             if (t.getPageId() >= 0 && t.getSlot() >= 0) {
                 String tbl = t.getTableName() != null ? t.getTableName() : stmt.tableName();
                 HeapTable table = tbl != null ? tables.get(tbl) : null;
-                transactionManager.getLockManager().acquireExclusive(
-                    new LockManager.RowId(tbl, t.getPageId(), t.getSlot()), txn.getXID());
+                LockManager.RowId rowId = new LockManager.RowId(tbl, t.getPageId(), t.getSlot());
+                if (isExclusive) {
+                    transactionManager.getLockManager().acquireExclusive(rowId, txn.getXID());
+                } else {
+                    transactionManager.getLockManager().acquireShared(rowId, txn.getXID());
+                }
                 if (table != null) {
+                    if (txn.getIsolationLevel() == IsolationLevel.READ_COMMITTED || txn.getIsolationLevel() == IsolationLevel.READ_UNCOMMITTED) {
+                        txn.setSnapshot(transactionManager.createSnapshot(txn.getXID()));
+                    }
                     byte[] stored = table.readTuple(t.getPageId(), t.getSlot());
                     if (stored != null && MVCCVisibility.isVisible(stored, txn.getSnapshot(), transactionManager)) {
-                        lockedRows.add(t);
+                        Tuple freshTuple = deserializeTuple(tbl, MVCCVisibility.readPayload(stored));
+                        freshTuple.setPageId(t.getPageId());
+                        freshTuple.setSlot(t.getSlot());
+                        freshTuple.setTableName(tbl);
+                        lockedRows.add(freshTuple);
                     }
                 } else {
                     lockedRows.add(t);
@@ -3438,6 +3488,10 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
         return QueryResult.success(lockedRows, result.getColumnNames());
+    }
+
+    private QueryResult applyForUpdateLocking(SelectStatement stmt, QueryResult result, Transaction txn) throws DeadlockException {
+        return applyLockingClause(stmt, result, txn);
     }
 
     private QueryResult executeSelectInternal(SelectStatement stmt, Transaction txn, List<Object> params) {
@@ -5754,6 +5808,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeUpdate(UpdateStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
+        acquireTableLockForDml(stmt.tableName(), txn);
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -5881,6 +5936,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult executeDelete(DeleteStatement stmt, Transaction txn, List<Object> params) throws DeadlockException {
+        acquireTableLockForDml(stmt.tableName(), txn);
         HeapTable table = tables.get(stmt.tableName());
         if (table == null) {
             return QueryResult.error("Table not found: " + stmt.tableName());
@@ -5932,13 +5988,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeDropTable(DropTableStatement stmt) {
         SessionState state = session.get();
         Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
-        return executeDropTable(stmt, txn);
+        try {
+            return executeDropTable(stmt, txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during DROP TABLE: " + e.getMessage());
+        }
     }
 
-    private QueryResult executeDropTable(DropTableStatement stmt, Transaction txn) {
+    private QueryResult executeDropTable(DropTableStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot drop system table: " + stmt.tableName());
         }
+        if (!tables.containsKey(stmt.tableName())) {
+            if (stmt.ifExists()) {
+                return QueryResult.success("Table dropped: " + stmt.tableName());
+            }
+            return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         if (!tables.containsKey(stmt.tableName())) {
             if (stmt.ifExists()) {
                 return QueryResult.success("Table dropped: " + stmt.tableName());
@@ -7186,13 +7253,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
     }
 
-    private QueryResult executeAlterTableAddColumn(AlterTableAddColumnStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableAddColumn(AlterTableAddColumnStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
@@ -7240,13 +7308,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return QueryResult.success("Column added: " + stmt.columnName());
     }
 
-    private QueryResult executeAlterTableDropColumn(AlterTableDropColumnStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableDropColumn(AlterTableDropColumnStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
@@ -7314,13 +7383,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * names similar cross-object-reference gaps elsewhere (e.g. DROP
      * EXTENSION's own note on functions still referencing it by name).
      */
-    private QueryResult executeAlterTableRenameColumn(AlterTableRenameColumnStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableRenameColumn(AlterTableRenameColumnStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
@@ -7392,16 +7462,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeAlterTableRenameTable(AlterTableRenameTableStatement stmt) {
         SessionState state = session.get();
         Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
-        return executeAlterTableRenameTable(stmt, txn);
+        try {
+            return executeAlterTableRenameTable(stmt, txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
+        }
     }
 
-    private QueryResult executeAlterTableRenameTable(AlterTableRenameTableStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableRenameTable(AlterTableRenameTableStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.oldTableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.oldTableName());
         }
         if (!tables.containsKey(stmt.oldTableName())) {
             return QueryResult.error("Table not found: " + stmt.oldTableName());
         }
+        acquireTableLockForDdl(stmt.oldTableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.oldTableName());
         if (denied != null) return denied;
         if (tables.containsKey(stmt.newTableName()) || views.containsKey(stmt.newTableName())) {
@@ -7486,13 +7561,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * in a large table fails the whole statement cleanly, with nothing
      * changed, rather than leaving the table half-converted.
      */
-    private QueryResult executeAlterTableAlterColumnType(AlterTableAlterColumnTypeStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableAlterColumnType(AlterTableAlterColumnTypeStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
@@ -7548,16 +7624,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeAlterTableSetDefault(AlterTableSetDefaultStatement stmt) {
         SessionState state = session.get();
         Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
-        return executeAlterTableSetDefault(stmt, txn);
+        try {
+            return executeAlterTableSetDefault(stmt, txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
+        }
     }
 
-    private QueryResult executeAlterTableSetDefault(AlterTableSetDefaultStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableSetDefault(AlterTableSetDefaultStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
@@ -7591,16 +7672,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeAlterTableDropDefault(AlterTableDropDefaultStatement stmt) {
         SessionState state = session.get();
         Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
-        return executeAlterTableDropDefault(stmt, txn);
+        try {
+            return executeAlterTableDropDefault(stmt, txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
+        }
     }
 
-    private QueryResult executeAlterTableDropDefault(AlterTableDropDefaultStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableDropDefault(AlterTableDropDefaultStatement stmt, Transaction txn) throws DeadlockException {
         if (SystemCatalog.isSystemTable(stmt.tableName())) {
             return QueryResult.error("Cannot alter system table: " + stmt.tableName());
         }
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        acquireTableLockForDdl(stmt.tableName(), txn);
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         List<String> columns = tableColumns.get(stmt.tableName());
@@ -7634,6 +7720,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        try {
+            acquireTableLockForDdl(stmt.tableName(), txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
+        }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         rlsEnabledTables.add(stmt.tableName());
@@ -7643,6 +7736,13 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     private QueryResult executeAlterTableDisableRls(AlterTableDisableRlsStatement stmt) {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
+        }
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        try {
+            acquireTableLockForDdl(stmt.tableName(), txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
         }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
@@ -7655,17 +7755,25 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (!tables.containsKey(stmt.tableName())) {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
+        SessionState state = session.get();
+        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        try {
+            acquireTableLockForDdl(stmt.tableName(), txn);
+        } catch (DeadlockException e) {
+            return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
+        }
         QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
         if (denied != null) return denied;
         rlsForcedTables.add(stmt.tableName());
         return QueryResult.success("Row level security forced on: " + stmt.tableName());
     }
 
-    private QueryResult executeAlterTableAddConstraint(AlterTableAddConstraintStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableAddConstraint(AlterTableAddConstraintStatement stmt, Transaction txn) throws DeadlockException {
         String table = SqlParser.cleanIdentifier(stmt.tableName());
         if (!tables.containsKey(table)) {
             return QueryResult.error("Table not found: " + table);
         }
+        acquireTableLockForDdl(table, txn);
         long xid = txn != null ? txn.getXID() : 0L;
         String type = stmt.constraintType().toUpperCase(Locale.ROOT);
         String cName = stmt.constraintName() != null ? stmt.constraintName() : table + "_" + type.toLowerCase(Locale.ROOT);
@@ -7695,8 +7803,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return QueryResult.success("Table altered: " + table);
     }
 
-    private QueryResult executeAlterTableDropConstraint(AlterTableDropConstraintStatement stmt, Transaction txn) {
+    private QueryResult executeAlterTableDropConstraint(AlterTableDropConstraintStatement stmt, Transaction txn) throws DeadlockException {
         String table = SqlParser.cleanIdentifier(stmt.tableName());
+        if (table != null && tables.containsKey(table)) {
+            acquireTableLockForDdl(table, txn);
+        }
         String cName = SqlParser.cleanIdentifier(stmt.constraintName());
         boolean removed = false;
 

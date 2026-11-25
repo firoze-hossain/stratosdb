@@ -19,6 +19,9 @@ import java.util.List;
  * exclusively under LockManager to prevent concurrent modifications until transaction ends.
  *
  * distinct: true when SELECT DISTINCT is specified.
+ *
+ * forShare: true when SELECT ... FOR SHARE is specified, acquiring shared locks (S)
+ * on selected rows and table-level intent shared (IS) locks.
  */
 public record SelectStatement(String tableName, List<String> columns, WhereExpr where,
                               String orderBy, String limit, String offset, List<JoinClause> joins,
@@ -26,7 +29,18 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                               List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                               List<String> columnAliases, List<OrderItem> orderItems,
                               SelectStatement fromSubquery, String tableAlias, boolean forUpdate,
-                              boolean distinct) implements Statement {
+                              boolean distinct, boolean forShare) implements Statement {
+
+    public SelectStatement(String tableName, List<String> columns, WhereExpr where,
+                           String orderBy, String limit, String offset, List<JoinClause> joins,
+                           List<AggregateCall> aggregates, List<String> groupBy, String havingClause,
+                           List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
+                           List<String> columnAliases, List<OrderItem> orderItems,
+                           SelectStatement fromSubquery, String tableAlias, boolean forUpdate,
+                           boolean distinct) {
+        this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
+             windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, false);
+    }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
                            String orderBy, String limit, String offset, List<JoinClause> joins,
@@ -35,7 +49,7 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<String> columnAliases, List<OrderItem> orderItems,
                            SelectStatement fromSubquery, String tableAlias, boolean forUpdate) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, false);
+             windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, false, false);
     }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
@@ -45,7 +59,7 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<String> columnAliases, List<OrderItem> orderItems,
                            SelectStatement fromSubquery, String tableAlias) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, false, false);
+             windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, false, false, false);
     }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
@@ -54,7 +68,7 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                            List<String> columnAliases, List<OrderItem> orderItems) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, orderItems, null, null, false, false);
+             windowFunctions, functionCalls, columnAliases, orderItems, null, null, false, false, false);
     }
 
     public SelectStatement(String tableName, List<String> columns, WhereExpr where,
@@ -63,7 +77,7 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
                            List<WindowFunctionCall> windowFunctions, List<FunctionCallItem> functionCalls,
                            List<String> columnAliases) {
         this(tableName, columns, where, orderBy, limit, offset, joins, aggregates, groupBy, havingClause,
-             windowFunctions, functionCalls, columnAliases, List.of(), null, null, false, false);
+             windowFunctions, functionCalls, columnAliases, List.of(), null, null, false, false, false);
     }
 
     @Override
@@ -82,30 +96,36 @@ public record SelectStatement(String tableName, List<String> columns, WhereExpr 
     public SelectStatement withWhere(WhereExpr newWhere) {
         return new SelectStatement(tableName, columns, newWhere, orderBy, limit, offset, joins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, forShare);
     }
 
     public SelectStatement withJoins(List<JoinClause> newJoins) {
         return new SelectStatement(tableName, columns, where, orderBy, limit, offset, newJoins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, forShare);
     }
 
     public SelectStatement withJoinsAndWhere(List<JoinClause> newJoins, WhereExpr newWhere) {
         return new SelectStatement(tableName, columns, newWhere, orderBy, limit, offset, newJoins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, forShare);
     }
 
     public SelectStatement withForUpdate(boolean newForUpdate) {
         return new SelectStatement(tableName, columns, where, orderBy, limit, offset, joins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias, newForUpdate, distinct);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, newForUpdate, distinct, forShare);
+    }
+
+    public SelectStatement withForShare(boolean newForShare) {
+        return new SelectStatement(tableName, columns, where, orderBy, limit, offset, joins,
+                                   aggregates, groupBy, havingClause, windowFunctions, functionCalls,
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, newForShare);
     }
 
     public SelectStatement withDistinct(boolean newDistinct) {
         return new SelectStatement(tableName, columns, where, orderBy, limit, offset, joins,
                                    aggregates, groupBy, havingClause, windowFunctions, functionCalls,
-                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, newDistinct);
+                                   columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, newDistinct, forShare);
     }
 }

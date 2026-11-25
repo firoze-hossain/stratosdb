@@ -237,7 +237,7 @@ savepointName: anyIdentifier;
 insert: INSERT INTO tableName (LPAREN columnName (COMMA columnName)* RPAREN)? VALUES LPAREN valueList RPAREN (COMMA LPAREN valueList RPAREN)* returningClause? SEMICOLON?;
 returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
 select: SELECT (ALL | DISTINCT)? selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? forUpdateClause? SEMICOLON?;
-forUpdateClause: FOR UPDATE (NOWAIT)?;
+forUpdateClause: FOR (UPDATE | SHARE) (NOWAIT)?;
 tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: anyIdentifier;
@@ -379,6 +379,7 @@ anyIdentifier: IDENTIFIER
              | ROLE | KEY | ACTION | CASCADE | RESTRICT | PRIMARY | UNIQUE | CHECK
              | NONE | MINVALUE | MAXVALUE | CACHE | CYCLE | RESTART | OWNED | ZONE | WITHOUT | CHARACTER | VARYING
              | BETWEEN
+             | SHARE
              ;
 tableName: (anyIdentifier DOT)? anyIdentifier;
 typeName: anyIdentifier;
@@ -468,6 +469,7 @@ FROM: F R O M;
 WHERE: W H E R E;
 BETWEEN: B E T W E E N;
 UPDATE: U P D A T E;
+SHARE: S H A R E;
 SET: S E T;
 DELETE: D E L E T E;
 ORDER: O R D E R;
