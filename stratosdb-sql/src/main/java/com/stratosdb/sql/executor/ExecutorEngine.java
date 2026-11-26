@@ -4531,7 +4531,18 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     return QueryResult.error("Table not found: " + join.effectiveTargetName());
                 }
 
-                currentOp = new HashJoinOperator(currentOp, joinedOp, join.leftColumn(), join.rightColumn(), join.joinType());
+                WhereExpr filter = join.residualFilter() != null
+                    ? join.residualFilter()
+                    : (join.leftColumns().isEmpty() ? join.onExpression() : null);
+
+                currentOp = new HashJoinOperator(
+                    currentOp,
+                    joinedOp,
+                    join.leftColumns(),
+                    join.rightColumns(),
+                    filter,
+                    join.joinType()
+                );
             }
         }
 
@@ -4988,8 +4999,21 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 if (!tables.containsKey(join.tableName())) {
                     return QueryResult.error("Table not found: " + join.tableName());
                 }
-                sb.append(" -> Seq Scan on ").append(join.tableName())
-                  .append(" ON ").append(join.leftColumn()).append("=").append(join.rightColumn());
+                sb.append(" -> Seq Scan on ").append(join.tableName());
+                if (!join.leftColumns().isEmpty() && !join.rightColumns().isEmpty()) {
+                    sb.append(" ON ");
+                    for (int i = 0; i < join.leftColumns().size(); i++) {
+                        if (i > 0) sb.append(" AND ");
+                        sb.append(join.leftColumns().get(i)).append("=").append(join.rightColumns().get(i));
+                    }
+                    if (join.residualFilter() != null) {
+                        sb.append(" AND ").append(join.residualFilter());
+                    }
+                } else if (join.onExpression() != null) {
+                    sb.append(" ON ").append(join.onExpression());
+                } else if (join.leftColumn() != null && join.rightColumn() != null) {
+                    sb.append(" ON ").append(join.leftColumn()).append("=").append(join.rightColumn());
+                }
             }
             return QueryResult.success(sb.toString());
         }

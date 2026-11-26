@@ -457,7 +457,7 @@ def create_project_plan_excel():
         # Sprint 4 (Month 2, Weeks 7-8)
         ["Sprint 04", "Week 07", "SQL Engine", "Compound & Non-Equi Join Engine",
          "Update grammar and ExecutorEngine to support compound join predicates (ON a.id = b.id AND a.status = b.status) and non-equi comparisons in Hash and Merge Joins.",
-         "High", "P1 - High", "Complex multi-column joins parse and execute correctly; cross-table composite key joins verified.", "Planned"],
+         "High", "P1 - High", "Complex multi-column joins parse and execute correctly; cross-table composite key joins verified.", "Completed"],
         ["Sprint 04", "Week 08", "SQL Engine", "Arbitrary Expression HAVING & DDL",
          "Refactor HAVING clause to evaluate arbitrary boolean expression trees with multiple aggregates. Implement online instant ALTER TABLE for default values and column metadata.",
          "Medium", "P1 - High", "Queries with HAVING COUNT(*) > 1 AND AVG(price) < 50 execute; instant column add requires zero table rewrites.", "Planned"],

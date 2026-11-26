@@ -97,8 +97,7 @@ public class SlottedPage extends Page {
         }
         
         byte[] tuple = new byte[tupleLength];
-        buf.position(tupleOffset);
-        buf.get(tuple);
+        buf.get(tupleOffset, tuple);
         return tuple;
     }
 
@@ -268,8 +267,7 @@ public class SlottedPage extends Page {
         short oldLength = buf.getShort(itemOffset + 4);
         if (oldLength == newData.length) {
             int tupleOffset = buf.getInt(itemOffset);
-            buf.position(tupleOffset);
-            buf.put(newData);
+            buf.put(tupleOffset, newData);
             setDirty(true);
             return true;
         }

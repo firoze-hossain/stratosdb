@@ -1,6 +1,7 @@
 package com.stratosdb.sql.execution;
 
 import com.stratosdb.sql.ast.JoinClause;
+import com.stratosdb.sql.ast.WhereExpr;
 import com.stratosdb.storage.page.Tuple;
 
 import java.util.ArrayList;
@@ -34,11 +35,52 @@ public class NestedLoopJoinOperator implements PhysicalOperator {
                                   String leftColumn,
                                   String rightColumn,
                                   JoinClause.JoinType joinType) {
+        this(left, right,
+             leftColumn != null ? List.of(leftColumn) : List.of(),
+             rightColumn != null ? List.of(rightColumn) : List.of(),
+             null, null, joinType);
+    }
+
+    public NestedLoopJoinOperator(PhysicalOperator left,
+                                  PhysicalOperator right,
+                                  List<String> leftColumns,
+                                  List<String> rightColumns,
+                                  WhereExpr nonEquiFilter,
+                                  BiPredicate<Tuple, Tuple> nonEquiCondition,
+                                  JoinClause.JoinType joinType) {
         this(left, right, (l, r) -> {
-            Object lVal = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(l, leftColumn));
-            Object rVal = JoinUtils.normalizeJoinKey(JoinUtils.findColumnValue(r, rightColumn));
-            return lVal != null && rVal != null && JoinUtils.compareKeys(lVal, rVal) == 0;
+            if (leftColumns != null && rightColumns != null && !leftColumns.isEmpty() && !rightColumns.isEmpty()) {
+                JoinUtils.CompositeKey lKey = JoinUtils.extractCompositeKey(l, leftColumns);
+                JoinUtils.CompositeKey rKey = JoinUtils.extractCompositeKey(r, rightColumns);
+                if (lKey.hasNull() || rKey.hasNull() || !lKey.equals(rKey)) {
+                    return false;
+                }
+            }
+            if (nonEquiFilter != null && !JoinUtils.evaluateJoinCondition(l, r, nonEquiFilter)) {
+                return false;
+            }
+            if (nonEquiCondition != null && !nonEquiCondition.test(l, r)) {
+                return false;
+            }
+            return true;
         }, joinType);
+    }
+
+    public NestedLoopJoinOperator(PhysicalOperator left,
+                                  PhysicalOperator right,
+                                  List<String> leftColumns,
+                                  List<String> rightColumns,
+                                  WhereExpr nonEquiFilter,
+                                  JoinClause.JoinType joinType) {
+        this(left, right, leftColumns, rightColumns, nonEquiFilter, null, joinType);
+    }
+
+    public NestedLoopJoinOperator(PhysicalOperator left,
+                                  PhysicalOperator right,
+                                  List<String> leftColumns,
+                                  List<String> rightColumns,
+                                  JoinClause.JoinType joinType) {
+        this(left, right, leftColumns, rightColumns, null, null, joinType);
     }
 
     public NestedLoopJoinOperator(PhysicalOperator left,

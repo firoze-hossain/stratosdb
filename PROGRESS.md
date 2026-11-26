@@ -2157,6 +2157,70 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - All 11 concurrency integration tests verified **11/11 passing**.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 03 Week 06 marked `Completed`.
 
+## Sprint 04 Week 07 — SQL Engine: Compound & Non-Equi Join Engine ✅ DONE
+
+- ✅ **SQL Grammar & Lexer Modernization**:
+  - Updated ANTLR4 grammar [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4): refactored `joinClause` from legacy single-equality `ON (col = col)` syntax to full expression support: `(joinType)? JOIN tableSource (ON expression)?`.
+  - Enables compound join predicates linked by `AND` (e.g. `ON a.id = b.id AND a.tenant = b.tenant`), parenthesized join conditions, non-equi join predicates (`<`, `<=`, `>`, `>=`, `!=`, `<>`), and `CROSS JOIN` without an `ON` clause.
+
+- ✅ **AST & Parser Equi/Residual Decomposition**:
+  - Refactored [`JoinClause`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/JoinClause.java) record to carry `List<String> leftColumns`, `List<String> rightColumns`, `List<String> operators`, `WhereExpr onExpression`, and `WhereExpr residualFilter` while maintaining full backward-compatible accessor methods (`leftColumn()`, `rightColumn()`).
+  - Added multi-column predicate classification helpers: `hasCompoundPredicates()` and `hasNonEquiPredicates()`.
+  - Upgraded [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java): implemented `extractEquiAndResidual`, partitioning arbitrary join expressions into primary equi-join keys (`leftColumns`, `rightColumns`) and secondary `residualFilter` predicates.
+  - Implemented automatic left/right table alias and column alignment (`belongsToTable`), correctly orienting outer vs joined columns regardless of query operand order (e.g. `ON b.id = a.id`).
+
+- ✅ **Multi-Column Composite Key Infrastructure**:
+  - Added static [`CompositeKey`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/JoinUtils.java) in `JoinUtils` supporting array value hashing, deep equality, and `hasNull()` detection.
+  - Implemented `extractCompositeKey(Tuple, List<String>)` with normalized types (e.g. `Number` normalization for cross-type integer/long/double matching).
+  - Implemented `compareCompositeKeys(Tuple, List<String>, Tuple, List<String>)` for multi-key lexicographical ordering.
+  - Implemented `evaluateJoinCondition(Tuple left, Tuple right, WhereExpr)` to evaluate compound expressions across both sides of a join tuple pair.
+
+- ✅ **HashJoinOperator Multi-Column & Non-Equi Engine**:
+  - Refactored [`HashJoinOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/HashJoinOperator.java) build phase to index using `CompositeKey`.
+  - Added candidate filtering against `nonEquiFilter` and `nonEquiCondition`.
+  - Added pure non-equi join execution fallback (`allBuildTuples` scanning) for queries without equi-keys.
+  - Preserved streaming execution and full support for `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `SEMI`, and `ANTI` joins.
+
+- ✅ **MergeJoinOperator Multi-Column & Non-Equi Engine**:
+  - Refactored [`MergeJoinOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/MergeJoinOperator.java) to advance and match sorted streams using composite keys (`compareCompositeKeys`).
+  - Added candidate filtering in runs against `testCondition(currentLeft, r)`.
+  - Fixed run boundary transitions and right-unmatched tuple preservation for `RIGHT` and `FULL` outer joins.
+  - Added pure non-equi merge join fallback (`nextPureNonEqui()`).
+
+- ✅ **NestedLoopJoinOperator & Cost-Based Optimizer Integration**:
+  - Updated [`NestedLoopJoinOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/NestedLoopJoinOperator.java) with composite key constructors and arbitrary `WhereExpr nonEquiFilter`.
+  - Updated [`JoinPlanNode`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/optimizer/JoinPlanNode.java) and [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java) to wire multi-column join keys and filters through physical plan generation and `EXPLAIN` visualization.
+
+- ✅ **Buffer Frame Concurrency Hardening**:
+  - Fixed read-concurrency safety in [`SlottedPage`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/page/SlottedPage.java): replaced relative `buf.position(offset); buf.get(tuple);` with absolute index access `buf.get(tupleOffset, tuple)`, guaranteeing absolute thread safety for concurrent readers under virtual threads without mutating shared buffer positions.
+
+- ✅ **Comprehensive Test Suite & Verification**:
+  - Authored [`CompoundAndNonEquiJoinParserTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/test/java/com/stratosdb/sql/parser/CompoundAndNonEquiJoinParserTest.java) (8 unit tests in `stratosdb-sql`):
+    1. `testSingleEquiJoin`: Single equi-key join parsing.
+    2. `testCompoundEquiJoinWithAnd`: 2-column compound equi-join parsing.
+    3. `testThreeColumnCompoundEquiJoin`: 3-column compound equi-join parsing.
+    4. `testCompoundJoinWithNonEquiInequality`: Equi-join combined with `>=` inequality residual filter.
+    5. `testPureNonEquiJoin`: Cross-table pure non-equi join parsing (`a.salary > b.threshold`).
+    6. `testCompoundJoinWithParentheses`: Parenthesized compound join expression parsing.
+    7. `testCrossJoinWithoutOnClause`: Cartesian product `CROSS JOIN` without `ON`.
+    8. `testReversedTableOperandsInOnClause`: Inverted operand column alignment (`ON b.id = a.id`).
+  - Authored [`CompoundAndNonEquiJoinIntegrationTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/CompoundAndNonEquiJoinIntegrationTest.java) (11 integration tests in `stratosdb-testing`):
+    1. `testCompoundInnerJoinTwoColumns`: 2-column composite key inner join.
+    2. `testCompoundLeftOuterJoinTwoColumns`: 2-column composite key left outer join with null padding.
+    3. `testCompoundRightOuterJoinTwoColumns`: 2-column composite key right outer join.
+    4. `testCompoundFullOuterJoinTwoColumns`: 2-column composite key full outer join.
+    5. `testCompoundJoinWithNonEquiInequality`: Equi-key plus non-equi inequality condition.
+    6. `testPureNonEquiJoinInequality`: Cross-table pure non-equi join execution.
+    7. `testThreeWayCompositeKeyJoin`: 3-table multi-column composite key join chain.
+    8. `testCompoundJoinWithWhereOrderByAndLimit`: Compound join combined with `WHERE`, `ORDER BY`, and `LIMIT/OFFSET`.
+    9. `testMergeJoinOperatorWithCompositeKeysAndNonEqui`: Direct operator verification of `MergeJoinOperator`.
+    10. `testHashJoinOperatorWithCompositeKeysAndNonEqui`: Direct operator verification of `HashJoinOperator`.
+    11. `testConcurrentCompoundJoinsUnderVirtualThreads`: 32 concurrent virtual threads running 800 compound join queries under load.
+  - Regression tested [`StreamingJoinOperatorsTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/StreamingJoinOperatorsTest.java) (9/9 passing).
+  - All 28 join parser and integration tests verified **28/28 passing**.
+  - All 44 `stratosdb-sql` tests verified **44/44 passing**.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 04 Week 07 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

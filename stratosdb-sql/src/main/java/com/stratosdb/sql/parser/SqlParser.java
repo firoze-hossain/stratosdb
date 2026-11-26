@@ -868,9 +868,6 @@ public class SqlParser {
             }
         }
 
-        List<StratosSQLParser.ColumnNameContext> columns = ctx.columnName();
-        String leftColumn = cleanColumnName(columns.get(0).getText());
-        String rightColumn = cleanColumnName(columns.get(1).getText());
         JoinClause.JoinType joinType = JoinClause.JoinType.INNER;
         if (ctx.joinType() != null) {
             if (ctx.joinType().LEFT() != null) {
@@ -887,7 +884,87 @@ public class SqlParser {
                 joinType = JoinClause.JoinType.ANTI;
             }
         }
-        return new JoinClause(tableName, leftColumn, rightColumn, joinType, subquery, tableAlias);
+
+        WhereExpr onExpr = null;
+        List<String> leftCols = new ArrayList<>();
+        List<String> rightCols = new ArrayList<>();
+        List<String> ops = new ArrayList<>();
+        List<WhereExpr> residuals = new ArrayList<>();
+
+        if (ctx.expression() != null) {
+            onExpr = buildWhereExpr(ctx.expression());
+            String targetName = tableAlias != null ? tableAlias : tableName;
+            extractEquiAndResidual(onExpr, targetName, leftCols, rightCols, ops, residuals);
+        }
+
+        WhereExpr residualFilter = combineResiduals(residuals);
+
+        return new JoinClause(
+            tableName,
+            leftCols,
+            rightCols,
+            joinType,
+            subquery,
+            tableAlias,
+            onExpr,
+            ops,
+            residualFilter
+        );
+    }
+
+    private void extractEquiAndResidual(WhereExpr expr,
+                                       String targetName,
+                                       List<String> leftCols,
+                                       List<String> rightCols,
+                                       List<String> ops,
+                                       List<WhereExpr> residuals) {
+        if (expr == null) return;
+        if (expr instanceof WhereExpr.And and) {
+            extractEquiAndResidual(and.left(), targetName, leftCols, rightCols, ops, residuals);
+            extractEquiAndResidual(and.right(), targetName, leftCols, rightCols, ops, residuals);
+            return;
+        }
+
+        if (expr instanceof WhereExpr.ColumnComparison cmp) {
+            if ("=".equals(cmp.operator())) {
+                String c1 = cmp.leftColumn();
+                String c2 = cmp.rightColumn();
+                boolean c1Target = belongsToTable(c1, targetName);
+                boolean c2Target = belongsToTable(c2, targetName);
+
+                if (c1Target && !c2Target) {
+                    leftCols.add(c2);
+                    rightCols.add(c1);
+                    ops.add("=");
+                } else {
+                    leftCols.add(c1);
+                    rightCols.add(c2);
+                    ops.add("=");
+                }
+                return;
+            }
+        }
+
+        // Non-equi or complex predicate
+        residuals.add(expr);
+    }
+
+    private boolean belongsToTable(String colName, String targetName) {
+        if (colName == null || targetName == null) return false;
+        if (colName.contains(".")) {
+            String prefix = colName.substring(0, colName.lastIndexOf('.'));
+            return prefix.equalsIgnoreCase(targetName);
+        }
+        return false;
+    }
+
+    private WhereExpr combineResiduals(List<WhereExpr> residuals) {
+        if (residuals == null || residuals.isEmpty()) return null;
+        WhereExpr combined = residuals.get(0);
+        for (int i = 1; i < residuals.size(); i++) {
+            combined = new WhereExpr.And(combined, residuals.get(i));
+        }
+        return combined;
     }
 
     private DeleteStatement buildDelete(StratosSQLParser.DeleteContext ctx) {

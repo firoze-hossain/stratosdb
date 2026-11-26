@@ -1,13 +1,17 @@
 package com.stratosdb.sql.execution;
 
+import com.stratosdb.sql.ast.WhereExpr;
 import com.stratosdb.storage.page.Tuple;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Shared utility operations for streaming join operators (tuple merging,
- * key normalization, key comparison, column lookup, and outer-join null padding).
+ * key normalization, key comparison, column lookup, outer-join null padding,
+ * composite key handling, and compound/non-equi join condition evaluation).
  */
 public final class JoinUtils {
 
@@ -92,6 +96,206 @@ public final class JoinUtils {
             return Double.compare(na.doubleValue(), nb.doubleValue());
         }
         return ((Comparable) a).compareTo(b);
+    }
+
+    /**
+     * Composite join key holding normalized values for multi-column join predicates.
+     */
+    public static final class CompositeKey {
+        private final Object[] values;
+        private final int hashCode;
+        private final boolean hasNull;
+
+        public CompositeKey(Object[] values) {
+            this.values = values != null ? values : new Object[0];
+            int h = 1;
+            boolean nullFound = false;
+            for (Object v : this.values) {
+                if (v == null) {
+                    nullFound = true;
+                    h = 31 * h;
+                } else {
+                    h = 31 * h + v.hashCode();
+                }
+            }
+            this.hashCode = h;
+            this.hasNull = nullFound;
+        }
+
+        public Object[] getValues() {
+            return values;
+        }
+
+        public boolean hasNull() {
+            return hasNull;
+        }
+
+        public int size() {
+            return values.length;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof CompositeKey other)) return false;
+            if (values.length != other.values.length) return false;
+            for (int i = 0; i < values.length; i++) {
+                Object a = values[i];
+                Object b = other.values[i];
+                if (a == null || b == null) {
+                    if (a != b) return false;
+                } else if (!Objects.equals(a, b)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        @Override
+        public int hashCode() {
+            return hashCode;
+        }
+
+        @Override
+        public String toString() {
+            return Arrays.toString(values);
+        }
+    }
+
+    public static CompositeKey extractCompositeKey(Tuple tuple, List<String> columns) {
+        if (tuple == null || columns == null || columns.isEmpty()) {
+            return new CompositeKey(new Object[0]);
+        }
+        Object[] vals = new Object[columns.size()];
+        for (int i = 0; i < columns.size(); i++) {
+            Object raw = findColumnValue(tuple, columns.get(i));
+            vals[i] = normalizeJoinKey(raw);
+        }
+        return new CompositeKey(vals);
+    }
+
+    public static int compareCompositeKeys(Tuple leftTuple, List<String> leftColumns,
+                                           Tuple rightTuple, List<String> rightColumns) {
+        if (leftColumns == null || rightColumns == null) return 0;
+        int count = Math.min(leftColumns.size(), rightColumns.size());
+        for (int i = 0; i < count; i++) {
+            Object lVal = normalizeJoinKey(findColumnValue(leftTuple, leftColumns.get(i)));
+            Object rVal = normalizeJoinKey(findColumnValue(rightTuple, rightColumns.get(i)));
+            if (lVal == null && rVal == null) continue;
+            if (lVal == null) return -1;
+            if (rVal == null) return 1;
+            int cmp = compareKeys(lVal, rVal);
+            if (cmp != 0) return cmp;
+        }
+        return Integer.compare(leftColumns.size(), rightColumns.size());
+    }
+
+    public static Object resolveTupleValue(Tuple left, Tuple right, String colName) {
+        if (colName == null) return null;
+        if (colName.contains(".")) {
+            int dot = colName.lastIndexOf('.');
+            String prefix = colName.substring(0, dot).toLowerCase();
+            if (left != null && tupleMatchesPrefix(left, prefix)) {
+                Object val = findColumnValue(left, colName);
+                if (val != null) return val;
+            }
+            if (right != null && tupleMatchesPrefix(right, prefix)) {
+                Object val = findColumnValue(right, colName);
+                if (val != null) return val;
+            }
+            if (left != null) {
+                Object val = findColumnValue(left, colName);
+                if (val != null) return val;
+            }
+            if (right != null) {
+                return findColumnValue(right, colName);
+            }
+            return null;
+        }
+        if (left != null) {
+            Object val = findColumnValue(left, colName);
+            if (val != null) return val;
+        }
+        if (right != null) {
+            return findColumnValue(right, colName);
+        }
+        return null;
+    }
+
+    private static boolean tupleMatchesPrefix(Tuple tuple, String prefix) {
+        if (tuple == null) return false;
+        if (tuple.getTableName() != null && tuple.getTableName().equalsIgnoreCase(prefix)) {
+            return true;
+        }
+        List<String> names = tuple.getColumnNames();
+        if (names != null) {
+            for (String n : names) {
+                if (n.toLowerCase().startsWith(prefix + ".")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public static Object parseLiteralValue(String literalText) {
+        if (literalText == null) return null;
+        String s = literalText.trim();
+        if (s.startsWith("'") && s.endsWith("'") && s.length() >= 2) {
+            return s.substring(1, s.length() - 1).replace("''", "'");
+        }
+        if ("true".equalsIgnoreCase(s)) return Boolean.TRUE;
+        if ("false".equalsIgnoreCase(s)) return Boolean.FALSE;
+        if ("null".equalsIgnoreCase(s)) return null;
+        try {
+            if (s.contains(".")) {
+                return Double.parseDouble(s);
+            } else {
+                return Long.parseLong(s);
+            }
+        } catch (NumberFormatException ignored) {}
+        return s;
+    }
+
+    public static boolean compareValues(Object a, String operator, Object b) {
+        if (a == null || b == null) return false;
+        int cmp = compareKeys(normalizeJoinKey(a), normalizeJoinKey(b));
+        return switch (operator) {
+            case "=", "==" -> cmp == 0;
+            case "!=", "<>" -> cmp != 0;
+            case ">" -> cmp > 0;
+            case ">=" -> cmp >= 0;
+            case "<" -> cmp < 0;
+            case "<=" -> cmp <= 0;
+            default -> false;
+        };
+    }
+
+    public static boolean evaluateJoinCondition(Tuple left, Tuple right, WhereExpr expr) {
+        if (expr == null) return true;
+        if (expr instanceof WhereExpr.BooleanLiteral bool) {
+            return bool.value();
+        }
+        if (expr instanceof WhereExpr.And and) {
+            return evaluateJoinCondition(left, right, and.left()) && evaluateJoinCondition(left, right, and.right());
+        }
+        if (expr instanceof WhereExpr.Or or) {
+            return evaluateJoinCondition(left, right, or.left()) || evaluateJoinCondition(left, right, or.right());
+        }
+        if (expr instanceof WhereExpr.Not not) {
+            return !evaluateJoinCondition(left, right, not.inner());
+        }
+        if (expr instanceof WhereExpr.ColumnComparison colCmp) {
+            Object lVal = resolveTupleValue(left, right, colCmp.leftColumn());
+            Object rVal = resolveTupleValue(left, right, colCmp.rightColumn());
+            return lVal != null && rVal != null && compareValues(lVal, colCmp.operator(), rVal);
+        }
+        if (expr instanceof WhereExpr.Comparison cmp) {
+            Object val = resolveTupleValue(left, right, cmp.column());
+            Object lit = parseLiteralValue(cmp.literal());
+            return val != null && lit != null && compareValues(val, cmp.operator(), lit);
+        }
+        return true;
     }
 
     public static Tuple qualify(Tuple tuple, String tableName) {

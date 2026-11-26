@@ -1,6 +1,7 @@
 package com.stratosdb.sql.optimizer;
 
 import com.stratosdb.sql.ast.JoinClause;
+import com.stratosdb.sql.ast.WhereExpr;
 import com.stratosdb.sql.execution.*;
 import com.stratosdb.sql.executor.ExecutorEngine;
 import com.stratosdb.transaction.Transaction;
@@ -9,6 +10,7 @@ import java.util.*;
 
 /**
  * Join plan node representing a 2-way join between two subplans.
+ * Supports multi-column composite equi-keys and residual non-equi filters.
  */
 public class JoinPlanNode implements PlanNode {
     public enum JoinAlgorithm {
@@ -21,8 +23,9 @@ public class JoinPlanNode implements PlanNode {
     private final PlanNode right;
     private final JoinAlgorithm algorithm;
     private final JoinClause.JoinType joinType;
-    private final String leftColumn;
-    private final String rightColumn;
+    private final List<String> leftColumns;
+    private final List<String> rightColumns;
+    private final WhereExpr nonEquiFilter;
     private final boolean buildOnRight;
     private final double cost;
     private final double estimatedRows;
@@ -33,8 +36,9 @@ public class JoinPlanNode implements PlanNode {
                         PlanNode right,
                         JoinAlgorithm algorithm,
                         JoinClause.JoinType joinType,
-                        String leftColumn,
-                        String rightColumn,
+                        List<String> leftColumns,
+                        List<String> rightColumns,
+                        WhereExpr nonEquiFilter,
                         boolean buildOnRight,
                         double cost,
                         double estimatedRows,
@@ -43,8 +47,9 @@ public class JoinPlanNode implements PlanNode {
         this.right = right;
         this.algorithm = algorithm;
         this.joinType = joinType != null ? joinType : JoinClause.JoinType.INNER;
-        this.leftColumn = leftColumn;
-        this.rightColumn = rightColumn;
+        this.leftColumns = leftColumns != null ? List.copyOf(leftColumns) : List.of();
+        this.rightColumns = rightColumns != null ? List.copyOf(rightColumns) : List.of();
+        this.nonEquiFilter = nonEquiFilter;
         this.buildOnRight = buildOnRight;
         this.cost = cost;
         this.estimatedRows = estimatedRows;
@@ -56,12 +61,31 @@ public class JoinPlanNode implements PlanNode {
         this.coveredTables = Collections.unmodifiableSet(tables);
     }
 
+    public JoinPlanNode(PlanNode left,
+                        PlanNode right,
+                        JoinAlgorithm algorithm,
+                        JoinClause.JoinType joinType,
+                        String leftColumn,
+                        String rightColumn,
+                        boolean buildOnRight,
+                        double cost,
+                        double estimatedRows,
+                        List<String> outputColumns) {
+        this(left, right, algorithm, joinType,
+             leftColumn != null ? List.of(leftColumn) : List.of(),
+             rightColumn != null ? List.of(rightColumn) : List.of(),
+             null, buildOnRight, cost, estimatedRows, outputColumns);
+    }
+
     public PlanNode getLeft() { return left; }
     public PlanNode getRight() { return right; }
     public JoinAlgorithm getAlgorithm() { return algorithm; }
     public JoinClause.JoinType getJoinType() { return joinType; }
-    public String getLeftColumn() { return leftColumn; }
-    public String getRightColumn() { return rightColumn; }
+    public String getLeftColumn() { return !leftColumns.isEmpty() ? leftColumns.get(0) : null; }
+    public String getRightColumn() { return !rightColumns.isEmpty() ? rightColumns.get(0) : null; }
+    public List<String> getLeftColumns() { return leftColumns; }
+    public List<String> getRightColumns() { return rightColumns; }
+    public WhereExpr getNonEquiFilter() { return nonEquiFilter; }
     public boolean isBuildOnRight() { return buildOnRight; }
 
     @Override
@@ -94,8 +118,15 @@ public class JoinPlanNode implements PlanNode {
         };
         sb.append(indent).append(algoName)
           .append(String.format(" (cost=%.1f rows=%.0f)", cost, estimatedRows));
-        if (leftColumn != null && rightColumn != null) {
-            sb.append(" ON ").append(leftColumn).append("=").append(rightColumn);
+        if (!leftColumns.isEmpty() && !rightColumns.isEmpty()) {
+            sb.append(" ON ");
+            for (int i = 0; i < leftColumns.size(); i++) {
+                if (i > 0) sb.append(" AND ");
+                sb.append(leftColumns.get(i)).append("=").append(rightColumns.get(i));
+            }
+            if (nonEquiFilter != null) {
+                sb.append(" AND ").append(nonEquiFilter);
+            }
         }
         sb.append("\n");
         sb.append(left.explain(indent + "  ")).append("\n");
@@ -104,7 +135,6 @@ public class JoinPlanNode implements PlanNode {
     }
 
     public String toCompactString() {
-        // e.g. "Hash Join (cost=291.6 rows=10000): Seq Scan on countries -> Seq Scan on customers -> Seq Scan on orders ON ..."
         List<String> scanDescriptions = new ArrayList<>();
         collectScans(this, scanDescriptions);
         String algoName = switch (algorithm) {
@@ -115,8 +145,15 @@ public class JoinPlanNode implements PlanNode {
         StringBuilder sb = new StringBuilder();
         sb.append(algoName).append(String.format(" (cost=%.1f rows=%.0f): ", cost, estimatedRows));
         sb.append(String.join(" -> ", scanDescriptions));
-        if (leftColumn != null && rightColumn != null) {
-            sb.append(" ON ").append(leftColumn).append("=").append(rightColumn);
+        if (!leftColumns.isEmpty() && !rightColumns.isEmpty()) {
+            sb.append(" ON ");
+            for (int i = 0; i < leftColumns.size(); i++) {
+                if (i > 0) sb.append(" AND ");
+                sb.append(leftColumns.get(i)).append("=").append(rightColumns.get(i));
+            }
+            if (nonEquiFilter != null) {
+                sb.append(" AND ").append(nonEquiFilter);
+            }
         }
         return sb.toString();
     }
@@ -142,15 +179,15 @@ public class JoinPlanNode implements PlanNode {
 
         if (algorithm == JoinAlgorithm.HASH) {
             if (buildOnRight) {
-                return new HashJoinOperator(leftOp, rightOp, leftColumn, rightColumn, joinType);
+                return new HashJoinOperator(leftOp, rightOp, leftColumns, rightColumns, nonEquiFilter, joinType);
             } else {
                 // Swap so build side is right internally
-                return new HashJoinOperator(rightOp, leftOp, rightColumn, leftColumn, joinType);
+                return new HashJoinOperator(rightOp, leftOp, rightColumns, leftColumns, nonEquiFilter, joinType);
             }
         } else if (algorithm == JoinAlgorithm.MERGE) {
-            return new MergeJoinOperator(leftOp, rightOp, leftColumn, rightColumn, joinType);
+            return new MergeJoinOperator(leftOp, rightOp, leftColumns, rightColumns, nonEquiFilter, joinType);
         } else {
-            return new NestedLoopJoinOperator(leftOp, rightOp, leftColumn, rightColumn, joinType);
+            return new NestedLoopJoinOperator(leftOp, rightOp, leftColumns, rightColumns, nonEquiFilter, joinType);
         }
     }
 

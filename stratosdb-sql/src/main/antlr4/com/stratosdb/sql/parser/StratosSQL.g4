@@ -241,7 +241,7 @@ forUpdateClause: FOR (UPDATE | SHARE) (NOWAIT)?;
 tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;
 selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
 cteName: anyIdentifier;
-joinClause: (joinType)? JOIN tableSource ON LPAREN? columnName ASSIGN columnName RPAREN?;
+joinClause: (joinType)? JOIN tableSource (ON expression)?;
 
 joinType: INNER
         | LEFT OUTER?
