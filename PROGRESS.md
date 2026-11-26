@@ -2221,6 +2221,50 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - All 44 `stratosdb-sql` tests verified **44/44 passing**.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 04 Week 07 marked `Completed`.
 
+## Sprint 04 Week 08 — SQL Engine: Arbitrary Expression HAVING & DDL ✅ DONE
+
+- ✅ **SQL Grammar Modernization for Arbitrary HAVING Expressions**:
+  - Refactored ANTLR4 grammar [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4) to replace the legacy flat `aggregateFunction op literal` HAVING rule with a recursive `havingClause: havingExpression;` hierarchy.
+  - Implemented full boolean expression grammar: `#HavingParenExpr` (`( expr )`), `#HavingNotExpr` (`NOT expr`), `#HavingCompare` (`operand op operand`), `#HavingAndExpr` (`expr AND expr`), and `#HavingOrExpr` (`expr OR expr`).
+  - Added rich `havingOperand` rule supporting `#HavingAggOperand` (aggregates like `COUNT(*)`, `AVG(price)`), `#HavingColOperand` (grouping columns like `department`), and `#HavingLitOperand` (literals like `1`, `50.0`, `'engineering'`).
+
+- ✅ **AST & Parser Expression Tree & Auxiliary Aggregates**:
+  - Updated [`SelectStatement`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/SelectStatement.java) record with `WhereExpr havingExpr` and `List<AggregateCall> havingAggregates`, while retaining `allAggregates()` to represent the union of SELECT and HAVING aggregates without duplicate computations.
+  - Modernized [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java): implemented `buildHavingExpr`, `collectHavingAggregates`, `parseHavingOperand`, `invertComparisonOp`, `compareLiterals`, and `checkAndAddHavingAggOperand`.
+  - Supports arbitrary left/right operand orientations (e.g. `HAVING 50 > AVG(price)` inverts to `AVG(price) < 50`), comparing two aggregates (`MAX(x) > MIN(y)`), and referencing grouping columns alongside aggregates.
+
+- ✅ **Execution Operators & Having Evaluation Engine**:
+  - Updated [`SortAndAggregateUtils`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/SortAndAggregateUtils.java): implemented recursive `evaluateHaving(WhereExpr, Map<String, Object>, Tuple)`, `resolveHavingOperandValue`, and type-aware numeric/string comparison (`compareHavingValues`).
+  - Updated [`HashAggregateOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/HashAggregateOperator.java) and [`StreamAggregateOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/StreamAggregateOperator.java):
+    - Accumulated all aggregates (`allAggregates`), properly capturing hidden auxiliary HAVING aggregates that are not projected in the final `SELECT` list.
+    - Evaluated `havingExpr` against computed aggregate results and group columns, seamlessly discarding non-matching groups before projection.
+  - Updated [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java) across simple table queries, joined queries, and derived tables.
+
+- ✅ **Instant Online ALTER TABLE (O(1) Zero Table Rewrites)**:
+  - Enhanced binary tuple layout in [`Tuple.java`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/page/Tuple.java): tracked `storedColumnCount` during deserialization (`deserializeNewFormat` and `deserializeLegacyFormat`), null-padding tuples whose stored columns are fewer than the current schema.
+  - Refactored [`ExecutorEngine.java`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java):
+    - Completely removed physical disk table rewrites (`rewriteAllRows`) from `executeAlterTableAddColumn`.
+    - Online $O(1)$ schema mutation: registers column and its default value in `tableColumnDefaults` / `tableColumnTypes` in memory and catalogs instantly.
+    - Tuple deserialization dynamically supplies default values for unwritten columns (`i >= storedCols`) on the fly when reading existing disk pages, achieving true zero-IO instant DDL.
+
+- ✅ **Comprehensive Test Suite & Verification**:
+  - Authored [`ArbitraryHavingParserTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/test/java/com/stratosdb/sql/parser/ArbitraryHavingParserTest.java) (7 unit tests in `stratosdb-sql`): **7/7 passing**.
+  - Authored [`HavingClauseAndInstantDdlTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/HavingClauseAndInstantDdlTest.java) (10 integration tests in `stratosdb-testing`): **10/10 passing**:
+    1. `testDoDQueriesWithHavingCountAndAvg`: Verifies DoD `HAVING COUNT(*) > 1 AND AVG(price) < 50`.
+    2. `testHavingAggregatesNotInSelectList`: Aggregates in HAVING omitted from SELECT projected columns.
+    3. `testArbitraryHavingWithOrAndNot`: Compound boolean tree with `OR`, `AND`, `NOT`.
+    4. `testHavingGroupByColumnAndAggregate`: Filter combining group-by column and aggregate.
+    5. `testHavingCompareTwoAggregates`: Comparing two aggregates (`MAX > MIN`).
+    6. `testInstantAlterTableAddColumnZeroTableRewrites`: 1,000 rows, instant execution (< 50ms), zero physical table rewrites.
+    7. `testInstantAlterTableMultipleColumnsAndDefaults`: INT defaults, NULL defaults, SET DEFAULT, DROP DEFAULT.
+    8. `testStreamAggregateOperatorArbitraryHaving`: Direct `StreamAggregateOperator` verification.
+    9. `testVirtualThreadsConcurrentHavingAndDdl`: 32 concurrent virtual threads running arbitrary HAVING queries, inserts, and instant ALTER TABLE.
+    10. `testArbitraryHavingCombinedWithJoinWhereOrderByLimit`: End-to-end full SQL query pipeline verification.
+  - All 51 `stratosdb-sql` tests verified **51/51 passing**.
+  - All 23 `stratosdb-storage` tests verified **23/23 passing**.
+  - Key regression tests in `stratosdb-testing`: **42/42 passing**.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 04 Week 08 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

@@ -767,7 +767,14 @@ public class SqlParser {
             }
         }
 
-        String havingClause = ctx.havingClause() != null ? ctx.havingClause().getText() : null;
+        WhereExpr havingExpr = null;
+        List<AggregateCall> havingAggregates = new ArrayList<>();
+        String havingClause = null;
+        if (ctx.havingClause() != null) {
+            havingClause = ctx.havingClause().getText();
+            havingExpr = buildHavingExpr(ctx.havingClause().havingExpression());
+            collectHavingAggregates(ctx.havingClause().havingExpression(), havingAggregates);
+        }
         WhereExpr where = buildWhereExpr(ctx.expression());
         String limit = ctx.limitValue() != null ? ctx.limitValue().getText() : null;
         String offset = ctx.offsetValue() != null ? ctx.offsetValue().getText() : null;
@@ -792,7 +799,7 @@ public class SqlParser {
             }
         }
         boolean distinct = ctx.DISTINCT() != null;
-        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, forShare);
+        return new SelectStatement(tableName, columns, where, orderByText, limit, offset, joins, aggregates, groupBy, havingClause, windowFunctions, functionCalls, columnAliases, orderItems, fromSubquery, tableAlias, forUpdate, distinct, forShare, havingExpr, havingAggregates);
     }
 
     private IsolationLevel parseIsolationLevel(StratosSQLParser.IsolationLevelContext ctx) {
@@ -849,6 +856,131 @@ public class SqlParser {
         String argument = ctx.STAR() != null ? "*" : cleanColumnName(ctx.columnName().getText());
         boolean distinct = ctx.DISTINCT() != null;
         return new AggregateCall(function, argument, alias, distinct);
+    }
+
+    private WhereExpr buildHavingExpr(StratosSQLParser.HavingExpressionContext ctx) {
+        if (ctx == null) {
+            return null;
+        }
+        if (ctx instanceof StratosSQLParser.HavingParenExprContext c) {
+            return buildHavingExpr(c.havingExpression());
+        }
+        if (ctx instanceof StratosSQLParser.HavingNotExprContext c) {
+            return new WhereExpr.Not(buildHavingExpr(c.havingExpression()));
+        }
+        if (ctx instanceof StratosSQLParser.HavingAndExprContext c) {
+            return new WhereExpr.And(buildHavingExpr(c.havingExpression(0)), buildHavingExpr(c.havingExpression(1)));
+        }
+        if (ctx instanceof StratosSQLParser.HavingOrExprContext c) {
+            return new WhereExpr.Or(buildHavingExpr(c.havingExpression(0)), buildHavingExpr(c.havingExpression(1)));
+        }
+        if (ctx instanceof StratosSQLParser.HavingCompareContext c) {
+            String op = c.op.getText();
+            HavingOperandInfo left = parseHavingOperand(c.havingOperand(0));
+            HavingOperandInfo right = parseHavingOperand(c.havingOperand(1));
+
+            if (left.isLiteral && right.isLiteral) {
+                boolean result = compareLiterals(left.name, right.name, op);
+                return new WhereExpr.BooleanLiteral(result);
+            }
+            if (left.isLiteral && !right.isLiteral) {
+                String invertedOp = invertComparisonOp(op);
+                return new WhereExpr.Comparison(right.name, invertedOp, left.name);
+            }
+            if (!left.isLiteral && right.isLiteral) {
+                return new WhereExpr.Comparison(left.name, op, right.name);
+            }
+            return new WhereExpr.ColumnComparison(left.name, op, right.name);
+        }
+        return null;
+    }
+
+    private static class HavingOperandInfo {
+        final String name;
+        final boolean isLiteral;
+        HavingOperandInfo(String name, boolean isLiteral) {
+            this.name = name;
+            this.isLiteral = isLiteral;
+        }
+    }
+
+    private HavingOperandInfo parseHavingOperand(StratosSQLParser.HavingOperandContext ctx) {
+        if (ctx instanceof StratosSQLParser.HavingAggOperandContext c) {
+            AggregateCall agg = buildAggregateCall(c.aggregateFunction(), null);
+            return new HavingOperandInfo(agg.canonicalForm(), false);
+        }
+        if (ctx instanceof StratosSQLParser.HavingColOperandContext c) {
+            return new HavingOperandInfo(cleanColumnName(c.columnName().getText()), false);
+        }
+        if (ctx instanceof StratosSQLParser.HavingLitOperandContext c) {
+            return new HavingOperandInfo(c.literal().getText(), true);
+        }
+        return new HavingOperandInfo(ctx.getText(), false);
+    }
+
+    private String invertComparisonOp(String op) {
+        return switch (op) {
+            case ">" -> "<";
+            case "<" -> ">";
+            case ">=" -> "<=";
+            case "<=" -> ">=";
+            default -> op;
+        };
+    }
+
+    private boolean compareLiterals(String left, String right, String op) {
+        try {
+            double l = Double.parseDouble(left);
+            double r = Double.parseDouble(right);
+            return switch (op) {
+                case "=" -> l == r;
+                case "!=" -> l != r;
+                case ">" -> l > r;
+                case ">=" -> l >= r;
+                case "<" -> l < r;
+                case "<=" -> l <= r;
+                default -> false;
+            };
+        } catch (NumberFormatException ignored) {
+            int cmp = left.compareTo(right);
+            return switch (op) {
+                case "=" -> cmp == 0;
+                case "!=" -> cmp != 0;
+                case ">" -> cmp > 0;
+                case ">=" -> cmp >= 0;
+                case "<" -> cmp < 0;
+                case "<=" -> cmp <= 0;
+                default -> false;
+            };
+        }
+    }
+
+    private void collectHavingAggregates(StratosSQLParser.HavingExpressionContext ctx, List<AggregateCall> list) {
+        if (ctx == null) return;
+        if (ctx instanceof StratosSQLParser.HavingParenExprContext c) {
+            collectHavingAggregates(c.havingExpression(), list);
+        } else if (ctx instanceof StratosSQLParser.HavingNotExprContext c) {
+            collectHavingAggregates(c.havingExpression(), list);
+        } else if (ctx instanceof StratosSQLParser.HavingAndExprContext c) {
+            collectHavingAggregates(c.havingExpression(0), list);
+            collectHavingAggregates(c.havingExpression(1), list);
+        } else if (ctx instanceof StratosSQLParser.HavingOrExprContext c) {
+            collectHavingAggregates(c.havingExpression(0), list);
+            collectHavingAggregates(c.havingExpression(1), list);
+        } else if (ctx instanceof StratosSQLParser.HavingCompareContext c) {
+            checkAndAddHavingAggOperand(c.havingOperand(0), list);
+            checkAndAddHavingAggOperand(c.havingOperand(1), list);
+        }
+    }
+
+    private void checkAndAddHavingAggOperand(StratosSQLParser.HavingOperandContext ctx, List<AggregateCall> list) {
+        if (ctx instanceof StratosSQLParser.HavingAggOperandContext c) {
+            AggregateCall agg = buildAggregateCall(c.aggregateFunction(), null);
+            boolean already = list.stream().anyMatch(a -> a.canonicalForm().equalsIgnoreCase(agg.canonicalForm()));
+            if (!already) {
+                list.add(agg);
+            }
+        }
     }
 
     private JoinClause buildJoinClause(StratosSQLParser.JoinClauseContext ctx) {

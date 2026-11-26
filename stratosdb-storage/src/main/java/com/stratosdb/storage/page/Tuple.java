@@ -48,6 +48,7 @@ public class Tuple {
     private long pageId = -1;
     private int slot = -1;
     private String tableName = null;
+    private int storedColumnCount = -1;
     
     public Tuple() {
         this.values = new ArrayList<>();
@@ -144,6 +145,9 @@ public class Tuple {
     }
     
     public List<Object> getValues() { return values; }
+
+    public int getStoredColumnCount() { return storedColumnCount; }
+    public void setStoredColumnCount(int storedColumnCount) { this.storedColumnCount = storedColumnCount; }
 
     public List<String> getColumnNames() {
         if (columnNames.isEmpty() && !values.isEmpty()) {
@@ -450,18 +454,24 @@ public class Tuple {
             colNames.addAll(schema);
         }
 
+        while (values.size() < colNames.size()) {
+            values.add(null);
+        }
+
         Tuple tuple = new Tuple(values, colNames);
         tuple.xmin = xmin;
         tuple.xmax = xmax;
         tuple.infomask = infomask;
+        tuple.storedColumnCount = numCols;
         return tuple;
     }
 
     private static Tuple deserializeLegacyFormat(byte[] data, List<String> schema) {
         Tuple tuple = new Tuple();
+        int count = 0;
         try {
             DataInputStream in = new DataInputStream(new java.io.ByteArrayInputStream(data));
-            int count = in.readInt();
+            count = in.readInt();
 
             for (int i = 0; i < count; i++) {
                 int nameLen = in.readInt();
@@ -480,8 +490,12 @@ public class Tuple {
         if (schema != null && !schema.isEmpty()) {
             tuple.columnNames.clear();
             tuple.columnNames.addAll(schema);
+            while (tuple.values.size() < tuple.columnNames.size()) {
+                tuple.values.add(null);
+            }
         }
 
+        tuple.storedColumnCount = count;
         return tuple;
     }
 

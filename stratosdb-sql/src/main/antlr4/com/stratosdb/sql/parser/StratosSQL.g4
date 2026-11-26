@@ -252,12 +252,19 @@ joinType: INNER
         | ANTI
         ;
 groupByList: columnName (COMMA columnName)*;
-havingClause: aggregateFunction ASSIGN literal
-            | aggregateFunction GT literal
-            | aggregateFunction LT literal
-            | aggregateFunction GE literal
-            | aggregateFunction LE literal
-            | aggregateFunction NE literal;
+havingClause: havingExpression;
+
+havingExpression: LPAREN havingExpression RPAREN                              #HavingParenExpr
+                | NOT havingExpression                                        #HavingNotExpr
+                | havingOperand op=(ASSIGN | GT | LT | GE | LE | NE) havingOperand #HavingCompare
+                | havingExpression AND havingExpression                       #HavingAndExpr
+                | havingExpression OR havingExpression                        #HavingOrExpr
+                ;
+
+havingOperand: aggregateFunction                                             #HavingAggOperand
+             | columnName                                                    #HavingColOperand
+             | literal                                                       #HavingLitOperand
+             ;
 aggregateFunction: (COUNT | SUM | AVG | MIN | MAX) LPAREN (ALL | DISTINCT)? (STAR | columnName) RPAREN;
 update: UPDATE tableName SET assignment (COMMA assignment)* (WHERE expression)? SEMICOLON?;
 delete: DELETE FROM tableName (WHERE expression)? SEMICOLON?;

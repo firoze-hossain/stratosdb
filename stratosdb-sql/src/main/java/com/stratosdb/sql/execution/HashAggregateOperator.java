@@ -1,6 +1,7 @@
 package com.stratosdb.sql.execution;
 
 import com.stratosdb.sql.ast.AggregateCall;
+import com.stratosdb.sql.ast.WhereExpr;
 import com.stratosdb.storage.page.Tuple;
 
 import java.util.ArrayList;
@@ -19,18 +20,41 @@ public class HashAggregateOperator implements PhysicalOperator {
     private final List<String> groupBy;
     private final List<AggregateCall> aggregates;
     private final String havingClause;
+    private final WhereExpr havingExpr;
+    private final List<AggregateCall> allAggregates;
     private final List<String> outputColumns;
 
     private List<Tuple> resultRows;
     private java.util.Iterator<Tuple> resultIterator;
 
     public HashAggregateOperator(PhysicalOperator child, List<String> groupBy, List<AggregateCall> aggregates, String havingClause) {
+        this(child, groupBy, aggregates, havingClause, null, null);
+    }
+
+    public HashAggregateOperator(PhysicalOperator child, List<String> groupBy, List<AggregateCall> aggregates,
+                                 String havingClause, WhereExpr havingExpr) {
+        this(child, groupBy, aggregates, havingClause, havingExpr, null);
+    }
+
+    public HashAggregateOperator(PhysicalOperator child, List<String> groupBy, List<AggregateCall> aggregates,
+                                 String havingClause, WhereExpr havingExpr, List<AggregateCall> havingAggregates) {
         this.child = child;
         this.groupBy = groupBy != null ? new ArrayList<>(groupBy) : List.of();
         this.aggregates = aggregates != null ? new ArrayList<>(aggregates) : List.of();
         this.havingClause = havingClause;
+        this.havingExpr = havingExpr;
         this.outputColumns = buildOutputColumns();
         this.resultRows = new ArrayList<>();
+
+        List<AggregateCall> all = new ArrayList<>(this.aggregates);
+        if (havingAggregates != null) {
+            for (AggregateCall ha : havingAggregates) {
+                if (all.stream().noneMatch(a -> a.canonicalForm().equalsIgnoreCase(ha.canonicalForm()))) {
+                    all.add(ha);
+                }
+            }
+        }
+        this.allAggregates = all;
     }
 
     private List<String> buildOutputColumns() {
@@ -58,13 +82,13 @@ public class HashAggregateOperator implements PhysicalOperator {
             }
             Tuple tuple = slot.getTuple();
             List<Object> key = extractGroupKey(tuple);
-            GroupAccumulator acc = groups.computeIfAbsent(key, k -> new GroupAccumulator(aggregates));
+            GroupAccumulator acc = groups.computeIfAbsent(key, k -> new GroupAccumulator(allAggregates));
             acc.update(tuple);
         }
 
         // Implicit group for empty table when no GROUP BY clause is specified
         if (groups.isEmpty() && groupBy.isEmpty()) {
-            groups.put(List.of(), new GroupAccumulator(aggregates));
+            groups.put(List.of(), new GroupAccumulator(allAggregates));
         }
 
         for (Map.Entry<List<Object>, GroupAccumulator> entry : groups.entrySet()) {
@@ -77,14 +101,23 @@ public class HashAggregateOperator implements PhysicalOperator {
             }
 
             Map<String, Object> aggValues = new HashMap<>();
-            for (int i = 0; i < aggregates.size(); i++) {
-                AggregateCall agg = aggregates.get(i);
+            for (int i = 0; i < allAggregates.size(); i++) {
+                AggregateCall agg = allAggregates.get(i);
                 Object val = acc.getValue(i);
-                out.addValue(agg.displayName(), val);
                 aggValues.put(agg.canonicalForm(), val);
+                aggValues.put(agg.displayName(), val);
+                aggValues.put(agg.function() + "(" + agg.argument() + ")", val);
             }
 
-            if (havingClause != null && !SortAndAggregateUtils.matchesHaving(havingClause, aggValues)) {
+            for (AggregateCall agg : aggregates) {
+                out.addValue(agg.displayName(), aggValues.get(agg.canonicalForm()));
+            }
+
+            if (havingExpr != null) {
+                if (!SortAndAggregateUtils.evaluateHaving(havingExpr, aggValues, out)) {
+                    continue;
+                }
+            } else if (havingClause != null && !SortAndAggregateUtils.matchesHaving(havingClause, aggValues)) {
                 continue;
             }
 

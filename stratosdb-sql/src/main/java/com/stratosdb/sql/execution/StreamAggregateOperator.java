@@ -1,6 +1,7 @@
 package com.stratosdb.sql.execution;
 
 import com.stratosdb.sql.ast.AggregateCall;
+import com.stratosdb.sql.ast.WhereExpr;
 import com.stratosdb.storage.page.Tuple;
 
 import java.util.ArrayList;
@@ -20,6 +21,8 @@ public class StreamAggregateOperator implements PhysicalOperator {
     private final List<String> groupBy;
     private final List<AggregateCall> aggregates;
     private final String havingClause;
+    private final WhereExpr havingExpr;
+    private final List<AggregateCall> allAggregates;
     private final List<String> outputColumns;
 
     private List<Object> currentGroupKey;
@@ -30,11 +33,32 @@ public class StreamAggregateOperator implements PhysicalOperator {
     private boolean emptyGroupEmitted;
 
     public StreamAggregateOperator(PhysicalOperator child, List<String> groupBy, List<AggregateCall> aggregates, String havingClause) {
+        this(child, groupBy, aggregates, havingClause, null, null);
+    }
+
+    public StreamAggregateOperator(PhysicalOperator child, List<String> groupBy, List<AggregateCall> aggregates,
+                                   String havingClause, WhereExpr havingExpr) {
+        this(child, groupBy, aggregates, havingClause, havingExpr, null);
+    }
+
+    public StreamAggregateOperator(PhysicalOperator child, List<String> groupBy, List<AggregateCall> aggregates,
+                                   String havingClause, WhereExpr havingExpr, List<AggregateCall> havingAggregates) {
         this.child = child;
         this.groupBy = groupBy != null ? new ArrayList<>(groupBy) : List.of();
         this.aggregates = aggregates != null ? new ArrayList<>(aggregates) : List.of();
         this.havingClause = havingClause;
+        this.havingExpr = havingExpr;
         this.outputColumns = buildOutputColumns();
+
+        List<AggregateCall> all = new ArrayList<>(this.aggregates);
+        if (havingAggregates != null) {
+            for (AggregateCall ha : havingAggregates) {
+                if (all.stream().noneMatch(a -> a.canonicalForm().equalsIgnoreCase(ha.canonicalForm()))) {
+                    all.add(ha);
+                }
+            }
+        }
+        this.allAggregates = all;
     }
 
     private List<String> buildOutputColumns() {
@@ -67,8 +91,9 @@ public class StreamAggregateOperator implements PhysicalOperator {
                 // If we have an active in-flight group, finalize and emit it
                 if (currentAccumulator != null) {
                     Tuple out = buildOutputTuple(currentGroupKey, currentAccumulator);
+                    GroupAccumulator finalizedAcc = currentAccumulator;
                     currentAccumulator = null;
-                    if (passesHaving(out, havingClause)) {
+                    if (passesHaving(out, finalizedAcc)) {
                         return TupleSlot.of(out);
                     }
                     continue;
@@ -77,9 +102,9 @@ public class StreamAggregateOperator implements PhysicalOperator {
                 // If input stream was completely empty and no GROUP BY was specified, emit single default row
                 if (!hasSeenRows && !emptyGroupEmitted && groupBy.isEmpty()) {
                     emptyGroupEmitted = true;
-                    GroupAccumulator emptyAcc = new GroupAccumulator(aggregates);
+                    GroupAccumulator emptyAcc = new GroupAccumulator(allAggregates);
                     Tuple out = buildOutputTuple(List.of(), emptyAcc);
-                    if (passesHaving(out, havingClause)) {
+                    if (passesHaving(out, emptyAcc)) {
                         return TupleSlot.of(out);
                     }
                 }
@@ -94,7 +119,7 @@ public class StreamAggregateOperator implements PhysicalOperator {
             if (currentAccumulator == null) {
                 // First group initialized
                 currentGroupKey = rowKey;
-                currentAccumulator = new GroupAccumulator(aggregates);
+                currentAccumulator = new GroupAccumulator(allAggregates);
                 currentAccumulator.update(row);
                 advanceChild();
             } else if (keysEqual(currentGroupKey, rowKey)) {
@@ -104,12 +129,13 @@ public class StreamAggregateOperator implements PhysicalOperator {
             } else {
                 // Group boundary encountered! Finalize previous group and initialize new group
                 Tuple out = buildOutputTuple(currentGroupKey, currentAccumulator);
+                GroupAccumulator finalizedAcc = currentAccumulator;
                 currentGroupKey = rowKey;
-                currentAccumulator = new GroupAccumulator(aggregates);
+                currentAccumulator = new GroupAccumulator(allAggregates);
                 currentAccumulator.update(row);
                 advanceChild();
 
-                if (passesHaving(out, havingClause)) {
+                if (passesHaving(out, finalizedAcc)) {
                     return TupleSlot.of(out);
                 }
                 // If HAVING rejected it, continue loop to produce next group
@@ -155,21 +181,28 @@ public class StreamAggregateOperator implements PhysicalOperator {
         }
         for (int i = 0; i < aggregates.size(); i++) {
             AggregateCall agg = aggregates.get(i);
-            out.addValue(agg.displayName(), acc.getValue(i));
+            int idx = allAggregates.indexOf(agg);
+            out.addValue(agg.displayName(), idx >= 0 ? acc.getValue(idx) : acc.getValue(i));
         }
         return out;
     }
 
-    private boolean passesHaving(Tuple outTuple, String having) {
-        if (having == null || having.isBlank()) {
+    private boolean passesHaving(Tuple outTuple, GroupAccumulator acc) {
+        if (havingExpr == null && (havingClause == null || havingClause.isBlank())) {
             return true;
         }
         Map<String, Object> aggValues = new HashMap<>();
-        for (int i = 0; i < aggregates.size(); i++) {
-            AggregateCall agg = aggregates.get(i);
-            aggValues.put(agg.canonicalForm(), outTuple.getValue(agg.displayName()));
+        for (int i = 0; i < allAggregates.size(); i++) {
+            AggregateCall agg = allAggregates.get(i);
+            Object val = acc.getValue(i);
+            aggValues.put(agg.canonicalForm(), val);
+            aggValues.put(agg.displayName(), val);
+            aggValues.put(agg.function() + "(" + agg.argument() + ")", val);
         }
-        return SortAndAggregateUtils.matchesHaving(having, aggValues);
+        if (havingExpr != null) {
+            return SortAndAggregateUtils.evaluateHaving(havingExpr, aggValues, outTuple);
+        }
+        return SortAndAggregateUtils.matchesHaving(havingClause, aggValues);
     }
 
     @Override

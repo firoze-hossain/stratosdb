@@ -460,7 +460,7 @@ def create_project_plan_excel():
          "High", "P1 - High", "Complex multi-column joins parse and execute correctly; cross-table composite key joins verified.", "Completed"],
         ["Sprint 04", "Week 08", "SQL Engine", "Arbitrary Expression HAVING & DDL",
          "Refactor HAVING clause to evaluate arbitrary boolean expression trees with multiple aggregates. Implement online instant ALTER TABLE for default values and column metadata.",
-         "Medium", "P1 - High", "Queries with HAVING COUNT(*) > 1 AND AVG(price) < 50 execute; instant column add requires zero table rewrites.", "Planned"],
+         "Medium", "P1 - High", "Queries with HAVING COUNT(*) > 1 AND AVG(price) < 50 execute; instant column add requires zero table rewrites.", "Completed"],
 
         # Sprint 5 (Month 3, Weeks 9-10)
         ["Sprint 05", "Week 09", "Execution Engine", "Vectorized SIMD Memory Formats",

@@ -1,5 +1,6 @@
 package com.stratosdb.sql.execution;
 
+import com.stratosdb.sql.ast.WhereExpr;
 import com.stratosdb.storage.page.Tuple;
 
 import java.util.List;
@@ -84,6 +85,96 @@ public final class SortAndAggregateUtils {
             }
         }
         return null;
+    }
+
+    /**
+     * Evaluates an arbitrary boolean expression tree (WhereExpr) representing a HAVING clause
+     * against computed aggregate values and output tuple values.
+     */
+    public static boolean evaluateHaving(WhereExpr expr, Map<String, Object> aggregateValues, Tuple outTuple) {
+        if (expr == null) {
+            return true;
+        }
+        if (expr instanceof WhereExpr.BooleanLiteral b) {
+            return b.value();
+        }
+        if (expr instanceof WhereExpr.Not not) {
+            return !evaluateHaving(not.inner(), aggregateValues, outTuple);
+        }
+        if (expr instanceof WhereExpr.And and) {
+            return evaluateHaving(and.left(), aggregateValues, outTuple) && evaluateHaving(and.right(), aggregateValues, outTuple);
+        }
+        if (expr instanceof WhereExpr.Or or) {
+            return evaluateHaving(or.left(), aggregateValues, outTuple) || evaluateHaving(or.right(), aggregateValues, outTuple);
+        }
+        if (expr instanceof WhereExpr.Comparison comp) {
+            Object val = resolveHavingOperandValue(comp.column(), aggregateValues, outTuple);
+            if (val == null) {
+                return false;
+            }
+            return compareHavingValues(val, comp.literal(), comp.operator());
+        }
+        if (expr instanceof WhereExpr.ColumnComparison colComp) {
+            Object leftVal = resolveHavingOperandValue(colComp.leftColumn(), aggregateValues, outTuple);
+            Object rightVal = resolveHavingOperandValue(colComp.rightColumn(), aggregateValues, outTuple);
+            if (leftVal == null || rightVal == null) {
+                return false;
+            }
+            return compareHavingValues(leftVal, rightVal.toString(), colComp.operator());
+        }
+        return true;
+    }
+
+    public static Object resolveHavingOperandValue(String name, Map<String, Object> aggregateValues, Tuple outTuple) {
+        if (name == null) return null;
+        if (aggregateValues != null) {
+            Object val = aggregateValues.get(name);
+            if (val != null) return val;
+
+            String normalized = name.replaceAll("\\s+", "").toLowerCase();
+            for (Map.Entry<String, Object> entry : aggregateValues.entrySet()) {
+                if (entry.getKey().replaceAll("\\s+", "").equalsIgnoreCase(normalized)) {
+                    return entry.getValue();
+                }
+            }
+        }
+        if (outTuple != null) {
+            Object val = JoinUtils.findColumnValue(outTuple, name);
+            if (val != null) return val;
+        }
+        return null;
+    }
+
+    public static boolean compareHavingValues(Object actualObj, String targetVal, String operator) {
+        if (actualObj == null || targetVal == null) return false;
+        if (targetVal.startsWith("'") && targetVal.endsWith("'") && targetVal.length() >= 2) {
+            targetVal = targetVal.substring(1, targetVal.length() - 1);
+        }
+        String actualStr = actualObj.toString();
+        try {
+            double actualNum = Double.parseDouble(actualStr);
+            double targetNum = Double.parseDouble(targetVal);
+            return switch (operator) {
+                case "=" -> actualNum == targetNum;
+                case "!=" -> actualNum != targetNum;
+                case ">" -> actualNum > targetNum;
+                case ">=" -> actualNum >= targetNum;
+                case "<" -> actualNum < targetNum;
+                case "<=" -> actualNum <= targetNum;
+                default -> false;
+            };
+        } catch (NumberFormatException ignored) {
+            int cmp = actualStr.compareTo(targetVal);
+            return switch (operator) {
+                case "=" -> cmp == 0;
+                case "!=" -> cmp != 0;
+                case ">" -> cmp > 0;
+                case ">=" -> cmp >= 0;
+                case "<" -> cmp < 0;
+                case "<=" -> cmp <= 0;
+                default -> false;
+            };
+        }
     }
 
     /**

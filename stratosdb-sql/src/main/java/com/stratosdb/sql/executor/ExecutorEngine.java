@@ -173,12 +173,35 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
 
     /**
      * Deserializes a schema-less binary tuple, dynamically resolving its column names
-     * from the catalog schema (tableColumns).
+     * from the catalog schema (tableColumns), and populating defaults for newly added columns
+     * without requiring physical table rewrites.
      */
     private Tuple deserializeTuple(String tableName, byte[] data) {
         if (data == null) return null;
         List<String> schema = tableName != null ? tableColumns.get(tableName) : null;
-        return Tuple.deserialize(data, schema);
+        Tuple tuple = Tuple.deserialize(data, schema);
+        if (tuple != null && tableName != null && schema != null) {
+            int storedCols = tuple.getStoredColumnCount() >= 0 ? tuple.getStoredColumnCount() : tuple.getValues().size();
+            if (storedCols < schema.size()) {
+                Map<String, String> defaults = tableColumnDefaults.get(tableName);
+                Map<String, String> types = tableColumnTypes.get(tableName);
+                for (int i = storedCols; i < schema.size(); i++) {
+                    String col = schema.get(i);
+                    Object val = null;
+                    if (defaults != null && defaults.containsKey(col)) {
+                        String defExpr = defaults.get(col);
+                        String colType = types != null ? types.get(col) : null;
+                        val = coerceForColumnType(col, colType, resolveValue(defExpr));
+                    }
+                    if (i < tuple.getValues().size()) {
+                        tuple.getValues().set(i, val);
+                    } else {
+                        tuple.addValue(col, val);
+                    }
+                }
+            }
+        }
+        return tuple;
     }
     /** tableName -> columnName -> its raw default expression text (a literal, or once SERIAL/sequences exist, a "nextval('seqname')" marker) - null/absent means no default, so an omitted column gets SQL NULL. */
     private final Map<String, Map<String, String>> tableColumnDefaults = new ConcurrentHashMap<>();
@@ -3539,9 +3562,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, finalDerivedStmt.where(), txn, null, params));
             }
 
-            boolean hasAggregates = !finalDerivedStmt.aggregates().isEmpty() || !finalDerivedStmt.groupBy().isEmpty();
+            boolean hasAggregates = !finalDerivedStmt.aggregates().isEmpty() || !finalDerivedStmt.groupBy().isEmpty()
+                || finalDerivedStmt.havingExpr() != null || (finalDerivedStmt.havingClause() != null && !finalDerivedStmt.havingClause().isBlank());
             if (hasAggregates) {
-                currentOp = new HashAggregateOperator(currentOp, finalDerivedStmt.groupBy(), finalDerivedStmt.aggregates(), finalDerivedStmt.havingClause());
+                currentOp = new HashAggregateOperator(currentOp, finalDerivedStmt.groupBy(), finalDerivedStmt.aggregates(),
+                    finalDerivedStmt.havingClause(), finalDerivedStmt.havingExpr(), finalDerivedStmt.havingAggregates());
             } else {
                 List<String> outputColumns = determineOutputColumns(finalDerivedStmt, scanOp.getOutputColumns());
                 currentOp = new ProjectOperator(
@@ -3585,7 +3610,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (table == null) {
             if (StdCatalogViews.isVirtualView(stmt.tableName())) {
                 List<Tuple> virtualRows = StdCatalogViews.generateRows(stmt.tableName(), this);
-                if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()) {
+                if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty() || stmt.havingExpr() != null || (stmt.havingClause() != null && !stmt.havingClause().isBlank())) {
                     return executeAggregateSelectOverRows(stmt, virtualRows, txn);
                 }
                 return applyOuterQueryToRows(stmt, virtualRows, txn);
@@ -3656,7 +3681,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return executeJoinedSelect(stmt, txn);
         }
 
-        if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()) {
+        if (!stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty() || stmt.havingExpr() != null || (stmt.havingClause() != null && !stmt.havingClause().isBlank())) {
             if (!stmt.windowFunctions().isEmpty()) {
                 return QueryResult.error("Window functions combined with GROUP BY/aggregates aren't supported yet");
             }
@@ -3728,9 +3753,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             currentOp = new FilterOperator(currentOp, tuple -> matchesWhere(tuple, stmt.where(), txn, null, params));
         }
 
-        boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
+        boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()
+            || stmt.havingExpr() != null || (stmt.havingClause() != null && !stmt.havingClause().isBlank());
         if (hasAggregates) {
-            currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(), stmt.havingClause());
+            currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(),
+                stmt.havingClause(), stmt.havingExpr(), stmt.havingAggregates());
         } else {
             // Apply ProjectOperator to evaluate expressions/projections and column aliases
             List<String> outputColumns = determineOutputColumns(stmt, schemaCols);
@@ -4362,14 +4389,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 outputRow.addValue(stmt.groupBy().get(i), groupKey.get(i));
             }
 
+            List<AggregateCall> allAggs = stmt.allAggregates();
             Map<String, Object> aggregateValues = new LinkedHashMap<>();
-            for (AggregateCall agg : stmt.aggregates()) {
+            for (AggregateCall agg : allAggs) {
                 Object value = computeAggregate(agg, groupRows);
                 aggregateValues.put(agg.canonicalForm(), value); // HAVING always references the FUNC(arg) form
-                outputRow.addValue(agg.displayName(), value);
+                aggregateValues.put(agg.displayName(), value);
+                aggregateValues.put(agg.function() + "(" + agg.argument() + ")", value);
             }
 
-            if (stmt.havingClause() != null && !matchesHaving(stmt.havingClause(), aggregateValues)) {
+            for (AggregateCall agg : stmt.aggregates()) {
+                outputRow.addValue(agg.displayName(), aggregateValues.get(agg.canonicalForm()));
+            }
+
+            if (stmt.havingExpr() != null) {
+                if (!SortAndAggregateUtils.evaluateHaving(stmt.havingExpr(), aggregateValues, outputRow)) {
+                    continue;
+                }
+            } else if (stmt.havingClause() != null && !matchesHaving(stmt.havingClause(), aggregateValues)) {
                 continue;
             }
 
@@ -4550,9 +4587,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             currentOp = new FilterOperator(currentOp, row -> matchesWhere(row, stmt.where(), txn));
         }
 
-        boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty();
+        boolean hasAggregates = !stmt.aggregates().isEmpty() || !stmt.groupBy().isEmpty()
+            || stmt.havingExpr() != null || (stmt.havingClause() != null && !stmt.havingClause().isBlank());
         if (hasAggregates) {
-            currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(), stmt.havingClause());
+            currentOp = new HashAggregateOperator(currentOp, stmt.groupBy(), stmt.aggregates(),
+                stmt.havingClause(), stmt.havingExpr(), stmt.havingAggregates());
         } else {
             boolean allSemiOrAnti = stmt.joins() != null && !stmt.joins().isEmpty() &&
                 stmt.joins().stream().allMatch(j -> j.joinType() == JoinClause.JoinType.SEMI || j.joinType() == JoinClause.JoinType.ANTI);
@@ -7296,19 +7335,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         String colName = stmt.columnName();
         String oldCatalogLine = catalogLines.get("TABLE:" + tableName);
 
-        Object resolvedDefault = stmt.defaultValue() != null
-            ? coerceForColumnType(stmt.columnName(), stmt.dataType(), resolveValue(stmt.defaultValue()))
-            : null;
-
-        rewriteAllRows(stmt.tableName(), txn.getXID(), oldTuple -> {
-            Tuple newTuple = new Tuple();
-            for (String col : oldTuple.getColumnNames()) {
-                newTuple.addValue(col, oldTuple.getValue(col));
-            }
-            newTuple.addValue(stmt.columnName(), resolvedDefault);
-            return newTuple;
-        });
-
+        // Instant ALTER TABLE: O(1) metadata-only update requiring zero physical table rewrites.
+        // Existing stored tuples on disk retain their original bytes and are dynamically padded with
+        // default values on read during deserialization.
         columns.add(stmt.columnName());
         tableColumnTypes.computeIfAbsent(stmt.tableName(), k -> new java.util.HashMap<>()).put(stmt.columnName(), stmt.dataType());
         if (stmt.defaultValue() != null) {
@@ -9186,7 +9215,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (table == null) {
             return QueryResult.error("Table not found: " + subquery.tableName());
         }
-        if (!subquery.aggregates().isEmpty() || !subquery.groupBy().isEmpty()) {
+        if (!subquery.aggregates().isEmpty() || !subquery.groupBy().isEmpty()
+            || subquery.havingExpr() != null || (subquery.havingClause() != null && !subquery.havingClause().isBlank())) {
             return executeAggregateSelect(subquery, txn, table);
         }
 
