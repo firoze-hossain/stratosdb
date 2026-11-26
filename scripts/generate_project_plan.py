@@ -484,7 +484,7 @@ def create_project_plan_excel():
          "Very High", "P1 - High", "Standard financial and leaderboard window queries produce exact PostgreSQL-compliant results.", "Completed"],
         ["Sprint 07", "Week 14", "Analytical Engine", "Recursive CTEs (WITH RECURSIVE)",
          "Implement recursive CTE evaluation engine: non-recursive term evaluation, worktable queue, recursive step evaluation until fixed-point termination.",
-         "High", "P1 - High", "Hierarchical organizational charts and graph path queries execute correctly with cycle detection.", "Planned"],
+         "High", "P1 - High", "Hierarchical organizational charts and graph path queries execute correctly with cycle detection.", "Completed"],
 
         # Sprint 8 (Month 4, Weeks 15-16)
         ["Sprint 08", "Week 15", "Data Types", "Binary JSONB & JSONPath Engine",

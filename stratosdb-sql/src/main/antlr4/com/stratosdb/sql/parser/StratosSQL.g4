@@ -239,7 +239,8 @@ returningClause: RETURNING (STAR | columnName (COMMA columnName)*);
 select: SELECT (ALL | DISTINCT)? selectList (FROM tableSource joinClause*)? (WHERE expression)? (GROUP BY groupByList)? (HAVING havingClause)? (ORDER BY orderList)? (LIMIT limitValue)? (OFFSET offsetValue)? forUpdateClause? SEMICOLON?;
 forUpdateClause: FOR (UPDATE | SHARE) (NOWAIT)?;
 tableSource: (tableName | LPAREN select RPAREN) (AS? alias)?;
-selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL select)? RPAREN select;
+selectWithCte: WITH RECURSIVE? cteName AS LPAREN select (UNION ALL? select)? RPAREN cycleClause? select;
+cycleClause: CYCLE columnName (COMMA columnName)* SET columnName USING columnName;
 cteName: anyIdentifier;
 joinClause: (joinType)? JOIN tableSource (ON expression)?;
 

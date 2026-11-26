@@ -1755,55 +1755,56 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * UNION ALL, does deduplicate) are further work, not attempted here.
      */
     private QueryResult executeRecursiveCteSelect(RecursiveCteSelectStatement stmt, Transaction txn) {
-        QueryResult baseResult = executeSelect(stmt.baseQuery(), txn);
-        if (!baseResult.isSuccess()) {
-            return baseResult;
-        }
-
-        // UNION ALL matches columns by POSITION, not by name, across its two
-        // branches - real SQL requires both sides to have the same column
-        // count for exactly this reason. Every row from every iteration is
-        // renamed to the base query's own column names, positionally,
-        // before being used as the next iteration's working set. Without
-        // this, a recursive branch that writes its own column names
-        // explicitly (e.g. "SELECT employees.id, ..." rather than a bare
-        // "id") produces differently-named columns each iteration, which
-        // silently breaks the NEXT iteration's join resolution (a real bug
-        // found this way: a real employee-hierarchy query stopped after one
-        // recursive step, silently missing the deeper levels, because
-        // "employees.id" from the recursive branch didn't match what a
-        // later join condition like "org_chart.id" was actually looking
-        // for once re-qualified).
-        List<String> baseColumnNames = baseResult.getRows().isEmpty() ? List.of() : baseResult.getRows().get(0).getColumnNames();
-        List<Tuple> accumulated = new ArrayList<>(alignColumnsToBaseSchema(baseResult.getRows(), baseColumnNames));
-        List<Tuple> newRowsFromLastIteration = accumulated;
-
         SessionState state = session.get();
-        int iterations = 0;
-        while (!newRowsFromLastIteration.isEmpty()) {
-            iterations++;
-            if (iterations > RECURSIVE_CTE_MAX_ITERATIONS) {
-                return QueryResult.error("Recursive CTE \"" + stmt.cteName() + "\" exceeded "
-                    + RECURSIVE_CTE_MAX_ITERATIONS + " iterations without reaching a fixpoint - "
-                    + "likely a non-terminating recursion (does the recursive branch actually converge toward a base case, "
-                    + "or could there be a cycle in the underlying data?)");
-            }
+        final QueryResult[] stepFailure = new QueryResult[1];
 
-            state.materializedCteRows.put(stmt.cteName(), newRowsFromLastIteration);
-            QueryResult stepResult;
-            try {
-                stepResult = executeSelect(stmt.recursiveQuery(), txn);
-            } finally {
-                state.materializedCteRows.remove(stmt.cteName());
-            }
-            if (!stepResult.isSuccess()) {
-                return stepResult;
-            }
+        RecursiveCteOperator op = new RecursiveCteOperator(
+            stmt.cteName(),
+            () -> {
+                QueryResult baseResult = executeSelect(stmt.baseQuery(), txn);
+                if (!baseResult.isSuccess()) {
+                    stepFailure[0] = baseResult;
+                    return List.of();
+                }
+                return baseResult.getRows();
+            },
+            worktable -> {
+                state.materializedCteRows.put(stmt.cteName(), worktable);
+                try {
+                    QueryResult stepResult = executeSelect(stmt.recursiveQuery(), txn);
+                    if (!stepResult.isSuccess()) {
+                        stepFailure[0] = stepResult;
+                        return List.of();
+                    }
+                    return stepResult.getRows();
+                } finally {
+                    state.materializedCteRows.remove(stmt.cteName());
+                }
+            },
+            stmt.unionAll(),
+            stmt.cycleColumns(),
+            stmt.cycleMarkColumn(),
+            stmt.cyclePathColumn(),
+            RECURSIVE_CTE_MAX_ITERATIONS
+        );
 
-            newRowsFromLastIteration = alignColumnsToBaseSchema(stepResult.getRows(), baseColumnNames);
-            accumulated.addAll(newRowsFromLastIteration);
+        List<Tuple> accumulated = new ArrayList<>();
+        try (op) {
+            op.open();
+            if (stepFailure[0] != null) {
+                return stepFailure[0];
+            }
+            TupleSlot slot;
+            while ((slot = op.next()) != null && !slot.isEmpty()) {
+                accumulated.add(slot.getTuple());
+            }
+        } catch (IllegalStateException e) {
+            return QueryResult.error(e.getMessage());
         }
 
+        if (stepFailure[0] != null) {
+            return stepFailure[0];
+        }
         return applyOuterQueryToRows(stmt.outerQuery(), accumulated, txn);
     }
 

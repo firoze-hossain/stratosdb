@@ -210,15 +210,29 @@ public class SqlParser {
             StratosSQLParser.SelectWithCteContext cteCtx = ctx.selectWithCte();
             String cteName = cleanIdentifier(cteCtx.cteName().getText());
             boolean hasRecursiveKeyword = cteCtx.RECURSIVE() != null;
-            boolean hasUnionAllStructure = cteCtx.select().size() == 3;
-            if (hasRecursiveKeyword != hasUnionAllStructure) {
-                throw new IllegalArgumentException("WITH RECURSIVE requires a \"base UNION ALL recursive\" structure inside the parentheses, and vice versa - got RECURSIVE=" + hasRecursiveKeyword + " but a UNION ALL structure=" + hasUnionAllStructure);
+            boolean hasUnionStructure = cteCtx.UNION() != null && cteCtx.select().size() == 3;
+            boolean isUnionAll = cteCtx.ALL() != null;
+            if (hasRecursiveKeyword != hasUnionStructure) {
+                throw new IllegalArgumentException("WITH RECURSIVE requires a \"base UNION [ALL] recursive\" structure inside the parentheses, and vice versa - got RECURSIVE=" + hasRecursiveKeyword + " but a UNION structure=" + hasUnionStructure);
             }
             if (hasRecursiveKeyword) {
                 SelectStatement baseQuery = buildSelect(cteCtx.select(0));
                 SelectStatement recursiveQuery = buildSelect(cteCtx.select(1));
                 SelectStatement outerQuery = buildSelect(cteCtx.select(2));
-                return new RecursiveCteSelectStatement(cteName, baseQuery, recursiveQuery, outerQuery);
+                List<String> cycleCols = new ArrayList<>();
+                String cycleMarkCol = null;
+                String cyclePathCol = null;
+                if (cteCtx.cycleClause() != null) {
+                    List<StratosSQLParser.ColumnNameContext> cols = cteCtx.cycleClause().columnName();
+                    int nCols = cols.size();
+                    for (int i = 0; i < nCols - 2; i++) {
+                        cycleCols.add(cleanColumnName(cols.get(i).getText()));
+                    }
+                    cycleMarkCol = cleanColumnName(cols.get(nCols - 2).getText());
+                    cyclePathCol = cleanColumnName(cols.get(nCols - 1).getText());
+                }
+                return new RecursiveCteSelectStatement(cteName, baseQuery, recursiveQuery, outerQuery,
+                    isUnionAll, cycleCols, cycleMarkCol, cyclePathCol);
             }
             SelectStatement cteQuery = buildSelect(cteCtx.select(0));
             SelectStatement outerQuery = buildSelect(cteCtx.select(1));

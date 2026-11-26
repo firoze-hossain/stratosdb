@@ -1,15 +1,30 @@
 package com.stratosdb.sql.ast;
 
+import java.util.List;
+
 /**
- * WITH RECURSIVE cteName AS (baseQuery UNION ALL recursiveQuery) outerQuery.
+ * WITH RECURSIVE cteName AS (baseQuery UNION [ALL] recursiveQuery) [CYCLE ...] outerQuery.
  *
- * recursiveQuery must reference cteName in its own FROM clause (that
- * self-reference is what makes it "recursive" - the same detection real
- * SQL engines use). Evaluated by fixpoint iteration: run baseQuery once to
- * seed the result; then repeatedly run recursiveQuery with cteName
- * resolving to only the PREVIOUS iteration's newly-produced rows (not the
- * whole accumulated set - standard "working table" semantics, matching
- * real Postgres), adding whatever's newly produced each time, until an
- * iteration adds nothing more.
+ * Evaluated by fixpoint iteration using a working-table queue:
+ * 1. Evaluate baseQuery once to seed the accumulated result and worktable.
+ * 2. Repeatedly evaluate recursiveQuery with cteName bound to the current worktable.
+ * 3. For UNION (without ALL), deduplicate against previously seen rows so cyclic graphs
+ *    reach a fixed point automatically.
+ * 4. For CYCLE col1, ... SET cycleMarkCol USING pathCol, track ancestor keys per path,
+ *    flag cycles, and prune cyclic branches from the worktable.
  */
-public record RecursiveCteSelectStatement(String cteName, SelectStatement baseQuery, SelectStatement recursiveQuery, SelectStatement outerQuery) implements Statement {}
+public record RecursiveCteSelectStatement(
+    String cteName,
+    SelectStatement baseQuery,
+    SelectStatement recursiveQuery,
+    SelectStatement outerQuery,
+    boolean unionAll,
+    List<String> cycleColumns,
+    String cycleMarkColumn,
+    String cyclePathColumn
+) implements Statement {
+    public RecursiveCteSelectStatement(String cteName, SelectStatement baseQuery,
+                                       SelectStatement recursiveQuery, SelectStatement outerQuery) {
+        this(cteName, baseQuery, recursiveQuery, outerQuery, true, List.of(), null, null);
+    }
+}

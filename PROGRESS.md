@@ -2352,6 +2352,25 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - `StratosDBTest#test*Window*` (**3/3 passing**) and `stratosdb-sql` (**51/51 passing**).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 07 Week 13 marked `Completed`.
 
+## Sprint 07 Week 14 — Analytical Engine: Recursive CTEs (WITH RECURSIVE) ✅ DONE
+
+- ✅ **SQL Grammar & AST for `UNION` Deduplication & `CYCLE` Detection**:
+  - Updated ANTLR4 grammar [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4): added `UNION` (without `ALL`) deduplicating recursion and PostgreSQL `CYCLE col1, ... SET cycle_col USING path_col` clause.
+  - Extended [`RecursiveCteSelectStatement`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/RecursiveCteSelectStatement.java) and [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java) to parse `unionAll` and `CYCLE` metadata.
+
+- ✅ **`RecursiveCteOperator` Worktable Queue & Cycle-Detection Engine**:
+  - Implemented [`RecursiveCteOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/RecursiveCteOperator.java) as a Volcano `PhysicalOperator`:
+    - Non-recursive base term evaluation seeding the accumulated output and `ArrayDeque` worktable queue.
+    - Iterative recursive step evaluation over the current worktable until fixed-point termination (or bounded `RECURSIVE_CTE_MAX_ITERATIONS` safety guard on unbounded `UNION ALL` cycles).
+    - `UNION` row-signature deduplication for automatic fixed-point termination on cyclic graphs.
+    - Per-branch `CYCLE` ancestor-path tracking (`path` string + `is_cycle` boolean flag) pruning cyclic back-edges while preserving diamond DAG paths.
+  - Wired `RecursiveCteOperator` into [`ExecutorEngine.executeRecursiveCteSelect`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java).
+
+- ✅ **Verification**:
+  - [`RecursiveCteEngineTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/RecursiveCteEngineTest.java) (**6/6 passing**): verified multi-level hierarchical org charts, cyclic graph reachability with `UNION` deduplication, `CYCLE ... SET ... USING ...` path tracking & cycle detection, diamond DAG non-false-positive verification, direct `RecursiveCteOperator` worktable queue, and 16-virtual-thread concurrency.
+  - `StratosDBTest` recursive/CTE tests (**8/8 passing**) and `stratosdb-sql` (**51/51 passing**).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 07 Week 14 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
