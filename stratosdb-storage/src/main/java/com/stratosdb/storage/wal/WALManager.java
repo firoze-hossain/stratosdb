@@ -489,19 +489,26 @@ public class WALManager {
     }
 
     public long logCommit(long transactionId) {
+        long commitLsn;
         if (!sync || !groupCommitEnabled || groupCommitCoordinator == null) {
             try {
                 ByteBuffer buffer = getDirectRecordBuffer(24);
                 buffer.putInt(OP_COMMIT);
                 buffer.putLong(transactionId);
                 buffer.putLong(System.currentTimeMillis());
-                return writeBuffer(buffer, true);
+                commitLsn = writeBuffer(buffer, true);
             } catch (Exception e) {
                 LOG.error("Failed to log commit", e);
                 return -1L;
             }
+        } else {
+            commitLsn = groupCommitCoordinator.commit(transactionId);
         }
-        return groupCommitCoordinator.commit(transactionId);
+        SyncReplicationWaiter waiter = this.syncReplicationWaiter;
+        if (commitLsn > 0 && waiter != null && synchronousCommitMode.requiresRemoteAck()) {
+            waiter.awaitSyncAck(commitLsn);
+        }
+        return commitLsn;
     }
 
     /**
@@ -774,7 +781,45 @@ public class WALManager {
         if (force && endLsn > 0) {
             syncWal(endLsn);
         }
+        if (endLsn > 0) {
+            synchronized (walPushMonitor) {
+                walPushMonitor.notifyAll();
+            }
+        }
         return endLsn;
+    }
+
+    /** Callback interface for synchronous streaming replication quorum ACK wait at commit. */
+    public interface SyncReplicationWaiter {
+        void awaitSyncAck(long commitLsn);
+    }
+
+    private final Object walPushMonitor = new Object();
+    private volatile SynchronousCommitMode synchronousCommitMode = SynchronousCommitMode.LOCAL;
+    private volatile SyncReplicationWaiter syncReplicationWaiter;
+
+    public void setSynchronousCommitMode(SynchronousCommitMode mode) {
+        this.synchronousCommitMode = mode != null ? mode : SynchronousCommitMode.LOCAL;
+    }
+
+    public SynchronousCommitMode getSynchronousCommitMode() {
+        return synchronousCommitMode;
+    }
+
+    public void setSyncReplicationWaiter(SyncReplicationWaiter waiter) {
+        this.syncReplicationWaiter = waiter;
+    }
+
+    /** Blocks until WAL advances past {@code knownLsn} or {@code timeoutMs} elapses. */
+    public void awaitWalAdvance(long knownLsn, long timeoutMs) throws InterruptedException {
+        if (currentLSN.get() > knownLsn) {
+            return;
+        }
+        synchronized (walPushMonitor) {
+            if (currentLSN.get() <= knownLsn) {
+                walPushMonitor.wait(Math.max(1L, timeoutMs));
+            }
+        }
     }
 
     /**

@@ -68,6 +68,27 @@ public class DatabaseConfig {
 
     /** Milliseconds; a statement taking at least this long gets logged at WARN. Negative (the default) disables slow-query logging entirely. */
     private long slowQueryThresholdMs = -1;
+    /** Synchronous commit mode for streaming replication (default LOCAL). */
+    private com.stratosdb.storage.wal.SynchronousCommitMode synchronousCommit = com.stratosdb.storage.wal.SynchronousCommitMode.LOCAL;
+    /** Quorum of connected replicas required to ACK when synchronous_commit is ON/REMOTE_APPLY/QUORUM. */
+    private int synchronousStandbyQuorum = 1;
+    /** Maximum milliseconds to wait for synchronous replica ACK before failing commit. */
+    private long synchronousReplicationTimeoutMs = 5000;
+
+    public com.stratosdb.storage.wal.SynchronousCommitMode getSynchronousCommit() { return synchronousCommit; }
+    public void setSynchronousCommit(com.stratosdb.storage.wal.SynchronousCommitMode synchronousCommit) {
+        this.synchronousCommit = synchronousCommit != null ? synchronousCommit : com.stratosdb.storage.wal.SynchronousCommitMode.LOCAL;
+    }
+
+    public int getSynchronousStandbyQuorum() { return synchronousStandbyQuorum; }
+    public void setSynchronousStandbyQuorum(int synchronousStandbyQuorum) {
+        this.synchronousStandbyQuorum = Math.max(1, synchronousStandbyQuorum);
+    }
+
+    public long getSynchronousReplicationTimeoutMs() { return synchronousReplicationTimeoutMs; }
+    public void setSynchronousReplicationTimeoutMs(long synchronousReplicationTimeoutMs) {
+        this.synchronousReplicationTimeoutMs = Math.max(100L, synchronousReplicationTimeoutMs);
+    }
 
     public long getSlowQueryThresholdMs() { return slowQueryThresholdMs; }
     public void setSlowQueryThresholdMs(long slowQueryThresholdMs) { this.slowQueryThresholdMs = slowQueryThresholdMs; }

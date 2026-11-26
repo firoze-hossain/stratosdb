@@ -47,6 +47,7 @@ public class StratosDB {
             config.getGroupCommitDelayMicros()
         );
         this.walManager.setSync(config.isSyncWAL());
+        this.walManager.setSynchronousCommitMode(config.getSynchronousCommit());
         this.transactionManager = new TransactionManager(config.getDataDirectory(), config.getLockPartitions());
         this.transactionManager.setSyncCommitLog(config.isSyncWAL());
         this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager, config.getDataDirectory());

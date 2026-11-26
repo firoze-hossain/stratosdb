@@ -10,8 +10,10 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The primary side of real physical (WAL-shipping) replication. Accepts
@@ -61,32 +63,44 @@ import java.util.concurrent.Executors;
  * from archived WAL segments (see WALManager.setWalArchiveDirectory)
  * yet, a real, separate, further piece of work.
  */
-public class ReplicationServer {
+public class ReplicationServer implements WALManager.SyncReplicationWaiter {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicationServer.class);
     private static final long DEFAULT_POLL_INTERVAL_MILLIS = 100;
+    private static final long DEFAULT_SYNC_TIMEOUT_MILLIS = 5000;
 
     private final int port;
     private final WALManager walManager;
     private final long pollIntervalMillis;
+    private final int quorum;
+    private final long syncTimeoutMillis;
+    private final ConcurrentHashMap<String, AtomicLong> replicaAckOffsets = new ConcurrentHashMap<>();
+    private final Object ackMonitor = new Object();
     private volatile boolean running = false;
     private ServerSocket serverSocket;
     private ExecutorService connectionExecutor;
 
     public ReplicationServer(int port, WALManager walManager) {
-        this(port, walManager, DEFAULT_POLL_INTERVAL_MILLIS);
+        this(port, walManager, DEFAULT_POLL_INTERVAL_MILLIS, 1, DEFAULT_SYNC_TIMEOUT_MILLIS);
     }
 
     public ReplicationServer(int port, WALManager walManager, long pollIntervalMillis) {
+        this(port, walManager, pollIntervalMillis, 1, DEFAULT_SYNC_TIMEOUT_MILLIS);
+    }
+
+    public ReplicationServer(int port, WALManager walManager, long pollIntervalMillis, int quorum, long syncTimeoutMillis) {
         this.port = port;
         this.walManager = walManager;
         this.pollIntervalMillis = pollIntervalMillis;
+        this.quorum = Math.max(1, quorum);
+        this.syncTimeoutMillis = Math.max(100L, syncTimeoutMillis);
     }
 
     public void start() throws IOException {
         serverSocket = new ServerSocket(port);
         running = true;
         connectionExecutor = Executors.newVirtualThreadPerTaskExecutor();
-        LOG.info("ReplicationServer listening on port {}", port);
+        walManager.setSyncReplicationWaiter(this);
+        LOG.info("ReplicationServer listening on port {} (push-based, quorum={})", port, quorum);
 
         Thread acceptThread = new Thread(() -> {
             while (running) {
@@ -104,11 +118,54 @@ public class ReplicationServer {
 
     public void stop() {
         running = false;
+        walManager.setSyncReplicationWaiter(null);
+        synchronized (ackMonitor) {
+            ackMonitor.notifyAll();
+        }
         try {
             if (serverSocket != null) serverSocket.close();
         } catch (IOException ignored) {
         }
         if (connectionExecutor != null) connectionExecutor.shutdownNow();
+    }
+
+    @Override
+    public void awaitSyncAck(long commitLsn) {
+        if (!running) {
+            throw new IllegalStateException("ReplicationServer is not running; cannot satisfy synchronous_commit");
+        }
+        long deadline = System.currentTimeMillis() + syncTimeoutMillis;
+        synchronized (ackMonitor) {
+            while (running && countAckedReplicas(commitLsn) < quorum) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    throw new IllegalStateException(
+                        "Timed out waiting for synchronous replication quorum ACK (quorum=" + quorum
+                            + ", acked=" + countAckedReplicas(commitLsn) + ", lsn=" + commitLsn + ")"
+                    );
+                }
+                try {
+                    ackMonitor.wait(Math.min(remaining, 50L));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted waiting for synchronous replication ACK", e);
+                }
+            }
+        }
+    }
+
+    private int countAckedReplicas(long commitLsn) {
+        int count = 0;
+        for (AtomicLong offset : replicaAckOffsets.values()) {
+            if (offset.get() >= commitLsn) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public int getConnectedReplicaCount() {
+        return replicaAckOffsets.size();
     }
 
     private void handleReplica(Socket socket) {
@@ -117,6 +174,7 @@ public class ReplicationServer {
         try (Socket s = socket;
              DataInputStream in = new DataInputStream(s.getInputStream());
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
+            s.setTcpNoDelay(true);
 
             long replicaEpoch = in.readLong();
             long fromOffset = in.readLong();
@@ -127,30 +185,57 @@ public class ReplicationServer {
             if (replicaEpoch != primaryEpoch) {
                 LOG.warn("Replica {} requested epoch {} but primary is now at epoch {} - refusing to stream from a stale offset; the replica must resync from a fresh base backup",
                     remote, replicaEpoch, primaryEpoch);
-                return; // closes the connection - the replica's own reconnect logic sees this and must not retry with the same offset
+                return;
             }
 
-            long sentUpTo = fromOffset;
-            LOG.info("Replica {} starting replication from epoch {} offset {}", remote, primaryEpoch, fromOffset);
-
-            while (running && !socket.isClosed()) {
-                byte[] newBytes = walManager.readBytesFromChecked(primaryEpoch, sentUpTo);
-                if (newBytes == null) {
-                    // The primary's own epoch advanced (a CHECKPOINT happened) while this
-                    // replica was actively streaming - continuing would silently hand it
-                    // bytes from an unrelated, post-truncation file at the same numeric
-                    // offset. Close cleanly; the replica's own reconnect will send its
-                    // now-stale epoch again and correctly be told to resync above.
-                    LOG.warn("Primary's WAL epoch advanced while replica {} was streaming - closing so it resyncs", remote);
-                    return;
+            AtomicLong ackOffset = new AtomicLong(fromOffset);
+            replicaAckOffsets.put(remote, ackOffset);
+            Thread ackReader = Thread.ofVirtual().name("repl-ack-" + remote).start(() -> {
+                try {
+                    while (running && !s.isClosed()) {
+                        long acked = in.readLong();
+                        ackOffset.accumulateAndGet(acked, Math::max);
+                        synchronized (ackMonitor) {
+                            ackMonitor.notifyAll();
+                        }
+                    }
+                } catch (IOException ignored) {
+                } finally {
+                    replicaAckOffsets.remove(remote);
+                    synchronized (ackMonitor) {
+                        ackMonitor.notifyAll();
+                    }
+                    try {
+                        s.close();
+                    } catch (IOException ignored) {
+                    }
                 }
-                if (newBytes.length > 0) {
-                    out.writeInt(newBytes.length);
-                    out.write(newBytes);
-                    out.flush();
-                    sentUpTo += newBytes.length;
-                } else {
-                    Thread.sleep(pollIntervalMillis);
+            });
+
+            long sentUpTo = fromOffset;
+            LOG.info("Replica {} starting push replication from epoch {} offset {}", remote, primaryEpoch, fromOffset);
+
+            try {
+                while (running && !s.isClosed()) {
+                    byte[] newBytes = walManager.readBytesFromChecked(primaryEpoch, sentUpTo);
+                    if (newBytes == null) {
+                        LOG.warn("Primary's WAL epoch advanced while replica {} was streaming - closing so it resyncs", remote);
+                        return;
+                    }
+                    if (newBytes.length > 0) {
+                        out.writeInt(newBytes.length);
+                        out.write(newBytes);
+                        out.flush();
+                        sentUpTo += newBytes.length;
+                    } else {
+                        walManager.awaitWalAdvance(sentUpTo, pollIntervalMillis);
+                    }
+                }
+            } finally {
+                replicaAckOffsets.remove(remote);
+                ackReader.interrupt();
+                synchronized (ackMonitor) {
+                    ackMonitor.notifyAll();
                 }
             }
         } catch (IOException e) {

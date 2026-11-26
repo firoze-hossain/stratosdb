@@ -8585,6 +8585,11 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             row.addValue("default_transaction_isolation", state.defaultIsolationLevel.getSqlName());
             return QueryResult.success(List.of(row));
         }
+        if (lowerName.equals("synchronous_commit")) {
+            Tuple row = new Tuple();
+            row.addValue("synchronous_commit", walManager.getSynchronousCommitMode().name().toLowerCase(java.util.Locale.ROOT));
+            return QueryResult.success(List.of(row));
+        }
         String value = KNOWN_SHOW_PARAMETERS.get(lowerName);
         if (value == null) {
             return QueryResult.error("unrecognized configuration parameter \"" + stmt.parameterName() + "\"");
@@ -8619,6 +8624,16 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return QueryResult.success("SET");
             } catch (Exception e) {
                 return QueryResult.error("invalid value for parameter \"" + stmt.parameterName() + "\": \"" + stmt.value() + "\"");
+            }
+        }
+        if (lowerName.equals("synchronous_commit")) {
+            try {
+                com.stratosdb.storage.wal.SynchronousCommitMode mode =
+                    com.stratosdb.storage.wal.SynchronousCommitMode.parse(stripQuotes(stmt.value()));
+                walManager.setSynchronousCommitMode(mode);
+                return QueryResult.success("SET");
+            } catch (Exception e) {
+                return QueryResult.error("invalid value for parameter \"synchronous_commit\": \"" + stmt.value() + "\"");
             }
         }
         return QueryResult.success("SET");

@@ -2399,6 +2399,20 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`EnterpriseTypesTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/EnterpriseTypesTest.java) (**3/3 passing**) and `StratosDBTest#*Inet*+*Array*` (**6/6 passing**).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 08 Week 16 marked `Completed`.
 
+## Sprint 09 Week 17 — High Availability: Synchronous Streaming Replication ✅ DONE
+
+- ✅ **Push-Based TCP WAL Streaming & Immediate Replica ACKs**:
+  - Added `walPushMonitor` and `awaitWalAdvance(knownLsn, timeoutMs)` to [`WALManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/WALManager.java) so WAL writes immediately wake connected streaming threads without polling latency.
+  - Updated [`ReplicationServer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/replication/ReplicationServer.java) and [`ReplicationClient`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/replication/ReplicationClient.java) with `TCP_NODELAY`, push-based streaming, and bi-directional 8-byte `lastAppliedOffset` ACKs sent immediately after `StreamingWalApplier.feed(chunk)`.
+
+- ✅ **`synchronous_commit` Configuration & Quorum ACK Wait (`RPO=0`)**:
+  - Added [`SynchronousCommitMode`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/SynchronousCommitMode.java) (`OFF`, `LOCAL`, `ON`, `REMOTE_APPLY`, `QUORUM`), [`DatabaseConfig`](file:///home/firoze/projects/Others/stratosdb/stratosdb-core/src/main/java/com/stratosdb/core/DatabaseConfig.java) settings, [`StratosDB`](file:///home/firoze/projects/Others/stratosdb/stratosdb-core/src/main/java/com/stratosdb/core/StratosDB.java) wiring, and `SET synchronous_commit` / `SHOW synchronous_commit` in [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java).
+  - Implemented `WALManager.SyncReplicationWaiter` in [`ReplicationServer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/replication/ReplicationServer.java) so `WALManager.logCommit` blocks until quorum replicas ACK the commit LSN (or fails on timeout).
+
+- ✅ **Verification**:
+  - [`SynchronousReplicationTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/SynchronousReplicationTest.java) (**2/2 passing**) and [`ReplicationEndToEndTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ReplicationEndToEndTest.java) (**4/4 passing**): verified `< 1ms` push-based replica lag, immediate read-after-commit visibility on replica, RPO=0 across primary shutdown, and quorum ACK enforcement on replica loss.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 09 Week 17 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

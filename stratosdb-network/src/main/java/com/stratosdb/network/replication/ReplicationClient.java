@@ -152,6 +152,7 @@ public class ReplicationClient {
     private void connectAndStream() throws IOException, InterruptedException {
         try (Socket socket = new Socket()) {
             activeSocket = socket;
+            socket.setTcpNoDelay(true);
             socket.connect(new InetSocketAddress(primaryHost, primaryPort), 5000);
             java.io.DataOutputStream out = new java.io.DataOutputStream(socket.getOutputStream());
             DataInputStream in = new DataInputStream(socket.getInputStream());
@@ -179,6 +180,9 @@ public class ReplicationClient {
                 in.readFully(chunk);
                 applier.feed(chunk);
                 lastAppliedOffset += chunkLength;
+                // Send immediate synchronous replication ACK back to primary
+                out.writeLong(lastAppliedOffset);
+                out.flush();
             }
         }
     }
