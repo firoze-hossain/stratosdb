@@ -465,7 +465,7 @@ def create_project_plan_excel():
         # Sprint 5 (Month 3, Weeks 9-10)
         ["Sprint 05", "Week 09", "Execution Engine", "Vectorized SIMD Memory Formats",
          "Implement columnar VectorBatch container holding 1024 flat primitive values (IntVector, LongVector, DoubleVector, ByteVector) in native memory.",
-         "Very High", "P1 - High", "Zero object allocation during table scan; memory throughput exceeds 4 GB/sec on sequential scan.", "Planned"],
+         "Very High", "P1 - High", "Zero object allocation during table scan; memory throughput exceeds 4 GB/sec on sequential scan.", "Completed"],
         ["Sprint 05", "Week 10", "Execution Engine", "Vectorized Filter & Aggregate Operators",
          "Build VectorizedFilterOperator and VectorizedAggregateOperator. Utilize Java 25 vector compiler intrinsics for SIMD evaluation of filter expressions and sum/count.",
          "High", "P1 - High", "Analytical aggregation queries execute 5x faster than Volcano row-by-row operator; verified on 10M rows.", "Planned"],

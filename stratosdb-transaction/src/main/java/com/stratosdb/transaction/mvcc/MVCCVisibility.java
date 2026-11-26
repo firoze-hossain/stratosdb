@@ -83,6 +83,16 @@ public final class MVCCVisibility {
         }
         long xmin = readXmin(stored);
         long xmax = readXmax(stored);
+        return isVisible(xmin, xmax, snapshot, txnManager);
+    }
+
+    /**
+     * Zero-allocation MVCC visibility check using xmin and xmax read directly from native MemorySegment.
+     */
+    public static boolean isVisible(long xmin, long xmax, Snapshot snapshot, TransactionManager txnManager) {
+        if (snapshot == null) {
+            return true;
+        }
 
         boolean creatorVisible = (xmin == 0L) || (xmin == snapshot.getOwnerXid()) || definitelyCommittedBefore(xmin, snapshot, txnManager);
         if (!creatorVisible) {

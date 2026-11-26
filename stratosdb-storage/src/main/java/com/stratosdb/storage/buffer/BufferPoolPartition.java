@@ -59,19 +59,28 @@ public class BufferPoolPartition {
         return directory;
     }
 
+    private BufferFrame findFrame(String tableName, long pageId) {
+        if (capacity <= 16) {
+            for (int i = 0; i < capacity; i++) {
+                BufferFrame frame = frames.get(i);
+                if (frame != null && frame.getState() == BufferFrame.STATE_VALID && frame.matches(tableName, pageId)) {
+                    return frame;
+                }
+            }
+            return null;
+        }
+        PageKey key = new PageKey(tableName, pageId);
+        Integer slot = directory.get(key);
+        return slot != null ? frames.get(slot) : null;
+    }
+
     /**
      * Lock-free page lookup on cache hit.
      * Uses AtomicReferenceArray and atomic pin/reference bit updates without acquiring any lock.
      */
     @SuppressWarnings("unchecked")
     public <T extends Page> T getPageIfPresent(String tableName, long pageId) {
-        PageKey key = new PageKey(tableName, pageId);
-        Integer slot = directory.get(key);
-        if (slot == null) {
-            return null;
-        }
-
-        BufferFrame frame = frames.get(slot);
+        BufferFrame frame = findFrame(tableName, pageId);
         if (frame != null && frame.getState() == BufferFrame.STATE_VALID && frame.matches(tableName, pageId)) {
             frame.pin();
             // Re-verify after pin to prevent race with concurrent eviction
@@ -242,24 +251,16 @@ public class BufferPoolPartition {
     }
 
     public void unpinPage(String tableName, long pageId) {
-        PageKey key = new PageKey(tableName, pageId);
-        Integer slot = directory.get(key);
-        if (slot != null) {
-            BufferFrame frame = frames.get(slot);
-            if (frame != null && frame.matches(tableName, pageId)) {
-                frame.unpin();
-            }
+        BufferFrame frame = findFrame(tableName, pageId);
+        if (frame != null && frame.matches(tableName, pageId)) {
+            frame.unpin();
         }
     }
 
     public void markDirty(String tableName, long pageId) {
-        PageKey key = new PageKey(tableName, pageId);
-        Integer slot = directory.get(key);
-        if (slot != null) {
-            BufferFrame frame = frames.get(slot);
-            if (frame != null && frame.matches(tableName, pageId)) {
-                frame.setDirty(true);
-            }
+        BufferFrame frame = findFrame(tableName, pageId);
+        if (frame != null && frame.matches(tableName, pageId)) {
+            frame.setDirty(true);
         }
     }
 

@@ -279,6 +279,17 @@ public class HeapTable {
     public long getLastPageId() { return lastPageId.get(); }
     public BufferPool getBufferPool() { return bufferPool; }
 
+    /**
+     * Opens a zero-allocation vectorized sequential scanner over this table's off-heap pages.
+     */
+    public com.stratosdb.storage.vector.VectorizedHeapScanner scanVectorized(
+            Snapshot snapshot,
+            TransactionManager txnManager,
+            int[] projectedColumnIndices) {
+        return new com.stratosdb.storage.vector.VectorizedHeapScanner(
+            this, snapshot, txnManager, projectedColumnIndices);
+    }
+
     /** Returns the 2-level Free Space Map for this table. */
     public FreeSpaceMap getFreeSpaceMap() {
         return fsm;

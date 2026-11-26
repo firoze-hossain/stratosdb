@@ -2265,6 +2265,24 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - Key regression tests in `stratosdb-testing`: **42/42 passing**.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 04 Week 08 marked `Completed`.
 
+## Sprint 05 Week 09 — Execution Engine: Vectorized SIMD Memory Formats ✅ DONE
+
+- ✅ **Native Off-Heap Columnar Vector Containers (`com.stratosdb.storage.vector`)**:
+  - Implemented [`VectorType`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/VectorType.java) and [`ColumnVector`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/ColumnVector.java): 64-byte SIMD-aligned native `MemorySegment` storage (default capacity 1024) with compact 64-byte-aligned off-heap null-mask bitmaps and $O(1)$ zero-allocation `reset()`.
+  - Implemented [`IntVector`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/IntVector.java), [`LongVector`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/LongVector.java), [`DoubleVector`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/DoubleVector.java), and [`ByteVector`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/ByteVector.java) with bulk `MemorySegment.copy` helpers and C2 SIMD auto-vectorized aggregation loops.
+  - Implemented [`VectorBatch`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/VectorBatch.java): unified `Arena.ofShared()` lifecycle management, 1024-row columnar batching, and reusable primitive selection vector.
+
+- ✅ **Zero-Allocation Vectorized Table Scan**:
+  - Added zero-allocation `isVisible(long xmin, long xmax, Snapshot, TransactionManager)` overload to [`MVCCVisibility`](file:///home/firoze/projects/Others/stratosdb/stratosdb-transaction/src/main/java/com/stratosdb/transaction/mvcc/MVCCVisibility.java).
+  - Eliminated `PageKey` allocations on cache hits, unpins, and dirty marks in [`BufferPoolPartition`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/buffer/BufferPoolPartition.java) (`findFrame`).
+  - Implemented [`VectorizedHeapScanner`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/vector/VectorizedHeapScanner.java) and [`HeapTable.scanVectorized`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/heap/HeapTable.java): reads MVCC headers, null bitmaps, and primitive column values directly from off-heap `SlottedPage` `MemorySegment`s into `VectorBatch` with **0 bytes** heap allocation.
+  - Added [`VectorizedOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/VectorizedOperator.java) and [`VectorizedSeqScanOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/VectorizedSeqScanOperator.java) in `stratosdb-sql`.
+
+- ✅ **Verification & Benchmarks**:
+  - [`VectorBatchTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/test/java/com/stratosdb/storage/vector/VectorBatchTest.java) (**4/4 passing**): verified 64-byte alignment, all 4 vector types + null bitmasks, **0 bytes** heap allocation on batch reuse via `ThreadMXBean`, and **5.84 GB/sec** sequential scan memory throughput (> 4 GB/sec DoD).
+  - [`VectorizedSimdMemoryFormatTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/VectorizedSimdMemoryFormatTest.java) (**5/5 passing**): verified MVCC visibility, **0 bytes** heap allocation during 5,000-row table scan, column projection & instant-DDL trailing column compatibility, > 4 GB/sec throughput, and 16-virtual-thread concurrency.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 05 Week 09 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
