@@ -2413,6 +2413,17 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`SynchronousReplicationTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/SynchronousReplicationTest.java) (**2/2 passing**) and [`ReplicationEndToEndTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ReplicationEndToEndTest.java) (**4/4 passing**): verified `< 1ms` push-based replica lag, immediate read-after-commit visibility on replica, RPO=0 across primary shutdown, and quorum ACK enforcement on replica loss.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 09 Week 17 marked `Completed`.
 
+## Sprint 09 Week 18 — High Availability: Raft Consensus Cluster Coordinator ✅ DONE
+
+- ✅ **Embedded Raft Consensus for 3-Node and 5-Node Clusters**:
+  - Extended [`StdRaftCluster`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/consensus/StdRaftCluster.java) with `createLocalCluster(...)` for 3-node and 5-node clusters, `waitForNewLeader(...)`, and `countLeaders()` alongside [`StdRaftNode`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/consensus/StdRaftNode.java) leader election, heartbeats, lease replication, and partition injection.
+
+- ✅ **Sub-3-Second Failover & Split-Brain Prevention**:
+  - Verified [`RaftConsensusClusterTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/RaftConsensusClusterTest.java) (**2/2 passing**) and [`DistributedFailoverEndToEndTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/DistributedFailoverEndToEndTest.java) (**3/3 passing**):
+    - **5-node cluster**: leader election, quorum (`3/5`) lease replication, minority/majority network partition with split-brain prevention, `< 3s` majority re-election, and single-leader convergence on heal.
+    - **3-node cluster mid-workload failover**: killed primary + Raft leader mid-workload; cluster elected new Raft leader, promoted standby, and resumed SQL write traffic in `< 3s` with zero data loss.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 09 Week 18 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

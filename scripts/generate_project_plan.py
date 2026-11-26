@@ -500,7 +500,7 @@ def create_project_plan_excel():
          "Very High", "P0 - Critical", "Transactions wait for replica ACK; zero data loss on primary failure; replica lag < 1ms.", "Completed"],
         ["Sprint 09", "Week 18", "High Availability", "Raft Consensus Cluster Coordinator",
          "Embed Raft consensus protocol for 3-node and 5-node clusters. Manage automated leader election, heartbeats, and sub-3-second failover without split-brain.",
-         "Very High", "P0 - Critical", "Kill primary node mid-workload; cluster elects new leader and resumes traffic in < 3s without human intervention.", "Planned"],
+         "Very High", "P0 - Critical", "Kill primary node mid-workload; cluster elects new leader and resumes traffic in < 3s without human intervention.", "Completed"],
 
         # Sprint 10 (Month 5, Weeks 19-20)
         ["Sprint 10", "Week 19", "Security", "Transparent Data Encryption (TDE)",
