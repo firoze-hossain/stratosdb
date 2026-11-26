@@ -481,7 +481,7 @@ def create_project_plan_excel():
         # Sprint 7 (Month 4, Weeks 13-14)
         ["Sprint 07", "Week 13", "Analytical Engine", "SQL Window Functions Engine",
          "Implement grammar and execution for OVER (PARTITION BY ... ORDER BY ...). Build WindowOperator supporting ROW_NUMBER(), RANK(), DENSE_RANK(), LEAD(), LAG().",
-         "Very High", "P1 - High", "Standard financial and leaderboard window queries produce exact PostgreSQL-compliant results.", "Planned"],
+         "Very High", "P1 - High", "Standard financial and leaderboard window queries produce exact PostgreSQL-compliant results.", "Completed"],
         ["Sprint 07", "Week 14", "Analytical Engine", "Recursive CTEs (WITH RECURSIVE)",
          "Implement recursive CTE evaluation engine: non-recursive term evaluation, worktable queue, recursive step evaluation until fixed-point termination.",
          "High", "P1 - High", "Hierarchical organizational charts and graph path queries execute correctly with cycle detection.", "Planned"],

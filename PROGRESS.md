@@ -2336,6 +2336,22 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     3. `testIndexOnlyScan3xThroughputSpeedup`: verified **5.37x speedup** on 20,000 indexed rows (`11.60 ms`, `heap_reads=0` vs `62.29 ms`, `heap_reads=60000`; DoD: $\ge 3.0\times$).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 06 Week 12 marked `Completed`.
 
+## Sprint 07 Week 13 — Analytical Engine: SQL Window Functions Engine ✅ DONE
+
+- ✅ **SQL Grammar & AST for `OVER (PARTITION BY ... ORDER BY ...)`**:
+  - Extended ANTLR4 grammar [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4) with `LEAD`, `LAG`, `overClause`, and window aggregate syntax (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX` `OVER (...)`) alongside `ROW_NUMBER`, `RANK`, and `DENSE_RANK`.
+  - Extended [`WindowFunctionCall`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/WindowFunctionCall.java) and [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java) to parse optional `offset` and `defaultValue` arguments for `LEAD`/`LAG` and aggregate column arguments.
+
+- ✅ **`WindowOperator` Physical Execution Engine**:
+  - Implemented [`WindowOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/WindowOperator.java) as a Volcano `PhysicalOperator` supporting multiple independent `OVER (...)` clauses in a single query.
+  - Implemented PostgreSQL-compliant semantics for `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LEAD(col, offset, default)`, `LAG(col, offset, default)` (preserving in-bounds `NULL`s vs out-of-bounds defaults), and window aggregates (full partition frame when unordered; peer-inclusive `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when ordered).
+  - Wired `WindowOperator` into [`ExecutorEngine.executeWindowFunctionSelect`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java) with `FilterOperator`, `SortOperator`, and `LimitOperator`.
+
+- ✅ **Verification & Benchmarks**:
+  - [`WindowFunctionsEngineTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/WindowFunctionsEngineTest.java) (**6/6 passing**): verified leaderboard rankings with ties, financial stock-series `LEAD`/`LAG` with offsets and defaults, running totals with peer ties, `WHERE` + `ORDER BY` + `LIMIT`, direct `WindowOperator` Volcano pipeline, and 16-virtual-thread concurrency.
+  - `StratosDBTest#test*Window*` (**3/3 passing**) and `stratosdb-sql` (**51/51 passing**).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 07 Week 13 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

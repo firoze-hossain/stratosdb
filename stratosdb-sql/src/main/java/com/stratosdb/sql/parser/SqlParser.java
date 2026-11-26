@@ -823,26 +823,75 @@ public class SqlParser {
 
     private WindowFunctionCall buildWindowFunctionCall(StratosSQLParser.WindowFunctionContext ctx, String alias) {
         String functionName;
-        if (ctx.ROW_NUMBER() != null) functionName = "ROW_NUMBER";
-        else if (ctx.RANK() != null) functionName = "RANK";
-        else functionName = "DENSE_RANK";
+        String argument = null;
+        int offset = 1;
+        Object defaultValue = null;
 
+        if (ctx.ROW_NUMBER() != null) {
+            functionName = "ROW_NUMBER";
+        } else if (ctx.RANK() != null) {
+            functionName = "RANK";
+        } else if (ctx.DENSE_RANK() != null) {
+            functionName = "DENSE_RANK";
+        } else if (ctx.LEAD() != null || ctx.LAG() != null) {
+            functionName = ctx.LEAD() != null ? "LEAD" : "LAG";
+            argument = cleanColumnName(ctx.columnName().getText());
+            List<StratosSQLParser.LiteralContext> lits = ctx.literal();
+            if (lits != null && !lits.isEmpty()) {
+                offset = Integer.parseInt(lits.get(0).getText());
+                if (lits.size() > 1) {
+                    defaultValue = parseWindowLiteral(lits.get(1).getText());
+                }
+            }
+        } else {
+            if (ctx.SUM() != null) functionName = "SUM";
+            else if (ctx.COUNT() != null) functionName = "COUNT";
+            else if (ctx.AVG() != null) functionName = "AVG";
+            else if (ctx.MIN() != null) functionName = "MIN";
+            else functionName = "MAX";
+            argument = ctx.STAR() != null ? "*" : cleanColumnName(ctx.columnName().getText());
+        }
+
+        StratosSQLParser.OverClauseContext over = ctx.overClause();
         List<String> partitionBy = new ArrayList<>();
-        if (ctx.groupByList() != null) {
-            for (StratosSQLParser.ColumnNameContext colCtx : ctx.groupByList().columnName()) {
+        if (over != null && over.groupByList() != null) {
+            for (StratosSQLParser.ColumnNameContext colCtx : over.groupByList().columnName()) {
                 partitionBy.add(cleanColumnName(colCtx.getText()));
             }
         }
 
         List<WindowOrderItem> orderBy = new ArrayList<>();
-        if (ctx.orderList() != null) {
-            for (StratosSQLParser.OrderItemContext itemCtx : ctx.orderList().orderItem()) {
+        if (over != null && over.orderList() != null) {
+            for (StratosSQLParser.OrderItemContext itemCtx : over.orderList().orderItem()) {
                 boolean descending = itemCtx.DESC() != null;
                 orderBy.add(new WindowOrderItem(cleanColumnName(itemCtx.columnName().getText()), descending));
             }
         }
 
-        return new WindowFunctionCall(functionName, partitionBy, orderBy, alias != null ? alias : functionName);
+        return new WindowFunctionCall(functionName, argument, offset, defaultValue,
+            partitionBy, orderBy, alias != null ? alias : functionName);
+    }
+
+    private static Object parseWindowLiteral(String raw) {
+        if (raw == null || "NULL".equalsIgnoreCase(raw)) return null;
+        if ((raw.startsWith("'") && raw.endsWith("'")) || (raw.startsWith("\"") && raw.endsWith("\""))) {
+            return raw.substring(1, raw.length() - 1);
+        }
+        if ("TRUE".equalsIgnoreCase(raw)) return Boolean.TRUE;
+        if ("FALSE".equalsIgnoreCase(raw)) return Boolean.FALSE;
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException e1) {
+            try {
+                return Long.parseLong(raw);
+            } catch (NumberFormatException e2) {
+                try {
+                    return Double.parseDouble(raw);
+                } catch (NumberFormatException e3) {
+                    return raw;
+                }
+            }
+        }
     }
 
     private AggregateCall buildAggregateCall(StratosSQLParser.AggregateFunctionContext ctx, String alias) {

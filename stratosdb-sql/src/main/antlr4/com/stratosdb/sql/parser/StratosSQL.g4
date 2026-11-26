@@ -287,7 +287,11 @@ indexName: anyIdentifier;
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
 selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | functionCall (AS alias)? | literal (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
-windowFunction: (ROW_NUMBER | RANK | DENSE_RANK) LPAREN RPAREN OVER LPAREN (PARTITION BY groupByList)? (ORDER BY orderList)? RPAREN;
+windowFunction: (ROW_NUMBER | RANK | DENSE_RANK) LPAREN RPAREN overClause
+              | (LEAD | LAG) LPAREN columnName (COMMA literal (COMMA literal)?)? RPAREN overClause
+              | (SUM | COUNT | AVG | MIN | MAX) LPAREN (STAR | columnName) RPAREN overClause
+              ;
+overClause: OVER LPAREN (PARTITION BY groupByList)? (ORDER BY orderList)? RPAREN;
 
 // Expressions
 // Alternative order matters for ANTLR4's left-recursion precedence: earlier
@@ -549,6 +553,8 @@ SQL_LANG: S Q L;
 ROW_NUMBER: R O W '_' N U M B E R;
 RANK: R A N K;
 DENSE_RANK: D E N S E '_' R A N K;
+LEAD: L E A D;
+LAG: L A G;
 OVER: O V E R;
 PARTITION: P A R T I T I O N;
 INCREMENT: I N C R E M E N T;

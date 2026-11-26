@@ -4269,32 +4269,35 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * rules.
      */
     private QueryResult executeWindowFunctionSelect(SelectStatement stmt, Transaction txn, HeapTable table) {
-        List<Tuple> rows = new ArrayList<>();
-        for (byte[] raw : table.scanMvcc(txn.getSnapshot(), transactionManager)) {
-            Tuple tuple = deserializeTuple(stmt.tableName(), raw);
-            if (matchesWhere(tuple, stmt.where(), txn)) {
-                rows.add(tuple);
+        List<String> schemaCols = tableColumns.getOrDefault(stmt.tableName(), List.of());
+        PhysicalOperator currentOp = new SeqScanOperator(
+            stmt.tableName(),
+            table,
+            txn != null ? txn.getSnapshot() : null,
+            transactionManager,
+            schemaCols,
+            this::deserializeTuple
+        );
+
+        if (stmt.where() != null) {
+            currentOp = new FilterOperator(currentOp, row -> matchesWhere(row, stmt.where(), txn));
+        }
+
+        currentOp = new WindowOperator(currentOp, stmt.columns(), stmt.windowFunctions());
+
+        if (stmt.orderItems() != null && !stmt.orderItems().isEmpty()) {
+            currentOp = new SortOperator(currentOp, stmt.orderItems(), SortOperator.DEFAULT_WORK_MEM_BYTES, stmt.columns(), stmt.columnAliases());
+        }
+
+        if (stmt.limit() != null || stmt.offset() != null) {
+            long limit = parseLongOrDefault(stmt.limit(), -1);
+            long offset = parseLongOrDefault(stmt.offset(), 0);
+            if (limit >= 0 || offset > 0) {
+                currentOp = new LimitOperator(currentOp, limit, offset);
             }
         }
 
-        // alias -> this window function's value for each row, by index into `rows`.
-        Map<String, long[]> windowValuesByAlias = new java.util.LinkedHashMap<>();
-        for (WindowFunctionCall call : stmt.windowFunctions()) {
-            windowValuesByAlias.put(call.alias(), computeWindowValues(rows, call));
-        }
-
-        List<Tuple> result = new ArrayList<>();
-        for (int i = 0; i < rows.size(); i++) {
-            Tuple projected = project(rows.get(i), stmt.columns());
-            for (Map.Entry<String, long[]> entry : windowValuesByAlias.entrySet()) {
-                projected.addValue(entry.getKey(), entry.getValue()[i]);
-            }
-            result.add(projected);
-        }
-
-        result = applyLimitOffset(result, stmt.limit(), stmt.offset());
-
-        return QueryResult.success(result);
+        return QueryResult.success(currentOp, currentOp.getOutputColumns());
     }
 
     private long[] computeWindowValues(List<Tuple> rows, WindowFunctionCall call) {
