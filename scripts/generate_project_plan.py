@@ -473,7 +473,7 @@ def create_project_plan_excel():
         # Sprint 6 (Month 3, Weeks 11-12)
         ["Sprint 06", "Week 11", "Optimizer", "Dynamic Programming Join Reordering",
          "Implement System-R Dynamic Programming join enumerator for queries up to 10 tables. Calculate optimal bushy/left-deep join trees using cardinality estimates.",
-         "High", "P1 - High", "Multi-table queries select optimal join order; verified against complex 6-table joins with 10x cost reduction.", "Planned"],
+         "High", "P1 - High", "Multi-table queries select optimal join order; verified against complex 6-table joins with 10x cost reduction.", "Completed"],
         ["Sprint 06", "Week 12", "Optimizer", "Visibility Map & Index-Only Scans",
          "Implement persistent 2-bit per page Visibility Map (all-visible, all-frozen). Implement Index-Only Scan operator bypassing heap tuple reads when pages are all-visible.",
          "High", "P1 - High", "Index-Only Scan reports 0 heap page reads in EXPLAIN ANALYZE; 3x throughput speedup on indexed queries.", "Planned"],

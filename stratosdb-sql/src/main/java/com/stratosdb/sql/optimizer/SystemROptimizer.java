@@ -18,6 +18,13 @@ import java.util.*;
  */
 public class SystemROptimizer {
 
+    public static final int MAX_DP_TABLES = 10;
+
+    public enum JoinTreeShape {
+        BUSHY,
+        LEFT_DEEP
+    }
+
     public record IndexInfo(String indexName, String tableName, String columnName, boolean isUnique, boolean isBTree, boolean isHash) {}
 
     @FunctionalInterface
@@ -41,7 +48,8 @@ public class SystemROptimizer {
 
     /**
      * Determines whether cost-based join optimization can be performed for this query.
-     * Returns true if all involved tables have persistent table statistics.
+     * Returns true if all involved tables have persistent table statistics,
+     * the relation count is within {@link #MAX_DP_TABLES} (10), and all joins are INNER/CROSS.
      */
     public static boolean canOptimize(SelectStatement stmt, Map<String, TableStatistics> statistics) {
         if (stmt == null || statistics == null || statistics.isEmpty()) {
@@ -53,17 +61,24 @@ public class SystemROptimizer {
         if (statistics.get(stmt.tableName()) == null) {
             return false;
         }
+        int tableCount = 1;
         if (stmt.joins() != null) {
             for (JoinClause join : stmt.joins()) {
                 if (join.isSubquery() || join.tableName() == null) {
                     return false;
                 }
+                if (join.joinType() != null
+                        && join.joinType() != JoinClause.JoinType.INNER
+                        && join.joinType() != JoinClause.JoinType.CROSS) {
+                    return false;
+                }
                 if (statistics.get(join.tableName()) == null) {
                     return false;
                 }
+                tableCount++;
             }
         }
-        return true;
+        return tableCount <= MAX_DP_TABLES;
     }
 
     public record Relation(
@@ -80,129 +95,217 @@ public class SystemROptimizer {
     }
 
     /**
-     * Optimizes a multi-table query using System-R dynamic programming join enumeration.
+     * Optimizes a multi-table query using System-R dynamic programming join enumeration
+     * (supporting bushy and left-deep join trees up to 10 tables).
      */
     public PlanNode optimize(SelectStatement stmt,
                              Map<String, TableStatistics> statistics,
                              Map<String, List<String>> tableColumns,
                              IndexResolver indexResolver) {
+        return optimize(stmt, statistics, tableColumns, indexResolver, JoinTreeShape.BUSHY);
+    }
+
+    /**
+     * Optimizes a multi-table query using System-R dynamic programming join enumeration
+     * with the specified {@link JoinTreeShape} ({@code BUSHY} or {@code LEFT_DEEP}).
+     */
+    public PlanNode optimize(SelectStatement stmt,
+                             Map<String, TableStatistics> statistics,
+                             Map<String, List<String>> tableColumns,
+                             IndexResolver indexResolver,
+                             JoinTreeShape shape) {
         if (!canOptimize(stmt, statistics)) {
             return null;
         }
 
-        // 1. Identify all relations in the query (FROM + JOIN targets)
+        List<Relation> relations = buildRelations(stmt, statistics, tableColumns);
+        int k = relations.size();
+        if (k == 0 || k > MAX_DP_TABLES) return null;
+
+        // 2. Extract join predicates (both JOIN ON clauses and WHERE equi-joins)
+        List<JoinPredicate> joinPredicates = extractJoinPredicates(stmt, relations);
+        int[] adjMask = buildAdjacencyMasks(k, joinPredicates, relations);
+
+        // 3. Size 1: Base Relation Access Path Selection (SeqScan vs IndexScan)
+        PlanNode[] memo = new PlanNode[1 << k];
+        for (int i = 0; i < k; i++) {
+            memo[1 << i] = planBaseRelation(relations.get(i), indexResolver);
+        }
+        if (k == 1) {
+            return memo[1];
+        }
+
+        // Precompute masks grouped by popcount for clean O(3^k) bottom-up DP
+        List<List<Integer>> masksBySize = new ArrayList<>(k + 1);
+        for (int s = 0; s <= k; s++) {
+            masksBySize.add(new ArrayList<>());
+        }
+        int totalMasks = 1 << k;
+        for (int mask = 1; mask < totalMasks; mask++) {
+            masksBySize.get(Integer.bitCount(mask)).add(mask);
+        }
+
+        // 4. Size 2 to K: O(3^k) System-R Dynamic Programming Join Enumeration
+        for (int size = 2; size <= k; size++) {
+            for (int mask : masksBySize.get(size)) {
+                boolean maskHasConnectedPair = hasAnyConnectedPartition(mask, adjMask);
+                PlanNode bestPlanForMask = null;
+
+                // Iterate all proper non-empty subsets s1 of mask in O(3^k) total
+                for (int s1 = (mask - 1) & mask; s1 > 0; s1 = (s1 - 1) & mask) {
+                    int s2 = mask ^ s1;
+                    if (s1 > s2) continue; // Symmetric avoidance
+
+                    if (shape == JoinTreeShape.LEFT_DEEP
+                            && Integer.bitCount(s1) > 1
+                            && Integer.bitCount(s2) > 1) {
+                        continue;
+                    }
+
+                    PlanNode p1 = memo[s1];
+                    PlanNode p2 = memo[s2];
+                    if (p1 == null || p2 == null) continue;
+
+                    boolean connected = areSubsetsConnected(s1, s2, adjMask);
+                    if (!connected && maskHasConnectedPair) {
+                        continue; // Avoid Cartesian products when a connected join exists
+                    }
+
+                    List<JoinPredicate> connecting = connected
+                        ? findConnectingPredicates(s1, s2, joinPredicates, relations)
+                        : List.of();
+
+                    PlanNode candidate = evaluateBestJoinBetween(p1, p2, connecting, relations, statistics);
+                    if (candidate != null && (bestPlanForMask == null || candidate.getCost() < bestPlanForMask.getCost())) {
+                        bestPlanForMask = candidate;
+                    }
+                }
+
+                if (bestPlanForMask != null) {
+                    memo[mask] = bestPlanForMask;
+                }
+            }
+        }
+
+        return memo[totalMasks - 1];
+    }
+
+    /**
+     * Estimates the cost of a naive left-deep join plan following the exact FROM/JOIN
+     * order written in the SQL query (for optimizer cost-reduction verification).
+     */
+    public PlanNode buildNaiveLeftDeepPlan(SelectStatement stmt,
+                                           Map<String, TableStatistics> statistics,
+                                           Map<String, List<String>> tableColumns,
+                                           IndexResolver indexResolver) {
+        if (!canOptimize(stmt, statistics)) {
+            return null;
+        }
+        List<Relation> relations = buildRelations(stmt, statistics, tableColumns);
+        if (relations.isEmpty()) return null;
+        List<JoinPredicate> joinPredicates = extractJoinPredicates(stmt, relations);
+
+        PlanNode current = planBaseRelation(relations.get(0), indexResolver);
+        int currentMask = 1;
+        for (int i = 1; i < relations.size(); i++) {
+            PlanNode nextRel = planBaseRelation(relations.get(i), indexResolver);
+            int nextMask = 1 << i;
+            List<JoinPredicate> connecting = findConnectingPredicates(currentMask, nextMask, joinPredicates, relations);
+            current = buildLeftDeepHashJoin(current, nextRel, connecting, relations, statistics);
+            currentMask |= nextMask;
+        }
+        return current;
+    }
+
+    private PlanNode buildLeftDeepHashJoin(PlanNode left, PlanNode right,
+                                           List<JoinPredicate> connecting,
+                                           List<Relation> relations,
+                                           Map<String, TableStatistics> statistics) {
+        double selectivity = calculateCombinedSelectivity(connecting, relations, statistics);
+        double outRows = Math.max(1.0, Math.round(left.getEstimatedRows() * right.getEstimatedRows() * selectivity));
+        List<String> combinedCols = JoinUtils.combineColumns(left.getOutputColumns(), right.getOutputColumns());
+        List<String> leftCols = new ArrayList<>();
+        List<String> rightCols = new ArrayList<>();
+        populateConnectingColumns(connecting, left, right, leftCols, rightCols);
+
+        double cost = costModel.costHashJoin(
+            left.getCost(), left.getEstimatedRows(),
+            right.getCost(), right.getEstimatedRows(), outRows, true);
+        return new JoinPlanNode(left, right, JoinPlanNode.JoinAlgorithm.HASH, JoinClause.JoinType.INNER,
+            leftCols, rightCols, null, true, cost, outRows, combinedCols);
+    }
+
+    private PlanNode evaluateBestJoinBetween(PlanNode p1, PlanNode p2,
+                                             List<JoinPredicate> connecting,
+                                             List<Relation> relations,
+                                             Map<String, TableStatistics> statistics) {
+        double selectivity = calculateCombinedSelectivity(connecting, relations, statistics);
+        double outRows = Math.max(1.0, Math.round(p1.getEstimatedRows() * p2.getEstimatedRows() * selectivity));
+        List<String> combinedCols = JoinUtils.combineColumns(p1.getOutputColumns(), p2.getOutputColumns());
+
+        List<String> p1Cols = new ArrayList<>();
+        List<String> p2Cols = new ArrayList<>();
+        populateConnectingColumns(connecting, p1, p2, p1Cols, p2Cols);
+
+        PlanNode best = null;
+
+        // Option A: Hash Join (Build on P2, Probe on P1)
+        double costA = costModel.costHashJoin(p1.getCost(), p1.getEstimatedRows(), p2.getCost(), p2.getEstimatedRows(), outRows, true);
+        best = new JoinPlanNode(p1, p2, JoinPlanNode.JoinAlgorithm.HASH, JoinClause.JoinType.INNER,
+            p1Cols, p2Cols, null, true, costA, outRows, combinedCols);
+
+        // Option B: Hash Join (Build on P1, Probe on P2)
+        double costB = costModel.costHashJoin(p2.getCost(), p2.getEstimatedRows(), p1.getCost(), p1.getEstimatedRows(), outRows, true);
+        if (costB < best.getCost()) {
+            best = new JoinPlanNode(p2, p1, JoinPlanNode.JoinAlgorithm.HASH, JoinClause.JoinType.INNER,
+                p2Cols, p1Cols, null, true, costB, outRows, combinedCols);
+        }
+
+        // Option C: Merge Join (only when at least one equi-join key exists)
+        if (!p1Cols.isEmpty()) {
+            double costMerge = costModel.costMergeJoin(p1.getCost(), p1.getEstimatedRows(), p2.getCost(), p2.getEstimatedRows(), outRows, false, false);
+            if (costMerge < best.getCost()) {
+                best = new JoinPlanNode(p1, p2, JoinPlanNode.JoinAlgorithm.MERGE, JoinClause.JoinType.INNER,
+                    p1Cols, p2Cols, null, false, costMerge, outRows, combinedCols);
+            }
+        }
+
+        // Option D: Nested Loop Join
+        double costNL = costModel.costNestedLoopJoin(p1.getCost(), p1.getEstimatedRows(), p2.getCost(), p2.getEstimatedRows(), outRows);
+        if (costNL < best.getCost()) {
+            best = new JoinPlanNode(p1, p2, JoinPlanNode.JoinAlgorithm.NESTED_LOOP, JoinClause.JoinType.INNER,
+                p1Cols, p2Cols, null, false, costNL, outRows, combinedCols);
+        }
+
+        return best;
+    }
+
+    private List<Relation> buildRelations(SelectStatement stmt,
+                                          Map<String, TableStatistics> statistics,
+                                          Map<String, List<String>> tableColumns) {
         List<Relation> relations = new ArrayList<>();
         String fromTable = stmt.tableName();
         String fromAlias = stmt.tableAlias();
-        List<String> fromCols = tableColumns.getOrDefault(fromTable, List.of());
+        List<String> fromCols = tableColumns != null ? tableColumns.getOrDefault(fromTable, List.of()) : List.of();
         TableStatistics fromStats = statistics.get(fromTable);
 
-        // Separate single-table WHERE filters vs multi-table join filters
         Map<String, List<WhereExpr>> filtersByTable = extractSingleTableFilters(stmt.where(), stmt);
-
         relations.add(new Relation(0, fromTable, fromAlias, fromCols, fromStats,
-            combineFilters(filtersByTable.get(fromAlias != null ? fromAlias.toLowerCase() : fromTable.toLowerCase()))));
+            combineFilters(filtersByTable.get((fromAlias != null ? fromAlias : fromTable).toLowerCase()))));
 
         int relIdx = 1;
         if (stmt.joins() != null) {
             for (JoinClause join : stmt.joins()) {
                 String jTable = join.tableName();
                 String jAlias = join.tableAlias();
-                List<String> jCols = tableColumns.getOrDefault(jTable, List.of());
+                List<String> jCols = tableColumns != null ? tableColumns.getOrDefault(jTable, List.of()) : List.of();
                 TableStatistics jStats = statistics.get(jTable);
                 String effKey = (jAlias != null ? jAlias : jTable).toLowerCase();
-                relations.add(new Relation(relIdx++, jTable, jAlias, jCols, jStats, combineFilters(filtersByTable.get(effKey))));
+                relations.add(new Relation(relIdx++, jTable, jAlias, jCols, jStats,
+                    combineFilters(filtersByTable.get(effKey))));
             }
         }
-
-        int k = relations.size();
-        if (k == 0) return null;
-
-        // 2. Extract join predicates
-        List<JoinPredicate> joinPredicates = extractJoinPredicates(stmt, relations);
-
-        // 3. Size 1: Base Relation Access Path Selection (SeqScan vs IndexScan)
-        Map<Integer, PlanNode> memo = new HashMap<>();
-        for (int i = 0; i < k; i++) {
-            Relation rel = relations.get(i);
-            PlanNode scanPlan = planBaseRelation(rel, indexResolver);
-            memo.put(1 << i, scanPlan);
-        }
-
-        // 4. Size 2 to K: Dynamic Programming Join Enumeration
-        for (int size = 2; size <= k; size++) {
-            for (int mask = 1; mask < (1 << k); mask++) {
-                if (Integer.bitCount(mask) != size) continue;
-
-                PlanNode bestPlanForMask = null;
-
-                // Enumerate non-empty disjoint partitions (S1, S2)
-                for (int s1 = 1; s1 < mask; s1++) {
-                    if ((mask & s1) != s1) continue;
-                    int s2 = mask ^ s1;
-                    if (s1 > s2) continue; // Symmetric avoidance
-
-                    PlanNode p1 = memo.get(s1);
-                    PlanNode p2 = memo.get(s2);
-                    if (p1 == null || p2 == null) continue;
-
-                    List<JoinPredicate> connecting = findConnectingPredicates(s1, s2, joinPredicates, relations);
-                    if (connecting.isEmpty()) {
-                        // Skip Cartesian product if a connected partition exists for this mask
-                        if (hasConnectedPartition(mask, joinPredicates, relations)) {
-                            continue;
-                        }
-                    }
-
-                    List<JoinPredicate> predicatesToTry = connecting.isEmpty()
-                        ? List.of(new JoinPredicate(null, null, null, null, JoinClause.JoinType.INNER))
-                        : connecting;
-
-                    for (JoinPredicate pred : predicatesToTry) {
-                        double selectivity = calculateJoinSelectivity(pred, relations, statistics);
-                        double outRows = Math.max(1.0, Math.round(p1.getEstimatedRows() * p2.getEstimatedRows() * selectivity));
-                        List<String> combinedCols = JoinUtils.combineColumns(p1.getOutputColumns(), p2.getOutputColumns());
-
-                        String leftCol = resolveColRef(pred, p1);
-                        String rightCol = resolveColRef(pred, p2);
-
-                        // Option A: Hash Join (Build on P2, Probe on P1)
-                        double costA = costModel.costHashJoin(p1.getCost(), p1.getEstimatedRows(), p2.getCost(), p2.getEstimatedRows(), outRows, true);
-                        if (bestPlanForMask == null || costA < bestPlanForMask.getCost()) {
-                            bestPlanForMask = new JoinPlanNode(p1, p2, JoinPlanNode.JoinAlgorithm.HASH, pred.getJoinType(),
-                                leftCol, rightCol, true, costA, outRows, combinedCols);
-                        }
-
-                        // Option B: Hash Join (Build on P1, Probe on P2)
-                        double costB = costModel.costHashJoin(p2.getCost(), p2.getEstimatedRows(), p1.getCost(), p1.getEstimatedRows(), outRows, true);
-                        if (costB < bestPlanForMask.getCost()) {
-                            bestPlanForMask = new JoinPlanNode(p2, p1, JoinPlanNode.JoinAlgorithm.HASH, pred.getJoinType(),
-                                rightCol, leftCol, true, costB, outRows, combinedCols);
-                        }
-
-                        // Option C: Merge Join
-                        double costMerge = costModel.costMergeJoin(p1.getCost(), p1.getEstimatedRows(), p2.getCost(), p2.getEstimatedRows(), outRows, false, false);
-                        if (costMerge < bestPlanForMask.getCost()) {
-                            bestPlanForMask = new JoinPlanNode(p1, p2, JoinPlanNode.JoinAlgorithm.MERGE, pred.getJoinType(),
-                                leftCol, rightCol, false, costMerge, outRows, combinedCols);
-                        }
-
-                        // Option D: Nested Loop Join
-                        double costNL = costModel.costNestedLoopJoin(p1.getCost(), p1.getEstimatedRows(), p2.getCost(), p2.getEstimatedRows(), outRows);
-                        if (costNL < bestPlanForMask.getCost()) {
-                            bestPlanForMask = new JoinPlanNode(p1, p2, JoinPlanNode.JoinAlgorithm.NESTED_LOOP, pred.getJoinType(),
-                                leftCol, rightCol, false, costNL, outRows, combinedCols);
-                        }
-                    }
-                }
-
-                if (bestPlanForMask != null) {
-                    memo.put(mask, bestPlanForMask);
-                }
-            }
-        }
-
-        return memo.get((1 << k) - 1);
+        return relations;
     }
 
     private PlanNode planBaseRelation(Relation rel, IndexResolver indexResolver) {
@@ -345,15 +448,80 @@ public class SystemROptimizer {
         return connecting;
     }
 
-    private static boolean hasConnectedPartition(int mask,
-                                                 List<JoinPredicate> joinPredicates,
-                                                 List<Relation> relations) {
-        for (int s1 = 1; s1 < mask; s1++) {
-            if ((mask & s1) != s1) continue;
-            int s2 = mask ^ s1;
-            if (!findConnectingPredicates(s1, s2, joinPredicates, relations).isEmpty()) {
+    private static double calculateCombinedSelectivity(List<JoinPredicate> connecting,
+                                                       List<Relation> relations,
+                                                       Map<String, TableStatistics> statistics) {
+        if (connecting == null || connecting.isEmpty()) {
+            return 1.0; // Cross join / Cartesian product
+        }
+        double sel = 1.0;
+        for (JoinPredicate pred : connecting) {
+            sel *= calculateJoinSelectivity(pred, relations, statistics);
+        }
+        return Math.max(1e-9, Math.min(1.0, sel));
+    }
+
+    private static void populateConnectingColumns(List<JoinPredicate> connecting,
+                                                  PlanNode p1,
+                                                  PlanNode p2,
+                                                  List<String> p1Cols,
+                                                  List<String> p2Cols) {
+        if (connecting == null) return;
+        for (JoinPredicate pred : connecting) {
+            String c1 = resolveColRef(pred, p1);
+            String c2 = resolveColRef(pred, p2);
+            if (c1 != null && c2 != null) {
+                p1Cols.add(c1);
+                p2Cols.add(c2);
+            }
+        }
+    }
+
+    private static int[] buildAdjacencyMasks(int k, List<JoinPredicate> joinPredicates, List<Relation> relations) {
+        int[] adj = new int[k];
+        for (JoinPredicate jp : joinPredicates) {
+            int l = findRelationIndex(jp.getLeftTable(), relations);
+            int r = findRelationIndex(jp.getRightTable(), relations);
+            if (l >= 0 && r >= 0 && l != r) {
+                adj[l] |= (1 << r);
+                adj[r] |= (1 << l);
+            }
+        }
+        return adj;
+    }
+
+    private static int findRelationIndex(String tableNameOrAlias, List<Relation> relations) {
+        if (tableNameOrAlias == null) return -1;
+        for (int i = 0; i < relations.size(); i++) {
+            Relation r = relations.get(i);
+            if (tableNameOrAlias.equalsIgnoreCase(r.effectiveName()) || tableNameOrAlias.equalsIgnoreCase(r.tableName())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean areSubsetsConnected(int s1, int s2, int[] adjMask) {
+        int m = s1;
+        while (m != 0) {
+            int lsb = Integer.numberOfTrailingZeros(m);
+            if ((adjMask[lsb] & s2) != 0) {
                 return true;
             }
+            m &= m - 1;
+        }
+        return false;
+    }
+
+    private static boolean hasAnyConnectedPartition(int mask, int[] adjMask) {
+        int m = mask;
+        while (m != 0) {
+            int lsb = Integer.numberOfTrailingZeros(m);
+            int rest = mask ^ (1 << lsb);
+            if ((adjMask[lsb] & rest) != 0) {
+                return true;
+            }
+            m &= m - 1;
         }
         return false;
     }
@@ -362,22 +530,43 @@ public class SystemROptimizer {
         List<JoinPredicate> list = new ArrayList<>();
         if (stmt.joins() != null) {
             for (JoinClause jc : stmt.joins()) {
-                String leftRaw = jc.leftColumn();
-                String rightRaw = jc.rightColumn();
-
-                String leftTbl = extractTable(leftRaw, relations);
-                String leftCol = unqualifyColName(leftRaw);
-                String rightTbl = extractTable(rightRaw, relations);
-                String rightCol = unqualifyColName(rightRaw);
-
-                if (leftTbl == null && jc.tableName() != null) {
-                    rightTbl = jc.effectiveTargetName();
+                List<String> lCols = jc.leftColumns();
+                List<String> rCols = jc.rightColumns();
+                if (lCols != null && rCols != null && !lCols.isEmpty() && lCols.size() == rCols.size()) {
+                    for (int i = 0; i < lCols.size(); i++) {
+                        addEquiPredicate(lCols.get(i), rCols.get(i), jc, relations, list);
+                    }
+                } else if (jc.leftColumn() != null && jc.rightColumn() != null) {
+                    addEquiPredicate(jc.leftColumn(), jc.rightColumn(), jc, relations, list);
                 }
-
-                list.add(new JoinPredicate(leftTbl, leftCol, rightTbl, rightCol, jc.joinType()));
+            }
+        }
+        if (stmt.where() != null) {
+            List<WhereExpr> conjuncts = new ArrayList<>();
+            splitAnd(stmt.where(), conjuncts);
+            for (WhereExpr c : conjuncts) {
+                if (c instanceof WhereExpr.ColumnComparison cc && "=".equals(cc.operator())) {
+                    addEquiPredicate(cc.leftColumn(), cc.rightColumn(), null, relations, list);
+                }
             }
         }
         return list;
+    }
+
+    private static void addEquiPredicate(String leftRaw, String rightRaw, JoinClause jc,
+                                         List<Relation> relations, List<JoinPredicate> list) {
+        String leftTbl = extractTable(leftRaw, relations);
+        String leftCol = unqualifyColName(leftRaw);
+        String rightTbl = extractTable(rightRaw, relations);
+        String rightCol = unqualifyColName(rightRaw);
+
+        if (leftTbl == null && jc != null && jc.tableName() != null) {
+            rightTbl = jc.effectiveTargetName();
+        }
+        if (leftTbl != null && rightTbl != null && !leftTbl.equalsIgnoreCase(rightTbl)) {
+            list.add(new JoinPredicate(leftTbl, leftCol, rightTbl, rightCol,
+                jc != null ? jc.joinType() : JoinClause.JoinType.INNER));
+        }
     }
 
     private static String extractTable(String colRef, List<Relation> relations) {
@@ -430,12 +619,38 @@ public class SystemROptimizer {
 
     private static Set<String> findReferencedTables(WhereExpr expr) {
         Set<String> tables = new HashSet<>();
-        if (expr instanceof WhereExpr.Comparison cmp) {
-            if (cmp.column() != null && cmp.column().contains(".")) {
-                tables.add(cmp.column().substring(0, cmp.column().lastIndexOf('.')));
-            }
-        }
+        collectReferencedTables(expr, tables);
         return tables;
+    }
+
+    private static void collectReferencedTables(WhereExpr expr, Set<String> tables) {
+        if (expr == null) return;
+        switch (expr) {
+            case WhereExpr.Comparison cmp -> addTablePrefix(cmp.column(), tables);
+            case WhereExpr.Like like -> addTablePrefix(like.column(), tables);
+            case WhereExpr.Contains c -> addTablePrefix(c.column(), tables);
+            case WhereExpr.InList in -> addTablePrefix(in.column(), tables);
+            case WhereExpr.ColumnComparison cc -> {
+                addTablePrefix(cc.leftColumn(), tables);
+                addTablePrefix(cc.rightColumn(), tables);
+            }
+            case WhereExpr.And and -> {
+                collectReferencedTables(and.left(), tables);
+                collectReferencedTables(and.right(), tables);
+            }
+            case WhereExpr.Or or -> {
+                collectReferencedTables(or.left(), tables);
+                collectReferencedTables(or.right(), tables);
+            }
+            case WhereExpr.Not not -> collectReferencedTables(not.inner(), tables);
+            default -> {}
+        }
+    }
+
+    private static void addTablePrefix(String col, Set<String> tables) {
+        if (col != null && col.contains(".")) {
+            tables.add(col.substring(0, col.lastIndexOf('.')));
+        }
     }
 
     private static WhereExpr combineFilters(List<WhereExpr> list) {

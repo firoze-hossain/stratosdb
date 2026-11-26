@@ -2301,6 +2301,22 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     4. `test10MRowsAnalyticalAggregation5xFasterThanVolcano`: verified **7.41x speedup** on 10,000,000 rows (`468.48 ms` Vectorized SIMD vs `3473.74 ms` Volcano row-by-row, exceeding 5.0x DoD).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 05 Week 10 marked `Completed`.
 
+## Sprint 06 Week 11 — Optimizer: Dynamic Programming Join Reordering ✅ DONE
+
+- ✅ **System-R $O(3^k)$ Bitmask DP Join Enumerator (`SystemROptimizer.java`)**:
+  - Upgraded [`SystemROptimizer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/optimizer/SystemROptimizer.java) to $O(3^k)$ subset enumeration (`for (int s1 = (mask - 1) & mask; s1 > 0; s1 = (s1 - 1) & mask)`) with precomputed adjacency bitmasks (`adjMask`) and popcount-grouped DP levels (`masksBySize`), supporting up to `MAX_DP_TABLES = 10` relations.
+  - Added `JoinTreeShape` (`BUSHY` default, plus `LEFT_DEEP` mode) and `buildNaiveLeftDeepPlan(...)` for optimizer cost-reduction verification.
+  - Added multi-predicate connecting join support (`populateConnectingColumns`, `calculateCombinedSelectivity`), `WHERE` equi-join predicate extraction (`WhereExpr.ColumnComparison`), recursive `findReferencedTables`, and outer-join safety guard in `canOptimize`.
+
+- ✅ **Verification & 6-Table Cost-Reduction Benchmarks**:
+  - [`DpJoinReorderingTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/DpJoinReorderingTest.java) (**4/4 passing**):
+    1. `testSixTableJoinAchievesOver10xCostReduction`: verified complex 6-table analytical join reduces cost from `1,006,026,820.01` (naive) to `1,800.31` (System-R DP optimal) — **> 500,000x cost reduction** (DoD: $\ge 10\times$).
+    2. `testBushyJoinTreeBeatsLeftDeepTree`: verified bushy `(t1 ⋈ t2) ⋈ (t3 ⋈ t4)` tree selection strictly outperforms left-deep trees.
+    3. `testTenTableDynamicProgrammingEnumeration`: verified 10-table DP enumeration and `MAX_DP_TABLES = 10` guard.
+    4. `testEndToEndSixTableJoinExecutionWithAnalyze`: verified end-to-end 6-table SQL execution with `ANALYZE` and `EXPLAIN` in `StratosDB`.
+  - `stratosdb-sql` (**51/51 passing**) and `CompoundAndNonEquiJoinIntegrationTest` (**11/11 passing**).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 06 Week 11 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
