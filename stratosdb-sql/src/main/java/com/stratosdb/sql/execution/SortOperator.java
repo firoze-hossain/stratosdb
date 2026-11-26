@@ -233,6 +233,11 @@ public class SortOperator implements PhysicalOperator {
         return child.getOutputColumns();
     }
 
+    @Override
+    public PhysicalOperator getChild() {
+        return child;
+    }
+
     public int getSpilledRunCount() {
         return spilledRunFiles.size();
     }

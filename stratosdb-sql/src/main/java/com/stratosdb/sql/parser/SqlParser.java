@@ -157,7 +157,7 @@ public class SqlParser {
         } else if (ctx.showCatalog() != null) {
             return new ShowCatalogStatement();
         } else if (ctx.explain() != null) {
-            return new ExplainStatement(buildSelect(ctx.explain().select()));
+            return new ExplainStatement(buildSelect(ctx.explain().select()), ctx.explain().ANALYZE() != null);
         } else if (ctx.analyze() != null) {
             String tbl = ctx.analyze().tableName() != null ? ctx.analyze().tableName().getText() : null;
             return new AnalyzeStatement(tbl);

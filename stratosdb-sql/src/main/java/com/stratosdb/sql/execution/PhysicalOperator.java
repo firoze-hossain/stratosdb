@@ -30,4 +30,11 @@ public interface PhysicalOperator extends AutoCloseable {
      * Returns the output schema (column names) of tuples produced by this operator.
      */
     List<String> getOutputColumns();
+
+    /**
+     * Returns the primary child operator in the pipeline, or {@code null} for leaf scans.
+     */
+    default PhysicalOperator getChild() {
+        return null;
+    }
 }

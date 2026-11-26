@@ -12,7 +12,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.List;
 
 /**
@@ -55,7 +54,7 @@ public class HeapTable {
      * before trusting an index's key value directly instead of fetching
      * the heap tuple to verify visibility.
      */
-    private final BitSet visibilityMap = new BitSet();
+    private final VisibilityMap visibilityMap;
     private final FreeSpaceMap fsm;
 
     public HeapTable(String name, BufferPool bufferPool) {
@@ -68,12 +67,23 @@ public class HeapTable {
         // page beyond the first for any table that survived a restart.
         long existingPages = bufferPool.getTablePageCount(name);
         this.lastPageId = new java.util.concurrent.atomic.AtomicLong(existingPages > 0 ? existingPages - 1 : 0);
+        this.visibilityMap = new VisibilityMap(name, bufferPool, existingPages);
         this.fsm = new FreeSpaceMap(name, bufferPool, existingPages);
     }
 
-    /** Whether pageId is currently known to be "all visible" - see visibilityMap's own javadoc for the exact guarantee this means. Conservatively false (never crashes) for a pageId never observed. */
+    /** Whether pageId is currently known to be "all visible" (persistent 2-bit VisibilityMap). */
     public boolean isAllVisible(long pageId) {
-        return pageId >= 0 && pageId <= Integer.MAX_VALUE && visibilityMap.get((int) pageId);
+        return visibilityMap.isAllVisible(pageId);
+    }
+
+    /** Whether pageId is currently known to be "all frozen" (persistent 2-bit VisibilityMap). */
+    public boolean isAllFrozen(long pageId) {
+        return visibilityMap.isAllFrozen(pageId);
+    }
+
+    /** Returns the persistent 2-bit-per-page VisibilityMap for this table. */
+    public VisibilityMap getVisibilityMap() {
+        return visibilityMap;
     }
 
     /**
@@ -103,7 +113,7 @@ public class HeapTable {
                     if (slot != -1) {
                         fsm.update(candidatePageId, page.getFreeSpace());
                         bufferPool.markDirty(name, candidatePageId);
-                        visibilityMap.clear((int) candidatePageId); // a new (possibly uncommitted) tuple just landed here
+                        visibilityMap.clear(candidatePageId); // a new (possibly uncommitted) tuple just landed here
                         LOG.debug("Inserted at {}/{} via FSM", candidatePageId, slot);
                         return new InsertResult(candidatePageId, slot);
                     }
@@ -137,7 +147,7 @@ public class HeapTable {
                     continue;
                 }
                 bufferPool.markDirty(name, candidatePageId);
-                visibilityMap.clear((int) candidatePageId); // a brand new page always starts NOT all-visible
+                visibilityMap.clear(candidatePageId); // a brand new page always starts NOT all-visible
                 lastPageId.compareAndSet(observedLast, candidatePageId);
                 fsm.registerNewPage(candidatePageId, newPage.getFreeSpace());
                 LOG.debug("Created new page {} for insertion", candidatePageId);
@@ -252,7 +262,7 @@ public class HeapTable {
             if (result) {
                 fsm.update(pageId, page.getFreeSpace());
                 bufferPool.markDirty(name, pageId);
-                visibilityMap.clear((int) pageId); // e.g. an xmax was just set (deleteMvcc's tombstone) - visibility on this page is now snapshot-dependent
+                visibilityMap.clear(pageId); // e.g. an xmax was just set (deleteMvcc's tombstone) - visibility on this page is now snapshot-dependent
             }
         } finally {
             page.getLatch().writeLock().unlock();
@@ -530,6 +540,7 @@ public class HeapTable {
                 // differs between snapshots, which disqualifies the whole page
                 // regardless of how much dead space vacuum just cleaned up.
                 boolean allVisible = true;
+                boolean allFrozen = true;
                 for (int slot : page.getValidSlots()) {
                     byte[] stored = page.readTuple(slot);
                     if (stored == null) {
@@ -539,20 +550,21 @@ public class HeapTable {
                     long xmax = MVCCVisibility.readXmax(stored);
                     if (!txnManager.isCommitted(xmin) || xmax != MVCCVisibility.NO_XMAX) {
                         allVisible = false;
+                        allFrozen = false;
                         break;
                     }
+                    if (xmin >= horizonXid) {
+                        allFrozen = false;
+                    }
                 }
-                if (allVisible) {
-                    visibilityMap.set((int) pageId);
-                } else {
-                    visibilityMap.clear((int) pageId);
-                }
+                visibilityMap.setVisibility(pageId, allVisible, allFrozen);
             } finally {
                 page.getLatch().writeLock().unlock();
                 bufferPool.unpinPage(name, pageId);
             }
         }
 
+        visibilityMap.saveToDisk();
         LOG.debug("Vacuumed {}: reclaimed {} dead row version(s) across {} page(s)", name, reclaimedVersions, pagesCompacted);
         return new VacuumResult(reclaimedVersions, pagesCompacted);
     }

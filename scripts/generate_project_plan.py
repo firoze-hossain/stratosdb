@@ -476,7 +476,7 @@ def create_project_plan_excel():
          "High", "P1 - High", "Multi-table queries select optimal join order; verified against complex 6-table joins with 10x cost reduction.", "Completed"],
         ["Sprint 06", "Week 12", "Optimizer", "Visibility Map & Index-Only Scans",
          "Implement persistent 2-bit per page Visibility Map (all-visible, all-frozen). Implement Index-Only Scan operator bypassing heap tuple reads when pages are all-visible.",
-         "High", "P1 - High", "Index-Only Scan reports 0 heap page reads in EXPLAIN ANALYZE; 3x throughput speedup on indexed queries.", "Planned"],
+         "High", "P1 - High", "Index-Only Scan reports 0 heap page reads in EXPLAIN ANALYZE; 3x throughput speedup on indexed queries.", "Completed"],
 
         # Sprint 7 (Month 4, Weeks 13-14)
         ["Sprint 07", "Week 13", "Analytical Engine", "SQL Window Functions Engine",

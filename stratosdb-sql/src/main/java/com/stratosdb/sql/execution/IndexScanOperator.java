@@ -37,6 +37,8 @@ public class IndexScanOperator implements PhysicalOperator {
     private Iterator<BTreePage.RID> ridIterator;
     private final TupleSlot slot = new TupleSlot();
     private boolean open = false;
+    private long heapPageReads = 0L;
+    private long indexOnlyHits = 0L;
 
     public IndexScanOperator(String tableName,
                             HeapTable table,
@@ -93,6 +95,7 @@ public class IndexScanOperator implements PhysicalOperator {
         while (ridIterator.hasNext()) {
             BTreePage.RID rid = ridIterator.next();
             if (indexOnlyEligible && table != null && table.isAllVisible(rid.pageId())) {
+                indexOnlyHits++;
                 Object valueToReturn;
                 if (loKey >= Integer.MIN_VALUE && loKey <= Integer.MAX_VALUE) {
                     valueToReturn = Integer.valueOf(loKey.intValue());
@@ -106,6 +109,7 @@ public class IndexScanOperator implements PhysicalOperator {
             }
 
             if (table != null) {
+                heapPageReads++;
                 byte[] stored = table.readTuple(rid.pageId(), rid.slot());
                 if (stored == null) {
                     continue;
@@ -148,5 +152,13 @@ public class IndexScanOperator implements PhysicalOperator {
 
     public String getIndexedColumn() {
         return indexedColumn;
+    }
+
+    public long getHeapPageReads() {
+        return heapPageReads;
+    }
+
+    public long getIndexOnlyHits() {
+        return indexOnlyHits;
     }
 }

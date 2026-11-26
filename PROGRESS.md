@@ -2317,6 +2317,25 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - `stratosdb-sql` (**51/51 passing**) and `CompoundAndNonEquiJoinIntegrationTest` (**11/11 passing**).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 06 Week 11 marked `Completed`.
 
+## Sprint 06 Week 12 — Optimizer: Visibility Map & Index-Only Scans ✅ DONE
+
+- ✅ **Persistent 2-Bit-Per-Page Visibility Map (`VisibilityMap.java`)**:
+  - Implemented [`VisibilityMap`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/heap/VisibilityMap.java): 2 bits per page (`ALL_VISIBLE_BIT = 0x01`, `ALL_FROZEN_BIT = 0x02`, 4 pages packed per byte) persisted to `<tableName>.vm` sidecar files.
+  - Integrated into [`HeapTable`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/heap/HeapTable.java): cleared on `insert`, `extendTable`, and `update`; updated (`allVisible` + `allFrozen`) and flushed to disk during `VACUUM`.
+
+- ✅ **Index-Only Scan Operator & `EXPLAIN ANALYZE`**:
+  - Added `BTreeIndex.rangeScanEntries(fromKey, toKey)` returning `KeyRidEntry(key, rid)` in [`BTreeIndex`](file:///home/firoze/projects/Others/stratosdb/stratosdb-index/src/main/java/com/stratosdb/index/btree/BTreeIndex.java) for both equality and range Index-Only Scans.
+  - Implemented [`IndexOnlyScanOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/IndexOnlyScanOperator.java): consults `table.isAllVisible(pageId)`, bypasses heap tuple reads (`heapPageReads == 0`) on all-visible pages, and safely falls back to heap fetch + MVCC visibility checks on modified pages.
+  - Added `EXPLAIN ANALYZE` grammar rule in [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4), [`ExplainStatement`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/ExplainStatement.java), [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java), and [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java) reporting `actual time`, `rows`, `heap_page_reads`, and `index_only_hits`.
+
+- ✅ **Verification & Throughput Benchmarks**:
+  - [`VisibilityMapTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/test/java/com/stratosdb/storage/heap/VisibilityMapTest.java) (**2/2 passing**): verified 2-bit packing, `VACUUM` visibility updates, and persistence across restarts.
+  - [`VisibilityMapAndIndexOnlyScanTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/VisibilityMapAndIndexOnlyScanTest.java) (**3/3 passing**):
+    1. `testIndexOnlyScanReportsZeroHeapPageReadsInExplainAnalyze`: verified `Index Only Scan` + `heap_page_reads=0` in `EXPLAIN ANALYZE` before and after database restart.
+    2. `testMutationClearsVisibilityBitAndTriggersSafeHeapFallback`: verified mutation clears `ALL_VISIBLE` and triggers safe heap fallback until re-`VACUUM`.
+    3. `testIndexOnlyScan3xThroughputSpeedup`: verified **5.37x speedup** on 20,000 indexed rows (`11.60 ms`, `heap_reads=0` vs `62.29 ms`, `heap_reads=60000`; DoD: $\ge 3.0\times$).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 06 Week 12 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

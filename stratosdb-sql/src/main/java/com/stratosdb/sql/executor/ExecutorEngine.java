@@ -3715,26 +3715,36 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         PhysicalOperator scanOp;
         if (plan.useIndex()) {
             boolean isEqualityScan = plan.loKey().equals(plan.hiKey());
-            boolean indexOnlyEligible = !stmt.forUpdate()
-                && isEqualityScan
-                && stmt.where() instanceof WhereExpr.Comparison
-                && stmt.columns().size() == 1
-                && stmt.columns().get(0).equalsIgnoreCase(plan.index().columnName());
-
-            scanOp = new IndexScanOperator(
-                stmt.tableName(),
-                table,
-                txn != null ? txn.getSnapshot() : null,
-                transactionManager,
-                plan.index().index(),
-                plan.loKey(),
-                plan.hiKey(),
-                isEqualityScan,
-                plan.index().columnName(),
-                schemaCols,
-                this::deserializeTuple,
-                indexOnlyEligible
-            );
+            if (isIndexOnlyEligible(stmt, plan)) {
+                scanOp = new IndexOnlyScanOperator(
+                    stmt.tableName(),
+                    table,
+                    txn != null ? txn.getSnapshot() : null,
+                    transactionManager,
+                    plan.index().index(),
+                    plan.loKey(),
+                    plan.hiKey(),
+                    isEqualityScan,
+                    plan.index().columnName(),
+                    schemaCols,
+                    this::deserializeTuple
+                );
+            } else {
+                scanOp = new IndexScanOperator(
+                    stmt.tableName(),
+                    table,
+                    txn != null ? txn.getSnapshot() : null,
+                    transactionManager,
+                    plan.index().index(),
+                    plan.loKey(),
+                    plan.hiKey(),
+                    isEqualityScan,
+                    plan.index().columnName(),
+                    schemaCols,
+                    this::deserializeTuple,
+                    false
+                );
+            }
         } else {
             scanOp = new SeqScanOperator(
                 stmt.tableName(),
@@ -5016,10 +5026,50 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         return executeExplain(stmt, session.get().currentParams);
     }
 
+    private boolean isIndexOnlyEligible(SelectStatement stmt, ScanPlan plan) {
+        if (stmt.forUpdate() || !plan.useIndex()) {
+            return false;
+        }
+        if (!(plan.index().index() instanceof com.stratosdb.index.btree.BTreeIndex)) {
+            return false;
+        }
+        String idxCol = plan.index().columnName();
+        if (!isSingleColumnComparisonTree(stmt.where(), idxCol)) {
+            return false;
+        }
+        if (stmt.columns().size() == 1 && stmt.columns().get(0).equalsIgnoreCase(idxCol)
+                && stmt.aggregates().isEmpty() && stmt.groupBy().isEmpty()) {
+            return true;
+        }
+        return stmt.groupBy().isEmpty()
+            && stmt.aggregates().size() == 1
+            && "COUNT".equalsIgnoreCase(stmt.aggregates().get(0).function())
+            && "*".equals(stmt.aggregates().get(0).argument());
+    }
+
+    private static boolean isSingleColumnComparisonTree(WhereExpr expr, String idxCol) {
+        if (expr instanceof WhereExpr.Comparison cmp) {
+            String col = cmp.column();
+            if (col != null && col.contains(".")) {
+                col = col.substring(col.lastIndexOf('.') + 1);
+            }
+            return idxCol.equalsIgnoreCase(col);
+        }
+        if (expr instanceof WhereExpr.And and) {
+            return isSingleColumnComparisonTree(and.left(), idxCol)
+                && isSingleColumnComparisonTree(and.right(), idxCol);
+        }
+        return false;
+    }
+
     private QueryResult executeExplain(ExplainStatement stmt, List<Object> params) {
         SelectStatement select = stmt.select();
         if (!tables.containsKey(select.tableName())) {
             return QueryResult.error("Table not found: " + select.tableName());
+        }
+
+        if (stmt.analyze()) {
+            return executeExplainAnalyze(select, params);
         }
 
         if (select.joins() != null && !select.joins().isEmpty()) {
@@ -5067,11 +5117,89 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         String costSuffix = plan.hasStatistics()
             ? String.format(" (cost=%.1f)", plan.estimatedCost())
             : " (no statistics - run ANALYZE for a cost-based choice)";
-        String description = plan.useIndex()
-            ? String.format("Index Scan using %s on %s (column=%s, range=[%s, %s])%s",
-                plan.index().indexName(), select.tableName(), plan.index().columnName(), plan.loKey(), plan.hiKey(), costSuffix)
-            : "Seq Scan on " + select.tableName() + costSuffix;
+        String description;
+        if (plan.useIndex() && isIndexOnlyEligible(select, plan)) {
+            description = String.format("Index Only Scan using %s on %s (column=%s, range=[%s, %s])%s",
+                plan.index().indexName(), select.tableName(), plan.index().columnName(), plan.loKey(), plan.hiKey(), costSuffix);
+        } else if (plan.useIndex()) {
+            description = String.format("Index Scan using %s on %s (column=%s, range=[%s, %s])%s",
+                plan.index().indexName(), select.tableName(), plan.index().columnName(), plan.loKey(), plan.hiKey(), costSuffix);
+        } else {
+            description = "Seq Scan on " + select.tableName() + costSuffix;
+        }
         return QueryResult.success(description);
+    }
+
+    private QueryResult executeExplainAnalyze(SelectStatement select, List<Object> params) {
+        HeapTable table = tables.get(select.tableName());
+        Transaction activeTxn = session.get().transaction;
+        boolean localTxn = (activeTxn == null);
+        Transaction txn = localTxn ? transactionManager.begin() : activeTxn;
+
+        long startNs = System.nanoTime();
+        long rowCount = 0;
+        long heapPageReads = 0;
+        long indexOnlyHits = 0;
+        String scanType = "Seq Scan on " + select.tableName();
+        double estCost = 0.0;
+
+        try {
+            if (select.joins() != null && !select.joins().isEmpty()) {
+                QueryResult qr = executeJoinedSelect(select, txn);
+                rowCount = qr.getRows().size();
+                scanType = "Join Plan";
+            } else {
+                ScanPlan plan = planScan(select.tableName(), select.where(), params);
+                estCost = plan.estimatedCost();
+                PhysicalOperator pipeline = buildPhysicalOperatorPipeline(select, table, txn, params);
+
+                IndexOnlyScanOperator ios = findOperator(pipeline, IndexOnlyScanOperator.class);
+                IndexScanOperator is = findOperator(pipeline, IndexScanOperator.class);
+
+                try (pipeline) {
+                    pipeline.open();
+                    TupleSlot slot;
+                    while ((slot = pipeline.next()) != null && !slot.isEmpty()) {
+                        rowCount++;
+                    }
+                }
+
+                if (ios != null) {
+                    heapPageReads = ios.getHeapPageReads();
+                    indexOnlyHits = ios.getIndexOnlyHits();
+                    scanType = String.format("Index Only Scan using %s on %s",
+                        plan.index().indexName(), select.tableName());
+                } else if (is != null) {
+                    heapPageReads = is.getHeapPageReads();
+                    indexOnlyHits = is.getIndexOnlyHits();
+                    scanType = String.format("Index Scan using %s on %s",
+                        plan.index().indexName(), select.tableName());
+                }
+            }
+            if (localTxn) {
+                transactionManager.commit(txn);
+            }
+        } catch (Exception e) {
+            if (localTxn) {
+                transactionManager.abort(txn);
+            }
+            return QueryResult.error("EXPLAIN ANALYZE failed: " + e.getMessage());
+        }
+
+        double elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0;
+        String summary = String.format(
+            "%s (cost=%.1f actual time=%.3f ms rows=%d) (heap_page_reads=%d, index_only_hits=%d)",
+            scanType, estCost, elapsedMs, rowCount, heapPageReads, indexOnlyHits);
+        return QueryResult.success(summary);
+    }
+
+    private static <T extends PhysicalOperator> T findOperator(PhysicalOperator root, Class<T> type) {
+        PhysicalOperator curr = root;
+        while (curr != null) {
+            if (type.isInstance(curr)) return type.cast(curr);
+            curr = curr.getChild();
+        }
+        return null;
     }
 
     /**
@@ -7774,16 +7902,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
         SessionState state = session.get();
-        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        boolean autoCommit = (state.transaction == null);
+        Transaction txn = autoCommit ? transactionManager.begin() : state.transaction;
         try {
             acquireTableLockForDdl(stmt.tableName(), txn);
+            QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+            if (denied != null) {
+                if (autoCommit) transactionManager.abort(txn);
+                return denied;
+            }
+            rlsEnabledTables.add(stmt.tableName());
+            if (autoCommit) transactionManager.commit(txn);
+            return QueryResult.success("Row level security enabled on: " + stmt.tableName());
         } catch (DeadlockException e) {
+            if (autoCommit) transactionManager.abort(txn);
             return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
         }
-        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
-        if (denied != null) return denied;
-        rlsEnabledTables.add(stmt.tableName());
-        return QueryResult.success("Row level security enabled on: " + stmt.tableName());
     }
 
     private QueryResult executeAlterTableDisableRls(AlterTableDisableRlsStatement stmt) {
@@ -7791,17 +7925,23 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
         SessionState state = session.get();
-        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        boolean autoCommit = (state.transaction == null);
+        Transaction txn = autoCommit ? transactionManager.begin() : state.transaction;
         try {
             acquireTableLockForDdl(stmt.tableName(), txn);
+            QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+            if (denied != null) {
+                if (autoCommit) transactionManager.abort(txn);
+                return denied;
+            }
+            rlsEnabledTables.remove(stmt.tableName());
+            rlsForcedTables.remove(stmt.tableName());
+            if (autoCommit) transactionManager.commit(txn);
+            return QueryResult.success("Row level security disabled on: " + stmt.tableName());
         } catch (DeadlockException e) {
+            if (autoCommit) transactionManager.abort(txn);
             return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
         }
-        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
-        if (denied != null) return denied;
-        rlsEnabledTables.remove(stmt.tableName());
-        rlsForcedTables.remove(stmt.tableName());
-        return QueryResult.success("Row level security disabled on: " + stmt.tableName());
     }
 
     private QueryResult executeAlterTableForceRls(AlterTableForceRlsStatement stmt) {
@@ -7809,16 +7949,22 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             return QueryResult.error("Table not found: " + stmt.tableName());
         }
         SessionState state = session.get();
-        Transaction txn = state.transaction != null ? state.transaction : transactionManager.begin();
+        boolean autoCommit = (state.transaction == null);
+        Transaction txn = autoCommit ? transactionManager.begin() : state.transaction;
         try {
             acquireTableLockForDdl(stmt.tableName(), txn);
+            QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
+            if (denied != null) {
+                if (autoCommit) transactionManager.abort(txn);
+                return denied;
+            }
+            rlsForcedTables.add(stmt.tableName());
+            if (autoCommit) transactionManager.commit(txn);
+            return QueryResult.success("Row level security forced on: " + stmt.tableName());
         } catch (DeadlockException e) {
+            if (autoCommit) transactionManager.abort(txn);
             return QueryResult.error("Deadlock detected during ALTER TABLE: " + e.getMessage());
         }
-        QueryResult denied = requireOwnerOrSuperuser(stmt.tableName());
-        if (denied != null) return denied;
-        rlsForcedTables.add(stmt.tableName());
-        return QueryResult.success("Row level security forced on: " + stmt.tableName());
     }
 
     private QueryResult executeAlterTableAddConstraint(AlterTableAddConstraintStatement stmt, Transaction txn) throws DeadlockException {

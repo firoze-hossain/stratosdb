@@ -159,4 +159,9 @@ public class HashAggregateOperator implements PhysicalOperator {
     public List<String> getOutputColumns() {
         return outputColumns;
     }
+
+    @Override
+    public PhysicalOperator getChild() {
+        return child;
+    }
 }

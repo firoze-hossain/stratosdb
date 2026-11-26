@@ -217,4 +217,9 @@ public class StreamAggregateOperator implements PhysicalOperator {
     public List<String> getOutputColumns() {
         return outputColumns;
     }
+
+    @Override
+    public PhysicalOperator getChild() {
+        return child;
+    }
 }

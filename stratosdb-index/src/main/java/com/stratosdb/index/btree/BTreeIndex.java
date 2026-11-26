@@ -1127,9 +1127,29 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
     // --- Range Scan with Leaf Sibling Latch Crabbing ---
 
+    public record KeyRidEntry(long key, BTreePage.RID rid) {}
+
+    @FunctionalInterface
+    private interface LeafEntryConsumer {
+        void accept(long key, BTreePage.RID rid);
+    }
+
     public List<BTreePage.RID> rangeScan(long fromKey, long toKey) {
         List<BTreePage.RID> results = new ArrayList<>();
+        scanLeafRange(fromKey, toKey, (k, rid) -> results.add(rid));
+        return results;
+    }
 
+    /**
+     * Range scan returning both the index key and heap RID for Index-Only Scans.
+     */
+    public List<KeyRidEntry> rangeScanEntries(long fromKey, long toKey) {
+        List<KeyRidEntry> results = new ArrayList<>();
+        scanLeafRange(fromKey, toKey, (k, rid) -> results.add(new KeyRidEntry(k, rid)));
+        return results;
+    }
+
+    private void scanLeafRange(long fromKey, long toKey, LeafEntryConsumer consumer) {
         rootLatch.readLock().lock();
         long currentRootId = this.rootPageId;
         BTreePage curr = bufferPool.getPage(indexName, currentRootId, BTreePage.FACTORY);
@@ -1185,7 +1205,7 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
                         break;
                     }
                     if (k >= fromKey) {
-                        results.add(values.get(i));
+                        consumer.accept(k, values.get(i));
                     }
                 }
 
@@ -1203,8 +1223,6 @@ public class BTreeIndex implements com.stratosdb.index.KeyValueIndex {
 
                 curr = next;
             }
-
-            return results;
         } finally {
             long leafId = curr.getPageId();
             curr.getLatch().readLock().unlock();

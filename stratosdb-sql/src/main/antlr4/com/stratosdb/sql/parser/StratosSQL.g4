@@ -215,7 +215,7 @@ createTrigger: CREATE TRIGGER triggerName (BEFORE | AFTER) (INSERT | UPDATE | DE
 dropTrigger: DROP TRIGGER triggerName ON tableName SEMICOLON?;
 triggerName: anyIdentifier;
 triggerHandlerName: IDENTIFIER;
-explain: EXPLAIN select;
+explain: EXPLAIN (ANALYZE)? select;
 analyze: ANALYZE (TABLE? tableName)? SEMICOLON?;
 vacuum: VACUUM tableName SEMICOLON?;
 reindexStatement: REINDEX (TABLE tableName | INDEX indexName | tableName) SEMICOLON?;

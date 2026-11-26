@@ -595,7 +595,7 @@ public class TransactionIsolationLevelsTest {
             // SELECT FOR UPDATE is rejected in read-only mode
             QueryResult forUpdate = db.execute("SELECT * FROM ro_tbl FOR UPDATE");
             assertFalse(forUpdate.isSuccess());
-            assertTrue(forUpdate.getError().contains("cannot execute SELECT FOR UPDATE in a read-only replica"));
+            assertTrue(forUpdate.getError().contains("cannot execute SELECT FOR UPDATE/SHARE in a read-only replica"));
 
             db.setReadOnly(false);
         } finally {
