@@ -144,6 +144,8 @@
                         <compilerArgs>
                             <arg>-Xlint:all</arg>
                             <arg>-Xlint:-options</arg>
+                            <arg>--add-modules</arg>
+                            <arg>jdk.incubator.vector</arg>
                         </compilerArgs>
                     </configuration>
                 </plugin>
@@ -164,7 +166,7 @@
                     <version>3.2.5</version>
                     <configuration>
                         <argLine>
-                            -XX:+UseZGC -XX:+AlwaysPreTouch -Xms1g -Xmx2g -Djdk.attach.allowAttachSelf=true
+                            --add-modules jdk.incubator.vector -XX:+UseZGC -XX:+AlwaysPreTouch -Xms1g -Xmx2g -Djdk.attach.allowAttachSelf=true
                         </argLine>
                     </configuration>
                 </plugin>

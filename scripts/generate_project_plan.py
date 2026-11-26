@@ -468,7 +468,7 @@ def create_project_plan_excel():
          "Very High", "P1 - High", "Zero object allocation during table scan; memory throughput exceeds 4 GB/sec on sequential scan.", "Completed"],
         ["Sprint 05", "Week 10", "Execution Engine", "Vectorized Filter & Aggregate Operators",
          "Build VectorizedFilterOperator and VectorizedAggregateOperator. Utilize Java 25 vector compiler intrinsics for SIMD evaluation of filter expressions and sum/count.",
-         "High", "P1 - High", "Analytical aggregation queries execute 5x faster than Volcano row-by-row operator; verified on 10M rows.", "Planned"],
+         "High", "P1 - High", "Analytical aggregation queries execute 5x faster than Volcano row-by-row operator; verified on 10M rows.", "Completed"],
 
         # Sprint 6 (Month 3, Weeks 11-12)
         ["Sprint 06", "Week 11", "Optimizer", "Dynamic Programming Join Reordering",

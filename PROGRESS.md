@@ -2283,6 +2283,24 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`VectorizedSimdMemoryFormatTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/VectorizedSimdMemoryFormatTest.java) (**5/5 passing**): verified MVCC visibility, **0 bytes** heap allocation during 5,000-row table scan, column projection & instant-DDL trailing column compatibility, > 4 GB/sec throughput, and 16-virtual-thread concurrency.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 05 Week 09 marked `Completed`.
 
+## Sprint 05 Week 10 — Execution Engine: Vectorized Filter & Aggregate Operators ✅ DONE
+
+- ✅ **Java 25 Vector API (`jdk.incubator.vector`) SIMD Kernels**:
+  - Enabled `--add-modules jdk.incubator.vector` in root [`pom.xml`](file:///home/firoze/projects/Others/stratosdb/pom.xml) (`maven-compiler-plugin` and `maven-surefire-plugin`).
+  - Implemented [`SimdVectorKernels`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/SimdVectorKernels.java): hardware-accelerated `jdk.incubator.vector` SIMD kernels operating directly on 64-byte-aligned off-heap `MemorySegment`s (`fromMemorySegment`, `v.compare`, `reduceLanes`, `reduceLanesToLong`) for `INT`, `LONG`, `DOUBLE`, and `BYTE` filtering, column-pair comparisons, `SUM`, `MIN`, `MAX`, and `COUNT`.
+
+- ✅ **VectorizedFilterOperator & VectorizedAggregateOperator**:
+  - Implemented [`VectorizedFilterOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/VectorizedFilterOperator.java): pre-compiles `WhereExpr` trees (`Comparison`, `ColumnComparison`, `And`, `Or`, `Not`, `BooleanLiteral`) into zero-allocation compiled nodes, evaluates SIMD bitmasks into pre-allocated `long[16]` buffers, and updates the `VectorBatch` selection vector in place.
+  - Implemented [`VectorizedAggregateOperator`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/execution/VectorizedAggregateOperator.java): executes `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` using SIMD kernels for global aggregates, hoisted specialized loops for filtered/nullable batches, and a zero-boxing open-addressing `PrimitiveGroupTable` for `GROUP BY` + `HAVING` queries.
+
+- ✅ **10M-Row Benchmark & Parity Verification**:
+  - [`VectorizedFilterAndAggregateTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/VectorizedFilterAndAggregateTest.java) (**4/4 passing**):
+    1. `testVectorizedFilterWithAndOrNotAndNulls`: verified `AND`/`OR`/`NOT`/NULL 3-valued logic over `HeapTable`.
+    2. `testVectorizedGlobalAggregatesParityWithVolcano`: verified exact parity across `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` vs `HashAggregateOperator`.
+    3. `testVectorizedGroupByAndHavingParity`: verified `GROUP BY` + arbitrary `HAVING` parity.
+    4. `test10MRowsAnalyticalAggregation5xFasterThanVolcano`: verified **7.41x speedup** on 10,000,000 rows (`468.48 ms` Vectorized SIMD vs `3473.74 ms` Volcano row-by-row, exceeding 5.0x DoD).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 05 Week 10 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
