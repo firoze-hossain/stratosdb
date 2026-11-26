@@ -46,6 +46,26 @@ public class StratosDB {
             config.getGroupCommitMaxBatchSize(),
             config.getGroupCommitDelayMicros()
         );
+        if (config.isTdeEnabled()) {
+            try {
+                javax.crypto.SecretKey masterKey;
+                if (config.getTdeKeyFile() != null && !config.getTdeKeyFile().isBlank()) {
+                    masterKey = com.stratosdb.storage.crypto.TdeKeyManager.loadFromKeyFile(java.nio.file.Path.of(config.getTdeKeyFile()));
+                } else if (config.getTdePassphrase() != null && !config.getTdePassphrase().isBlank()) {
+                    byte[] salt = com.stratosdb.storage.crypto.TdeKeyManager.loadOrCreateSalt(
+                        java.nio.file.Path.of(config.getDataDirectory(), "tde.salt")
+                    );
+                    masterKey = com.stratosdb.storage.crypto.TdeKeyManager.deriveKey(config.getTdePassphrase().toCharArray(), salt);
+                } else {
+                    throw new IllegalStateException("TDE enabled but neither tdeKeyFile nor tdePassphrase was provided");
+                }
+                com.stratosdb.storage.crypto.TdeCipher cipher = new com.stratosdb.storage.crypto.TdeCipher(masterKey);
+                this.diskManager.setTdeCipher(cipher);
+                this.walManager.setTdeCipher(cipher);
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException("Failed to initialize TDE master key", e);
+            }
+        }
         this.walManager.setSync(config.isSyncWAL());
         this.walManager.setSynchronousCommitMode(config.getSynchronousCommit());
         this.transactionManager = new TransactionManager(config.getDataDirectory(), config.getLockPartitions());

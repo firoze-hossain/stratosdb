@@ -709,6 +709,36 @@ public class WALManager {
         synchronized (appendLock) {
             try {
                 buffer.flip();
+                if (tdeCipher != null) {
+                    byte[] plain = new byte[buffer.remaining()];
+                    buffer.get(plain);
+                    byte[] enc = tdeCipher.encrypt(plain);
+                    int frameLen = 4 + enc.length;
+                    ByteBuffer frame = ByteBuffer.allocate(frameLen);
+                    frame.putInt(enc.length);
+                    frame.put(enc);
+                    frame.flip();
+
+                    long lsn = currentLSN.get();
+                    long segNum = getSegmentNumberForLsn(lsn);
+                    long segOffset = getSegmentOffsetForLsn(lsn);
+                    if (segOffset + frameLen > segmentSize) {
+                        rotateToNextSegment(segNum);
+                        lsn = currentLSN.get();
+                        segNum = getSegmentNumberForLsn(lsn);
+                        segOffset = getSegmentOffsetForLsn(lsn);
+                    }
+                    ensureActiveSegment(segNum);
+                    activeChannel.position(segOffset);
+                    while (frame.hasRemaining()) {
+                        activeChannel.write(frame);
+                    }
+                    currentLSN.addAndGet(frameLen);
+                    if (segOffset + frameLen >= segmentSize) {
+                        rotateToNextSegment(segNum);
+                    }
+                    return lsn + frameLen;
+                }
                 int totalBytes = buffer.remaining();
                 long recordStartLsn = currentLSN.get();
 
@@ -797,6 +827,15 @@ public class WALManager {
     private final Object walPushMonitor = new Object();
     private volatile SynchronousCommitMode synchronousCommitMode = SynchronousCommitMode.LOCAL;
     private volatile SyncReplicationWaiter syncReplicationWaiter;
+    private volatile com.stratosdb.storage.crypto.TdeCipher tdeCipher;
+
+    public void setTdeCipher(com.stratosdb.storage.crypto.TdeCipher tdeCipher) {
+        this.tdeCipher = tdeCipher;
+    }
+
+    public com.stratosdb.storage.crypto.TdeCipher getTdeCipher() {
+        return tdeCipher;
+    }
 
     public void setSynchronousCommitMode(SynchronousCommitMode mode) {
         this.synchronousCommitMode = mode != null ? mode : SynchronousCommitMode.LOCAL;
@@ -915,7 +954,7 @@ public class WALManager {
 
             Set<Long> committedXids = new HashSet<>();
             long[] maxCheckpointLsn = new long[]{lastCheckpointLSN.get()};
-            try (SegmentedWalReader pass1Reader = new SegmentedWalReader(new File(walDirectory), segmentSize, segNumbers, startLsn, endLsn)) {
+            try (SegmentedWalReader pass1Reader = new SegmentedWalReader(new File(walDirectory), segmentSize, segNumbers, startLsn, endLsn, tdeCipher)) {
                 while (pass1Reader.hasRemaining()) {
                     Integer opType;
                     try {
@@ -947,7 +986,7 @@ public class WALManager {
             int replayedOps = 0;
             long recoveredLsn = startLsn;
 
-            try (SegmentedWalReader pass2Reader = new SegmentedWalReader(new File(walDirectory), segmentSize, segNumbers, startLsn, endLsn)) {
+            try (SegmentedWalReader pass2Reader = new SegmentedWalReader(new File(walDirectory), segmentSize, segNumbers, startLsn, endLsn, tdeCipher)) {
                 while (pass2Reader.hasRemaining()) {
                     Integer opType;
                     try {

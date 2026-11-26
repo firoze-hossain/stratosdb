@@ -2424,6 +2424,19 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
     - **3-node cluster mid-workload failover**: killed primary + Raft leader mid-workload; cluster elected new Raft leader, promoted standby, and resumed SQL write traffic in `< 3s` with zero data loss.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 09 Week 18 marked `Completed`.
 
+## Sprint 10 Week 19 — Security: Transparent Data Encryption (TDE) ✅ DONE
+
+- ✅ **Master Key Management & AES-256-GCM Cipher**:
+  - Implemented [`TdeKeyManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/crypto/TdeKeyManager.java) supporting PBKDF2-HMAC-SHA256 (`65,536` iterations, persisted 16-byte `tde.salt`) key derivation from master passphrases as well as external 256-bit key files (`loadFromKeyFile` / `saveKeyFile`).
+  - Implemented [`TdeCipher`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/crypto/TdeCipher.java) using `AES/GCM/NoPadding` (12-byte IV, 128-bit GCM auth tag) with thread-local `Cipher`/`SecureRandom` and direct `ByteBuffer`-to-`ByteBuffer` page encryption/decryption.
+
+- ✅ **Table Pages, Index Pages, & WAL Segments Integration**:
+  - Wired `TdeCipher` into [`DiskManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/disk/DiskManager.java) (`readPage`, `readPageIntoBuffer`, `writePage`, `writePageFromSegment`, `appendPage`, `truncateTable`, `getTablePageCount`) and [`WALManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/WALManager.java) + [`SegmentedWalReader`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/SegmentedWalReader.java), configured via [`DatabaseConfig`](file:///home/firoze/projects/Others/stratosdb/stratosdb-core/src/main/java/com/stratosdb/core/DatabaseConfig.java) and [`StratosDB`](file:///home/firoze/projects/Others/stratosdb/stratosdb-core/src/main/java/com/stratosdb/core/StratosDB.java).
+
+- ✅ **Verification**:
+  - [`TransparentDataEncryptionTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/TransparentDataEncryptionTest.java) (**4/4 passing**): verified PBKDF2 & external key file round-trip, zero plaintext leakage across all `.dat` and `wal_*.log` files, GCM authentication failure on wrong key, encrypted WAL recovery on restart, and AES-NI page decryption throughput.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 10 Week 19 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

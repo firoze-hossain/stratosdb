@@ -25,9 +25,16 @@ public class SegmentedWalReader implements AutoCloseable {
 
     private RandomAccessFile currentRaf;
     private long currentOpenSegNum = -1L;
+    private final byte[] decryptedStream;
+    private int decryptedPos = 0;
 
     public SegmentedWalReader(File walDirectory, long segmentSize, List<Long> availableSegmentNumbers,
                               long startLsn, long maxLsn) throws IOException {
+        this(walDirectory, segmentSize, availableSegmentNumbers, startLsn, maxLsn, null);
+    }
+
+    public SegmentedWalReader(File walDirectory, long segmentSize, List<Long> availableSegmentNumbers,
+                              long startLsn, long maxLsn, com.stratosdb.storage.crypto.TdeCipher tdeCipher) throws IOException {
         this.walDirectory = walDirectory;
         this.segmentSize = segmentSize;
         this.availableSegmentNumbers = availableSegmentNumbers;
@@ -35,6 +42,31 @@ public class SegmentedWalReader implements AutoCloseable {
         this.maxLsn = maxLsn;
         this.currentSegmentIndex = findSegmentIndexForLsn(startLsn);
         openSegmentForLsn(startLsn);
+        if (tdeCipher != null) {
+            this.decryptedStream = decryptAllFrames(tdeCipher);
+        } else {
+            this.decryptedStream = null;
+        }
+    }
+
+    private byte[] decryptAllFrames(com.stratosdb.storage.crypto.TdeCipher tdeCipher) throws IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        while (hasRemainingRaw()) {
+            byte[] lenBytes = new byte[4];
+            int r = readRawPartialBytes(lenBytes, 0, 4);
+            if (r < 4) {
+                break;
+            }
+            int frameLen = ((lenBytes[0] & 0xFF) << 24) | ((lenBytes[1] & 0xFF) << 16)
+                | ((lenBytes[2] & 0xFF) << 8) | (lenBytes[3] & 0xFF);
+            if (frameLen <= 0) {
+                break;
+            }
+            byte[] enc = readRawBytes(frameLen);
+            byte[] plain = tdeCipher.decrypt(enc);
+            out.write(plain);
+        }
+        return out.toByteArray();
     }
 
     private int findSegmentIndexForLsn(long lsn) {
@@ -81,6 +113,13 @@ public class SegmentedWalReader implements AutoCloseable {
     }
 
     public boolean hasRemaining() {
+        if (decryptedStream != null) {
+            return decryptedPos < decryptedStream.length;
+        }
+        return hasRemainingRaw();
+    }
+
+    private boolean hasRemainingRaw() {
         if (maxLsn > 0 && currentLsn >= maxLsn) {
             return false;
         }
@@ -125,6 +164,19 @@ public class SegmentedWalReader implements AutoCloseable {
     }
 
     public byte[] readBytes(int n) throws IOException {
+        if (decryptedStream != null) {
+            if (n <= 0) return new byte[0];
+            if (decryptedPos + n > decryptedStream.length) {
+                throw new IOException("Decrypted WAL ends prematurely mid-record");
+            }
+            byte[] data = java.util.Arrays.copyOfRange(decryptedStream, decryptedPos, decryptedPos + n);
+            decryptedPos += n;
+            return data;
+        }
+        return readRawBytes(n);
+    }
+
+    private byte[] readRawBytes(int n) throws IOException {
         if (n <= 0) {
             return new byte[0];
         }
@@ -160,6 +212,17 @@ public class SegmentedWalReader implements AutoCloseable {
     }
 
     private int readPartialBytes(byte[] dest, int offset, int length) throws IOException {
+        if (decryptedStream != null) {
+            int avail = Math.min(length, decryptedStream.length - decryptedPos);
+            if (avail <= 0) return 0;
+            System.arraycopy(decryptedStream, decryptedPos, dest, offset, avail);
+            decryptedPos += avail;
+            return avail;
+        }
+        return readRawPartialBytes(dest, offset, length);
+    }
+
+    private int readRawPartialBytes(byte[] dest, int offset, int length) throws IOException {
         int totalRead = 0;
         while (totalRead < length) {
             openSegmentForLsn(currentLsn);
@@ -188,10 +251,14 @@ public class SegmentedWalReader implements AutoCloseable {
     }
 
     public long position() {
-        return currentLsn;
+        return decryptedStream != null ? decryptedPos : currentLsn;
     }
 
     public void seek(long lsn) throws IOException {
+        if (decryptedStream != null) {
+            this.decryptedPos = (int) Math.max(0, Math.min(lsn, decryptedStream.length));
+            return;
+        }
         this.currentLsn = lsn;
         openSegmentForLsn(lsn);
     }

@@ -21,6 +21,21 @@ public class DiskManager {
     private final String dataDirectory;
     private final ConcurrentHashMap<String, FileChannel> openFiles;
     private final ConcurrentHashMap<String, Long> fileSizes;
+    private volatile com.stratosdb.storage.crypto.TdeCipher tdeCipher;
+
+    public void setTdeCipher(com.stratosdb.storage.crypto.TdeCipher tdeCipher) {
+        this.tdeCipher = tdeCipher;
+    }
+
+    public com.stratosdb.storage.crypto.TdeCipher getTdeCipher() {
+        return tdeCipher;
+    }
+
+    private int diskPageSize() {
+        return tdeCipher == null
+            ? PageConstants.PAGE_SIZE
+            : PageConstants.PAGE_SIZE + com.stratosdb.storage.crypto.TdeCipher.OVERHEAD_BYTES;
+    }
     
     public DiskManager(String dataDirectory) {
         this.dataDirectory = dataDirectory;
@@ -49,27 +64,40 @@ public class DiskManager {
         try {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
-            
-            long position = pageId * PageConstants.PAGE_SIZE;
+            int dPageSize = diskPageSize();
+            long position = pageId * dPageSize;
             Page page = new Page(pageId);
-            
-            // Check if file is large enough
+
             if (position >= channel.size()) {
-                // Page doesn't exist yet
                 return page;
             }
-            
+
+            if (tdeCipher != null) {
+                ByteBuffer encBuf = ByteBuffer.allocate(dPageSize);
+                long curPos = position;
+                while (encBuf.hasRemaining()) {
+                    int bytesRead = channel.read(encBuf, curPos);
+                    if (bytesRead <= 0) break;
+                    curPos += bytesRead;
+                }
+                if (encBuf.position() == dPageSize) {
+                    encBuf.flip();
+                    tdeCipher.decryptPage(encBuf, PageConstants.PAGE_SIZE, page.getBuffer().duplicate());
+                }
+                return page;
+            }
+
             ByteBuffer buffer = page.getBuffer().duplicate();
             buffer.position(0);
             buffer.limit(PageConstants.PAGE_SIZE);
-            
+
             long curPos = position;
             while (buffer.hasRemaining()) {
                 int bytesRead = channel.read(buffer, curPos);
                 if (bytesRead <= 0) break;
                 curPos += bytesRead;
             }
-            
+
             return page;
         } catch (Exception e) {
             LOG.error("Failed to read page {} from table {}", pageId, tableName, e);
@@ -86,11 +114,27 @@ public class DiskManager {
         try {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
-
-            long position = pageId * PageConstants.PAGE_SIZE;
+            int dPageSize = diskPageSize();
+            long position = pageId * dPageSize;
             if (position >= channel.size()) {
                 buffer.clear();
                 return false;
+            }
+
+            if (tdeCipher != null) {
+                ByteBuffer encBuf = ByteBuffer.allocate(dPageSize);
+                long curPos = position;
+                while (encBuf.hasRemaining()) {
+                    int bytesRead = channel.read(encBuf, curPos);
+                    if (bytesRead <= 0) break;
+                    curPos += bytesRead;
+                }
+                if (encBuf.position() == dPageSize) {
+                    encBuf.flip();
+                    tdeCipher.decryptPage(encBuf, PageConstants.PAGE_SIZE, buffer);
+                }
+                buffer.position(0);
+                return true;
             }
 
             buffer.position(0);
@@ -133,10 +177,16 @@ public class DiskManager {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
 
-            ByteBuffer buffer = segment.asByteBuffer().duplicate();
-            buffer.position(0);
-            buffer.limit(PageConstants.PAGE_SIZE);
-            long position = pageId * PageConstants.PAGE_SIZE;
+            ByteBuffer buffer;
+            if (tdeCipher != null) {
+                buffer = ByteBuffer.allocate(diskPageSize());
+                tdeCipher.encryptPage(segment.asByteBuffer(), PageConstants.PAGE_SIZE, buffer);
+            } else {
+                buffer = segment.asByteBuffer().duplicate();
+                buffer.position(0);
+                buffer.limit(PageConstants.PAGE_SIZE);
+            }
+            long position = pageId * diskPageSize();
 
             long curPos = position;
             while (buffer.hasRemaining()) {
@@ -158,10 +208,16 @@ public class DiskManager {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
             
-            ByteBuffer buffer = page.getBuffer().duplicate();
-            buffer.position(0);
-            buffer.limit(PageConstants.PAGE_SIZE);
-            long position = page.getPageId() * PageConstants.PAGE_SIZE;
+            ByteBuffer buffer;
+            if (tdeCipher != null) {
+                buffer = ByteBuffer.allocate(diskPageSize());
+                tdeCipher.encryptPage(page.getBuffer(), PageConstants.PAGE_SIZE, buffer);
+            } else {
+                buffer = page.getBuffer().duplicate();
+                buffer.position(0);
+                buffer.limit(PageConstants.PAGE_SIZE);
+            }
+            long position = page.getPageId() * diskPageSize();
             
             long curPos = position;
             while (buffer.hasRemaining()) {
@@ -186,9 +242,15 @@ public class DiskManager {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
             
-            ByteBuffer buffer = page.getBuffer().duplicate();
-            buffer.position(0);
-            buffer.limit(PageConstants.PAGE_SIZE);
+            ByteBuffer buffer;
+            if (tdeCipher != null) {
+                buffer = ByteBuffer.allocate(diskPageSize());
+                tdeCipher.encryptPage(page.getBuffer(), PageConstants.PAGE_SIZE, buffer);
+            } else {
+                buffer = page.getBuffer().duplicate();
+                buffer.position(0);
+                buffer.limit(PageConstants.PAGE_SIZE);
+            }
 
             long position;
             synchronized (channel) {
@@ -201,7 +263,7 @@ public class DiskManager {
                 channel.force(false);
             }
             
-            long pageId = position / PageConstants.PAGE_SIZE;
+            long pageId = position / diskPageSize();
             page.setDirty(false);
             
             LOG.debug("Appended page {} to table {}", pageId, tableName);
@@ -270,7 +332,7 @@ public class DiskManager {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
             synchronized (channel) {
-                long newSize = Math.max(0, newPageCount * PageConstants.PAGE_SIZE);
+                long newSize = Math.max(0, newPageCount * diskPageSize());
                 channel.truncate(newSize);
                 channel.force(true);
                 fileSizes.put(fileName, newSize);
@@ -297,7 +359,7 @@ public class DiskManager {
         try {
             String fileName = getTableFileName(tableName);
             FileChannel channel = getFileChannel(fileName);
-            return channel.size() / PageConstants.PAGE_SIZE;
+            return channel.size() / diskPageSize();
         } catch (Exception e) {
             LOG.warn("Failed to get page count for table {}", tableName);
             return 0;

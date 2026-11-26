@@ -74,6 +74,21 @@ public class DatabaseConfig {
     private int synchronousStandbyQuorum = 1;
     /** Maximum milliseconds to wait for synchronous replica ACK before failing commit. */
     private long synchronousReplicationTimeoutMs = 5000;
+    /** Transparent Data Encryption (TDE) enabled flag (default false). */
+    private boolean tdeEnabled = false;
+    /** Master passphrase for PBKDF2-HMAC-SHA256 TDE key derivation (when tdeKeyFile is not set). */
+    private String tdePassphrase;
+    /** Optional path to external 256-bit AES key file for TDE. */
+    private String tdeKeyFile;
+
+    public boolean isTdeEnabled() { return tdeEnabled; }
+    public void setTdeEnabled(boolean tdeEnabled) { this.tdeEnabled = tdeEnabled; }
+
+    public String getTdePassphrase() { return tdePassphrase; }
+    public void setTdePassphrase(String tdePassphrase) { this.tdePassphrase = tdePassphrase; }
+
+    public String getTdeKeyFile() { return tdeKeyFile; }
+    public void setTdeKeyFile(String tdeKeyFile) { this.tdeKeyFile = tdeKeyFile; }
 
     public com.stratosdb.storage.wal.SynchronousCommitMode getSynchronousCommit() { return synchronousCommit; }
     public void setSynchronousCommit(com.stratosdb.storage.wal.SynchronousCommitMode synchronousCommit) {

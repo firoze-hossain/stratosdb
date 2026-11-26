@@ -505,7 +505,7 @@ def create_project_plan_excel():
         # Sprint 10 (Month 5, Weeks 19-20)
         ["Sprint 10", "Week 19", "Security", "Transparent Data Encryption (TDE)",
          "Implement AES-256-GCM encryption for table pages, index pages, and WAL segments. Master key management with PBKDF2 key derivation and external key file support.",
-         "High", "P0 - Critical", "All on-disk bytes encrypted; files unreadable with strings/hexdump; decryption overhead < 5% via AES-NI.", "Planned"],
+         "High", "P0 - Critical", "All on-disk bytes encrypted; files unreadable with strings/hexdump; decryption overhead < 5% via AES-NI.", "Completed"],
         ["Sprint 10", "Week 20", "Security", "Tamper-Evident Audit Logging & Auth",
          "Build immutable cryptographic audit logger writing SHA-256 chained event records for all DDL, DCL, and failed logins. Add external LDAP/Active Directory auth.",
          "Medium", "P1 - High", "Audit trail cannot be altered without breaking hash chain; LDAP authentication verified with OpenLDAP test server.", "Planned"],
