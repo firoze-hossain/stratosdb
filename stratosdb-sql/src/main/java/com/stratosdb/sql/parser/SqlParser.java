@@ -658,6 +658,13 @@ public class SqlParser {
         if (ctx instanceof StratosSQLParser.TsMatchCompareContext c) {
             return new WhereExpr.TsMatch(cleanColumnName(c.columnName().getText()), c.literal().getText());
         }
+        if (ctx instanceof StratosSQLParser.NetworkCompareContext c) {
+            String op = c.INET_CONTAINED() != null ? "<<"
+                : c.INET_CONTAINED_OR_EQ() != null ? "<<="
+                : c.INET_CONTAINS() != null ? ">>"
+                : ">>=";
+            return new WhereExpr.NetworkContains(cleanColumnName(c.columnName().getText()), op, c.literal().getText());
+        }
         if (ctx instanceof StratosSQLParser.EqZeroArgFunctionCompareContext c) {
             return new WhereExpr.EqZeroArgFunction(cleanColumnName(c.columnName().getText()), c.IDENTIFIER().getText());
         }

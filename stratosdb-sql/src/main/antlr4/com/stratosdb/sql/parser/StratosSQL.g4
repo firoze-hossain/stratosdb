@@ -322,6 +322,7 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName CONTAINS literal                            #ContainsCompare
           | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
           | columnName TS_MATCH literal                           #TsMatchCompare
+          | columnName (INET_CONTAINED | INET_CONTAINED_OR_EQ | INET_CONTAINS | INET_CONTAINS_OR_EQ) literal #NetworkCompare
           | columnName JSON_EXTRACT_TEXT literal ASSIGN literal    #JsonExtractTextEqCompare
           | columnName QUESTION literal                            #JsonKeyExistsCompare
           | jsonPathExpr ASSIGN literal                            #JsonPathEqCompare
@@ -350,7 +351,7 @@ jsonPathExpr: columnName jsonStep+;
 
 // Values
 valueList: insertValue (COMMA insertValue)*;
-insertValue: literal | NEXTVAL LPAREN STRING_LITERAL RPAREN | CURRVAL LPAREN STRING_LITERAL RPAREN | arrayLiteral;
+insertValue: literal | NEXTVAL LPAREN STRING_LITERAL RPAREN | CURRVAL LPAREN STRING_LITERAL RPAREN | arrayLiteral | anyIdentifier LPAREN RPAREN;
 arrayLiteral: ARRAY LBRACKET (literal (COMMA literal)*)? RBRACKET;
 
 // Data types
@@ -695,6 +696,10 @@ RPAREN: ')';
 COMMA: ',';
 SEMICOLON: ';';
 ASSIGN: '=';
+INET_CONTAINED_OR_EQ: '<<=';
+INET_CONTAINS_OR_EQ: '>>=';
+INET_CONTAINED: '<<';
+INET_CONTAINS: '>>';
 GT: '>';
 LT: '<';
 GE: '>=';

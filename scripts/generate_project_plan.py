@@ -492,7 +492,7 @@ def create_project_plan_excel():
          "High", "P1 - High", "JSONB containment searches execute in < 1ms via GIN index; nested object extraction verified.", "Completed"],
         ["Sprint 08", "Week 16", "Data Types", "Enterprise Types: UUID, INET, Arrays",
          "Implement native 16-byte UUID type with gen_random_uuid(), IP address INET/CIDR types with subnet containment, and 1D typed arrays (int[], text[]).",
-         "Medium", "P2 - Medium", "UUID primary keys index efficiently; subnet containment searches match standard CIDR semantics.", "Planned"],
+         "Medium", "P2 - Medium", "UUID primary keys index efficiently; subnet containment searches match standard CIDR semantics.", "Completed"],
 
         # Sprint 9 (Month 5, Weeks 17-18)
         ["Sprint 09", "Week 17", "High Availability", "Synchronous Streaming Replication",

@@ -5394,6 +5394,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         String litStr = litObj != null ? litObj.toString() : cmp.literal();
         WherePredicate pred = toPredicate(cmp.column(), cmp.operator(), litStr);
         if (!pred.isNumeric()) {
+            if (pred.operator().equals("=")) {
+                IndexEntry eqIdx = findEqualityIndex(tableName, pred.column());
+                if (eqIdx != null) {
+                    Object lookupVal = litObj;
+                    Map<String, String> colTypes = tableColumnTypes.get(tableName);
+                    if (colTypes != null && "UUID".equalsIgnoreCase(colTypes.get(pred.column())) && litObj instanceof String s) {
+                        try {
+                            lookupVal = java.util.UUID.fromString(s.trim());
+                        } catch (IllegalArgumentException ignored) {
+                            return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
+                        }
+                    }
+                    Long key = toIndexKey(lookupVal);
+                    if (key != null) {
+                        return ScanPlan.indexScan(eqIdx, key, key, hasStats ? costIndexScan(stats, eqIdx.columnName(), "=", key, key) : 0, hasStats);
+                    }
+                }
+            }
             return ScanPlan.seqScan(hasStats ? costSeqScan(stats) : 0, hasStats);
         }
         boolean isEquality = pred.operator().equals("=");
@@ -5671,6 +5689,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (value instanceof Long l) return l;
         if (value instanceof Short s) return s.longValue();
         if (value instanceof Byte b) return b.longValue();
+        if (value instanceof java.util.UUID u) return u.getMostSignificantBits() ^ u.getLeastSignificantBits();
         if (value instanceof String s) {
             long hash = 0xcbf29ce484222325L;
             for (int i = 0; i < s.length(); i++) {
@@ -8796,7 +8815,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         // own dialect initialization calls this directly) can be given.
         "current_schema", () -> "public",
         "now", () -> java.time.Instant.now().toString(),
-        "session_user", () -> "stratos"
+        "session_user", () -> "stratos",
+        "gen_random_uuid", java.util.UUID::randomUUID
     );
 
     /**
@@ -8833,6 +8853,8 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             || lowerName.equals("encoding_to_char") || lowerName.equals("std_encoding_to_char") || lowerName.equals("pg_encoding_to_char")
             || lowerName.equals("quote_ident")
             || lowerName.equals("array_to_string")
+            || lowerName.equals("array_length")
+            || lowerName.equals("cardinality")
             || lowerName.equals("get_expr") || lowerName.equals("std_get_expr") || lowerName.equals("pg_get_expr")
             || lowerName.equals("get_indexdef") || lowerName.equals("std_get_indexdef") || lowerName.equals("pg_get_indexdef")
             || lowerName.equals("get_constraintdef") || lowerName.equals("std_get_constraintdef") || lowerName.equals("pg_get_constraintdef")
@@ -8863,6 +8885,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if (lowerName.equals("to_tsvector") && argValues.size() == 1) {
             return TextSearch.toTsVector(String.valueOf(argValues.get(0)));
+        }
+        if (lowerName.equals("array_length") && argValues.size() == 2) {
+            Object arr = argValues.get(0);
+            if (arr instanceof List<?> list) {
+                return list.size();
+            }
+            return null;
+        }
+        if (lowerName.equals("cardinality") && argValues.size() == 1) {
+            Object arr = argValues.get(0);
+            if (arr instanceof List<?> list) {
+                return list.size();
+            }
+            return 0;
         }
         if (lowerName.equals("to_tsquery") && argValues.size() == 1) {
             return TextSearch.toTsQuery(String.valueOf(argValues.get(0)));
@@ -9278,6 +9314,25 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             com.stratosdb.storage.page.TsQuery query = TextSearch.toTsQuery(queryStr);
             return query.matches(vector);
         }
+        if (expr instanceof WhereExpr.NetworkContains netCmp) {
+            Object value = resolveColumnValue(row, netCmp.column(), outerRow);
+            if (value == null) {
+                return false;
+            }
+            com.stratosdb.storage.page.NetworkAddress left = (value instanceof com.stratosdb.storage.page.NetworkAddress na)
+                ? na
+                : com.stratosdb.storage.page.NetworkAddress.parse(value.toString(), false);
+            Object rightObj = resolveLiteralOrParam(netCmp.literal(), params);
+            String rightStr = rightObj != null ? rightObj.toString() : stripQuotes(netCmp.literal());
+            com.stratosdb.storage.page.NetworkAddress right = com.stratosdb.storage.page.NetworkAddress.parse(rightStr, false);
+            return switch (netCmp.operator()) {
+                case "<<" -> left.isContainedBy(right);
+                case "<<=" -> left.isContainedByOrEquals(right);
+                case ">>" -> left.contains(right);
+                case ">>=" -> left.containsOrEquals(right);
+                default -> false;
+            };
+        }
         if (expr instanceof WhereExpr.EqZeroArgFunction eqFn) {
             Object columnValue = resolveColumnValue(row, eqFn.column(), outerRow);
             // current_user() is special-cased directly (a simple, non-throwing
@@ -9502,6 +9557,24 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 case "!=" -> !ba.equals(bb);
                 default -> false;
             };
+        }
+        if (a instanceof java.util.UUID || b instanceof java.util.UUID) {
+            try {
+                java.util.UUID ua = (a instanceof java.util.UUID u) ? u : java.util.UUID.fromString(a.toString().trim());
+                java.util.UUID ub = (b instanceof java.util.UUID u) ? u : java.util.UUID.fromString(b.toString().trim());
+                int cmp = ua.compareTo(ub);
+                return switch (operator) {
+                    case "=" -> cmp == 0;
+                    case "!=" -> cmp != 0;
+                    case "<" -> cmp < 0;
+                    case "<=" -> cmp <= 0;
+                    case ">" -> cmp > 0;
+                    case ">=" -> cmp >= 0;
+                    default -> false;
+                };
+            } catch (IllegalArgumentException ignored) {
+                return operator.equals("!=");
+            }
         }
         Double da = asNumberOrNull(a);
         Double db = asNumberOrNull(b);
@@ -9761,6 +9834,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         if (arrayMatch.matches()) {
             return parseArrayLiteral(arrayMatch.group(1));
         }
+        if (raw.trim().equalsIgnoreCase("gen_random_uuid()")) {
+            return java.util.UUID.randomUUID();
+        }
         return parseLiteral(raw);
     }
 
@@ -9851,10 +9927,20 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return n.doubleValue();
             }
         }
+        if (normalizedType.endsWith("[]")) {
+            return coerceTypedArray(columnName, normalizedType, resolvedValue);
+        }
         if (!(resolvedValue instanceof String)) {
             return resolvedValue;
         }
         String rawValue = (String) resolvedValue;
+        if (normalizedType.equals("UUID")) {
+            try {
+                return java.util.UUID.fromString(rawValue.trim());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid UUID for column \"" + columnName + "\": \"" + rawValue + "\"");
+            }
+        }
         if (normalizedType.equals("BYTEA") || normalizedType.equals("BLOB") || normalizedType.equals("BYTES")) {
             if (rawValue.startsWith("\\x") || rawValue.startsWith("\\X") || rawValue.startsWith("x'") || rawValue.startsWith("X'")) {
                 return decodeHex(rawValue);
@@ -9876,7 +9962,7 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
         }
         if (normalizedType.equals("INET") || normalizedType.equals("CIDR")) {
-            return validateNetworkAddress(columnName, normalizedType, rawValue);
+            return com.stratosdb.storage.page.NetworkAddress.parse(rawValue, normalizedType.equals("CIDR"));
         }
         if (normalizedType.equals("INT4RANGE") || normalizedType.equals("DATERANGE")) {
             try {
@@ -9914,42 +10000,60 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     /**
-     * A real INET (a single host address, optionally with a real
-     * /prefix-length suffix) or CIDR (a real network address, ALWAYS with
-     * a real /prefix-length suffix - real Postgres itself requires this
-     * for CIDR, unlike INET where it's optional) value - validated with
-     * java.net.InetAddress itself, not a hand-rolled regex: passing it a
-     * literal IP address string (not a hostname) only ever checks the
-     * address's own format, never performs a real DNS lookup - documented
-     * JDK behavior this relies on directly.
+     * Validates and coerces 1D typed array values (e.g. INT[], BIGINT[], TEXT[], VARCHAR[])
+     * from either {@code ARRAY[...]} lists or PostgreSQL {@code '{...}'} array literals.
      */
-    private String validateNetworkAddress(String columnName, String typeName, String rawValue) {
-        String addressPart = rawValue;
-        Integer prefixLength = null;
-        int slashIndex = rawValue.indexOf('/');
-        if (slashIndex >= 0) {
-            addressPart = rawValue.substring(0, slashIndex);
-            try {
-                prefixLength = Integer.parseInt(rawValue.substring(slashIndex + 1));
-            } catch (NumberFormatException e) {
-                throw new IllegalArgumentException("Invalid " + typeName + " for column \"" + columnName + "\": bad prefix length in \"" + rawValue + "\"");
+    private List<Object> coerceTypedArray(String columnName, String normalizedType, Object resolvedValue) {
+        String elemType = normalizedType.substring(0, normalizedType.length() - 2).trim();
+        List<?> rawList;
+        if (resolvedValue instanceof List<?> list) {
+            rawList = list;
+        } else if (resolvedValue instanceof String s) {
+            String trimmed = s.trim();
+            if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+                String inner = trimmed.substring(1, trimmed.length() - 1).trim();
+                rawList = parseArrayLiteral(inner);
+            } else {
+                throw new IllegalArgumentException("Invalid array literal for column \"" + columnName + "\": " + s);
             }
-        } else if (typeName.equals("CIDR")) {
-            throw new IllegalArgumentException("Invalid CIDR for column \"" + columnName + "\": \"" + rawValue + "\" is missing its required /prefix-length");
+        } else {
+            throw new IllegalArgumentException("Expected array for column \"" + columnName + "\", got: " + resolvedValue.getClass().getSimpleName());
         }
-        java.net.InetAddress address;
-        try {
-            address = java.net.InetAddress.getByName(addressPart);
-        } catch (java.net.UnknownHostException e) {
-            throw new IllegalArgumentException("Invalid " + typeName + " for column \"" + columnName + "\": \"" + addressPart + "\" is not a real IP address");
-        }
-        if (prefixLength != null) {
-            int maxPrefix = address instanceof java.net.Inet6Address ? 128 : 32;
-            if (prefixLength < 0 || prefixLength > maxPrefix) {
-                throw new IllegalArgumentException("Invalid " + typeName + " for column \"" + columnName + "\": prefix length " + prefixLength + " is out of range (0-" + maxPrefix + ")");
+        List<Object> coerced = new ArrayList<>(rawList.size());
+        for (Object item : rawList) {
+            if (item == null) {
+                coerced.add(null);
+            } else if (elemType.equals("INT") || elemType.equals("INTEGER") || elemType.equals("INT4")) {
+                if (item instanceof Number n) {
+                    coerced.add(n.intValue());
+                } else {
+                    try {
+                        coerced.add(Integer.parseInt(item.toString().trim()));
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("Invalid integer element \"" + item + "\" for " + normalizedType + " column \"" + columnName + "\"");
+                    }
+                }
+            } else if (elemType.equals("BIGINT") || elemType.equals("INT8")) {
+                if (item instanceof Number n) {
+                    coerced.add(n.longValue());
+                } else {
+                    try {
+                        coerced.add(Long.parseLong(item.toString().trim()));
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("Invalid bigint element \"" + item + "\" for " + normalizedType + " column \"" + columnName + "\"");
+                    }
+                }
+            } else if (elemType.equals("TEXT") || elemType.startsWith("VARCHAR") || elemType.startsWith("CHAR")) {
+                String str = item.toString();
+                if (str.length() >= 2 && str.startsWith("\"") && str.endsWith("\"")) {
+                    str = str.substring(1, str.length() - 1).replace("\\\"", "\"");
+                }
+                coerced.add(str);
+            } else {
+                coerced.add(item);
             }
         }
-        return rawValue;
+        return coerced;
     }
 
     /**

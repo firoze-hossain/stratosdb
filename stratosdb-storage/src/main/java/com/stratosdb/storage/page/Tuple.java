@@ -40,6 +40,8 @@ public class Tuple {
     private static final byte TAG_TSQUERY = 10;
     private static final byte TAG_BYTES = 11;
     private static final byte TAG_JSONB = 12;
+    private static final byte TAG_UUID = 13;
+    private static final byte TAG_INET = 14;
 
     private final List<Object> values;
     private final List<String> columnNames;
@@ -325,6 +327,18 @@ public class Tuple {
             out.writeByte(TAG_JSONB);
             out.writeInt(raw.length);
             out.write(raw);
+        } else if (value instanceof java.util.UUID uuid) {
+            out.writeByte(TAG_UUID);
+            out.writeLong(uuid.getMostSignificantBits());
+            out.writeLong(uuid.getLeastSignificantBits());
+        } else if (value instanceof NetworkAddress net) {
+            byte[] addr = net.getAddressBytes();
+            out.writeByte(TAG_INET);
+            out.writeByte(net.isCidr() ? 1 : 0);
+            out.writeByte(net.hasExplicitPrefix() ? 1 : 0);
+            out.writeByte((byte) net.getPrefixLength());
+            out.writeByte((byte) addr.length);
+            out.write(addr);
         } else if (value instanceof Short s) {
             out.writeByte(TAG_INT);
             out.writeInt(s.intValue());
@@ -575,6 +589,20 @@ public class Tuple {
                 byte[] bytes = new byte[len];
                 in.readFully(bytes);
                 return new BinaryJsonb(bytes);
+            }
+            case TAG_UUID: {
+                long msb = in.readLong();
+                long lsb = in.readLong();
+                return new java.util.UUID(msb, lsb);
+            }
+            case TAG_INET: {
+                boolean isCidr = in.readByte() == 1;
+                boolean hasPrefix = in.readByte() == 1;
+                int prefixLen = in.readByte() & 0xFF;
+                int addrLen = in.readByte() & 0xFF;
+                byte[] addr = new byte[addrLen];
+                in.readFully(addr);
+                return new NetworkAddress(addr, prefixLen, isCidr, hasPrefix);
             }
             case TAG_NULL:
                 return null;

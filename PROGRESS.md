@@ -2385,6 +2385,20 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`JsonbTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/JsonbTest.java) (**3/3 passing**) and `StratosDBTest#*Json*+*Gin*` (**12/12 passing**): verified binary format/Tuple round-trip, nested `->`/`->>`/`@>`/`?` queries, and `< 1ms` GIN-indexed `@>` containment searches.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 08 Week 15 marked `Completed`.
 
+## Sprint 08 Week 16 — Data Types: Enterprise Types: UUID, INET, Arrays ✅ DONE
+
+- ✅ **Native 16-Byte `UUID` & `gen_random_uuid()`**:
+  - Added native `TAG_UUID` (`13`) 16-byte (`msb` + `lsb`) serialization/deserialization in [`Tuple`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/page/Tuple.java).
+  - Registered `gen_random_uuid()` in `BUILTIN_ZERO_ARG_FUNCTIONS`, `DEFAULT` / `VALUES` resolution in [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4) and [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java), strict `UUID.fromString` coercion, and B-Tree/Hash primary key index support (`toIndexKey` + `planScan`).
+
+- ✅ **`INET`/`CIDR` Network Types & Subnet Containment**:
+  - Implemented [`NetworkAddress`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/page/NetworkAddress.java) with IPv4/IPv6 validation, native `TAG_INET` (`14`) Tuple serialization, and PostgreSQL subnet containment operators (`<<`, `<<=`, `>>`, `>>=`) across [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4), [`WhereExpr`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/WhereExpr.java), [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java), and [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java).
+
+- ✅ **1D Typed Arrays (`INT[]`, `TEXT[]`) & Verification**:
+  - Added element-level type validation and coercion for both `ARRAY[...]` and PostgreSQL `'{...}'` literals (`INT[]`, `INTEGER[]`, `BIGINT[]`, `TEXT[]`, `VARCHAR[]`), plus `array_length(arr, 1)` and `cardinality(arr)` functions and GIN `@>` indexing.
+  - [`EnterpriseTypesTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/EnterpriseTypesTest.java) (**3/3 passing**) and `StratosDBTest#*Inet*+*Array*` (**6/6 passing**).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 08 Week 16 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

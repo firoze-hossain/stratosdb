@@ -43,6 +43,8 @@ public sealed interface WhereExpr {
     record JsonPathCompare(String column, List<JsonStep> steps, String operator, String valueLiteral) implements WhereExpr {}
     /** JSONB key existence (?): column ? 'key' or column->'a' ? 'key'. */
     record JsonKeyExists(String column, List<JsonStep> steps, String keyLiteral) implements WhereExpr {}
+    /** column << 'cidr', <<= 'cidr', >> 'cidr', >>= 'cidr' - INET/CIDR subnet containment operators. */
+    record NetworkContains(String column, String operator, String literal) implements WhereExpr {}
 
     /** (startColumn, endColumn) OVERLAPS (queryStart, queryEnd) - real interval/range overlap, GiST's own classic real-world use case. Two intervals [a,b] and [c,d] overlap iff a <= d AND c <= b - the standard interval overlap test, used both here (for the no-index fallback) and by GistIntervalIndex's own search/pruning. */
     record RangeOverlaps(String startColumn, String endColumn, String queryStartLiteral, String queryEndLiteral) implements WhereExpr {}
