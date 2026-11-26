@@ -489,7 +489,7 @@ def create_project_plan_excel():
         # Sprint 8 (Month 4, Weeks 15-16)
         ["Sprint 08", "Week 15", "Data Types", "Binary JSONB & JSONPath Engine",
          "Implement decomposed binary JSONB format with header, offsets, and type tags. Build jsonpath query operators (->, ->>, @>, ?). Integrate with GIN indexing.",
-         "High", "P1 - High", "JSONB containment searches execute in < 1ms via GIN index; nested object extraction verified.", "Planned"],
+         "High", "P1 - High", "JSONB containment searches execute in < 1ms via GIN index; nested object extraction verified.", "Completed"],
         ["Sprint 08", "Week 16", "Data Types", "Enterprise Types: UUID, INET, Arrays",
          "Implement native 16-byte UUID type with gen_random_uuid(), IP address INET/CIDR types with subnet containment, and 1D typed arrays (int[], text[]).",
          "Medium", "P2 - Medium", "UUID primary keys index efficiently; subnet containment searches match standard CIDR semantics.", "Planned"],

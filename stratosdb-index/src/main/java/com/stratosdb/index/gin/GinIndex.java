@@ -68,6 +68,43 @@ public class GinIndex {
         return rids == null ? new ArrayList<>() : new ArrayList<>(rids);
     }
 
+    /** Intersects posting lists for all given exact keys, starting from the smallest set for sub-millisecond lookups. */
+    public List<BTreePage.RID> searchAll(List<String> keys) {
+        if (keys == null || keys.isEmpty()) {
+            return new ArrayList<>();
+        }
+        Set<BTreePage.RID> smallest = null;
+        List<Set<BTreePage.RID>> others = new ArrayList<>(keys.size());
+        for (String key : keys) {
+            Set<BTreePage.RID> set = wordToRids.get(normalize(key));
+            if (set == null || set.isEmpty()) {
+                return new ArrayList<>();
+            }
+            if (smallest == null || set.size() < smallest.size()) {
+                if (smallest != null) {
+                    others.add(smallest);
+                }
+                smallest = set;
+            } else {
+                others.add(set);
+            }
+        }
+        List<BTreePage.RID> result = new ArrayList<>();
+        for (BTreePage.RID rid : smallest) {
+            boolean inAll = true;
+            for (Set<BTreePage.RID> other : others) {
+                if (!other.contains(rid)) {
+                    inAll = false;
+                    break;
+                }
+            }
+            if (inAll) {
+                result.add(rid);
+            }
+        }
+        return result;
+    }
+
     /** Splits on anything that isn't a letter or digit, lowercases, and drops empty tokens - simple but real word boundaries, not a naive whitespace-only split (so "cat," and "cat" both index as the same word "cat"). */
     public static Set<String> tokenize(String text) {
         Set<String> words = new HashSet<>();

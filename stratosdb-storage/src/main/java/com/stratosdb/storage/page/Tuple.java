@@ -39,6 +39,7 @@ public class Tuple {
     private static final byte TAG_TSVECTOR = 9;
     private static final byte TAG_TSQUERY = 10;
     private static final byte TAG_BYTES = 11;
+    private static final byte TAG_JSONB = 12;
 
     private final List<Object> values;
     private final List<String> columnNames;
@@ -319,6 +320,11 @@ public class Tuple {
             out.writeByte(TAG_BYTES);
             out.writeInt(bytes.length);
             out.write(bytes);
+        } else if (value instanceof BinaryJsonb jsonb) {
+            byte[] raw = jsonb.rawBytes();
+            out.writeByte(TAG_JSONB);
+            out.writeInt(raw.length);
+            out.write(raw);
         } else if (value instanceof Short s) {
             out.writeByte(TAG_INT);
             out.writeInt(s.intValue());
@@ -563,6 +569,12 @@ public class Tuple {
                 byte[] bytes = new byte[len];
                 in.readFully(bytes);
                 return bytes;
+            }
+            case TAG_JSONB: {
+                int len = in.readInt();
+                byte[] bytes = new byte[len];
+                in.readFully(bytes);
+                return new BinaryJsonb(bytes);
             }
             case TAG_NULL:
                 return null;

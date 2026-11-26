@@ -287,7 +287,7 @@ indexName: anyIdentifier;
 
 // Select list
 selectList: STAR | selectItem (COMMA selectItem)*;
-selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | functionCall (AS alias)? | literal (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
+selectItem: windowFunction (AS alias)? | aggregateFunction (AS alias)? | functionCall (AS alias)? | jsonPathExpr (AS alias)? | literal (AS alias)? | expression (AS alias)? | columnName (AS alias)?;
 windowFunction: (ROW_NUMBER | RANK | DENSE_RANK) LPAREN RPAREN overClause
               | (LEAD | LAG) LPAREN columnName (COMMA literal (COMMA literal)?)? RPAREN overClause
               | (SUM | COUNT | AVG | MIN | MAX) LPAREN (STAR | columnName) RPAREN overClause
@@ -323,6 +323,11 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | columnName ARRAY_CONTAINS literal                      #ArrayContainsCompare
           | columnName TS_MATCH literal                           #TsMatchCompare
           | columnName JSON_EXTRACT_TEXT literal ASSIGN literal    #JsonExtractTextEqCompare
+          | columnName QUESTION literal                            #JsonKeyExistsCompare
+          | jsonPathExpr ASSIGN literal                            #JsonPathEqCompare
+          | jsonPathExpr NE literal                                #JsonPathNeCompare
+          | jsonPathExpr QUESTION literal                          #JsonPathKeyExistsCompare
+          | jsonPathExpr ARRAY_CONTAINS literal                    #JsonPathContainsCompare
           | LPAREN columnName COMMA columnName RPAREN OVERLAPS LPAREN literal COMMA literal RPAREN #RangeOverlapsCompare
           | columnName IN LPAREN valueList RPAREN                  #InListExpr
           | columnName NOT IN LPAREN valueList RPAREN               #NotInListExpr
@@ -339,6 +344,9 @@ expression: LPAREN expression RPAREN                              #ParenExpr
           | expression AND expression                                #AndExpr
           | expression OR expression                                 #OrExpr
           ;
+
+jsonStep: (JSON_EXTRACT_TEXT | JSON_EXTRACT) literal;
+jsonPathExpr: columnName jsonStep+;
 
 // Values
 valueList: insertValue (COMMA insertValue)*;
@@ -375,7 +383,8 @@ dataType: (INT | INTEGER | BIGINT | SMALLINT | TINYINT | SERIAL | BIGSERIAL
         | IDENTIFIER) (LBRACKET RBRACKET)?;
 
 // Literals
-literal: STRING_LITERAL | MINUS? INTEGER_LITERAL | MINUS? FLOAT_LITERAL | TRUE | FALSE | NULL | PARAMETER;
+literal: STRING_LITERAL | MINUS? INTEGER_LITERAL | MINUS? FLOAT_LITERAL | TRUE | FALSE | NULL | param;
+param: PARAMETER | QUESTION;
 defaultValue: literal
             | CURRENT_DATE
             | CURRENT_TIME
@@ -397,8 +406,8 @@ tableName: (anyIdentifier DOT)? anyIdentifier;
 typeName: anyIdentifier;
 columnName: (anyIdentifier DOT (anyIdentifier DOT)?)? anyIdentifier;
 alias: anyIdentifier | STRING_LITERAL;
-limitValue: INTEGER_LITERAL | PARAMETER;
-offsetValue: INTEGER_LITERAL | PARAMETER;
+limitValue: INTEGER_LITERAL | param;
+offsetValue: INTEGER_LITERAL | param;
 
 // Lexer rules
 // TRUE/FALSE MUST be declared before IDENTIFIER (see IDENTIFIER's own
@@ -694,6 +703,7 @@ NE: '!=';
 ARRAY_CONTAINS: '@>';
 TS_MATCH: '@@';
 JSON_EXTRACT_TEXT: '->>';
+JSON_EXTRACT: '->';
 COLONCOLON: '::';
 STAR: '*';
 
@@ -710,7 +720,8 @@ IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
 STRING_LITERAL: '\'' ('\'\'' | ~['])* '\'';
 /** Postgres's own $$ ... $$ delimiter for a function body - lets the body contain semicolons, quotes, or anything else without conflicting with the surrounding statement's own delimiters. Non-greedy (.*?) so the FIRST closing $$ ends the body, not the last one in the whole remaining input. */
 DOLLAR_QUOTED_STRING: '$$' .*? '$$';
-PARAMETER: '$' [0-9]+ | '?';
+QUESTION: '?';
+PARAMETER: '$' [0-9]+;
 INTEGER_LITERAL: [0-9]+;
 FLOAT_LITERAL: [0-9]+ '.' [0-9]+;
 

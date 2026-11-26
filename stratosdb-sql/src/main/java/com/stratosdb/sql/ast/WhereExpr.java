@@ -35,8 +35,14 @@ public sealed interface WhereExpr {
     /** column = functionName() - a real, general comparison against a zero-arg function's own result (e.g. `owner = current_user()`), found missing entirely while building real row-level security: without this, a policy could only ever compare a column against a fixed literal, never against the real, dynamic identity of whoever is actually running the query - the single most common real RLS pattern. */
 
 
-    /** column ->> 'key' = 'value' - extracts a top-level JSON key as text and compares it for equality. Deliberately scoped to top-level keys and equality only - real Postgres's ->> also supports array-index extraction and #>>'{path,to,key}' for nested paths, real further work not attempted here. */
+    /** column ->> 'key' = 'value' - extracts a top-level JSON key as text and compares it for equality. */
     record JsonExtractTextEquals(String column, String key, String value) implements WhereExpr {}
+    /** A single -> or ->> step in a JSONPath expression. */
+    record JsonStep(String op, String keyLiteral) {}
+    /** Chained JSONPath comparison: column->'a'->>'b' = 'val', != 'val', or @> '{"x":1}'. */
+    record JsonPathCompare(String column, List<JsonStep> steps, String operator, String valueLiteral) implements WhereExpr {}
+    /** JSONB key existence (?): column ? 'key' or column->'a' ? 'key'. */
+    record JsonKeyExists(String column, List<JsonStep> steps, String keyLiteral) implements WhereExpr {}
 
     /** (startColumn, endColumn) OVERLAPS (queryStart, queryEnd) - real interval/range overlap, GiST's own classic real-world use case. Two intervals [a,b] and [c,d] overlap iff a <= d AND c <= b - the standard interval overlap test, used both here (for the no-index fallback) and by GistIntervalIndex's own search/pruning. */
     record RangeOverlaps(String startColumn, String endColumn, String queryStartLiteral, String queryEndLiteral) implements WhereExpr {}

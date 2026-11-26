@@ -946,7 +946,14 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 sb.append("$$");
                 i++;
             } else if (c == '?' && !inSingleQuotes && !inDollarQuotes) {
-                sb.append('$').append(paramIndex++);
+                int j = i + 1;
+                while (j < len && Character.isWhitespace(sql.charAt(j))) j++;
+                if (j < len && sql.charAt(j) == '\'') {
+                    // JSONB key-existence operator: doc ? 'key'
+                    sb.append(c);
+                } else {
+                    sb.append('$').append(paramIndex++);
+                }
             } else {
                 sb.append(c);
             }
@@ -969,7 +976,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // message type specifically).
             return QueryResult.success("OK");
         }
-        sql = replaceQuestionMarks(sql);
+        if (params != null && !params.isEmpty()) {
+            sql = replaceQuestionMarks(sql);
+        }
         SessionState state = session.get();
         List<Object> oldParams = state.currentParams;
         state.currentParams = params != null ? params : List.of();
@@ -2866,11 +2875,17 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                     index.insertExact(element.toString(), rid);
                 }
             }
+        } else if (value instanceof com.stratosdb.storage.page.BinaryJsonb jsonb) {
+            List<String> keys = new ArrayList<>();
+            jsonb.collectGinKeys(keys);
+            for (String key : keys) {
+                index.insertExact(key, rid);
+            }
         } else if (value instanceof Map<?, ?> jsonObject) {
-            for (Map.Entry<?, ?> entry : jsonObject.entrySet()) {
-                if (entry.getValue() != null) {
-                    index.insertExact(jsonKeyValueIndexKey(entry.getKey().toString(), entry.getValue()), rid);
-                }
+            List<String> keys = new ArrayList<>();
+            com.stratosdb.storage.page.BinaryJsonb.encode(jsonObject).collectGinKeys(keys);
+            for (String key : keys) {
+                index.insertExact(key, rid);
             }
         } else if (value instanceof com.stratosdb.storage.page.TsVector tsVector) {
             // Each real lexeme is already fully normalized (lowercased, stop
@@ -3938,7 +3953,40 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             // see indexGinValue), so the search key must be the exact literal
             // text, not stripped/lowered the way word-search's Contains is.
             Object targetElement = parseLiteral(arrayContains.literalElement());
-            candidateRids = ginEntry.index().search(targetElement.toString());
+            String targetStr = targetElement != null ? targetElement.toString().trim() : "";
+            if ((targetStr.startsWith("{") && targetStr.endsWith("}")) || (targetStr.startsWith("[") && targetStr.endsWith("]"))) {
+                try {
+                    Object parsed = JsonParser.parse(targetStr);
+                    List<String> queryKeys = new ArrayList<>();
+                    com.stratosdb.storage.page.BinaryJsonb.encode(parsed).collectGinKeys(queryKeys);
+                    if (queryKeys.isEmpty()) {
+                        return null;
+                    }
+                    candidateRids = ginEntry.index().searchAll(queryKeys);
+                } catch (JsonParser.JsonParseException e) {
+                    candidateRids = ginEntry.index().search(targetStr);
+                }
+            } else {
+                candidateRids = ginEntry.index().search(targetStr);
+            }
+        } else if (stmt.where() instanceof WhereExpr.JsonKeyExists keyExists && keyExists.steps().isEmpty()) {
+            GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), keyExists.column());
+            if (ginEntry == null) {
+                return null;
+            }
+            candidateRids = ginEntry.index().search("$key:" + stripQuotes(keyExists.keyLiteral()));
+        } else if (stmt.where() instanceof WhereExpr.JsonPathCompare jp && jp.operator().equals("=")
+                && jp.steps().stream().allMatch(s -> s.op().equals("->") || s.op().equals("->>"))) {
+            GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), jp.column());
+            if (ginEntry == null) {
+                return null;
+            }
+            StringBuilder path = new StringBuilder();
+            for (int i = 0; i < jp.steps().size(); i++) {
+                if (i > 0) path.append('.');
+                path.append(stripQuotes(jp.steps().get(i).keyLiteral()));
+            }
+            candidateRids = ginEntry.index().search(path + ":" + stripQuotes(jp.valueLiteral()));
         } else if (stmt.where() instanceof WhereExpr.JsonExtractTextEquals jsonExtract) {
             GinIndexEntry ginEntry = findGinIndex(stmt.tableName(), jsonExtract.column());
             if (ginEntry == null) {
@@ -4993,6 +5041,96 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
      * not "42.0" - the form a user would naturally write when comparing
      * against it (data->>'count' = '42'), not Java's own Double.toString().
      */
+    private Object evaluateProjectedJsonPath(Tuple tuple, String expr) {
+        int firstArrow = expr.indexOf("->");
+        if (firstArrow <= 0) {
+            return null;
+        }
+        String baseCol = expr.substring(0, firstArrow).trim();
+        Object baseVal = findColumnValue(tuple, baseCol);
+        if (baseVal == null) {
+            return null;
+        }
+        List<WhereExpr.JsonStep> steps = new ArrayList<>();
+        int pos = firstArrow;
+        while (pos < expr.length()) {
+            String op;
+            if (expr.startsWith("->>", pos)) {
+                op = "->>";
+                pos += 3;
+            } else if (expr.startsWith("->", pos)) {
+                op = "->";
+                pos += 2;
+            } else {
+                break;
+            }
+            int nextArrow = expr.indexOf("->", pos);
+            String rawLiteral = (nextArrow >= 0 ? expr.substring(pos, nextArrow) : expr.substring(pos)).trim();
+            steps.add(new WhereExpr.JsonStep(op, rawLiteral));
+            if (nextArrow < 0) break;
+            pos = nextArrow;
+        }
+        boolean finalAsText = !steps.isEmpty() && steps.get(steps.size() - 1).op().equals("->>");
+        return evaluateJsonSteps(baseVal, steps, finalAsText);
+    }
+
+    private Object evaluateJsonSteps(Object root, List<WhereExpr.JsonStep> steps, boolean finalAsText) {
+        if (root == null) {
+            return null;
+        }
+        if (root instanceof com.stratosdb.storage.page.BinaryJsonb jsonb) {
+            List<Object> navSteps = new ArrayList<>(steps.size());
+            for (WhereExpr.JsonStep step : steps) {
+                String lit = step.keyLiteral().trim();
+                if (lit.startsWith("'") && lit.endsWith("'")) {
+                    navSteps.add(stripQuotes(lit));
+                } else {
+                    try {
+                        navSteps.add(Integer.parseInt(lit));
+                    } catch (NumberFormatException e) {
+                        navSteps.add(stripQuotes(lit));
+                    }
+                }
+            }
+            com.stratosdb.storage.page.BinaryJsonb result = jsonb.navigate(navSteps);
+            if (result == null) {
+                return null;
+            }
+            if (finalAsText) {
+                return result.asText();
+            }
+            return result;
+        }
+        Object current = root;
+        for (WhereExpr.JsonStep step : steps) {
+            if (current == null) {
+                return null;
+            }
+            String lit = step.keyLiteral().trim();
+            if (current instanceof Map<?, ?> map) {
+                current = map.get(stripQuotes(lit));
+            } else if (current instanceof List<?> list) {
+                try {
+                    int idx = Integer.parseInt(lit);
+                    current = (idx >= 0 && idx < list.size()) ? list.get(idx) : null;
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        if (current == null) {
+            return null;
+        }
+        if (finalAsText) {
+            return (current instanceof Map || current instanceof List)
+                ? JsonParser.toJsonText(current)
+                : jsonScalarAsText(current);
+        }
+        return current;
+    }
+
     private String jsonScalarAsText(Object jsonValue) {
         if (jsonValue instanceof Double d) {
             if (d == Math.floor(d) && !Double.isInfinite(d)) {
@@ -9099,6 +9237,26 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if (expr instanceof WhereExpr.ArrayContains arrayContains) {
             Object value = resolveColumnValue(row, arrayContains.column(), outerRow);
+            if (value instanceof com.stratosdb.storage.page.BinaryJsonb jsonb) {
+                Object targetElement = resolveLiteralOrParam(arrayContains.literalElement(), params);
+                String targetStr = targetElement != null ? targetElement.toString() : stripQuotes(arrayContains.literalElement());
+                try {
+                    com.stratosdb.storage.page.BinaryJsonb targetJsonb = com.stratosdb.storage.page.BinaryJsonb.encode(JsonParser.parse(targetStr));
+                    return jsonb.contains(targetJsonb);
+                } catch (JsonParser.JsonParseException e) {
+                    return false;
+                }
+            }
+            if (value instanceof Map<?, ?> jsonMap) {
+                Object targetElement = resolveLiteralOrParam(arrayContains.literalElement(), params);
+                String targetStr = targetElement != null ? targetElement.toString() : stripQuotes(arrayContains.literalElement());
+                try {
+                    com.stratosdb.storage.page.BinaryJsonb targetJsonb = com.stratosdb.storage.page.BinaryJsonb.encode(JsonParser.parse(targetStr));
+                    return com.stratosdb.storage.page.BinaryJsonb.encode(jsonMap).contains(targetJsonb);
+                } catch (JsonParser.JsonParseException e) {
+                    return false;
+                }
+            }
             if (!(value instanceof List)) {
                 return false; // not an array column at all, or NULL - @> is false either way
             }
@@ -9135,21 +9293,75 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
         }
         if (expr instanceof WhereExpr.JsonExtractTextEquals jsonExtract) {
             Object value = resolveColumnValue(row, jsonExtract.column(), outerRow);
+            String key = stripQuotes(jsonExtract.key());
+            Object targetObj = resolveLiteralOrParam(jsonExtract.value(), params);
+            String targetText = targetObj != null ? targetObj.toString() : stripQuotes(jsonExtract.value());
+            if (value instanceof com.stratosdb.storage.page.BinaryJsonb jsonb) {
+                com.stratosdb.storage.page.BinaryJsonb extracted = jsonb.get(key);
+                if (extracted == null || extracted.isNull()) {
+                    return false;
+                }
+                return targetText.equals(extracted.asText());
+            }
             if (!(value instanceof Map)) {
                 return false; // not a JSON column at all, or NULL
             }
-            String key = stripQuotes(jsonExtract.key());
             Object extracted = ((Map<?, ?>) value).get(key);
             if (extracted == null) {
                 return false; // key doesn't exist in this document, or its value is JSON null - either way, not equal to any comparison value
             }
-            Object targetObj = resolveLiteralOrParam(jsonExtract.value(), params);
-            String targetText = targetObj != null ? targetObj.toString() : stripQuotes(jsonExtract.value());
-            // JSON scalars are stored as String/Double/Boolean (see JsonParser) -
-            // compare as text, matching real Postgres's own ->>'key' semantics
-            // (the "text" extraction operator, as opposed to -> which preserves
-            // the JSON type).
             return jsonScalarAsText(extracted).equals(targetText);
+        }
+        if (expr instanceof WhereExpr.JsonKeyExists keyExists) {
+            Object value = resolveColumnValue(row, keyExists.column(), outerRow);
+            Object navigated = evaluateJsonSteps(value, keyExists.steps(), false);
+            if (navigated == null) {
+                return false;
+            }
+            Object keyObj = resolveLiteralOrParam(keyExists.keyLiteral(), params);
+            String key = keyObj != null ? keyObj.toString() : stripQuotes(keyExists.keyLiteral());
+            if (navigated instanceof com.stratosdb.storage.page.BinaryJsonb jsonb) {
+                return jsonb.hasKey(key);
+            }
+            if (navigated instanceof Map<?, ?> map) {
+                return map.containsKey(key);
+            }
+            return false;
+        }
+        if (expr instanceof WhereExpr.JsonPathCompare jp) {
+            Object value = resolveColumnValue(row, jp.column(), outerRow);
+            boolean finalAsText = !jp.steps().isEmpty() && jp.steps().get(jp.steps().size() - 1).op().equals("->>");
+            Object extracted = evaluateJsonSteps(value, jp.steps(), finalAsText);
+            if (extracted == null) {
+                return false;
+            }
+            Object targetObj = resolveLiteralOrParam(jp.valueLiteral(), params);
+            String targetText = targetObj != null ? targetObj.toString() : stripQuotes(jp.valueLiteral());
+            if (jp.operator().equals("@>")) {
+                try {
+                    com.stratosdb.storage.page.BinaryJsonb targetJsonb = com.stratosdb.storage.page.BinaryJsonb.encode(JsonParser.parse(targetText));
+                    com.stratosdb.storage.page.BinaryJsonb leftJsonb = (extracted instanceof com.stratosdb.storage.page.BinaryJsonb b)
+                        ? b
+                        : com.stratosdb.storage.page.BinaryJsonb.encode(extracted);
+                    return leftJsonb.contains(targetJsonb);
+                } catch (JsonParser.JsonParseException e) {
+                    return false;
+                }
+            }
+            boolean eq;
+            if (finalAsText) {
+                eq = targetText.equals(extracted.toString());
+            } else if (extracted instanceof com.stratosdb.storage.page.BinaryJsonb b) {
+                try {
+                    com.stratosdb.storage.page.BinaryJsonb targetJsonb = com.stratosdb.storage.page.BinaryJsonb.encode(JsonParser.parse(targetText));
+                    eq = b.equals(targetJsonb);
+                } catch (JsonParser.JsonParseException e) {
+                    eq = targetText.equals(b.asText());
+                }
+            } else {
+                eq = targetText.equals(jsonScalarAsText(extracted));
+            }
+            return jp.operator().equals("!=") ? !eq : eq;
         }
         if (expr instanceof WhereExpr.RangeOverlaps rangeOverlaps) {
             Object startValue = resolveColumnValue(row, rangeOverlaps.startColumn(), outerRow);
@@ -9435,6 +9647,9 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
                 return tuple.getValue(i);
             }
         }
+        if (columnName.contains("->")) {
+            return evaluateProjectedJsonPath(tuple, columnName);
+        }
         // Convenience fallback for joined tuples, whose columns are all
         // qualified as "table.column": a bare "amount" resolves to
         // "orders.amount" if some qualified column ends with ".amount".
@@ -9646,11 +9861,18 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
             }
             return rawValue.getBytes(StandardCharsets.UTF_8);
         }
-        if (normalizedType.equals("JSON") || normalizedType.equals("JSONB")) {
+        if (normalizedType.equals("JSON")) {
             try {
                 return JsonParser.parse(rawValue);
             } catch (JsonParser.JsonParseException e) {
                 throw new IllegalArgumentException("Invalid JSON for column \"" + columnName + "\": " + e.getMessage());
+            }
+        }
+        if (normalizedType.equals("JSONB")) {
+            try {
+                return com.stratosdb.storage.page.BinaryJsonb.encode(JsonParser.parse(rawValue));
+            } catch (JsonParser.JsonParseException e) {
+                throw new IllegalArgumentException("Invalid JSONB for column \"" + columnName + "\": " + e.getMessage());
             }
         }
         if (normalizedType.equals("INET") || normalizedType.equals("CIDR")) {

@@ -2371,6 +2371,20 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - `StratosDBTest` recursive/CTE tests (**8/8 passing**) and `stratosdb-sql` (**51/51 passing**).
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 07 Week 14 marked `Completed`.
 
+## Sprint 08 Week 15 — Data Types: Binary JSONB & JSONPath Engine ✅ DONE
+
+- ✅ **Decomposed Binary JSONB Format (`BinaryJsonb`)**:
+  - Implemented [`BinaryJsonb`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/page/BinaryJsonb.java) with a fixed 12-byte header (`JSB1` magic, version, flags, root tag, root offset), per-node type tags (`TAG_NULL`, `TAG_FALSE`, `TAG_TRUE`, `TAG_LONG`, `TAG_DOUBLE`, `TAG_STRING`, `TAG_ARRAY`, `TAG_OBJECT`), O(1) array element offset tables, and lexicographically sorted `(keyOffset, valOffset)` object tables for O(log N) binary key lookup without decoding sibling fields.
+  - Integrated native `TAG_JSONB` (`12`) serialization/deserialization in [`Tuple`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/page/Tuple.java) and `JSONB` column ingestion in [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java).
+
+- ✅ **JSONPath Query Operators (`->`, `->>`, `@>`, `?`)**:
+  - Updated [`StratosSQL.g4`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/antlr4/com/stratosdb/sql/parser/StratosSQL.g4), [`WhereExpr`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/ast/WhereExpr.java), and [`SqlParser`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/parser/SqlParser.java) to support chained `->` and `->>` extraction in both `SELECT` projections and `WHERE` predicates, `@>` structural containment, and `?` key existence (preserving `?` SQL parameter placeholders).
+
+- ✅ **GIN Index Integration & Verification**:
+  - Added [`GinIndex.searchAll`](file:///home/firoze/projects/Others/stratosdb/stratosdb-index/src/main/java/com/stratosdb/index/gin/GinIndex.java) for smallest-posting-list-first intersection and indexed nested paths + `$key:<k>` markers for `BinaryJsonb` and `JSON` documents.
+  - [`JsonbTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/JsonbTest.java) (**3/3 passing**) and `StratosDBTest#*Json*+*Gin*` (**12/12 passing**): verified binary format/Tuple round-trip, nested `->`/`->>`/`@>`/`?` queries, and `< 1ms` GIN-indexed `@>` containment searches.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 08 Week 15 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

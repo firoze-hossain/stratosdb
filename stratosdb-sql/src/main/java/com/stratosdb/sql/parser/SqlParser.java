@@ -664,6 +664,21 @@ public class SqlParser {
         if (ctx instanceof StratosSQLParser.JsonExtractTextEqCompareContext c) {
             return new WhereExpr.JsonExtractTextEquals(cleanColumnName(c.columnName().getText()), c.literal(0).getText(), c.literal(1).getText());
         }
+        if (ctx instanceof StratosSQLParser.JsonKeyExistsCompareContext c) {
+            return new WhereExpr.JsonKeyExists(cleanColumnName(c.columnName().getText()), List.of(), c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.JsonPathEqCompareContext c) {
+            return buildJsonPathCompare(c.jsonPathExpr(), "=", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.JsonPathNeCompareContext c) {
+            return buildJsonPathCompare(c.jsonPathExpr(), "!=", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.JsonPathContainsCompareContext c) {
+            return buildJsonPathCompare(c.jsonPathExpr(), "@>", c.literal().getText());
+        }
+        if (ctx instanceof StratosSQLParser.JsonPathKeyExistsCompareContext c) {
+            return new WhereExpr.JsonKeyExists(cleanColumnName(c.jsonPathExpr().columnName().getText()), buildJsonSteps(c.jsonPathExpr()), c.literal().getText());
+        }
         if (ctx instanceof StratosSQLParser.RangeOverlapsCompareContext c) {
             return new WhereExpr.RangeOverlaps(cleanColumnName(c.columnName(0).getText()), cleanColumnName(c.columnName(1).getText()), c.literal(0).getText(), c.literal(1).getText());
         }
@@ -753,6 +768,9 @@ public class SqlParser {
                     aggregates.add(buildAggregateCall(itemCtx.aggregateFunction(), alias));
                 } else if (itemCtx.functionCall() != null) {
                     functionCalls.add(buildFunctionCallItem(itemCtx.functionCall(), alias));
+                } else if (itemCtx.jsonPathExpr() != null) {
+                    columns.add(formatJsonPathExpr(itemCtx.jsonPathExpr()));
+                    columnAliases.add(alias);
                 } else if (itemCtx.columnName() != null) {
                     columns.add(cleanColumnName(itemCtx.columnName().getText()));
                     columnAliases.add(alias);
@@ -823,6 +841,33 @@ public class SqlParser {
         if (ctx.SERIALIZABLE() != null) return IsolationLevel.SERIALIZABLE;
         if (ctx.READ() != null && ctx.UNCOMMITTED() != null) return IsolationLevel.READ_UNCOMMITTED;
         return IsolationLevel.fromString(ctx.getText());
+    }
+
+    private List<WhereExpr.JsonStep> buildJsonSteps(StratosSQLParser.JsonPathExprContext ctx) {
+        List<WhereExpr.JsonStep> steps = new ArrayList<>();
+        for (StratosSQLParser.JsonStepContext stepCtx : ctx.jsonStep()) {
+            String op = stepCtx.JSON_EXTRACT_TEXT() != null ? "->>" : "->";
+            steps.add(new WhereExpr.JsonStep(op, stepCtx.literal().getText()));
+        }
+        return steps;
+    }
+
+    private WhereExpr.JsonPathCompare buildJsonPathCompare(StratosSQLParser.JsonPathExprContext ctx, String operator, String valueLiteral) {
+        return new WhereExpr.JsonPathCompare(
+            cleanColumnName(ctx.columnName().getText()),
+            buildJsonSteps(ctx),
+            operator,
+            valueLiteral
+        );
+    }
+
+    private String formatJsonPathExpr(StratosSQLParser.JsonPathExprContext ctx) {
+        StringBuilder sb = new StringBuilder(cleanColumnName(ctx.columnName().getText()));
+        for (StratosSQLParser.JsonStepContext stepCtx : ctx.jsonStep()) {
+            sb.append(stepCtx.JSON_EXTRACT_TEXT() != null ? "->>" : "->");
+            sb.append(stepCtx.literal().getText());
+        }
+        return sb.toString();
     }
 
     private FunctionCallItem buildFunctionCallItem(StratosSQLParser.FunctionCallContext ctx, String alias) {
