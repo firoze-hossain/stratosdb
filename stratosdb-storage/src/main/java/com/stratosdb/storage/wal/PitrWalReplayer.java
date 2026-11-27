@@ -45,7 +45,20 @@ public class PitrWalReplayer {
      * when no specific point in time was requested) are actually
      * applied.
      */
+    /** Threshold distinguishing epoch microseconds (>= 10^14) from legacy epoch milliseconds. */
+    private static final long MICROS_THRESHOLD = 100_000_000_000_000L;
+
     public static ReplayResult replay(List<byte[]> segments, DiskManager diskManager, Long targetTimeMillis) {
+        Long targetTimeMicros = (targetTimeMillis != null) ? targetTimeMillis * 1_000L : null;
+        return replayMicros(segments, diskManager, targetTimeMicros);
+    }
+
+    /**
+     * Replays segments, in the given order, against diskManager with microsecond
+     * target-time precision. Only transactions that committed at or before
+     * {@code targetTimeMicros} (or all committed transactions if null) are applied.
+     */
+    public static ReplayResult replayMicros(List<byte[]> segments, DiskManager diskManager, Long targetTimeMicros) {
         Map<Long, Long> committedXidToTimestamp = new HashMap<>();
         for (byte[] segment : segments) {
             collectCommits(segment, committedXidToTimestamp);
@@ -58,7 +71,8 @@ public class PitrWalReplayer {
 
         Set<Long> xidsToApply = new HashSet<>();
         for (Map.Entry<Long, Long> entry : committedXidToTimestamp.entrySet()) {
-            if (targetTimeMillis == null || entry.getValue() <= targetTimeMillis) {
+            long commitMicros = entry.getValue() >= MICROS_THRESHOLD ? entry.getValue() : entry.getValue() * 1_000L;
+            if (targetTimeMicros == null || commitMicros <= targetTimeMicros) {
                 xidsToApply.add(entry.getKey());
             }
         }
@@ -76,7 +90,7 @@ public class PitrWalReplayer {
 
         String summary = "PITR replay complete: " + segments.size() + " segment(s), "
             + replayedOps + " operation(s) from " + xidsToApply.size() + " committed transaction(s) applied"
-            + (targetTimeMillis != null ? " (target time: " + java.time.Instant.ofEpochMilli(targetTimeMillis) + ")" : " (no target time - replayed everything available)")
+            + (targetTimeMicros != null ? " (target time: " + java.time.Instant.ofEpochSecond(targetTimeMicros / 1_000_000L, (targetTimeMicros % 1_000_000L) * 1_000L) + ")" : " (no target time - replayed everything available)")
             + ", across " + dirtyPages.size() + " page(s)";
         LOG.info(summary);
         return new ReplayResult(summary, xidsToApply, highestXidSeen);

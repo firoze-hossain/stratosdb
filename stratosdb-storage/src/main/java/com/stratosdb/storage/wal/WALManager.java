@@ -488,6 +488,12 @@ public class WALManager {
         }
     }
 
+    /** Returns current wall-clock time in microseconds since Unix epoch for sub-millisecond PITR precision. */
+    public static long currentEpochMicros() {
+        java.time.Instant now = java.time.Instant.now();
+        return now.getEpochSecond() * 1_000_000L + (now.getNano() / 1_000L);
+    }
+
     public long logCommit(long transactionId) {
         long commitLsn;
         if (!sync || !groupCommitEnabled || groupCommitCoordinator == null) {
@@ -495,7 +501,7 @@ public class WALManager {
                 ByteBuffer buffer = getDirectRecordBuffer(24);
                 buffer.putInt(OP_COMMIT);
                 buffer.putLong(transactionId);
-                buffer.putLong(System.currentTimeMillis());
+                buffer.putLong(currentEpochMicros());
                 commitLsn = writeBuffer(buffer, true);
             } catch (Exception e) {
                 LOG.error("Failed to log commit", e);

@@ -521,7 +521,7 @@ def create_project_plan_excel():
         # Sprint 12 (Month 6, Weeks 23-24)
         ["Sprint 12", "Week 23", "Disaster Recovery", "Continuous Archiving & PITR Engine",
          "Build automated WAL archiver streaming completed 16MB WAL segments to local archive or S3. Enhance PITR restore to roll forward WAL to exact microsecond timestamp.",
-         "High", "P0 - Critical", "Restore database to point-in-time 5 seconds before simulated accidental DROP TABLE; 100% data recovered.", "Planned"],
+         "High", "P0 - Critical", "Restore database to point-in-time 5 seconds before simulated accidental DROP TABLE; 100% data recovered.", "Completed"],
         ["Sprint 12", "Week 24", "Verification", "Jepsen Partition Testing & Chaos",
          "Build automated Jepsen chaos test harness. Subject 3-node StratosDB cluster to network partitions, packet loss, clock skew, and kill -9 during TPC-C workload.",
          "Very High", "P0 - Critical", "Zero stale reads, zero lost updates, zero split-brain inconsistencies under 48 hours continuous chaos.", "Planned"],

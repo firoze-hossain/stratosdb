@@ -2474,6 +2474,19 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`ConnectionMultiplexerTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ConnectionMultiplexerTest.java) (**1/1 passing**): verified **10,000** simultaneous client connections with `< 150` live JVM threads, `< 500MB` heap usage, and active SQL `CREATE TABLE`/`INSERT`/`SELECT` execution over wire protocol with zero thread starvation.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 11 Week 22 marked `Completed`.
 
+## Sprint 12 Week 23 — Disaster Recovery: Continuous Archiving & PITR Engine ✅ DONE
+
+- ✅ **Automated WAL Archiver & Archive Sinks ([`WalArchiver`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/WalArchiver.java), [`WalArchiveSink`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/WalArchiveSink.java))**:
+  - Implemented `WalArchiveSink` abstraction with `LocalWalArchiveSink` and `S3WalArchiveSink` (HTTP/S3 `PUT` + SigV4-compatible/unsigned `LIST` support for completed `.walseg` WAL segments).
+  - Implemented `WalArchiver` background daemon + `archiveNow()` to continuously stream completed WAL segments to local archive directories or S3 buckets without blocking transaction execution.
+
+- ✅ **Microsecond-Precision PITR Replay ([`WALManager`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/WALManager.java), [`GroupCommitRingBuffer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/GroupCommitRingBuffer.java), [`PitrWalReplayer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-storage/src/main/java/com/stratosdb/storage/wal/PitrWalReplayer.java), [`PitrRestore`](file:///home/firoze/projects/Others/stratosdb/stratosdb-cli/src/main/java/com/stratosdb/cli/PitrRestore.java))**:
+  - Upgraded `OP_COMMIT` records to store epoch microsecond timestamps (`currentEpochMicros()`) and added `PitrWalReplayer.replayMicros(...)` (with legacy millisecond normalization) and microsecond target-time parsing in `PitrRestore`.
+
+- ✅ **Verification**:
+  - [`ContinuousArchivingAndPitrTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ContinuousArchivingAndPitrTest.java), [`PitrEndToEndTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/PitrEndToEndTest.java), and `WalArchivingTest` (**3/3 passing**): verified automated `WalArchiver` streaming to both S3 HTTP endpoint and local archive sink, and end-to-end microsecond PITR restore recovering 100% of data before an accidental `DROP TABLE`.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 12 Week 23 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

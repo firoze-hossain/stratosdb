@@ -63,12 +63,13 @@ public class PitrRestore {
             return;
         }
 
-        Long targetTimeMillis = null;
+        Long targetTimeMicros = null;
         if (targetTimeArg != null) {
             try {
-                targetTimeMillis = Instant.parse(targetTimeArg).toEpochMilli();
+                Instant inst = Instant.parse(targetTimeArg);
+                targetTimeMicros = inst.getEpochSecond() * 1_000_000L + (inst.getNano() / 1_000L);
             } catch (Exception e) {
-                System.err.println("--target-time must be an ISO-8601 instant, e.g. 2026-08-26T15:00:00Z - got: " + targetTimeArg);
+                System.err.println("--target-time must be an ISO-8601 instant, e.g. 2026-08-26T15:00:00.123456Z - got: " + targetTimeArg);
                 return;
             }
         }
@@ -96,7 +97,7 @@ public class PitrRestore {
         }
 
         DiskManager diskManager = new DiskManager(targetDataDir);
-        PitrWalReplayer.ReplayResult result = PitrWalReplayer.replay(segmentBytes, diskManager, targetTimeMillis);
+        PitrWalReplayer.ReplayResult result = PitrWalReplayer.replayMicros(segmentBytes, diskManager, targetTimeMicros);
         System.err.println(result.summary());
         diskManager.close();
 

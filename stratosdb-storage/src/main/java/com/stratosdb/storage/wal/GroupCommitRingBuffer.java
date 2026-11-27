@@ -127,7 +127,7 @@ public class GroupCommitRingBuffer implements AutoCloseable {
         }
 
         slot.txId = transactionId;
-        slot.timestamp = System.currentTimeMillis();
+        slot.timestamp = WALManager.currentEpochMicros();
         slot.waiter = Thread.currentThread();
         slot.completed = false;
         slot.resultLsn = -1;
