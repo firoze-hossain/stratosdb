@@ -2464,6 +2464,16 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`MySqlGatewayTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/MySqlGatewayTest.java) (**2/2 passing**): verified `caching_sha2_password` (valid + invalid credentials), `mysql_native_password`, `COM_PING`, `SET NAMES`, `SELECT @@version_comment`, DDL/DML/SELECT over `COM_QUERY`, and `COM_QUIT`.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 11 Week 21 marked `Completed`.
 
+## Sprint 11 Week 22 — Gateway & Protocols: Built-in Connection Multiplexer ✅ DONE
+
+- ✅ **NIO `Selector` Connection Multiplexer ([`ConnectionMultiplexer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/multiplexer/ConnectionMultiplexer.java))**:
+  - Decouples client `SocketChannel`s from SQL execution threads using a multi-reactor `Selector` pool (`OP_READ`/`OP_WRITE` with shared per-reactor direct scratch buffers) and a bounded worker `ExecutorService`.
+  - Releases per-connection partial frame buffers when idle and pauses `OP_READ` during in-flight query execution for per-connection ordering and backpressure.
+
+- ✅ **Verification**:
+  - [`ConnectionMultiplexerTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ConnectionMultiplexerTest.java) (**1/1 passing**): verified **10,000** simultaneous client connections with `< 150` live JVM threads, `< 500MB` heap usage, and active SQL `CREATE TABLE`/`INSERT`/`SELECT` execution over wire protocol with zero thread starvation.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 11 Week 22 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
