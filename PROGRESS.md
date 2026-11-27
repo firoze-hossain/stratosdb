@@ -2451,6 +2451,19 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`AuditAndLdapAuthTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/AuditAndLdapAuthTest.java) (**2/2 passing**): verified SHA-256 hash-chain integrity across DDL/DCL/FAILED_LOGIN, tamper detection pinpointing the exact modified sequence, and end-to-end wire-protocol LDAPv3 authentication against an embedded RFC 4511 LDAP server.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 10 Week 20 marked `Completed`.
 
+## Sprint 11 Week 21 — Gateway & Protocols: MySQL Protocol v10 Gateway ✅ DONE
+
+- ✅ **MySQL Client/Server Protocol v10 Codec & Auth**:
+  - Implemented [`MySqlPacketCodec`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/mysql/MySqlPacketCodec.java) for MySQL v10 framing, `HandshakeV10`, `OK_Packet`, `EOF_Packet`, `ERR_Packet`, `ColumnDefinition41`, and text-protocol result rows.
+  - Implemented [`MySqlAuth`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/mysql/MySqlAuth.java) supporting both `caching_sha2_password` (fast-auth `AuthMoreData` + `OK_Packet`) and `mysql_native_password` scramble verification.
+
+- ✅ **MySQL Server Gateway ([`MySqlServer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/mysql/MySqlServer.java))**:
+  - Added `MySqlServer` (default port `3306`) handling `COM_QUERY` (SQL execution + MySQL CLI/Workbench session probes such as `SET NAMES`, `SELECT @@version_comment`, `SELECT VERSION()`, `SELECT DATABASE()`), `COM_PING`, `COM_INIT_DB`, `COM_QUIT`, and failed-login audit logging.
+
+- ✅ **Verification**:
+  - [`MySqlGatewayTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/MySqlGatewayTest.java) (**2/2 passing**): verified `caching_sha2_password` (valid + invalid credentials), `mysql_native_password`, `COM_PING`, `SET NAMES`, `SELECT @@version_comment`, DDL/DML/SELECT over `COM_QUERY`, and `COM_QUIT`.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 11 Week 21 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
