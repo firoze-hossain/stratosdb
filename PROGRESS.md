@@ -2437,6 +2437,20 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`TransparentDataEncryptionTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/TransparentDataEncryptionTest.java) (**4/4 passing**): verified PBKDF2 & external key file round-trip, zero plaintext leakage across all `.dat` and `wal_*.log` files, GCM authentication failure on wrong key, encrypted WAL recovery on restart, and AES-NI page decryption throughput.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 10 Week 19 marked `Completed`.
 
+## Sprint 10 Week 20 — Security: Tamper-Evident Audit Logging & Auth ✅ DONE
+
+- ✅ **Immutable SHA-256 Chained Audit Logger ([`AuditLogger`](file:///home/firoze/projects/Others/stratosdb/stratosdb-common/src/main/java/com/stratosdb/common/security/AuditLogger.java))**:
+  - Persists `DSYNC`-flushed, SHA-256 hash-chained records (`seq|ts|category|actor|action|detail|prevHash|hash`) to `audit.log` with `verifyIntegrity()` detecting any altered, deleted, or reordered record.
+  - Wired into [`ExecutorEngine`](file:///home/firoze/projects/Others/stratosdb/stratosdb-sql/src/main/java/com/stratosdb/sql/executor/ExecutorEngine.java) (`DDL` and `DCL` statements), [`StratosDB`](file:///home/firoze/projects/Others/stratosdb/stratosdb-core/src/main/java/com/stratosdb/core/StratosDB.java), and [`StdWireServer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/stdwire/StdWireServer.java) (`FAILED_LOGIN` events).
+
+- ✅ **External LDAP / Active Directory Authentication ([`LdapAuthProvider`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/auth/LdapAuthProvider.java), [`LdapConfig`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/auth/LdapConfig.java))**:
+  - Implemented JNDI LDAPv3 authentication supporting OpenLDAP DN bind patterns, Active Directory UPNs, and service-account search-then-bind with LDAP DN/filter injection escaping and anonymous-bind rejection.
+  - Integrated into [`StdWireServer`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/stdwire/StdWireServer.java) and [`StdWireMessages`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/stdwire/StdWireMessages.java) (`AuthenticationCleartextPassword`).
+
+- ✅ **Verification**:
+  - [`AuditAndLdapAuthTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/AuditAndLdapAuthTest.java) (**2/2 passing**): verified SHA-256 hash-chain integrity across DDL/DCL/FAILED_LOGIN, tamper detection pinpointing the exact modified sequence, and end-to-end wire-protocol LDAPv3 authentication against an embedded RFC 4511 LDAP server.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 10 Week 20 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

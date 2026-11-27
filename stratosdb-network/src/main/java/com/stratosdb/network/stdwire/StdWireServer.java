@@ -55,6 +55,7 @@ public class StdWireServer {
     /** This connection's own thread's own currently-resolved database, in cluster mode - set once in performStartup, read by every other per-connection method via {@link #db()} for the lifetime of this connection. Irrelevant, never touched, in single-database mode. */
     private final ThreadLocal<StratosDB> currentDb = new ThreadLocal<>();
     private final UserStore userStore; // null = trust auth, matching StratosServer's own established convention for this project
+    private volatile com.stratosdb.network.auth.LdapAuthProvider ldapAuthProvider;
     /** Stateless - safe to keep one, reused only for isEffectivelyEmpty's own real lexer check below (real SQL parsing itself still goes through StratosDB.execute's own internal parser, not this instance). */
     private final SqlParser sqlParser = new SqlParser();
     private volatile boolean running = false;
@@ -84,6 +85,10 @@ public class StdWireServer {
      */
     public void setReplicationClient(com.stratosdb.network.replication.ReplicationClient replicationClient) {
         this.replicationClient = replicationClient;
+    }
+
+    public void setLdapAuthProvider(com.stratosdb.network.auth.LdapAuthProvider ldapAuthProvider) {
+        this.ldapAuthProvider = ldapAuthProvider;
     }
 
     public StdWireServer(int port, StratosDB db) {
@@ -430,6 +435,10 @@ public class StdWireServer {
             }
             LOG.info("Client certificate authenticated: user={} CN={}", requestedUser, certCn);
             StdWireMessages.writeAuthenticationOk(out);
+        } else if (ldapAuthProvider != null) {
+            if (!performLdapAuthentication(params.get("user"), in, out)) {
+                return null;
+            }
         } else if (userStore != null) {
             boolean tlsActive = sslHandler != null;
             Map<String, byte[]> channelBindings = tlsActive ? sslHandler.getChannelBindings() : Map.of();
@@ -469,6 +478,26 @@ public class StdWireServer {
         StdWireMessages.writeReadyForQuery(out, 'I');
         out.flush();
         return params.get("user");
+    }
+
+    private boolean performLdapAuthentication(String username, DataInputStream in, DataOutputStream out) throws IOException {
+        StdWireMessages.writeAuthenticationCleartextPassword(out);
+        out.flush();
+        StdWireMessages.TypedMessage msg = StdWireMessages.readTypedMessage(in);
+        if (msg.type() != 'p') {
+            StdWireMessages.writeErrorResponse(out, "Expected PasswordMessage");
+            out.flush();
+            return false;
+        }
+        String password = StdWireMessages.readPasswordMessage(msg);
+        if (!ldapAuthProvider.authenticate(username, password)) {
+            db().getAuditLogger().logEvent("AUTH", username, "FAILED_LOGIN", "LDAP authentication failed");
+            StdWireMessages.writeErrorResponse(out, "LDAP authentication failed for user \"" + username + "\"");
+            out.flush();
+            return false;
+        }
+        StdWireMessages.writeAuthenticationOk(out);
+        return true;
     }
 
     /**
@@ -532,6 +561,7 @@ public class StdWireServer {
             serverFinalMessage = handshake.clientFinal(clientFinalMessage);
         } catch (ScramSha256.ScramAuthenticationException e) {
             LOG.warn("SCRAM authentication failed for user {}: {}", username, e.getMessage());
+            db().getAuditLogger().logEvent("AUTH", username, "FAILED_LOGIN", "SCRAM authentication failed");
             StdWireMessages.writeErrorResponse(out, "password authentication failed for user \"" + username + "\"");
             out.flush();
             return false;

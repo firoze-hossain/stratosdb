@@ -197,6 +197,10 @@ public class StratosDB {
         LOG.info("Autovacuum started, running every {} ms", intervalMs);
     }
 
+    public com.stratosdb.common.security.AuditLogger getAuditLogger() {
+        return executor.getAuditLogger();
+    }
+
     public synchronized void stopAutovacuum() {
         if (autovacuumTask != null) {
             autovacuumTask.cancel(false);

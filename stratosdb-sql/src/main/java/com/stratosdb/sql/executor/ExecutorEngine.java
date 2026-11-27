@@ -1607,6 +1607,62 @@ public class ExecutorEngine implements com.stratosdb.sql.plpgsql.PlpgsqlHost {
     }
 
     private QueryResult dispatch(Statement stmt, Transaction txn, String sql, List<Object> params) throws DeadlockException {
+        QueryResult result = dispatchCore(stmt, txn, sql, params);
+        auditIfDdlOrDcl(stmt, sql, result);
+        return result;
+    }
+
+    private volatile com.stratosdb.common.security.AuditLogger auditLogger;
+
+    public com.stratosdb.common.security.AuditLogger getAuditLogger() {
+        if (auditLogger == null) {
+            synchronized (this) {
+                if (auditLogger == null) {
+                    String dir = (dataDirectory != null && !dataDirectory.isBlank()) ? dataDirectory : ".";
+                    auditLogger = new com.stratosdb.common.security.AuditLogger(java.nio.file.Path.of(dir, "audit.log"));
+                }
+            }
+        }
+        return auditLogger;
+    }
+
+    private void auditIfDdlOrDcl(Statement stmt, String sql, QueryResult result) {
+        if (loadingCatalog || stmt == null) {
+            return;
+        }
+        String category = null;
+        if (stmt instanceof CreateRoleStatement || stmt instanceof DropRoleStatement
+                || stmt instanceof GrantStatement || stmt instanceof RevokeStatement
+                || stmt instanceof GrantDatabaseStatement || stmt instanceof RevokeDatabaseStatement
+                || stmt instanceof GrantRoleStatement || stmt instanceof RevokeRoleStatement
+                || stmt instanceof CreatePolicyStatement || stmt instanceof DropPolicyStatement
+                || stmt instanceof AlterTableEnableRlsStatement || stmt instanceof AlterTableDisableRlsStatement
+                || stmt instanceof AlterTableForceRlsStatement) {
+            category = "DCL";
+        } else if (stmt instanceof CreateTableStatement || stmt instanceof DropTableStatement
+                || stmt instanceof CreateIndexStatement || stmt instanceof DropIndexStatement
+                || stmt instanceof CreateDatabaseStatement || stmt instanceof DropDatabaseStatement
+                || stmt instanceof CreateViewStatement || stmt instanceof DropViewStatement
+                || stmt instanceof CreateSequenceStatement || stmt instanceof AlterSequenceStatement
+                || stmt instanceof DropSequenceStatement || stmt instanceof CreateTypeStatement
+                || stmt instanceof DropTypeStatement || stmt instanceof CreateFunctionStatement
+                || stmt instanceof DropFunctionStatement || stmt instanceof CreateProcedureStatement
+                || stmt instanceof DropProcedureStatement || stmt instanceof CreateTriggerStatement
+                || stmt instanceof DropTriggerStatement || stmt instanceof AlterTableAddColumnStatement
+                || stmt instanceof AlterTableDropColumnStatement || stmt instanceof AlterTableRenameColumnStatement
+                || stmt instanceof AlterTableRenameTableStatement || stmt instanceof AlterTableAlterColumnTypeStatement
+                || stmt instanceof AlterTableSetDefaultStatement || stmt instanceof AlterTableDropDefaultStatement
+                || stmt instanceof AlterTableAddConstraintStatement || stmt instanceof AlterTableDropConstraintStatement) {
+            category = "DDL";
+        }
+        if (category != null) {
+            String detail = (sql != null ? sql : stmt.toString())
+                + (result != null && !result.isSuccess() ? " [FAILED: " + result.getError() + "]" : "");
+            getAuditLogger().logEvent(category, currentUserFunction(), stmt.getClass().getSimpleName(), detail);
+        }
+    }
+
+    private QueryResult dispatchCore(Statement stmt, Transaction txn, String sql, List<Object> params) throws DeadlockException {
         if (isReadOnly() && !READ_ONLY_SAFE_STATEMENTS.contains(stmt.getClass())) {
             return QueryResult.error("cannot execute statement in a read-only replica");
         }

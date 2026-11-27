@@ -508,7 +508,7 @@ def create_project_plan_excel():
          "High", "P0 - Critical", "All on-disk bytes encrypted; files unreadable with strings/hexdump; decryption overhead < 5% via AES-NI.", "Completed"],
         ["Sprint 10", "Week 20", "Security", "Tamper-Evident Audit Logging & Auth",
          "Build immutable cryptographic audit logger writing SHA-256 chained event records for all DDL, DCL, and failed logins. Add external LDAP/Active Directory auth.",
-         "Medium", "P1 - High", "Audit trail cannot be altered without breaking hash chain; LDAP authentication verified with OpenLDAP test server.", "Planned"],
+         "Medium", "P1 - High", "Audit trail cannot be altered without breaking hash chain; LDAP authentication verified with OpenLDAP test server.", "Completed"],
 
         # Sprint 11 (Month 6, Weeks 21-22)
         ["Sprint 11", "Week 21", "Gateway & Protocols", "MySQL Protocol v10 Gateway",

@@ -224,6 +224,19 @@ public final class StdWireMessages {
         writeMessage(out, 'R', buf -> buf.putInt(0));
     }
 
+    public static void writeAuthenticationCleartextPassword(DataOutputStream out) throws IOException {
+        writeMessage(out, 'R', buf -> buf.putInt(3));
+    }
+
+    public static String readPasswordMessage(TypedMessage msg) {
+        byte[] body = msg.body();
+        int len = 0;
+        while (len < body.length && body[len] != 0) {
+            len++;
+        }
+        return new String(body, 0, len, StandardCharsets.UTF_8);
+    }
+
     // --- SCRAM-SHA-256 authentication (AuthenticationSASL family) ---
 
     /** AuthenticationSASL (auth code 10): lists the mechanism names the server supports, each null-terminated, ending with one additional empty string - a real client picks one and responds with SASLInitialResponse. */
