@@ -163,4 +163,34 @@ public class StdRaftCluster implements AutoCloseable {
             node.setPartitionFilter(null);
         }
     }
+
+    /**
+     * Injects simulated packet loss (0.0 to 1.0) across all nodes in the cluster.
+     */
+    public void setPacketLoss(double rate) {
+        for (StdRaftNode node : nodes.values()) {
+            node.setPacketLossRate(rate);
+        }
+    }
+
+    /**
+     * Injects simulated wall-clock skew (in milliseconds) on a specific node.
+     */
+    public void setClockSkew(String nodeId, long skewMillis) {
+        StdRaftNode node = nodes.get(nodeId);
+        if (node != null) {
+            node.setClockSkewMillis(skewMillis);
+        }
+    }
+
+    /**
+     * Clears all injected partitions, packet loss, and clock skew across the cluster.
+     */
+    public void clearChaos() {
+        for (StdRaftNode node : nodes.values()) {
+            node.setPartitionFilter(null);
+            node.setPacketLossRate(0.0);
+            node.setClockSkewMillis(0L);
+        }
+    }
 }

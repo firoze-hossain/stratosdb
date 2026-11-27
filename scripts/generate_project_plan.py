@@ -524,7 +524,7 @@ def create_project_plan_excel():
          "High", "P0 - Critical", "Restore database to point-in-time 5 seconds before simulated accidental DROP TABLE; 100% data recovered.", "Completed"],
         ["Sprint 12", "Week 24", "Verification", "Jepsen Partition Testing & Chaos",
          "Build automated Jepsen chaos test harness. Subject 3-node StratosDB cluster to network partitions, packet loss, clock skew, and kill -9 during TPC-C workload.",
-         "Very High", "P0 - Critical", "Zero stale reads, zero lost updates, zero split-brain inconsistencies under 48 hours continuous chaos.", "Planned"],
+         "Very High", "P0 - Critical", "Zero stale reads, zero lost updates, zero split-brain inconsistencies under 48 hours continuous chaos.", "Completed"],
 
         # Sprint 13 (Month 6, Weeks 25-26)
         ["Sprint 13", "Week 25", "Performance", "TPC-C & Sysbench 100k TPS Benchmark",

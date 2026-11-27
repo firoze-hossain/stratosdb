@@ -47,6 +47,8 @@ public class StdRaftNode implements AutoCloseable {
 
     private volatile long lastHeartbeatTime = 0;
     private volatile long lastQuorumAckTime = 0;
+    private volatile long lastHeartbeatMonoNanos = System.nanoTime();
+    private volatile long lastQuorumAckMonoNanos = System.nanoTime();
 
     private final List<StdRaftLogEntry> log = new CopyOnWriteArrayList<>();
     private volatile long commitIndex = 0;
@@ -58,8 +60,10 @@ public class StdRaftNode implements AutoCloseable {
     private volatile long leaseExpiresAt = 0;
     private volatile long leaseGrantedTerm = 0;
 
-    // Network partition simulation filter: if non-null, only peers matching this predicate can be reached/accepted
+    // Network partition & chaos simulation hooks
     private volatile Predicate<String> partitionFilter = null;
+    private volatile double packetLossRate = 0.0;
+    private volatile long clockSkewMillis = 0L;
 
     private ServerSocket serverSocket;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -110,7 +114,8 @@ public class StdRaftNode implements AutoCloseable {
 
     public boolean isLeader() {
         if (role != StdRaftRole.LEADER) return false;
-        if (!peers.isEmpty() && (System.currentTimeMillis() - lastQuorumAckTime > maxElectionTimeoutMillis)) {
+        long leaderLeaseWindowMs = Math.max(heartbeatIntervalMillis * 2, minElectionTimeoutMillis - 20);
+        if (!peers.isEmpty() && ((System.nanoTime() - lastQuorumAckMonoNanos) / 1_000_000L > leaderLeaseWindowMs)) {
             return false;
         }
         return true;
@@ -133,7 +138,7 @@ public class StdRaftNode implements AutoCloseable {
     }
 
     public boolean isLeaseActive(String key) {
-        long now = System.currentTimeMillis();
+        long now = nowMillis();
         return now < leaseExpiresAt && leaseHolder != null && (key == null || key.equals(leaseKey));
     }
 
@@ -143,6 +148,31 @@ public class StdRaftNode implements AutoCloseable {
 
     public Predicate<String> getPartitionFilter() {
         return partitionFilter;
+    }
+
+    public void setPacketLossRate(double packetLossRate) {
+        this.packetLossRate = Math.max(0.0, Math.min(1.0, packetLossRate));
+    }
+
+    public double getPacketLossRate() {
+        return packetLossRate;
+    }
+
+    public void setClockSkewMillis(long clockSkewMillis) {
+        this.clockSkewMillis = clockSkewMillis;
+    }
+
+    public long getClockSkewMillis() {
+        return clockSkewMillis;
+    }
+
+    private long nowMillis() {
+        return System.currentTimeMillis() + clockSkewMillis;
+    }
+
+    private boolean shouldDropPacket() {
+        double rate = this.packetLossRate;
+        return rate > 0.0 && ThreadLocalRandom.current().nextDouble() < rate;
     }
 
     public boolean canCommunicateWith(String peerId) {
@@ -226,6 +256,11 @@ public class StdRaftNode implements AutoCloseable {
              InputStream in = socket.getInputStream();
              OutputStream out = socket.getOutputStream()) {
 
+            if (shouldDropPacket()) {
+                socket.close();
+                return;
+            }
+
             StdRaftMessages.RaftPacket packet = StdRaftMessages.readPacket(in);
             switch (packet.type()) {
                 case StdRaftMessages.MSG_REQUEST_VOTE -> {
@@ -278,6 +313,7 @@ public class StdRaftNode implements AutoCloseable {
         if (canVote) {
             votedFor.set(req.candidateId());
             lastHeartbeatTime = System.currentTimeMillis();
+            lastHeartbeatMonoNanos = System.nanoTime();
             LOG.debug("Node {} voted for {} in term {}", nodeId, req.candidateId(), req.term());
             return new StdRaftMessages.RequestVoteResponse(nodeId, currentTerm.get(), true);
         } else {
@@ -299,6 +335,7 @@ public class StdRaftNode implements AutoCloseable {
         role = StdRaftRole.FOLLOWER;
         leaderId = req.leaderId();
         lastHeartbeatTime = System.currentTimeMillis();
+        lastHeartbeatMonoNanos = System.nanoTime();
 
         if (req.leaseExpiresAt() > 0) {
             this.leaseHolder = req.leaseHolder();
@@ -313,10 +350,11 @@ public class StdRaftNode implements AutoCloseable {
             return new StdRaftMessages.LeaseAcquireResponse(false, currentTerm.get(), leaseExpiresAt, leaderId);
         }
 
-        long now = System.currentTimeMillis();
+        long now = nowMillis();
+        long monoQuorumAgeMs = (System.nanoTime() - lastQuorumAckMonoNanos) / 1_000_000L;
         // Quorum liveness check: leader must have confirmed quorum recently
-        if (peers.size() > 0 && (now - lastQuorumAckTime > maxElectionTimeoutMillis * 2)) {
-            LOG.warn("Leader {} cannot grant lease: quorum heartbeat lost (last ack {}ms ago)", nodeId, now - lastQuorumAckTime);
+        if (peers.size() > 0 && (monoQuorumAgeMs > maxElectionTimeoutMillis * 2)) {
+            LOG.warn("Leader {} cannot grant lease: quorum heartbeat lost (last ack {}ms ago)", nodeId, monoQuorumAgeMs);
             return new StdRaftMessages.LeaseAcquireResponse(false, currentTerm.get(), leaseExpiresAt, null);
         }
 
@@ -338,7 +376,7 @@ public class StdRaftNode implements AutoCloseable {
     }
 
     public synchronized StdRaftMessages.LeaseQueryResponse handleLeaseQuery(String key) {
-        long now = System.currentTimeMillis();
+        long now = nowMillis();
         boolean active = (now < leaseExpiresAt) && leaseHolder != null && (key == null || key.equals(leaseKey));
         return new StdRaftMessages.LeaseQueryResponse(active, leaseHolder, leaseExpiresAt, leaderId);
     }
@@ -348,7 +386,8 @@ public class StdRaftNode implements AutoCloseable {
         while (running.get()) {
             try {
                 if (role == StdRaftRole.LEADER) {
-                    if (!peers.isEmpty() && (System.currentTimeMillis() - lastQuorumAckTime > maxElectionTimeoutMillis)) {
+                    long monoQuorumAgeMs = (System.nanoTime() - lastQuorumAckMonoNanos) / 1_000_000L;
+                    if (!peers.isEmpty() && (monoQuorumAgeMs > maxElectionTimeoutMillis)) {
                         synchronized (this) {
                             if (role == StdRaftRole.LEADER) {
                                 LOG.warn("Node {} stepping down from LEADER to FOLLOWER due to quorum loss", nodeId);
@@ -361,7 +400,7 @@ public class StdRaftNode implements AutoCloseable {
                     }
                     Thread.sleep(heartbeatIntervalMillis);
                 } else {
-                    long elapsed = System.currentTimeMillis() - lastHeartbeatTime;
+                    long elapsed = (System.nanoTime() - lastHeartbeatMonoNanos) / 1_000_000L;
                     if (elapsed >= nextTimeout) {
                         startElection();
                         nextTimeout = pickElectionTimeout();
@@ -389,6 +428,7 @@ public class StdRaftNode implements AutoCloseable {
         votedFor.set(nodeId);
         leaderId = null;
         lastHeartbeatTime = System.currentTimeMillis();
+        lastHeartbeatMonoNanos = System.nanoTime();
 
         LOG.info("Node {} starting election for term {}, quorum={}", nodeId, term, getQuorumSize());
 
@@ -438,6 +478,7 @@ public class StdRaftNode implements AutoCloseable {
         role = StdRaftRole.LEADER;
         leaderId = nodeId;
         lastQuorumAckTime = System.currentTimeMillis();
+        lastQuorumAckMonoNanos = System.nanoTime();
         LOG.info("Node {} elected LEADER for term {}", nodeId, term);
         broadcastHeartbeatAsync();
     }
@@ -487,6 +528,7 @@ public class StdRaftNode implements AutoCloseable {
                             if (resp.success() && role == StdRaftRole.LEADER) {
                                 if (acks.incrementAndGet() >= getQuorumSize()) {
                                     lastQuorumAckTime = System.currentTimeMillis();
+                                    lastQuorumAckMonoNanos = System.nanoTime();
                                 }
                             }
                         }

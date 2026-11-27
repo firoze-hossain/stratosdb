@@ -70,13 +70,14 @@ public class StratosDB {
         this.walManager.setSynchronousCommitMode(config.getSynchronousCommit());
         this.transactionManager = new TransactionManager(config.getDataDirectory(), config.getLockPartitions());
         this.transactionManager.setSyncCommitLog(config.isSyncWAL());
+
+        // Recover from WAL before ExecutorEngine loads the relational SystemCatalog
+        this.walManager.recover(diskManager);
+
         this.executor = new ExecutorEngine(bufferPool, walManager, transactionManager, config.getDataDirectory());
         if (config.getSlowQueryThresholdMs() >= 0) {
             this.executor.setSlowQueryThresholdMs(config.getSlowQueryThresholdMs());
         }
-
-        // Recover from WAL
-        this.walManager.recover(diskManager);
 
         if (config.getAutovacuumIntervalMs() > 0) {
             startAutovacuum(config.getAutovacuumIntervalMs());

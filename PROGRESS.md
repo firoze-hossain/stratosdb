@@ -2487,6 +2487,20 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`ContinuousArchivingAndPitrTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ContinuousArchivingAndPitrTest.java), [`PitrEndToEndTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/PitrEndToEndTest.java), and `WalArchivingTest` (**3/3 passing**): verified automated `WalArchiver` streaming to both S3 HTTP endpoint and local archive sink, and end-to-end microsecond PITR restore recovering 100% of data before an accidental `DROP TABLE`.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 12 Week 23 marked `Completed`.
 
+## Sprint 12 Week 24 — Verification: Jepsen Partition Testing & Chaos ✅ DONE
+
+- ✅ **Automated Jepsen Chaos Harness & Consistency Verifier ([`JepsenChaosHarness`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/jepsen/JepsenChaosHarness.java), [`JepsenHistoryVerifier`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/jepsen/JepsenHistoryVerifier.java))**:
+  - Subjects a 3-node StratosDB cluster (with `StdRaftCluster` consensus + synchronous `REMOTE_APPLY` replication + `StratosHa` failover) to continuous **network partitions**, **packet loss** (`30%`), **clock skew** (`+/- 5000ms`), and **`kill -9` (`SIGKILL`)** during concurrent TPC-C (`NEW_ORDER`, `PAYMENT`, `ORDER_STATUS`, `STOCK_LEVEL`) and linearizable register workloads.
+  - Supports configurable soak duration (`-Djepsen.duration.seconds` and CLI `--duration-seconds 172800` for 48-hour continuous runs) while enforcing zero stale reads, zero lost updates, and zero split-brain (`countLeaders() <= 1`).
+
+- ✅ **Consensus & Crash-Recovery Hardening ([`StdRaftNode`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/consensus/StdRaftNode.java), [`StdRaftCluster`](file:///home/firoze/projects/Others/stratosdb/stratosdb-network/src/main/java/com/stratosdb/network/consensus/StdRaftCluster.java), [`StratosDB`](file:///home/firoze/projects/Others/stratosdb/stratosdb-core/src/main/java/com/stratosdb/core/StratosDB.java))**:
+  - Added packet-loss (`setPacketLossRate`) and wall-clock skew (`setClockSkewMillis`) fault injection, monotonic `System.nanoTime()` quorum/election timers, tightened leader lease expiry strictly below `minElectionTimeoutMillis` to prevent dual-leader overlap during partitions, and fixed `startElection()` monotonic timer reset to break split-vote lockstep.
+  - Fixed `StratosDB` startup ordering so `walManager.recover(diskManager)` runs before `ExecutorEngine` loads the relational `SystemCatalog`.
+
+- ✅ **Verification**:
+  - [`JepsenChaosTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/JepsenChaosTest.java) and [`RaftConsensusClusterTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/RaftConsensusClusterTest.java) (**4/4 passing**): verified 3-node continuous chaos across all 4 fault types with zero stale reads, zero lost updates, and zero split-brain, plus real OS `SIGKILL` (`destroyForcibly()`) WAL durability recovery.
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 12 Week 24 marked `Completed`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.
