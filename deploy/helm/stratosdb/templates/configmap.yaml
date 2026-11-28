@@ -8,3 +8,8 @@ data:
   STRATOS_PORT: {{ .Values.ports.native | quote }}
   STRATOS_STDWIRE_PORT: {{ .Values.ports.stdwire | quote }}
   STRATOS_REPLICATION_PORT: {{ .Values.ports.replication | quote }}
+  STRATOS_MYSQL_PORT: {{ .Values.ports.mysql | default 3306 | quote }}
+  STRATOS_RAFT_PORT: {{ .Values.ports.raft | default 5435 | quote }}
+  STRATOS_RAFT_ENABLED: {{ .Values.raft.enabled | default true | quote }}
+  STRATOS_RAFT_CLUSTER_SIZE: {{ .Values.raft.clusterSize | default 3 | quote }}
+  STRATOS_TLS_ENABLED: {{ .Values.tls.enabled | default true | quote }}

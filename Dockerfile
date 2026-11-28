@@ -5,9 +5,13 @@
 
 FROM openjdk:25-ea-slim
 
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 LABEL org.opencontainers.image.title="StratosDB" \
-      org.opencontainers.image.description="PostgreSQL-compatible Relational Database Engine in Java 25 with Zero-Pause Generational ZGC" \
-      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.description="PostgreSQL & MySQL-compatible Enterprise Relational Database Engine in Java 25 with Zero-Pause Generational ZGC" \
+      org.opencontainers.image.version="2.0.0" \
+      org.opencontainers.image.architecture="${TARGETARCH}" \
       org.opencontainers.image.vendor="StratosDB Project" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.authors="Firoze Hossain <firoze.hossain@outlook.com>"
@@ -71,7 +75,10 @@ VOLUME ["/var/lib/stratosdb/data"]
 # 5432 - Standard PostgreSQL v3 wire protocol (psql, pgjdbc, Hibernate, Prisma)
 # 5431 - Stratos Wire Protocol SWP v1.0 (native driver, DBNavigator)
 # 5434 - Streaming Physical Replication (WAL shipping & networked base backup)
+# 3306 - MySQL Client/Server Protocol v10 Gateway
+# 5435 - Raft Consensus Cluster Coordinator
 EXPOSE 5432 5431 5434
+EXPOSE 3306 5435
 
 # Container Healthcheck (readiness probe on wire port 5432)
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=5 \

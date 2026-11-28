@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>StratosDB 2.0 Enterprise Documentation Portal</title>
+  <style>
+    :root { --bg: #f8fafc; --card: #ffffff; --ink: #0f172a; --muted: #475569; --accent: #2563eb; --border: #e2e8f0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: var(--bg); color: var(--ink); line-height: 1.6; }
+    header { background: linear-gradient(135deg, #0f172a, #1e3a8a); color: #fff; padding: 48px 24px; text-align: center; }
+    header h1 { margin: 0 0 8px; font-size: 2.2rem; }
+    header p { margin: 0; opacity: 0.9; font-size: 1.05rem; }
+    main { max-width: 1040px; margin: 32px auto; padding: 0 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; margin-top: 20px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+    .card h3 { margin-top: 0; color: var(--accent); }
+    pre { background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.88rem; }
+    a { color: var(--accent); text-decoration: none; font-weight: 600; }
+    a:hover { text-decoration: underline; }
+    .badge { display: inline-block; background: #dbeafe; color: #1e40af; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="badge">v2.0.0 Enterprise GA</span>
+    <h1>StratosDB 2.0 Documentation Portal</h1>
+    <p>High-Throughput Hybrid Relational Database Engine — PostgreSQL &amp; MySQL Wire-Compatible, Raft HA, TDE &amp; PITR</p>
+  </header>
+  <main>
+    <h2>Quick Start</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Multi-Arch Docker (amd64 / arm64)</h3>
+        <pre>docker run -d --name stratosdb \
+  -p 5432:5432 -p 3306:3306 -p 5431:5431 \
+  stratosdb:2.0.0</pre>
+        <p>See <a href="DOCKER_GUIDE.md">Docker Deployment Guide</a>.</p>
+      </div>
+      <div class="card">
+        <h3>Kubernetes 3-Node Raft HA + TLS</h3>
+        <pre>helm install stratosdb ./deploy/helm/stratosdb \
+  --set raft.enabled=true \
+  --set raft.clusterSize=3 \
+  --set tls.enabled=true</pre>
+        <p>Brings up a 3-node TLS-secured Raft cluster in &lt; 60s. See <a href="../deploy/helm/stratosdb/README.md">Helm README</a>.</p>
+      </div>
+      <div class="card">
+        <h3>Pure-Java Type 4 JDBC Driver</h3>
+        <pre>String url = "jdbc:stratos://localhost:5431/stratos";
+Connection c = DriverManager.getConnection(url, "admin", "admin");</pre>
+        <p>Maven artifact: <code>com.stratosdb:stratosdb-jdbc:1.0.0-SNAPSHOT</code>. See <a href="CLIENT_CONNECTIVITY.md">Client Connectivity</a>.</p>
+      </div>
+    </div>
+
+    <h2>Documentation Index (100% Coverage)</h2>
+    <div class="grid">
+      <div class="card">
+        <h3><a href="STRATOSDB_2_0_REFERENCE.md">StratosDB 2.0 Feature &amp; Architecture Reference</a></h3>
+        <p>Recursive CTEs, Binary JSONB &amp; GIN, UUID/INET/Arrays, Synchronous Replication, Raft Consensus, TDE (AES-256-GCM), Audit Logging &amp; LDAP, MySQL v10 Gateway, Connection Multiplexer, PITR, Jepsen Chaos &amp; 100k TPS Benchmarks.</p>
+      </div>
+      <div class="card">
+        <h3><a href="HIGH_AVAILABILITY_GUIDE.md">High Availability &amp; Raft Clustering</a></h3>
+        <p>3-node and 5-node Raft consensus, synchronous <code>REMOTE_APPLY</code> replication, automated failover, and split-brain lease protection.</p>
+      </div>
+      <div class="card">
+        <h3><a href="SECURITY_GUIDE.md">Security, TDE, Audit &amp; LDAP</a></h3>
+        <p>AES-256-GCM Transparent Data Encryption, SHA-256 tamper-evident audit logging, SCRAM-SHA-256, TLS 1.3, RBAC/RLS, and LDAPv3 / Active Directory authentication.</p>
+      </div>
+      <div class="card">
+        <h3><a href="PRODUCTION_DEPLOYMENT.md">Production Deployment &amp; Operations</a></h3>
+        <p>Linux systemd packaging, Generational ZGC tuning, continuous WAL archiving (S3/local), microsecond PITR restore, and Prometheus observability.</p>
+      </div>
+      <div class="card">
+        <h3><a href="CLIENT_CONNECTIVITY.md">Client Connectivity &amp; Drivers</a></h3>
+        <p>PostgreSQL v3 wire protocol (<code>psql</code>, pgJDBC, Prisma, Hibernate), MySQL v10 gateway (port 3306), and pure-Java StratosDB JDBC driver.</p>
+      </div>
+      <div class="card">
+        <h3><a href="../benchmarks/stratosdb_vs_pg17_charts.html">Performance Benchmarks vs PostgreSQL 17</a></h3>
+        <p>100-warehouse TPC-C &amp; 10M-row Sysbench OLTP charts, lock-free L1 buffer pool benchmarks, and P99 latency metrics.</p>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

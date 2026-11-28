@@ -2516,6 +2516,22 @@ The Windows `.msi` and macOS `.dmg` build steps in the workflow could not be dir
   - [`Benchmark100kAndChartTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/Benchmark100kAndChartTest.java) (**2/2 passing**): verified 64-byte cache-line alignment (`address % 64 == 0`), **1,029,464 lookups/sec** across 8 threads on the lock-free `BufferPoolPartition` L1 `hotCache`, and automated generation of all PG 17 SVG/HTML/Markdown comparison charts.
   - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 13 Week 25 marked `Completed`.
 
+## Sprint 13 Week 26 — Release Engineering: StratosDB 2.0 Enterprise GA Release ✅ DONE
+
+- ✅ **Multi-Arch Docker Container (`linux/amd64`, `linux/arm64`)**:
+  - Updated [`Dockerfile`](file:///home/firoze/projects/Others/stratosdb/Dockerfile) with `TARGETOS`/`TARGETARCH`, `2.0.0` OCI labels, and MySQL (`3306`) + Raft (`5435`) ports, plus [`build-multiarch-docker.sh`](file:///home/firoze/projects/Others/stratosdb/scripts/build-multiarch-docker.sh) using `docker buildx build --platform linux/amd64,linux/arm64`.
+
+- ✅ **Kubernetes Helm Charts with Automated 3-Node Raft Clustering & TLS**:
+  - Updated [`values.yaml`](file:///home/firoze/projects/Others/stratosdb/deploy/helm/stratosdb/values.yaml) and [`configmap.yaml`](file:///home/firoze/projects/Others/stratosdb/deploy/helm/stratosdb/templates/configmap.yaml), and added [`raft-cluster.yaml`](file:///home/firoze/projects/Others/stratosdb/deploy/helm/stratosdb/templates/raft-cluster.yaml) (`podManagementPolicy: Parallel`, 3-node `StatefulSet`, headless DNS peer discovery, `< 60s` startup/readiness probes) and [`tls-secret.yaml`](file:///home/firoze/projects/Others/stratosdb/deploy/helm/stratosdb/templates/tls-secret.yaml) (automated CA + signed TLS certificate generation).
+
+- ✅ **Pure-Java JDBC Driver & Documentation Portal**:
+  - Verified [`stratosdb-jdbc`](file:///home/firoze/projects/Others/stratosdb/stratosdb-jdbc/pom.xml) Type 4 JDBC driver (**9/9 tests passing** across `StratosDriverTest` and `TlsIntegrationTest`).
+  - Published [`docs/index.html`](file:///home/firoze/projects/Others/stratosdb/docs/index.html) documentation portal and [`STRATOSDB_2_0_REFERENCE.md`](file:///home/firoze/projects/Others/stratosdb/docs/STRATOSDB_2_0_REFERENCE.md) alongside all deployment, security, HA, Docker, and client connectivity guides.
+
+- ✅ **Verification & GA Tag**:
+  - [`EnterpriseGaReleaseTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/EnterpriseGaReleaseTest.java) (**3/3 passing**) and [`ProductionReleaseAndDockerPackagingEndToEndTest`](file:///home/firoze/projects/Others/stratosdb/stratosdb-testing/src/test/java/com/stratosdb/testing/ProductionReleaseAndDockerPackagingEndToEndTest.java) (**5/5 passing**).
+  - Updated `StratosDB_6Month_Project_Plan.xlsx`: Sprint 13 Week 26 marked `Completed`; tagged `v2.0.0`.
+
 ## What to do next
 
 **Now addressed for both `HeapTable` and index structures (`BTreeIndex`)**, with fine-grained page latch crabbing and deadlock-free coupling fully verified under sustained 64-thread concurrency.

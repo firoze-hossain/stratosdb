@@ -16,6 +16,23 @@ ports:
   stdwire: 5432
   native: 5431
   replication: 5434
+  mysql: 3306
+  raft: 5435
+
+raft:
+  enabled: true
+  clusterSize: 3
+  port: 5435
+  heartbeatIntervalMs: 50
+  electionTimeoutMs: 300
+  startupTimeoutSeconds: 60
+
+tls:
+  enabled: true
+  autoGenerate: true
+  existingSecret: ""
+  caCommonName: "stratosdb-cluster-ca"
+  certValidityDays: 365
 
 primary:
   replicaCount: 1

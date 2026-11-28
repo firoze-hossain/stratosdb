@@ -1,0 +1,94 @@
+{{- if .Values.raft.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stratosdb.fullname" . }}-raft
+  labels:
+    {{- include "stratosdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: raft-cluster
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: stdwire
+      port: {{ .Values.ports.stdwire }}
+    - name: native
+      port: {{ .Values.ports.native }}
+    - name: replication
+      port: {{ .Values.ports.replication }}
+    - name: raft
+      port: {{ .Values.ports.raft | default 5435 }}
+  selector:
+    {{- include "stratosdb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: raft-cluster
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "stratosdb.fullname" . }}-raft
+  labels:
+    {{- include "stratosdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: raft-cluster
+spec:
+  serviceName: {{ include "stratosdb.fullname" . }}-raft
+  podManagementPolicy: Parallel
+  replicas: {{ .Values.raft.clusterSize | default 3 }}
+  selector:
+    matchLabels:
+      {{- include "stratosdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: raft-cluster
+  template:
+    metadata:
+      labels:
+        {{- include "stratosdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: raft-cluster
+    spec:
+      containers:
+        - name: stratosdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "stratosdb.fullname" . }}-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: STRATOS_RAFT_NODE_ID
+              value: "$(POD_NAME)"
+            - name: STRATOS_RAFT_HEARTBEAT_MS
+              value: {{ .Values.raft.heartbeatIntervalMs | default 50 | quote }}
+            - name: STRATOS_RAFT_ELECTION_TIMEOUT_MS
+              value: {{ .Values.raft.electionTimeoutMs | default 300 | quote }}
+          ports:
+            - name: stdwire
+              containerPort: {{ .Values.ports.stdwire }}
+            - name: native
+              containerPort: {{ .Values.ports.native }}
+            - name: raft
+              containerPort: {{ .Values.ports.raft | default 5435 }}
+          startupProbe:
+            tcpSocket:
+              port: {{ .Values.ports.stdwire }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 25
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.ports.stdwire }}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/stratosdb/tls
+              readOnly: true
+          {{- end }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "stratosdb.fullname" .)) }}
+      {{- end }}
+{{- end }}
