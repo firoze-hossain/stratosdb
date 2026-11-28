@@ -529,7 +529,7 @@ def create_project_plan_excel():
         # Sprint 13 (Month 6, Weeks 25-26)
         ["Sprint 13", "Week 25", "Performance", "TPC-C & Sysbench 100k TPS Benchmark",
          "Execute 100-warehouse TPC-C and 10M-row Sysbench OLTP suites on 32-core dedicated server. Optimize lock-free paths, memory alignment, and CPU cache locality.",
-         "High", "P0 - Critical", "Achieve > 100,000 TPS on Sysbench and > 50,000 tpmC on TPC-C; publish automated comparison charts vs PG 17.", "Planned"],
+         "High", "P0 - Critical", "Achieve > 100,000 TPS on Sysbench and > 50,000 tpmC on TPC-C; publish automated comparison charts vs PG 17.", "Completed"],
         ["Sprint 13", "Week 26", "Release Engineering", "StratosDB 2.0 Enterprise GA Release",
          "Finalize multi-arch Docker container (amd64, arm64), Kubernetes Helm charts with automated Raft clustering, pure-Java JDBC driver, and documentation portal.",
          "Medium", "P0 - Critical", "Helm install brings up 3-node HA cluster with TLS in < 60s; 100% documentation coverage; GA release tagged.", "Planned"]

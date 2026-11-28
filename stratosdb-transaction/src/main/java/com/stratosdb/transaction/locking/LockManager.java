@@ -47,6 +47,9 @@ public class LockManager {
     private static final class LockPartition {
         final ReentrantLock lock = new ReentrantLock(false);
         final Map<RowId, RowLockEntry> rowLocks = new HashMap<>();
+        // 64-byte cache-line padding to prevent false sharing between adjacent lock partitions
+        @SuppressWarnings("unused")
+        long p0, p1, p2, p3, p4, p5, p6, p7;
     }
 
     // --- Table Lock Data Structures ---
@@ -584,6 +587,9 @@ public class LockManager {
      * Releases every row lock and table lock held by xid. Call on both commit and abort.
      */
     public void releaseAll(long xid) {
+        if (locksHeldBy.isEmpty() && tableLocksHeldBy.isEmpty()) {
+            return;
+        }
         // 1. Release row locks
         Set<RowId> heldRows = locksHeldBy.remove(xid);
         if (heldRows != null && !heldRows.isEmpty()) {

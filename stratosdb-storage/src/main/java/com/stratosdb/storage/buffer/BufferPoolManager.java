@@ -48,8 +48,15 @@ public class BufferPoolManager implements BufferPool {
     private final AtomicLong totalBackgroundFlushes = new AtomicLong(0);
     private final AtomicLong totalDirtyPagesFlushed = new AtomicLong(0);
 
+    // 64-byte cache-line padded hit/miss counters to avoid false sharing across cores
+    @SuppressWarnings("unused")
+    private long p0, p1, p2, p3, p4, p5, p6, p7;
     private final LongAdder hits = new LongAdder();
+    @SuppressWarnings("unused")
+    private long q0, q1, q2, q3, q4, q5, q6, q7;
     private final LongAdder misses = new LongAdder();
+    @SuppressWarnings("unused")
+    private long r0, r1, r2, r3, r4, r5, r6, r7;
 
     public BufferPoolManager(int maxPages, DiskManager diskManager) {
         this(maxPages, diskManager, 0L, false, DEFAULT_PARTITION_COUNT);
@@ -258,7 +265,8 @@ public class BufferPoolManager implements BufferPool {
             directFramePool.poll();
             return seg;
         }
-        return poolArena.allocate(PageConstants.PAGE_SIZE, 8);
+        // 64-byte CPU cache-line aligned native off-heap page frame allocation
+        return poolArena.allocate(PageConstants.PAGE_SIZE, 64);
     }
 
     public ByteBuffer acquireDirectFrame() {

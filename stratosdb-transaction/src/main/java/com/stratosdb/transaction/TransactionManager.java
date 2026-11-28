@@ -43,7 +43,12 @@ public class TransactionManager {
     /** How many xids get reserved (persisted) at once. A crash after using some of a batch just wastes the rest of it - xids are cheap, 64-bit, and never need reclaiming. */
     private static final long XID_BATCH_SIZE = 1000;
 
+    // 64-byte cache-line padded XID generator to prevent false sharing across cores
+    @SuppressWarnings("unused")
+    private long p0, p1, p2, p3, p4, p5, p6, p7;
     private final AtomicLong nextXID = new AtomicLong(1);
+    @SuppressWarnings("unused")
+    private long q0, q1, q2, q3, q4, q5, q6, q7;
     private final ThreadLocal<Transaction> currentTransaction = new ThreadLocal<>();
 
     private final Set<Long> activeXids = ConcurrentHashMap.newKeySet();

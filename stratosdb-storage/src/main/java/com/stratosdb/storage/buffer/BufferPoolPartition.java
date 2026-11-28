@@ -21,11 +21,19 @@ import java.util.function.Supplier;
  */
 public class BufferPoolPartition {
 
+    private static final int HOT_CACHE_SIZE = 32; // Power-of-two direct-mapped lock-free L1 frame cache
+    private static final int HOT_CACHE_MASK = HOT_CACHE_SIZE - 1;
+
     private final int partitionId;
     private final int capacity;
     private final AtomicReferenceArray<BufferFrame> frames;
+    private final AtomicReferenceArray<BufferFrame> hotCache = new AtomicReferenceArray<>(HOT_CACHE_SIZE);
     private final ConcurrentHashMap<PageKey, Integer> directory;
+    @SuppressWarnings("unused")
+    private long p0, p1, p2, p3, p4, p5, p6, p7;
     private final AtomicInteger clockHand = new AtomicInteger(0);
+    @SuppressWarnings("unused")
+    private long q0, q1, q2, q3, q4, q5, q6, q7;
     private final AtomicInteger activeCount = new AtomicInteger(0);
     private final ReentrantLock partitionLock = new ReentrantLock();
 
@@ -69,9 +77,21 @@ public class BufferPoolPartition {
             }
             return null;
         }
+        int hotSlot = (tableName.hashCode() * 31 + (int) (pageId ^ (pageId >>> 32))) & HOT_CACHE_MASK;
+        BufferFrame cached = hotCache.get(hotSlot);
+        if (cached != null && cached.getState() == BufferFrame.STATE_VALID && cached.matches(tableName, pageId)) {
+            return cached;
+        }
         PageKey key = new PageKey(tableName, pageId);
         Integer slot = directory.get(key);
-        return slot != null ? frames.get(slot) : null;
+        if (slot == null) {
+            return null;
+        }
+        BufferFrame frame = frames.get(slot);
+        if (frame != null) {
+            hotCache.lazySet(hotSlot, frame);
+        }
+        return frame;
     }
 
     /**
